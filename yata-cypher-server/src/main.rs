@@ -19,8 +19,13 @@ use yata_cypher::{parse, Executor, Graph, MemoryGraph, NodeRef, RelRef, Row};
 struct AppState {
     graph: RwLock<MemoryGraph>,
     tonbo_url: String,
+    domain: String,
+    // shinshi domain
     models_table: String,
     follows_table: String,
+    // pachinko domain
+    machines_table: String,
+    stores_table: String,
 }
 
 // ---- API types -----------------------------------------------------------
@@ -106,7 +111,7 @@ async fn query(
 }
 
 async fn sync_now(State(state): State<Arc<AppState>>) -> Json<JValue> {
-    match load_graph(&state.tonbo_url, &state.models_table, &state.follows_table).await {
+    match load_graph_for_domain(&state).await {
         Ok(g) => {
             let nc = g.nodes().len();
             let rc = g.rels().len();
@@ -206,6 +211,176 @@ async fn load_graph(
     info!("loaded {follow_count} FOLLOWS edges from tonbo");
 
     Ok(g)
+}
+
+async fn load_graph_for_domain(state: &AppState) -> anyhow::Result<MemoryGraph> {
+    if state.domain == "pachinko" {
+        load_pachinko_graph(&state.tonbo_url, &state.machines_table, &state.stores_table).await
+    } else {
+        load_graph(&state.tonbo_url, &state.models_table, &state.follows_table).await
+    }
+}
+
+// ---- Pachinko graph loader -----------------------------------------------
+//
+// Graph schema:
+//   (m:Machine) — machine_id, name, maker, machineType, recommendScore, riskScore, borderEqual
+//   (s:Store)   — store_id, name, chain, addressRegion
+//   (s)-[:CARRIES]->(m)
+//
+// Key Cypher queries for pachinko:
+//
+//   Top machines by recommend score:
+//     MATCH (m:Machine) RETURN m ORDER BY m.recommendScore DESC LIMIT 20
+//
+//   Stores carrying a specific machine:
+//     MATCH (s:Store)-[:CARRIES]->(m:Machine {machineId: $id}) RETURN s
+//
+//   Machines carried by a store:
+//     MATCH (s:Store {storeId: $id})-[:CARRIES]->(m:Machine) RETURN m
+//
+//   Related machines (same maker):
+//     MATCH (m:Machine {machineId: $id})
+//     MATCH (r:Machine) WHERE r.maker = m.maker AND r.machineId <> m.machineId
+//     RETURN r ORDER BY r.recommendScore DESC LIMIT 5
+//
+//   Stores by prefecture:
+//     MATCH (s:Store) WHERE s.addressRegion = $region RETURN s
+
+async fn load_pachinko_graph(
+    tonbo_url: &str,
+    machines_table: &str,
+    stores_table: &str,
+) -> anyhow::Result<MemoryGraph> {
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
+    let mut g = MemoryGraph::new();
+
+    // ---- machines ----
+    let resp: TonboQueryResp = client
+        .post(format!("{tonbo_url}/v1/table/{machines_table}/query/"))
+        .json(&serde_json::json!({"limit": 50000, "offset": 0}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    for row in &resp.rows {
+        let machine_id = row_str(row, "machine_id");
+        if machine_id.is_empty() {
+            continue;
+        }
+        // spec_json contains the full machineSpec as JSON
+        let spec: serde_json::Value = serde_json::from_str(&row_str(row, "spec_json"))
+            .unwrap_or(serde_json::Value::Null);
+        let mut props = IndexMap::new();
+        props.insert("machineId".to_string(), yata_cypher::Value::Str(machine_id.clone()));
+        props.insert("name".to_string(), yata_cypher::Value::Str(row_str(row, "name")));
+        props.insert("maker".to_string(), yata_cypher::Value::Str(row_str(row, "maker")));
+        props.insert(
+            "machineType".to_string(),
+            yata_cypher::Value::Str(row_str(row, "machine_type")),
+        );
+        props.insert(
+            "recommendScore".to_string(),
+            yata_cypher::Value::Int(spec_i64(&spec, "recommendScore")),
+        );
+        props.insert(
+            "riskScore".to_string(),
+            yata_cypher::Value::Int(spec_i64(&spec, "riskScore")),
+        );
+        props.insert(
+            "borderEqual".to_string(),
+            yata_cypher::Value::Float(spec_f64(&spec, "borderEqual")),
+        );
+        g.add_node(NodeRef {
+            id: format!("machine:{machine_id}"),
+            labels: vec!["Machine".to_string()],
+            props,
+        });
+    }
+    info!("pachinko: loaded {} Machine nodes", resp.rows.len());
+
+    // ---- stores + CARRIES edges ----
+    let resp: TonboQueryResp = client
+        .post(format!("{tonbo_url}/v1/table/{stores_table}/query/"))
+        .json(&serde_json::json!({"limit": 50000, "offset": 0}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let mut carries_count = 0usize;
+    for row in &resp.rows {
+        let store_id = row_str(row, "store_id");
+        if store_id.is_empty() {
+            continue;
+        }
+        let store_json_raw = row_str(row, "store_json");
+        let spec: serde_json::Value =
+            serde_json::from_str(&store_json_raw).unwrap_or(serde_json::Value::Null);
+
+        let mut props = IndexMap::new();
+        props.insert("storeId".to_string(), yata_cypher::Value::Str(store_id.clone()));
+        props.insert("name".to_string(), yata_cypher::Value::Str(row_str(row, "name")));
+        props.insert(
+            "chain".to_string(),
+            yata_cypher::Value::Str(spec_str(&spec, "chain")),
+        );
+        props.insert(
+            "addressRegion".to_string(),
+            yata_cypher::Value::Str(spec_nested_str(&spec, "address", "addressRegion")),
+        );
+        let store_node_id = format!("store:{store_id}");
+        g.add_node(NodeRef {
+            id: store_node_id.clone(),
+            labels: vec!["Store".to_string()],
+            props,
+        });
+
+        // CARRIES edges from machineIds array in spec_json
+        if let Some(machine_ids) = spec.get("machineIds").and_then(|v| v.as_array()) {
+            for mid in machine_ids {
+                if let Some(mid_str) = mid.as_str() {
+                    let machine_node_id = format!("machine:{mid_str}");
+                    if g.node_by_id(&machine_node_id).is_some() {
+                        g.add_rel(RelRef {
+                            id: format!("carries:{store_id}:{mid_str}"),
+                            rel_type: "CARRIES".to_string(),
+                            src: store_node_id.clone(),
+                            dst: machine_node_id,
+                            props: IndexMap::new(),
+                        });
+                        carries_count += 1;
+                    }
+                }
+            }
+        }
+    }
+    info!("pachinko: loaded {} Store nodes, {} CARRIES edges", resp.rows.len(), carries_count);
+
+    Ok(g)
+}
+
+fn spec_str(spec: &serde_json::Value, key: &str) -> String {
+    spec.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+
+fn spec_nested_str(spec: &serde_json::Value, obj: &str, key: &str) -> String {
+    spec.get(obj)
+        .and_then(|o| o.get(key))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn spec_i64(spec: &serde_json::Value, key: &str) -> i64 {
+    spec.get(key).and_then(|v| v.as_i64()).unwrap_or(0)
+}
+
+fn spec_f64(spec: &serde_json::Value, key: &str) -> f64 {
+    spec.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0)
 }
 
 fn row_str(row: &serde_json::Map<String, JValue>, key: &str) -> String {
