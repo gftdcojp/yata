@@ -776,6 +776,53 @@ pub mod parser {
             }
         }
 
+        /// Like expect_ident but also accepts keyword tokens as names.
+        /// Used for labels, relationship types, and property keys where
+        /// reserved words are commonly used as identifiers in Cypher.
+        fn expect_name(&mut self) -> Result<String> {
+            match self.next()? {
+                Token::Ident(s) => Ok(s),
+                // Allow any keyword as a name in label/type position
+                Token::Match => Ok("Match".into()),
+                Token::Optional => Ok("Optional".into()),
+                Token::Create => Ok("Create".into()),
+                Token::Merge => Ok("Merge".into()),
+                Token::Return => Ok("Return".into()),
+                Token::With => Ok("With".into()),
+                Token::Where => Ok("Where".into()),
+                Token::Set => Ok("Set".into()),
+                Token::Delete => Ok("Delete".into()),
+                Token::Detach => Ok("Detach".into()),
+                Token::And => Ok("And".into()),
+                Token::Or => Ok("Or".into()),
+                Token::Not => Ok("Not".into()),
+                Token::Xor => Ok("Xor".into()),
+                Token::In => Ok("In".into()),
+                Token::Is => Ok("Is".into()),
+                Token::Null => Ok("Null".into()),
+                Token::True => Ok("True".into()),
+                Token::False => Ok("False".into()),
+                Token::As => Ok("As".into()),
+                Token::Distinct => Ok("Distinct".into()),
+                Token::Order => Ok("Order".into()),
+                Token::By => Ok("By".into()),
+                Token::Asc => Ok("Asc".into()),
+                Token::Desc => Ok("Desc".into()),
+                Token::Limit => Ok("Limit".into()),
+                Token::Skip => Ok("Skip".into()),
+                Token::Unwind => Ok("Unwind".into()),
+                Token::Case => Ok("Case".into()),
+                Token::When => Ok("When".into()),
+                Token::Then => Ok("Then".into()),
+                Token::Else => Ok("Else".into()),
+                Token::End => Ok("End".into()),
+                tok => Err(CypherError::ParseError(format!(
+                    "expected name, got {:?}",
+                    tok
+                ))),
+            }
+        }
+
         fn is_clause_start(tok: &Token) -> bool {
             matches!(
                 tok,
@@ -1046,7 +1093,7 @@ pub mod parser {
             let mut labels = Vec::new();
             while matches!(self.peek()?, Token::Colon) {
                 self.next()?;
-                labels.push(self.expect_ident()?);
+                labels.push(self.expect_name()?);
             }
             let props = if matches!(self.peek()?, Token::LBrace) {
                 self.parse_props_map()?
@@ -1091,11 +1138,11 @@ pub mod parser {
                     let mut types = Vec::new();
                     while matches!(self.peek()?, Token::Colon) {
                         self.next()?;
-                        types.push(self.expect_ident()?);
+                        types.push(self.expect_name()?);
                         // Support |TYPE2
                         while matches!(self.peek()?, Token::Pipe) {
                             self.next()?;
-                            types.push(self.expect_ident()?);
+                            types.push(self.expect_name()?);
                         }
                     }
                     // Variable hops: *2..5 or * or *2
@@ -1181,7 +1228,7 @@ pub mod parser {
             let mut props = Vec::new();
             if !matches!(self.peek()?, Token::RBrace) {
                 loop {
-                    let key = self.expect_ident()?;
+                    let key = self.expect_name()?;
                     self.expect(&Token::Colon)?;
                     let val = self.parse_expr()?;
                     props.push((key, val));
@@ -1379,15 +1426,7 @@ pub mod parser {
         }
 
         fn parse_concat(&mut self) -> Result<Expr> {
-            let mut lhs = self.parse_add_sub()?;
-            loop {
-                if matches!(self.peek()?, Token::Plus) {
-                    // Check if it's string concat or add — handled the same way
-                    // We'll use Add for both; executor will decide
-                    break;
-                }
-                break;
-            }
+            let lhs = self.parse_add_sub()?;
             Ok(lhs)
         }
 
@@ -1537,7 +1576,7 @@ pub mod parser {
                     let mut entries = Vec::new();
                     if !matches!(self.peek()?, Token::RBrace) {
                         loop {
-                            let key = self.expect_ident()?;
+                            let key = self.expect_name()?;
                             self.expect(&Token::Colon)?;
                             let val = self.parse_expr()?;
                             entries.push((key, val));
@@ -2537,11 +2576,11 @@ pub mod executor {
         }
 
         fn dedup_bindings(&self, bindings: Vec<Binding>) -> Vec<Binding> {
-            let mut seen = Vec::new();
+            let mut seen: Vec<Vec<(String, String)>> = Vec::new();
             let mut result = Vec::new();
             for b in bindings {
-                let key: Vec<(&String, String)> =
-                    b.iter().map(|(k, v)| (k, v.to_string())).collect();
+                let key: Vec<(String, String)> =
+                    b.iter().map(|(k, v)| (k.clone(), v.to_string())).collect();
                 if !seen.contains(&key) {
                     seen.push(key);
                     result.push(b);
