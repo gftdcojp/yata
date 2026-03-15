@@ -1,5 +1,5 @@
 # ── Stage 1: builder ──────────────────────────────────────────────────────────
-FROM rust:1.85-slim-bookworm AS builder
+FROM rust:1.93-slim-bookworm AS builder
 
 # UCX dev headers + runtime libs needed at link time
 RUN apt-get update && apt-get install -y --no-install-recommends \

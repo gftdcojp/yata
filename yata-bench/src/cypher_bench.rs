@@ -11,10 +11,9 @@
 //!   EDGES      (default: 3000)
 
 use anyhow::Result;
-use indexmap::IndexMap;
 use rand::{Rng, SeedableRng, rngs::StdRng};
-use std::time::{Duration, Instant};
-use yata_cypher::{executor::Executor, graph::MemoryGraph, parser, types::Value};
+use std::time::Instant;
+use yata_cypher::{Executor, Graph, MemoryGraph, NodeRef, RelRef, Value, parse};
 
 // ── report helpers ───────────────────────────────────────────────────────────
 
@@ -101,14 +100,12 @@ fn generate_dataset(n_nodes: usize, n_edges: usize, seed: u64) -> Dataset {
 // ── yata-cypher backend ──────────────────────────────────────────────────────
 
 fn build_yata_graph(ds: &Dataset) -> MemoryGraph {
-    use yata_cypher::graph::MemoryGraph;
-    use yata_cypher::types::{NodeRef, RelRef};
-
     let mut g = MemoryGraph::new();
     for n in &ds.nodes {
-        let mut props = IndexMap::new();
-        props.insert("name".to_owned(), Value::Str(n.name.clone()));
-        props.insert("age".to_owned(), Value::Int(n.age));
+        let props = [
+            ("name".to_owned(), Value::Str(n.name.clone())),
+            ("age".to_owned(), Value::Int(n.age)),
+        ].into_iter().collect();
         g.add_node(NodeRef {
             id: n.id.clone(),
             labels: vec![n.label.clone()],
@@ -121,7 +118,7 @@ fn build_yata_graph(ds: &Dataset) -> MemoryGraph {
             rel_type: e.rel_type.clone(),
             src: e.src.clone(),
             dst: e.dst.clone(),
-            props: IndexMap::new(),
+            props: Default::default(),
         });
     }
     g
@@ -141,7 +138,7 @@ impl YataBenchmark {
     }
 
     fn run_query(&mut self, cypher: &str) -> Result<usize> {
-        let query = parser::parse(cypher)?;
+        let query = parse(cypher)?;
         let result = self.exec.execute(&query, &mut self.graph)?;
         Ok(result.rows.len())
     }
