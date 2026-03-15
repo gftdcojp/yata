@@ -21,7 +21,7 @@ spec:
         - name: ghcr-pull-secret
       containers:
         - name: flight
-          image: ghcr.io/gftdcojp/yata-flight:20260315-6bd85c45a8-amd64
+          image: ghcr.io/gftdcojp/yata-flight:20260316-a6532cf648-amd64
           ports:
             - name: grpc
               containerPort: 32010
@@ -31,6 +31,8 @@ spec:
               value: "0.0.0.0:32010"
             - name: YATA_LANCE_URI
               value: "s3://ai-gftd-lancedb/yata-lancedb"
+            - name: YATA_GRAPH_URI
+              value: "s3://ai-gftd-lancedb/yata-graph"
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:

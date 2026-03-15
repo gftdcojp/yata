@@ -1285,7 +1285,7 @@ pub mod parser {
         }
 
         fn parse_set_item(&mut self) -> Result<SetItem> {
-            let lhs = self.parse_expr()?;
+            let lhs = self.parse_postfix()?;
             match self.peek()? {
                 Token::Eq | Token::PlusEq => {
                     self.next()?;

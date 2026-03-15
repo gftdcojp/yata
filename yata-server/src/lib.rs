@@ -13,8 +13,8 @@ use std::sync::Arc;
 use yata_arrow::ArrowBatchHandle;
 use yata_b2::{B2Config, B2Sync, TieredObjectStore};
 use yata_core::{
-    Ack, AppendLog, Blake3Hash, Envelope, ObjectStorage, PayloadRef, PublishRequest, Result,
-    SchemaId, StreamId, Subject,
+    Ack, AppendLog, Blake3Hash, Envelope, KvStore, ObjectStorage, PayloadRef, PublishRequest,
+    Result, SchemaId, StreamId, Subject,
 };
 use yata_kv::KvBucketStore;
 use yata_lance::{LocalLanceSink, LanceSink, SyncStats};
@@ -36,6 +36,8 @@ pub struct BrokerConfig {
     pub b2_sync_interval_ms: u64,
     /// Graph store base URI. When set, initializes a LanceGraphStore at this path.
     pub graph_uri: Option<String>,
+    /// NATS config. When set, uses NATS JetStream for log/kv/object instead of local.
+    pub nats: Option<yata_nats::NatsConfig>,
 }
 
 impl Default for BrokerConfig {
@@ -47,6 +49,7 @@ impl Default for BrokerConfig {
             b2: None,
             b2_sync_interval_ms: 30_000,
             graph_uri: None,
+            nats: None,
         }
     }
 }
@@ -54,16 +57,20 @@ impl Default for BrokerConfig {
 /// The central broker: owns all subsystems.
 pub struct Broker {
     pub config: BrokerConfig,
-    pub log: Arc<LocalLog>,
-    pub kv: Arc<KvBucketStore>,
-    /// ObjectStore — `TieredObjectStore` when B2 is configured, else `LocalObjectStore`.
+    pub log: Arc<dyn AppendLog>,
+    pub kv: Arc<dyn KvStore>,
+    /// ObjectStore — NATS / TieredObjectStore / LocalObjectStore.
     pub objects: Arc<dyn ObjectStorage>,
     pub ocel: Arc<MemoryOcelProjector>,
     pub lance: Arc<LocalLanceSink>,
     /// Graph store — initialized when `BrokerConfig.graph_uri` is set.
     pub graph: Option<Arc<yata_graph::LanceGraphStore>>,
+    /// Local KV handle for drain_pending (None when NATS is used).
+    local_kv: Option<Arc<KvBucketStore>>,
     /// B2 sync handle; used by background tasks for log/kv/lance dir sync.
     b2_sync: Option<Arc<B2Sync>>,
+    /// NATS backend (for Arrow pub/sub when NATS is enabled).
+    pub nats: Option<Arc<yata_nats::NatsBackend>>,
 }
 
 impl Broker {
@@ -72,30 +79,58 @@ impl Broker {
         let data_dir = &config.data_dir;
         tokio::fs::create_dir_all(data_dir).await?;
 
-        let log = Arc::new(LocalLog::new(data_dir.join("log")).await?);
-        log.recover().await?;
+        // NATS backend (when configured, replaces local log/kv/object)
+        let nats_backend = if let Some(ref nats_cfg) = config.nats {
+            Some(Arc::new(
+                yata_nats::NatsBackend::connect(nats_cfg)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("nats connect: {e}"))?,
+            ))
+        } else {
+            None
+        };
 
-        let kv_payload_store = Arc::new(
-            PayloadStore::new(data_dir.join("kv_payloads"))
-                .await
-                .map_err(anyhow::Error::from)?,
-        );
-        let kv = Arc::new(KvBucketStore::new(log.clone(), kv_payload_store).await?);
+        let (log, kv, local_kv_handle, objects, b2_sync): (
+            Arc<dyn AppendLog>,
+            Arc<dyn KvStore>,
+            Option<Arc<KvBucketStore>>,
+            Arc<dyn ObjectStorage>,
+            Option<Arc<B2Sync>>,
+        ) = if let Some(ref nats) = nats_backend {
+            // NATS JetStream backends
+            let log: Arc<dyn AppendLog> = Arc::new(nats.append_log());
+            let kv: Arc<dyn KvStore> = Arc::new(nats.kv_store());
+            let objects: Arc<dyn ObjectStorage> = Arc::new(nats.object_store());
+            (log, kv, None, objects, None)
+        } else {
+            // Local backends (original path)
+            let local_log = Arc::new(LocalLog::new(data_dir.join("log")).await?);
+            local_log.recover().await?;
 
-        let local_objects =
-            Arc::new(LocalObjectStore::new(data_dir.join("objects")).await?);
+            let kv_payload_store = Arc::new(
+                PayloadStore::new(data_dir.join("kv_payloads"))
+                    .await
+                    .map_err(anyhow::Error::from)?,
+            );
+            let local_kv = Arc::new(KvBucketStore::new(local_log.clone(), kv_payload_store).await?);
 
-        let (objects, b2_sync): (Arc<dyn ObjectStorage>, Option<Arc<B2Sync>>) =
-            if let Some(ref b2_cfg) = config.b2 {
-                let b2 = Arc::new(
-                    B2Sync::new(b2_cfg.clone(), local_objects.clone())
-                        .map_err(anyhow::Error::from)?,
-                );
-                let tiered = Arc::new(TieredObjectStore::new(local_objects, b2.clone()));
-                (tiered, Some(b2))
-            } else {
-                (local_objects, None)
-            };
+            let local_objects =
+                Arc::new(LocalObjectStore::new(data_dir.join("objects")).await?);
+
+            let (objects, b2_sync): (Arc<dyn ObjectStorage>, Option<Arc<B2Sync>>) =
+                if let Some(ref b2_cfg) = config.b2 {
+                    let b2 = Arc::new(
+                        B2Sync::new(b2_cfg.clone(), local_objects.clone())
+                            .map_err(anyhow::Error::from)?,
+                    );
+                    let tiered = Arc::new(TieredObjectStore::new(local_objects, b2.clone()));
+                    (tiered, Some(b2))
+                } else {
+                    (local_objects as Arc<dyn ObjectStorage>, None)
+                };
+
+            (local_log as Arc<dyn AppendLog>, local_kv.clone() as Arc<dyn KvStore>, Some(local_kv), objects, b2_sync)
+        };
 
         let ocel = Arc::new(MemoryOcelProjector::new());
         let lance = Arc::new(LocalLanceSink::new(&config.lance_uri).await?);
@@ -118,7 +153,9 @@ impl Broker {
             ocel,
             lance,
             graph,
+            local_kv: local_kv_handle,
             b2_sync,
+            nats: nats_backend,
         })
     }
 
@@ -282,10 +319,13 @@ impl Broker {
             self.lance.write_o2o_edges(&snapshot.object_object_edges).await?;
         }
 
-        // Flush KV history — drains the pending buffer populated by put/delete
-        let kv_entries = self.kv.drain_pending();
-        if !kv_entries.is_empty() {
-            self.lance.write_kv_history(&kv_entries).await?;
+        // Flush KV history — drains the pending buffer (local backend only).
+        // When using NATS, KV history is tracked by JetStream natively.
+        if let Some(ref local_kv) = self.local_kv {
+            let kv_entries = local_kv.drain_pending();
+            if !kv_entries.is_empty() {
+                self.lance.write_kv_history(&kv_entries).await?;
+            }
         }
 
         let stats = self.lance.sync_stats().await?;

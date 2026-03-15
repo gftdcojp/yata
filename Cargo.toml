@@ -21,6 +21,7 @@ members = [
     "yata-cypher-server",
     "yata-flight",
     "yata-graph",
+    "yata-nats",
 ]
 
 [workspace.package]
@@ -119,3 +120,7 @@ yata-bench = { path = "yata-bench" }
 yata-cypher = { path = "yata-cypher" }
 yata-flight = { path = "yata-flight" }
 yata-graph = { path = "yata-graph" }
+yata-nats = { path = "yata-nats" }
+
+# NATS
+async-nats = "0.38"

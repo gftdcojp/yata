@@ -13,7 +13,7 @@ use arrow_flight::{
     flight_service_server::FlightService,
 };
 use arrow_schema::{DataType, Field, Schema};
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, TryStreamExt};
 use indexmap::IndexMap;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -237,7 +237,6 @@ impl YataFlightService {
 
         Ok(Box::pin(stream))
     }
-}
 
     // ---- Write operations -------------------------------------------------
 
@@ -759,5 +758,317 @@ mod tests {
         let active_val = rows[0].iter().find(|(c, _)| c == "active").map(|(_, v)| v.as_str()).unwrap_or("");
         assert_eq!(age_val,    "25");
         assert_eq!(active_val, "true");
+    }
+
+    // ---- Write operation tests ------------------------------------------
+
+    /// Lance table direct write: build RecordBatch → execute_lance_write → verify via scan.
+    #[tokio::test]
+    async fn test_execute_lance_write_and_scan_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let conn = lancedb::connect(uri).execute().await.unwrap();
+
+        // Build a 2-row batch
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["r1", "r2"])) as Arc<dyn arrow_array::Array>,
+                Arc::new(StringArray::from(vec!["hello", "world"])) as Arc<dyn arrow_array::Array>,
+            ],
+        )
+        .unwrap();
+
+        let rows = YataFlightService::execute_lance_write(conn.clone(), "test_table", vec![batch])
+            .await
+            .unwrap();
+        assert_eq!(rows, 2);
+
+        // Read back
+        let tbl = conn.open_table("test_table").execute().await.unwrap();
+        let batches: Vec<RecordBatch> = tbl
+            .query()
+            .execute()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    /// Graph vertex batch write: build Arrow RecordBatch → write_vertices_batch → load back.
+    #[tokio::test]
+    async fn test_execute_graph_write_vertices_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_uri = dir.path().to_str().unwrap();
+
+        let schema = yata_graph::graph_arrow::vertices_schema();
+        let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["v1", "v2"])) as Arc<dyn arrow_array::Array>,
+                Arc::new(StringArray::from(vec![r#"["Person"]"#, r#"["Company"]"#]))
+                    as Arc<dyn arrow_array::Array>,
+                Arc::new(StringArray::from(vec![
+                    r#"{"name":"Alice"}"#,
+                    r#"{"name":"GFTD"}"#,
+                ])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int64Array::from(vec![now_ns, now_ns])) as Arc<dyn arrow_array::Array>,
+            ],
+        )
+        .unwrap();
+
+        let rows =
+            YataFlightService::execute_graph_write(graph_uri, "vertices", vec![batch])
+                .await
+                .unwrap();
+        assert_eq!(rows, 2);
+
+        // Verify via LanceGraphStore load
+        let store = LanceGraphStore::new(graph_uri).await.unwrap();
+        let nodes = store.load_vertices().await.unwrap();
+        assert_eq!(nodes.len(), 2);
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"v1"));
+        assert!(ids.contains(&"v2"));
+    }
+
+    /// Graph edge batch write: Arrow RecordBatch → write_edges_batch → verify adj auto-gen.
+    #[tokio::test]
+    async fn test_execute_graph_write_edges_batch_with_adj() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_uri = dir.path().to_str().unwrap();
+
+        // Write vertices first
+        let store = LanceGraphStore::new(graph_uri).await.unwrap();
+        store
+            .write_vertices(&[
+                yata_cypher::NodeRef {
+                    id: "a".into(),
+                    labels: vec!["X".into()],
+                    props: IndexMap::new(),
+                },
+                yata_cypher::NodeRef {
+                    id: "b".into(),
+                    labels: vec!["Y".into()],
+                    props: IndexMap::new(),
+                },
+            ])
+            .await
+            .unwrap();
+
+        // Build edge batch
+        let edge_schema = yata_graph::graph_arrow::edges_schema();
+        let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let edge_batch = RecordBatch::try_new(
+            edge_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["e1"])) as Arc<dyn arrow_array::Array>,
+                Arc::new(StringArray::from(vec!["a"])) as Arc<dyn arrow_array::Array>,
+                Arc::new(StringArray::from(vec!["b"])) as Arc<dyn arrow_array::Array>,
+                Arc::new(StringArray::from(vec!["LINKS"])) as Arc<dyn arrow_array::Array>,
+                Arc::new(StringArray::from(vec![r#"{}"#])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int64Array::from(vec![now_ns])) as Arc<dyn arrow_array::Array>,
+            ],
+        )
+        .unwrap();
+
+        let rows =
+            YataFlightService::execute_graph_write(graph_uri, "edges", vec![edge_batch])
+                .await
+                .unwrap();
+        assert_eq!(rows, 1);
+
+        // Verify edges loaded
+        let edges = store.load_edges().await.unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].rel_type, "LINKS");
+
+        // Verify Cypher traversal works (adj index must be present)
+        let mut g = store.to_memory_graph().await.unwrap();
+        let result = g
+            .query("MATCH (a)-[:LINKS]->(b) RETURN a, b", &[])
+            .unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    /// Cypher mutate: CREATE nodes → verify delta persisted to Lance.
+    #[tokio::test]
+    async fn test_execute_cypher_mutate_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_uri = dir.path().to_str().unwrap();
+
+        let ticket = CypherMutateTicket::new(
+            "CREATE (a:Person {name: \"Alice\"})-[:KNOWS]->(b:Person {name: \"Bob\"})",
+            vec![],
+        );
+        let mut ticket_with_uri = ticket;
+        ticket_with_uri.graph_uri = Some(graph_uri.to_string());
+
+        let result =
+            YataFlightService::execute_cypher_mutate(ticket_with_uri, None)
+                .await
+                .unwrap();
+
+        assert_eq!(result.nodes_created, 2);
+        assert_eq!(result.edges_created, 1);
+        assert_eq!(result.nodes_modified, 0);
+        assert_eq!(result.edges_modified, 0);
+        assert_eq!(result.nodes_deleted, 0);
+        assert_eq!(result.edges_deleted, 0);
+
+        // Verify persistence: reload and query
+        let store = LanceGraphStore::new(graph_uri).await.unwrap();
+        let mut g = store.to_memory_graph().await.unwrap();
+        let rows = g
+            .query(
+                "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS aname, b.name AS bname",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// Cypher mutate: SET property on existing node → verify modification persisted.
+    #[tokio::test]
+    async fn test_execute_cypher_mutate_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_uri = dir.path().to_str().unwrap();
+
+        // Seed graph
+        let store = LanceGraphStore::new(graph_uri).await.unwrap();
+        let mut props = IndexMap::new();
+        props.insert("name".into(), yata_cypher::Value::Str("Alice".into()));
+        props.insert("age".into(), yata_cypher::Value::Int(30));
+        store
+            .write_vertices(&[yata_cypher::NodeRef {
+                id: "alice".into(),
+                labels: vec!["Person".into()],
+                props,
+            }])
+            .await
+            .unwrap();
+
+        // Mutate: SET age = 31
+        let ticket = CypherMutateTicket {
+            cypher: "MATCH (n:Person {name: \"Alice\"}) SET n.age = 31 RETURN n".into(),
+            params: vec![],
+            graph_uri: Some(graph_uri.to_string()),
+        };
+
+        let result = YataFlightService::execute_cypher_mutate(ticket, None)
+            .await
+            .unwrap();
+        assert_eq!(result.nodes_modified, 1);
+        assert_eq!(result.nodes_created, 0);
+
+        // Verify persistence
+        let store2 = LanceGraphStore::new(graph_uri).await.unwrap();
+        let mut g = store2.to_memory_graph().await.unwrap();
+        let rows = g.query("MATCH (n:Person) RETURN n.age AS age", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].1, "31");
+    }
+
+    /// Cypher mutate: DETACH DELETE → verify tombstone written, node absent on reload.
+    #[tokio::test]
+    async fn test_execute_cypher_mutate_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_uri = dir.path().to_str().unwrap();
+
+        // Seed: Alice -[KNOWS]-> Bob
+        let store = LanceGraphStore::new(graph_uri).await.unwrap();
+        let mut ap = IndexMap::new();
+        ap.insert("name".into(), yata_cypher::Value::Str("Alice".into()));
+        let mut bp = IndexMap::new();
+        bp.insert("name".into(), yata_cypher::Value::Str("Bob".into()));
+        store
+            .write_vertices(&[
+                yata_cypher::NodeRef { id: "alice".into(), labels: vec!["Person".into()], props: ap },
+                yata_cypher::NodeRef { id: "bob".into(),   labels: vec!["Person".into()], props: bp },
+            ])
+            .await
+            .unwrap();
+        store
+            .write_edges(&[yata_cypher::RelRef {
+                id: "e1".into(), src: "alice".into(), dst: "bob".into(),
+                rel_type: "KNOWS".into(), props: IndexMap::new(),
+            }])
+            .await
+            .unwrap();
+
+        // Delete Alice (detach)
+        let ticket = CypherMutateTicket {
+            cypher: "MATCH (n:Person {name: \"Alice\"}) DETACH DELETE n".into(),
+            params: vec![],
+            graph_uri: Some(graph_uri.to_string()),
+        };
+        let result = YataFlightService::execute_cypher_mutate(ticket, None)
+            .await
+            .unwrap();
+        assert_eq!(result.nodes_deleted, 1);
+        assert_eq!(result.edges_deleted, 1);
+
+        // Verify: reload — last-write-wins with _deleted tombstone.
+        // The tombstone overwrites the original node (props contains _deleted:true).
+        let store2 = LanceGraphStore::new(graph_uri).await.unwrap();
+        let nodes = store2.load_vertices().await.unwrap();
+        // alice should have _deleted:true in props
+        let alice = nodes.iter().find(|n| n.id == "alice");
+        assert!(alice.is_some());
+        let has_deleted = alice
+            .unwrap()
+            .props
+            .get("_deleted")
+            .map(|v| matches!(v, yata_cypher::Value::Bool(true)))
+            .unwrap_or(false);
+        assert!(has_deleted, "alice should have _deleted tombstone");
+    }
+
+    /// Multi-batch do_put: two batches written atomically in one Lance append.
+    #[tokio::test]
+    async fn test_execute_lance_write_multi_batch_concat() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let conn = lancedb::connect(uri).execute().await.unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+        ]));
+        let b1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["a", "b"])) as Arc<dyn arrow_array::Array>],
+        )
+        .unwrap();
+        let b2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["c"])) as Arc<dyn arrow_array::Array>],
+        )
+        .unwrap();
+
+        let rows =
+            YataFlightService::execute_lance_write(conn.clone(), "multi", vec![b1, b2])
+                .await
+                .unwrap();
+        assert_eq!(rows, 3);
+
+        let tbl = conn.open_table("multi").execute().await.unwrap();
+        let batches: Vec<RecordBatch> = tbl
+            .query()
+            .execute()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3);
     }
 }

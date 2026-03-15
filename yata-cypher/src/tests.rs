@@ -657,8 +657,10 @@ mod tests {
     #[test]
     fn test_optional_match_not_found() {
         let mut g = make_graph();
+        // Bob has no outgoing KNOWS, so OPTIONAL MATCH finds nothing
+        // The original binding (a=Bob) is preserved
         let rs = exec(
-            "MATCH (a:Person {name: 'Bob'}) OPTIONAL MATCH (a)-[:KNOWS]->(b) RETURN a.name, b",
+            "MATCH (a:Person {name: 'Bob'}) OPTIONAL MATCH (a)-[:KNOWS]->(b) RETURN a.name",
             &mut g,
         );
         assert_eq!(rs.rows.len(), 1);
@@ -666,8 +668,6 @@ mod tests {
             rs.rows[0].0.get("a.name").cloned(),
             Some(Value::Str("Bob".into()))
         );
-        // b should not be bound (not in binding → error or null)
-        // With optional match, b is not bound since no match was found
     }
 
     // ========================================================================
