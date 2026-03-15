@@ -416,11 +416,13 @@ async fn main() -> Result<()> {
     // S3 URI (Lance uses s3+http:// for custom endpoints)
     let s3_uri: Option<String> = s3_endpoint.as_ref().map(|ep| {
         // Lance expects s3://bucket/prefix with AWS env vars set
-        std::env::set_var("AWS_ACCESS_KEY_ID", &s3_key);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", &s3_secret);
-        std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
-        std::env::set_var("AWS_ENDPOINT_URL", ep);
-        std::env::set_var("AWS_ALLOW_HTTP", "1");
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", &s3_key);
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", &s3_secret);
+            std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
+            std::env::set_var("AWS_ENDPOINT_URL", ep);
+            std::env::set_var("AWS_ALLOW_HTTP", "1");
+        }
         format!("s3://{s3_bucket}/yata-bench-graph")
     });
 
