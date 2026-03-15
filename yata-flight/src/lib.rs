@@ -4,7 +4,10 @@ mod error;
 mod service;
 
 pub use catalog::YataTableCatalog;
-pub use codec::{CypherTicket, ScanTicket};
+pub use codec::{
+    CypherMutateResult, CypherMutateTicket, CypherTicket, GraphWriteTicket, ScanTicket,
+    WriteTicket,
+};
 pub use error::FlightError;
 pub use service::YataFlightService;
 

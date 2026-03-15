@@ -7387,6 +7387,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "indexmap 2.13.0",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -7422,6 +7423,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "bytes",
+ "chrono",
  "futures",
  "indexmap 2.13.0",
  "lancedb",
