@@ -1,13 +1,20 @@
 #![allow(dead_code)]
 
 //! YATA broker/runtime — wires together log, kv, object, ocel, lance.
+//!
+//! Tiered storage is always active when `BrokerConfig.b2` is set:
+//! - ObjectStore: local CAS + async B2 sync, read-through fallback
+//! - KV: flushed to Lance `yata_kv_history` + log segments synced to B2
+//! - Flight/Lance: datasets synced to B2 periodically
+//! - Cypher: implicitly tiered via OCEL → Lance → B2
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use yata_arrow::ArrowBatchHandle;
+use yata_b2::{B2Config, B2Sync, TieredObjectStore};
 use yata_core::{
-    Ack, AppendLog, Blake3Hash, Envelope, PayloadRef, PublishRequest, Result, SchemaId, StreamId,
-    Subject,
+    Ack, AppendLog, Blake3Hash, Envelope, ObjectStorage, PayloadRef, PublishRequest, Result,
+    SchemaId, StreamId, Subject,
 };
 use yata_kv::KvBucketStore;
 use yata_lance::{LocalLanceSink, LanceSink, SyncStats};
@@ -23,6 +30,10 @@ pub struct BrokerConfig {
     pub lance_uri: String,
     /// Lance flush interval (milliseconds).
     pub lance_flush_interval_ms: u64,
+    /// B2 credentials. When set, enables tiered storage for all subsystems.
+    pub b2: Option<B2Config>,
+    /// How often to sync log/kv_payloads/lance dirs to B2 (milliseconds).
+    pub b2_sync_interval_ms: u64,
 }
 
 impl Default for BrokerConfig {
@@ -31,6 +42,8 @@ impl Default for BrokerConfig {
             data_dir: PathBuf::from("./yata-data"),
             lance_uri: "./yata-lance".to_string(),
             lance_flush_interval_ms: 5000,
+            b2: None,
+            b2_sync_interval_ms: 30_000,
         }
     }
 }
@@ -40,9 +53,12 @@ pub struct Broker {
     pub config: BrokerConfig,
     pub log: Arc<LocalLog>,
     pub kv: Arc<KvBucketStore>,
-    pub objects: Arc<LocalObjectStore>,
+    /// ObjectStore — `TieredObjectStore` when B2 is configured, else `LocalObjectStore`.
+    pub objects: Arc<dyn ObjectStorage>,
     pub ocel: Arc<MemoryOcelProjector>,
     pub lance: Arc<LocalLanceSink>,
+    /// B2 sync handle; used by background tasks for log/kv/lance dir sync.
+    b2_sync: Option<Arc<B2Sync>>,
 }
 
 impl Broker {
@@ -60,9 +76,22 @@ impl Broker {
                 .map_err(anyhow::Error::from)?,
         );
         let kv = Arc::new(KvBucketStore::new(log.clone(), kv_payload_store).await?);
-        let objects = Arc::new(
-            LocalObjectStore::new(data_dir.join("objects")).await?,
-        );
+
+        let local_objects =
+            Arc::new(LocalObjectStore::new(data_dir.join("objects")).await?);
+
+        let (objects, b2_sync): (Arc<dyn ObjectStorage>, Option<Arc<B2Sync>>) =
+            if let Some(ref b2_cfg) = config.b2 {
+                let b2 = Arc::new(
+                    B2Sync::new(b2_cfg.clone(), local_objects.clone())
+                        .map_err(anyhow::Error::from)?,
+                );
+                let tiered = Arc::new(TieredObjectStore::new(local_objects, b2.clone()));
+                (tiered, Some(b2))
+            } else {
+                (local_objects, None)
+            };
+
         let ocel = Arc::new(MemoryOcelProjector::new());
         let lance = Arc::new(LocalLanceSink::new(&config.lance_uri).await?);
 
@@ -73,22 +102,61 @@ impl Broker {
             objects,
             ocel,
             lance,
+            b2_sync,
         })
     }
 
-    /// Start background tasks: Lance flush, GC scheduler.
+    /// Start background tasks: Lance flush, B2 data sync.
     pub async fn start_background_tasks(self: Arc<Self>) -> anyhow::Result<()> {
-        let flush_interval = self.config.lance_flush_interval_ms;
-        let broker = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(flush_interval));
-            loop {
-                interval.tick().await;
-                if let Err(e) = broker.flush_lance().await {
-                    tracing::warn!("lance flush error: {}", e);
+        // Lance flush loop
+        {
+            let broker = self.clone();
+            let flush_ms = self.config.lance_flush_interval_ms;
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(tokio::time::Duration::from_millis(flush_ms));
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = broker.flush_lance().await {
+                        tracing::warn!("lance flush error: {}", e);
+                    }
                 }
-            }
-        });
+            });
+        }
+
+        // B2 data sync loop: log segments, kv_payloads, lance datasets
+        if let Some(ref b2) = self.b2_sync {
+            let b2 = b2.clone();
+            let data_dir = self.config.data_dir.clone();
+            let lance_uri = self.config.lance_uri.clone();
+            let sync_ms = self.config.b2_sync_interval_ms;
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(tokio::time::Duration::from_millis(sync_ms));
+                loop {
+                    interval.tick().await;
+
+                    // Sync append-only log segments
+                    if let Err(e) = b2.sync_dir(&data_dir.join("log"), "log/").await {
+                        tracing::warn!("b2 log sync error: {}", e);
+                    }
+                    // Sync KV payload blobs
+                    if let Err(e) =
+                        b2.sync_dir(&data_dir.join("kv_payloads"), "kv_payloads/").await
+                    {
+                        tracing::warn!("b2 kv_payloads sync error: {}", e);
+                    }
+                    // Sync Lance datasets (when lance_uri is a local path)
+                    if !lance_uri.starts_with("s3://") && !lance_uri.starts_with("gs://") {
+                        let lance_path = std::path::Path::new(&lance_uri);
+                        if let Err(e) = b2.sync_dir(lance_path, "lance/").await {
+                            tracing::warn!("b2 lance sync error: {}", e);
+                        }
+                    }
+                }
+            });
+        }
+
         Ok(())
     }
 
@@ -181,7 +249,7 @@ impl Broker {
         self.log.append(req).await
     }
 
-    /// Flush pending OCEL projection to Lance.
+    /// Flush pending OCEL projection + KV history to Lance.
     pub async fn flush_lance(&self) -> Result<SyncStats> {
         let snapshot = self.ocel.snapshot().await?;
 
@@ -196,6 +264,12 @@ impl Broker {
         }
         if !snapshot.object_object_edges.is_empty() {
             self.lance.write_o2o_edges(&snapshot.object_object_edges).await?;
+        }
+
+        // Flush KV history — drains the pending buffer populated by put/delete
+        let kv_entries = self.kv.drain_pending();
+        if !kv_entries.is_empty() {
+            self.lance.write_kv_history(&kv_entries).await?;
         }
 
         let stats = self.lance.sync_stats().await?;
@@ -281,7 +355,6 @@ impl yata_client::ClientBackend for BrokerBackend {
         data: bytes::Bytes,
         meta: yata_core::ObjectMeta,
     ) -> yata_core::Result<yata_core::ObjectManifest> {
-        use yata_core::ObjectStorage;
         self.broker.objects.put_object(data, meta).await
     }
 
@@ -289,7 +362,6 @@ impl yata_client::ClientBackend for BrokerBackend {
         &self,
         id: &yata_core::ObjectId,
     ) -> yata_core::Result<bytes::Bytes> {
-        use yata_core::ObjectStorage;
         self.broker.objects.get_object(id).await
     }
 

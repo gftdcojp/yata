@@ -1696,7 +1696,7 @@ pub mod graph {
         fn delete_rel(&mut self, id: &str);
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     pub struct MemoryGraph {
         nodes: IndexMap<String, NodeRef>,
         rels: IndexMap<String, RelRef>,

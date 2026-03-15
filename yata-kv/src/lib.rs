@@ -12,6 +12,7 @@ use futures::StreamExt;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::sync::{broadcast, RwLock};
 use tokio_stream::wrappers::BroadcastStream;
 use yata_core::{
@@ -28,6 +29,8 @@ pub struct KvBucketStore {
     payload_store: Arc<PayloadStore>,
     snapshots: RwLock<HashMap<String, HashMap<String, KvEntry>>>,
     watchers: RwLock<HashMap<String, broadcast::Sender<KvEvent>>>,
+    /// Buffered entries waiting to be flushed to Lance / B2 by the Broker.
+    pending_sync: Mutex<Vec<KvEntry>>,
 }
 
 impl KvBucketStore {
@@ -37,7 +40,14 @@ impl KvBucketStore {
             payload_store,
             snapshots: RwLock::new(HashMap::new()),
             watchers: RwLock::new(HashMap::new()),
+            pending_sync: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Drain and return all KvEntries buffered since the last call.
+    /// The Broker flushes these to Lance (yata_kv_history) on each sync cycle.
+    pub fn drain_pending(&self) -> Vec<KvEntry> {
+        self.pending_sync.lock().unwrap().drain(..).collect()
     }
 
     pub async fn load_snapshot(&self, bucket: &BucketId) -> Result<()> {
@@ -166,6 +176,9 @@ impl KvStore for KvBucketStore {
             bucket_snap.insert(req.key.clone(), kv_entry.clone());
         }
 
+        // Buffer for Lance / B2 flush
+        self.pending_sync.lock().unwrap().push(kv_entry.clone());
+
         // Broadcast
         let tx = self.get_or_init_watcher(&req.bucket).await;
         let _ = tx.send(KvEvent {
@@ -243,6 +256,9 @@ impl KvStore for KvBucketStore {
                 bucket_snap.remove(key);
             }
         }
+
+        // Buffer for Lance / B2 flush
+        self.pending_sync.lock().unwrap().push(kv_entry.clone());
 
         // Broadcast
         let tx = self.get_or_init_watcher(bucket).await;

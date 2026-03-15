@@ -5,12 +5,16 @@
 //! Syncs CAS chunks and object manifests from a LocalObjectStore to B2.
 //! Uses manifest-first approach — no reliance on S3 ACL/tags.
 
+use async_trait::async_trait;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as OsPath;
 use object_store::{ObjectStore, PutPayload};
+use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
-use yata_core::{Blake3Hash, ObjectId, ObjectManifest, Result, YataError};
+use yata_core::{
+    Blake3Hash, ObjectId, ObjectManifest, ObjectMeta, ObjectStorage, Result, YataError,
+};
 use yata_object::LocalObjectStore;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -204,6 +208,48 @@ impl B2Sync {
         Ok(manifest)
     }
 
+    /// Recursively sync all files under `local_dir` to B2 under `remote_prefix`.
+    /// Files already present on B2 are skipped. Returns number of files uploaded.
+    pub async fn sync_dir(&self, local_dir: &Path, remote_prefix: &str) -> Result<u64> {
+        self.sync_dir_recursive(local_dir, remote_prefix).await
+    }
+
+    fn sync_dir_recursive<'a>(
+        &'a self,
+        local_dir: &'a Path,
+        remote_prefix: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut uploaded = 0u64;
+            let mut rd = match tokio::fs::read_dir(local_dir).await {
+                Ok(r) => r,
+                Err(_) => return Ok(0),
+            };
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let path = entry.path();
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy().into_owned();
+                if path.is_dir() {
+                    let sub = format!("{}{}/", remote_prefix, name_str);
+                    uploaded += self.sync_dir_recursive(&path, &sub).await?;
+                } else {
+                    let key = OsPath::from(format!("{}{}", remote_prefix, name_str));
+                    if self.store.head(&key).await.is_ok() {
+                        continue;
+                    }
+                    let data = tokio::fs::read(&path).await.map_err(YataError::Io)?;
+                    let payload = PutPayload::from_bytes(bytes::Bytes::from(data));
+                    self.store
+                        .put(&key, payload)
+                        .await
+                        .map_err(|e| YataError::Storage(e.to_string()))?;
+                    uploaded += 1;
+                }
+            }
+            Ok(uploaded)
+        })
+    }
+
     fn chunk_key(&self, hash: &Blake3Hash) -> OsPath {
         let hex = hash.hex();
         OsPath::from(format!(
@@ -217,6 +263,73 @@ impl B2Sync {
 
     fn manifest_key(&self, id: &ObjectId) -> OsPath {
         OsPath::from(format!("{}manifests/{}.cbor", self.config.prefix, id))
+    }
+}
+
+// ── TieredObjectStore ─────────────────────────────────────────────────────────
+//
+// Implements ObjectStorage: writes go to local first, then async-syncs to B2.
+// Reads fall back to B2 restore when the local chunk/manifest is missing.
+
+pub struct TieredObjectStore {
+    local: Arc<LocalObjectStore>,
+    b2: Arc<B2Sync>,
+}
+
+impl TieredObjectStore {
+    pub fn new(local: Arc<LocalObjectStore>, b2: Arc<B2Sync>) -> Self {
+        Self { local, b2 }
+    }
+}
+
+#[async_trait]
+impl ObjectStorage for TieredObjectStore {
+    async fn put_object(&self, data: bytes::Bytes, meta: ObjectMeta) -> Result<ObjectManifest> {
+        let manifest = self.local.put_object(data, meta).await?;
+        let b2 = self.b2.clone();
+        let manifest_id = manifest.object_id.clone();
+        let chunks = manifest.chunks.clone();
+        tokio::spawn(async move {
+            for chunk in &chunks {
+                if let Err(e) = b2.sync_chunk(&chunk.hash).await {
+                    tracing::warn!("b2 chunk sync failed hash={}: {}", chunk.hash.hex(), e);
+                }
+            }
+            if let Err(e) = b2.sync_manifest(&manifest_id).await {
+                tracing::warn!("b2 manifest sync failed id={}: {}", manifest_id, e);
+            }
+        });
+        Ok(manifest)
+    }
+
+    async fn get_object(&self, id: &ObjectId) -> Result<bytes::Bytes> {
+        match self.local.get_object(id).await {
+            Ok(data) => Ok(data),
+            Err(YataError::NotFound(_)) => {
+                self.b2.restore_manifest(id).await?;
+                self.local.get_object(id).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn head_object(&self, id: &ObjectId) -> Result<Option<ObjectManifest>> {
+        if let Some(m) = self.local.head_object(id).await? {
+            return Ok(Some(m));
+        }
+        match self.b2.restore_manifest(id).await {
+            Ok(m) => Ok(Some(m)),
+            Err(YataError::Storage(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn pin_object(&self, id: &ObjectId) -> Result<()> {
+        self.local.pin_object(id).await
+    }
+
+    async fn gc(&self) -> Result<u64> {
+        self.local.gc().await
     }
 }
 

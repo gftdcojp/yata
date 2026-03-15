@@ -17,6 +17,7 @@ yata-arrow.workspace = true
 yata-log.workspace = true
 yata-kv.workspace = true
 yata-object.workspace = true
+yata-b2.workspace = true
 yata-ocel.workspace = true
 yata-lance.workspace = true
 yata-client.workspace = true

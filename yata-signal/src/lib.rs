@@ -104,6 +104,12 @@ pub mod keys {
             Self { secret, public }
         }
         pub fn public_bytes(&self) -> [u8; 32] { self.public.to_bytes() }
+        pub fn from_secret_bytes(secret: [u8; 32]) -> Self {
+            let secret = StaticSecret::from(secret);
+            let public = PublicKey::from(&secret);
+            Self { secret, public }
+        }
+        pub fn secret_bytes(&self) -> [u8; 32] { self.secret.to_bytes() }
     }
 
     /// Signed prekey.
@@ -558,13 +564,14 @@ pub mod group {
         pub nonce: [u8; 12],
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
     struct SenderState {
         chain_key: [u8; 32],
         iteration: u32,
     }
 
     /// Group session managing Sender Key encryption for a group channel.
+    #[derive(serde::Serialize, serde::Deserialize)]
     pub struct GroupSession {
         pub group_id: String,
         pub our_did: String,
@@ -627,6 +634,14 @@ pub mod group {
             let cipher = ChaCha20Poly1305::new(Key::from_slice(&mk));
             let nonce = Nonce::from_slice(&msg.nonce);
             cipher.decrypt(nonce, msg.ciphertext.as_slice()).map_err(|_| SignalError::DecryptionFailed)
+        }
+
+        pub fn to_json(&self) -> super::Result<Vec<u8>> {
+            serde_json::to_vec(self).map_err(|e| super::SignalError::Serialization(e.to_string()))
+        }
+
+        pub fn from_json(data: &[u8]) -> super::Result<Self> {
+            serde_json::from_slice(data).map_err(|e| super::SignalError::Serialization(e.to_string()))
         }
     }
 
@@ -746,5 +761,214 @@ pub mod payload {
             let bytes = bytes::Bytes::from(self.to_bytes()?);
             Ok(PayloadRef::InlineBytes(bytes))
         }
+    }
+}
+
+/// High-level synchronous API for the magatama host plugin.
+/// All I/O uses JSON-serialized bytes for maximum WIT compatibility.
+pub mod host_api {
+    use super::keys::{DHKeyPair, IdentityKeyPair, OneTimePreKey, PreKeyBundle, SignedPreKey};
+    use super::ratchet::RatchetSession;
+    use super::group::GroupSession;
+    use super::{Result, SignalError};
+    use x25519_dalek::StaticSecret;
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct SpkJson {
+        key_id: u32,
+        secret: [u8; 32],
+        public: [u8; 32],
+        signature: Vec<u8>,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct OpkJson {
+        key_id: u32,
+        secret: [u8; 32],
+        public: [u8; 32],
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct X3DHResultJson {
+        shared_secret: [u8; 32],
+        ad: Vec<u8>,
+        init_msg: Option<super::x3dh::X3DHInitMessage>,
+    }
+
+    pub fn generate_identity() -> Result<Vec<u8>> {
+        IdentityKeyPair::generate().to_bytes()
+    }
+
+    pub fn generate_signed_prekey(identity_cbor: &[u8], key_id: u32) -> Result<Vec<u8>> {
+        let ik = IdentityKeyPair::from_bytes(identity_cbor)?;
+        let spk = SignedPreKey::generate(&ik, key_id);
+        let mut sig = vec![0u8; 64];
+        sig.copy_from_slice(&spk.signature);
+        let j = SpkJson {
+            key_id: spk.key_id,
+            secret: spk.key_pair.secret.to_bytes(),
+            public: spk.key_pair.public_bytes(),
+            signature: sig,
+        };
+        serde_json::to_vec(&j).map_err(|e| SignalError::Serialization(e.to_string()))
+    }
+
+    pub fn generate_one_time_prekey(key_id: u32) -> Result<Vec<u8>> {
+        let opk = OneTimePreKey::generate(key_id);
+        let j = OpkJson {
+            key_id: opk.key_id,
+            secret: opk.key_pair.secret.to_bytes(),
+            public: opk.key_pair.public_bytes(),
+        };
+        serde_json::to_vec(&j).map_err(|e| SignalError::Serialization(e.to_string()))
+    }
+
+    pub fn build_pre_key_bundle(identity_cbor: &[u8], spk_json: &[u8], opk_json: Option<&[u8]>) -> Result<Vec<u8>> {
+        let ik = IdentityKeyPair::from_bytes(identity_cbor)?;
+        let spk: SpkJson = serde_json::from_slice(spk_json)
+            .map_err(|e| SignalError::Serialization(e.to_string()))?;
+        let sig: [u8; 64] = spk.signature.as_slice().try_into()
+            .map_err(|_| SignalError::InvalidKey("signature must be 64 bytes".into()))?;
+        let opk_fields = if let Some(opk_bytes) = opk_json {
+            let opk: OpkJson = serde_json::from_slice(opk_bytes)
+                .map_err(|e| SignalError::Serialization(e.to_string()))?;
+            (Some(opk.key_id), Some(opk.public))
+        } else {
+            (None, None)
+        };
+        let bundle = PreKeyBundle {
+            registration_id: ik.registration_id(),
+            identity_key: ik.dh_public_bytes(),
+            identity_sign_key: ik.sign_public_bytes(),
+            spk_id: spk.key_id,
+            spk_public: spk.public,
+            spk_signature: sig,
+            opk_id: opk_fields.0,
+            opk_public: opk_fields.1,
+        };
+        serde_json::to_vec(&bundle).map_err(|e| SignalError::Serialization(e.to_string()))
+    }
+
+    pub fn x3dh_initiate(sender_ik_cbor: &[u8], bundle_json: &[u8]) -> Result<Vec<u8>> {
+        let ik = IdentityKeyPair::from_bytes(sender_ik_cbor)?;
+        let bundle: PreKeyBundle = serde_json::from_slice(bundle_json)
+            .map_err(|e| SignalError::Serialization(e.to_string()))?;
+        let (secret, init_msg) = super::x3dh::initiate(&ik, &bundle)?;
+        let result = X3DHResultJson {
+            shared_secret: secret.shared_secret,
+            ad: secret.ad,
+            init_msg: Some(init_msg),
+        };
+        serde_json::to_vec(&result).map_err(|e| SignalError::Serialization(e.to_string()))
+    }
+
+    pub fn x3dh_respond(recipient_ik_cbor: &[u8], spk_json: &[u8], opk_json: Option<&[u8]>, init_msg_json: &[u8]) -> Result<Vec<u8>> {
+        let ik = IdentityKeyPair::from_bytes(recipient_ik_cbor)?;
+        let spk_data: SpkJson = serde_json::from_slice(spk_json)
+            .map_err(|e| SignalError::Serialization(e.to_string()))?;
+        let sig: [u8; 64] = spk_data.signature.as_slice().try_into()
+            .map_err(|_| SignalError::InvalidKey("signature must be 64 bytes".into()))?;
+        let spk = SignedPreKey {
+            key_id: spk_data.key_id,
+            key_pair: DHKeyPair::from_secret_bytes(spk_data.secret),
+            signature: sig,
+        };
+        let opk = if let Some(opk_bytes) = opk_json {
+            let opk_data: OpkJson = serde_json::from_slice(opk_bytes)
+                .map_err(|e| SignalError::Serialization(e.to_string()))?;
+            Some(OneTimePreKey {
+                key_id: opk_data.key_id,
+                key_pair: DHKeyPair::from_secret_bytes(opk_data.secret),
+            })
+        } else {
+            None
+        };
+        let init_msg: super::x3dh::X3DHInitMessage = serde_json::from_slice(init_msg_json)
+            .map_err(|e| SignalError::Serialization(e.to_string()))?;
+        let secret = super::x3dh::respond(&ik, &spk, opk.as_ref(), &init_msg)?;
+        let result = X3DHResultJson {
+            shared_secret: secret.shared_secret,
+            ad: secret.ad,
+            init_msg: None,
+        };
+        serde_json::to_vec(&result).map_err(|e| SignalError::Serialization(e.to_string()))
+    }
+
+    pub fn ratchet_init_sender(x3dh_result_json: &[u8], recipient_ratchet_public: [u8; 32]) -> Result<Vec<u8>> {
+        let r: X3DHResultJson = serde_json::from_slice(x3dh_result_json)
+            .map_err(|e| SignalError::Serialization(e.to_string()))?;
+        let ss = super::x3dh::X3DHSharedSecret { shared_secret: r.shared_secret, ad: r.ad };
+        let session = RatchetSession::init_sender(&ss, recipient_ratchet_public)?;
+        session.to_cbor()
+    }
+
+    pub fn ratchet_init_receiver(x3dh_result_json: &[u8], our_ratchet_secret: [u8; 32]) -> Result<Vec<u8>> {
+        let r: X3DHResultJson = serde_json::from_slice(x3dh_result_json)
+            .map_err(|e| SignalError::Serialization(e.to_string()))?;
+        let ss = super::x3dh::X3DHSharedSecret { shared_secret: r.shared_secret, ad: r.ad };
+        let session = RatchetSession::init_receiver(&ss, StaticSecret::from(our_ratchet_secret))?;
+        session.to_cbor()
+    }
+
+    pub fn ratchet_encrypt(session_cbor: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+        let mut session = RatchetSession::from_cbor(session_cbor)?;
+        let msg = session.encrypt(plaintext)?;
+        let session_bytes = session.to_cbor()?;
+        #[derive(serde::Serialize)]
+        struct Out { session: Vec<u8>, msg: super::ratchet::EncryptedMessage }
+        serde_json::to_vec(&Out { session: session_bytes, msg })
+            .map_err(|e| SignalError::Serialization(e.to_string()))
+    }
+
+    pub fn ratchet_decrypt(session_cbor: &[u8], msg_json: &[u8]) -> Result<Vec<u8>> {
+        let mut session = RatchetSession::from_cbor(session_cbor)?;
+        let msg: super::ratchet::EncryptedMessage = serde_json::from_slice(msg_json)
+            .map_err(|e| SignalError::Serialization(e.to_string()))?;
+        let plaintext = session.decrypt(&msg)?;
+        let session_bytes = session.to_cbor()?;
+        #[derive(serde::Serialize)]
+        struct Out { session: Vec<u8>, plaintext: Vec<u8> }
+        serde_json::to_vec(&Out { session: session_bytes, plaintext })
+            .map_err(|e| SignalError::Serialization(e.to_string()))
+    }
+
+    pub fn group_init_sender(group_id: &str, our_did: &str) -> Result<Vec<u8>> {
+        let mut gs = GroupSession::new(group_id, our_did);
+        let dist = gs.init_sender()?;
+        let session_json = gs.to_json()?;
+        #[derive(serde::Serialize)]
+        struct Out { session: Vec<u8>, distribution: super::group::SenderKeyDistribution }
+        serde_json::to_vec(&Out { session: session_json, distribution: dist })
+            .map_err(|e| SignalError::Serialization(e.to_string()))
+    }
+
+    pub fn group_process_distribution(session_json: &[u8], dist_json: &[u8]) -> Result<Vec<u8>> {
+        let mut gs = GroupSession::from_json(session_json)?;
+        let dist: super::group::SenderKeyDistribution = serde_json::from_slice(dist_json)
+            .map_err(|e| SignalError::Serialization(e.to_string()))?;
+        gs.process_distribution(&dist)?;
+        gs.to_json()
+    }
+
+    pub fn group_encrypt(session_json: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+        let mut gs = GroupSession::from_json(session_json)?;
+        let msg = gs.encrypt(plaintext)?;
+        let session_bytes = gs.to_json()?;
+        #[derive(serde::Serialize)]
+        struct Out { session: Vec<u8>, msg: super::group::SenderKeyMessage }
+        serde_json::to_vec(&Out { session: session_bytes, msg })
+            .map_err(|e| SignalError::Serialization(e.to_string()))
+    }
+
+    pub fn group_decrypt(session_json: &[u8], msg_json: &[u8]) -> Result<Vec<u8>> {
+        let mut gs = GroupSession::from_json(session_json)?;
+        let msg: super::group::SenderKeyMessage = serde_json::from_slice(msg_json)
+            .map_err(|e| SignalError::Serialization(e.to_string()))?;
+        let plaintext = gs.decrypt(&msg)?;
+        let session_bytes = gs.to_json()?;
+        #[derive(serde::Serialize)]
+        struct Out { session: Vec<u8>, plaintext: Vec<u8> }
+        serde_json::to_vec(&Out { session: session_bytes, plaintext })
+            .map_err(|e| SignalError::Serialization(e.to_string()))
     }
 }

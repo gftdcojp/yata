@@ -6,11 +6,10 @@ use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
     encode::FlightDataEncoderBuilder,
-    error::FlightError as ArrowFlightError,
+    error::{FlightError, Result as FlightResult},
     flight_service_server::FlightService,
 };
 use arrow_schema::Schema;
-use bytes::Bytes;
 use futures::{Stream, TryStreamExt};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -28,22 +27,21 @@ impl YataFlightService {
         }
     }
 
-    /// Serialize an Arrow schema to IPC message bytes for FlightInfo / SchemaResult.
-    ///
-    /// `StreamWriter::try_new` writes the schema IPC message immediately.
-    /// `finish()` appends the EOS marker (8 bytes) which Flight clients safely ignore.
-    fn schema_ipc_bytes(schema: &Arc<Schema>) -> Bytes {
+    /// Serialize an Arrow schema to IPC message bytes (schema message + EOS marker).
+    /// StreamWriter writes the schema IPC message in `try_new`, and finish() appends
+    /// the EOS marker. Flight clients parse only the schema message and ignore the EOS.
+    fn schema_ipc_bytes(schema: &Arc<Schema>) -> bytes::Bytes {
         let mut buf = Vec::new();
         if let Ok(mut writer) =
             arrow::ipc::writer::StreamWriter::try_new(&mut buf, schema.as_ref())
         {
             let _ = writer.finish();
         }
-        Bytes::from(buf)
+        bytes::Bytes::from(buf)
     }
 
     /// Parse a FlightDescriptor into a ScanTicket.
-    /// CMD → JSON ScanTicket; PATH → path[0] is the table name.
+    /// CMD → JSON-encoded ScanTicket bytes; PATH → path[0] is the table name.
     fn parse_descriptor(desc: &FlightDescriptor) -> Result<ScanTicket, Status> {
         if !desc.cmd.is_empty() {
             ScanTicket::from_bytes(&desc.cmd)
@@ -55,7 +53,7 @@ impl YataFlightService {
         }
     }
 
-    fn make_flight_info(
+    fn build_flight_info(
         catalog: &YataTableCatalog,
         table: &str,
         desc: FlightDescriptor,
@@ -64,12 +62,14 @@ impl YataFlightService {
         let schema = catalog
             .schema(table)
             .ok_or_else(|| Status::not_found(format!("table not found: {table}")))?;
-        Ok(FlightInfo::new()
-            .with_schema(&schema)
+        let info = FlightInfo::new()
+            .try_with_schema(&schema)
+            .map_err(|e| Status::internal(e.to_string()))?
             .with_descriptor(desc)
             .with_endpoint(FlightEndpoint::new().with_ticket(Ticket::new(ticket.to_bytes())))
             .with_total_records(-1)
-            .with_total_bytes(-1))
+            .with_total_bytes(-1);
+        Ok(info)
     }
 
     async fn execute_scan(
@@ -86,12 +86,13 @@ impl YataFlightService {
         let dataset = match lance::dataset::Dataset::open(&uri).await {
             Ok(ds) => ds,
             Err(e) => {
-                tracing::debug!(table = %ticket.table, err = %e, "dataset not found, returning empty stream");
-                let empty = futures::stream::empty::<Result<RecordBatch, ArrowFlightError>>();
+                tracing::debug!(table = %ticket.table, err = %e, "dataset not found, returning empty");
+                // Return schema-only stream (no rows)
+                let empty = futures::stream::empty::<FlightResult<RecordBatch>>();
                 let stream = FlightDataEncoderBuilder::new()
                     .with_schema(schema)
                     .build(empty)
-                    .map_err(|e: ArrowFlightError| Status::internal(e.to_string()));
+                    .map_err(tonic::Status::from);
                 return Ok(Box::pin(stream));
             }
         };
@@ -122,8 +123,8 @@ impl YataFlightService {
 
         let flight_stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
-            .build(batch_stream.map_err(|e: arrow::error::ArrowError| ArrowFlightError::Arrow(e)))
-            .map_err(|e: ArrowFlightError| Status::internal(e.to_string()));
+            .build(batch_stream.map_err(|e| FlightError::ExternalError(Box::new(e))))
+            .map_err(tonic::Status::from);
 
         Ok(Box::pin(flight_stream))
     }
@@ -159,14 +160,16 @@ impl FlightService for YataFlightService {
             .filter_map(|&table| {
                 let schema = catalog.schema(table)?;
                 let ticket = ScanTicket::table(table);
-                Some(Ok(FlightInfo::new()
-                    .with_schema(&schema)
+                let info = FlightInfo::new()
+                    .try_with_schema(&schema)
+                    .ok()?
                     .with_descriptor(FlightDescriptor::new_path(vec![table.to_string()]))
                     .with_endpoint(
                         FlightEndpoint::new().with_ticket(Ticket::new(ticket.to_bytes())),
                     )
                     .with_total_records(-1)
-                    .with_total_bytes(-1)))
+                    .with_total_bytes(-1);
+                Some(Ok(info))
             })
             .collect();
 
@@ -179,7 +182,7 @@ impl FlightService for YataFlightService {
     ) -> Result<Response<FlightInfo>, Status> {
         let desc = request.into_inner();
         let ticket = Self::parse_descriptor(&desc)?;
-        let info = Self::make_flight_info(&self.catalog, &ticket.table.clone(), desc, ticket)?;
+        let info = Self::build_flight_info(&self.catalog, &ticket.table.clone(), desc, ticket)?;
         Ok(Response::new(info))
     }
 
