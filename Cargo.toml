@@ -17,6 +17,7 @@ members = [
     "yata-at",
     "yata-signal",
     "yata-bench",
+    "yata-cypher",
 ]
 
 [workspace.package]
@@ -104,3 +105,4 @@ yata-cas = { path = "yata-cas" }
 yata-at = { path = "yata-at" }
 yata-signal = { path = "yata-signal" }
 yata-bench = { path = "yata-bench" }
+yata-cypher = { path = "yata-cypher" }

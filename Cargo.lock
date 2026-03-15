@@ -5772,6 +5772,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "yata-cypher"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "indexmap",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+ "yata-core",
+ "yata-ocel",
+]
+
+[[package]]
 name = "yata-kv"
 version = "0.1.0"
 dependencies = [
