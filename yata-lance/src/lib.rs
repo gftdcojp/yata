@@ -107,7 +107,7 @@ pub mod schema {
 
 pub mod sink {
     use super::schema::*;
-    use arrow::record_batch::RecordBatch;
+    use arrow::record_batch::{RecordBatch, RecordBatchIterator};
     use arrow_array::{
         Array, BinaryArray, Int64Array, LargeBinaryArray, StringArray, TimestampMicrosecondArray,
         UInt32Array, UInt64Array,
@@ -141,7 +141,7 @@ pub mod sink {
     }
 
     pub struct LocalLanceSink {
-        base_uri: String,
+        conn: lancedb::Connection,
         stats: RwLock<SyncStats>,
     }
 
@@ -154,14 +154,14 @@ pub mod sink {
                     .await
                     .map_err(YataError::Io)?;
             }
+            let conn = lancedb::connect(&base_uri)
+                .execute()
+                .await
+                .map_err(|e| YataError::Storage(e.to_string()))?;
             Ok(Self {
-                base_uri,
+                conn,
                 stats: RwLock::new(SyncStats::default()),
             })
-        }
-
-        async fn dataset_uri(&self, table: &str) -> String {
-            format!("{}/{}", self.base_uri.trim_end_matches('/'), table)
         }
 
         async fn write_batches(
@@ -177,22 +177,25 @@ pub mod sink {
             if total_rows == 0 {
                 return Ok(0);
             }
-            let uri = self.dataset_uri(table).await;
-            let write_params = lance::dataset::WriteParams {
-                mode: lance::dataset::WriteMode::Append,
-                ..Default::default()
-            };
-            let reader = arrow::record_batch::RecordBatchIterator::new(
+            let reader = Box::new(RecordBatchIterator::new(
                 batches.into_iter().map(Ok::<_, arrow::error::ArrowError>),
                 schema,
-            );
-            lance::dataset::Dataset::write(
-                reader,
-                &uri,
-                Some(write_params),
-            )
-            .await
-            .map_err(|e| YataError::Storage(e.to_string()))?;
+            ));
+            match self.conn.open_table(table).execute().await {
+                Ok(tbl) => {
+                    tbl.add(reader)
+                        .execute()
+                        .await
+                        .map_err(|e| YataError::Storage(e.to_string()))?;
+                }
+                Err(_) => {
+                    self.conn
+                        .create_table(table, reader)
+                        .execute()
+                        .await
+                        .map_err(|e| YataError::Storage(e.to_string()))?;
+                }
+            }
             Ok(total_rows)
         }
     }

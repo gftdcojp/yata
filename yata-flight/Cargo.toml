@@ -23,7 +23,7 @@ arrow-ipc.workspace = true
 arrow-schema.workspace = true
 arrow-flight = { workspace = true }
 tonic = { version = "0.12", features = ["transport"] }
-lance.workspace = true
+lancedb.workspace = true
 tokio = { workspace = true }
 futures.workspace = true
 serde.workspace = true

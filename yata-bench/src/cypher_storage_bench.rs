@@ -87,6 +87,8 @@ fn edges_schema() -> Arc<Schema> {
 }
 
 async fn write_lance(ds: &Dataset, base_uri: &str) -> Result<()> {
+    let conn = lancedb::connect(base_uri).execute().await?;
+
     // nodes table
     let ids:    Vec<&str> = ds.nodes.iter().map(|(id,_,_,_)| id.as_str()).collect();
     let labels: Vec<&str> = ds.nodes.iter().map(|(_,l,_,_)| l.as_str()).collect();
@@ -99,12 +101,9 @@ async fn write_lance(ds: &Dataset, base_uri: &str) -> Result<()> {
         Arc::new(StringArray::from(names)),
         Arc::new(Int64Array::from(ages)),
     ])?;
-
-    let nodes_uri = format!("{}/graph_nodes", base_uri.trim_end_matches('/'));
-    let wp = lance::dataset::WriteParams { mode: lance::dataset::WriteMode::Create, ..Default::default() };
-    let reader = arrow::record_batch::RecordBatchIterator::new(
-        [Ok(batch)].into_iter(), nodes_schema());
-    lance::dataset::Dataset::write(reader, &nodes_uri, Some(wp)).await?;
+    let reader = Box::new(arrow::record_batch::RecordBatchIterator::new(
+        [Ok(batch)].into_iter(), nodes_schema()));
+    conn.create_table("graph_nodes", reader).execute().await?;
 
     // edges table
     let eids:  Vec<&str> = ds.edges.iter().map(|(id,_,_,_)| id.as_str()).collect();
@@ -118,30 +117,26 @@ async fn write_lance(ds: &Dataset, base_uri: &str) -> Result<()> {
         Arc::new(StringArray::from(dsts)),
         Arc::new(StringArray::from(rtys)),
     ])?;
-
-    let edges_uri = format!("{}/graph_edges", base_uri.trim_end_matches('/'));
-    let wp2 = lance::dataset::WriteParams { mode: lance::dataset::WriteMode::Create, ..Default::default() };
-    let reader2 = arrow::record_batch::RecordBatchIterator::new(
-        [Ok(ebatch)].into_iter(), edges_schema());
-    lance::dataset::Dataset::write(reader2, &edges_uri, Some(wp2)).await?;
+    let reader2 = Box::new(arrow::record_batch::RecordBatchIterator::new(
+        [Ok(ebatch)].into_iter(), edges_schema()));
+    conn.create_table("graph_edges", reader2).execute().await?;
 
     Ok(())
 }
 
 /// Load all nodes + edges from Lance into MemoryGraph (disk cold-load, then warm).
 async fn load_lance_to_memory(base_uri: &str) -> Result<MemoryGraph> {
-    let nodes_uri = format!("{}/graph_nodes", base_uri.trim_end_matches('/'));
-    let edges_uri = format!("{}/graph_edges", base_uri.trim_end_matches('/'));
-
-    let nd = lance::dataset::Dataset::open(&nodes_uri).await?;
-    let ed = lance::dataset::Dataset::open(&edges_uri).await?;
-
+    use futures::TryStreamExt;
+    let conn = lancedb::connect(base_uri).execute().await?;
     let mut g = MemoryGraph::new();
 
     // scan nodes
-    let nstream = nd.scan().try_into_stream().await?;
-    use futures::TryStreamExt;
-    let nbatches: Vec<RecordBatch> = nstream.try_collect().await?;
+    let nd = conn.open_table("graph_nodes").execute().await
+        .map_err(|e| anyhow::anyhow!("open graph_nodes: {e}"))?;
+    let nbatches: Vec<RecordBatch> = nd.query().execute_stream().await
+        .map_err(|e| anyhow::anyhow!("stream graph_nodes: {e}"))?
+        .try_collect().await
+        .map_err(|e| anyhow::anyhow!("collect graph_nodes: {e}"))?;
     for batch in nbatches {
         let ids    = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         let labels = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
@@ -161,8 +156,12 @@ async fn load_lance_to_memory(base_uri: &str) -> Result<MemoryGraph> {
     }
 
     // scan edges
-    let estream = ed.scan().try_into_stream().await?;
-    let ebatches: Vec<RecordBatch> = estream.try_collect().await?;
+    let ed = conn.open_table("graph_edges").execute().await
+        .map_err(|e| anyhow::anyhow!("open graph_edges: {e}"))?;
+    let ebatches: Vec<RecordBatch> = ed.query().execute_stream().await
+        .map_err(|e| anyhow::anyhow!("stream graph_edges: {e}"))?
+        .try_collect().await
+        .map_err(|e| anyhow::anyhow!("collect graph_edges: {e}"))?;
     for batch in ebatches {
         let eids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         let srcs = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();

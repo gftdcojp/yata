@@ -30,8 +30,8 @@ pub async fn serve(
     graph_base_uri: Option<String>,
 ) -> anyhow::Result<()> {
     let service = match graph_base_uri {
-        Some(g) => YataFlightService::new_with_graph(lance_base_uri.into(), g),
-        None => YataFlightService::new(lance_base_uri.into()),
+        Some(g) => YataFlightService::new_with_graph(lance_base_uri.into(), g).await?,
+        None => YataFlightService::new(lance_base_uri.into()).await?,
     };
     let svc = FlightServiceServer::new(service);
     tracing::info!(%addr, "yata-flight listening");
