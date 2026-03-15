@@ -32,6 +32,7 @@ yata-core.workspace = true
 yata-at.workspace = true
 yata-signal.workspace = true
 x25519-dalek.workspace = true
+ciborium.workspace = true
 yata-arrow.workspace = true
 yata-log.workspace = true
 yata-kv.workspace = true

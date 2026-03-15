@@ -160,8 +160,6 @@ impl YataFlightService {
         default_graph_base_uri: Option<&str>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>, Status>
     {
-        use yata_cypher::Graph;
-
         let graph_uri = ticket
             .graph_uri
             .as_deref()

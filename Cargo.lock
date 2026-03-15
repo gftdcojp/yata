@@ -7660,6 +7660,7 @@ dependencies = [
  "aws-sdk-s3",
  "bytes",
  "chrono",
+ "ciborium",
  "futures",
  "lance 0.20.0",
  "libc",

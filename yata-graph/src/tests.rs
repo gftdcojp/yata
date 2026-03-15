@@ -84,7 +84,7 @@ async fn test_to_memory_graph_and_cypher_match() {
     let mut g = store.to_memory_graph().await.unwrap();
     let q = parse("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name").unwrap();
     let ex = Executor::new();
-    let result = ex.execute(&q, &mut g).unwrap();
+    let result = ex.execute(&q, &mut g.0).unwrap();
 
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0].0.get("a.name"), Some(&str_val("Alice")));
@@ -113,7 +113,7 @@ async fn test_cypher_create_then_persist() {
     // Step 3: Reload and run MATCH
     let mut g2 = store.to_memory_graph().await.unwrap();
     let q2 = parse("MATCH (c:Company)-[:FOUNDED_BY]->(p:Person) RETURN c.name, p.name").unwrap();
-    let result = ex.execute(&q2, &mut g2).unwrap();
+    let result = ex.execute(&q2, &mut g2.0).unwrap();
 
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0].0.get("c.name"), Some(&str_val("GFTD")));

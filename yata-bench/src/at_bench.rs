@@ -289,6 +289,7 @@ async fn bench_bridge_publish() -> Result<()> {
         data_dir: dir.path().join("data"),
         lance_uri: dir.path().join("lance").to_str().unwrap().to_owned(),
         lance_flush_interval_ms: 999_999,
+        ..Default::default()
     };
     let broker = Arc::new(Broker::new(config).await?);
 
