@@ -11,7 +11,7 @@ use yata_core::{
 };
 use yata_kv::KvBucketStore;
 use yata_lance::{LocalLanceSink, LanceSink, SyncStats};
-use yata_log::LocalLog;
+use yata_log::{LocalLog, PayloadStore};
 use yata_object::LocalObjectStore;
 use yata_ocel::{MemoryOcelProjector, OcelEventDraft, OcelProjector};
 
@@ -54,7 +54,12 @@ impl Broker {
         let log = Arc::new(LocalLog::new(data_dir.join("log")).await?);
         log.recover().await?;
 
-        let kv = Arc::new(KvBucketStore::new(log.clone()).await?);
+        let kv_payload_store = Arc::new(
+            PayloadStore::new(data_dir.join("kv_payloads"))
+                .await
+                .map_err(anyhow::Error::from)?,
+        );
+        let kv = Arc::new(KvBucketStore::new(log.clone(), kv_payload_store).await?);
         let objects = Arc::new(
             LocalObjectStore::new(data_dir.join("objects")).await?,
         );

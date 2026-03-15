@@ -27,3 +27,5 @@ ciborium.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = "3"
+yata-log = { path = "../yata-log" }

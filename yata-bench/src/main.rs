@@ -171,12 +171,13 @@ async fn bench_log_throughput(dir: &tempfile::TempDir) -> Result<()> {
 
 async fn bench_kv(dir: &tempfile::TempDir) -> Result<()> {
     use yata_core::{BucketId, KvPutRequest, KvStore};
-    use yata_log::LocalLog;
+    use yata_log::{LocalLog, PayloadStore};
     use yata_kv::KvBucketStore;
 
     println!("\n[KV — put/get throughput]");
     let log = Arc::new(LocalLog::new(dir.path().join("kv_log")).await?);
-    let kv = Arc::new(KvBucketStore::new(log).await?);
+    let ps = Arc::new(PayloadStore::new(dir.path().join("kv_payloads")).await?);
+    let kv = Arc::new(KvBucketStore::new(log, ps).await?);
     let bucket = BucketId::from("bench.kv");
 
     const ITERS: usize = 2_000;

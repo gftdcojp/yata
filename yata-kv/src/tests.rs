@@ -1,12 +1,13 @@
 use bytes::Bytes;
 use std::sync::Arc;
 use yata_core::{BucketId, KvOp, KvPutRequest, KvStore, Revision};
-use yata_log::LocalLog;
+use yata_log::{LocalLog, PayloadStore};
 use crate::KvBucketStore;
 
 async fn make_store(dir: &tempfile::TempDir) -> Arc<KvBucketStore> {
     let log = Arc::new(LocalLog::new(dir.path().join("log")).await.unwrap());
-    Arc::new(KvBucketStore::new(log).await.unwrap())
+    let ps = Arc::new(PayloadStore::new(dir.path().join("kv_payloads")).await.unwrap());
+    Arc::new(KvBucketStore::new(log, ps).await.unwrap())
 }
 
 #[tokio::test]
@@ -72,7 +73,6 @@ async fn test_revision_conflict() {
         ttl_secs: None,
     }).await.unwrap();
 
-    // Expect revision 99 but actual is 1 → conflict
     let result = store.put(KvPutRequest {
         bucket: bucket.clone(),
         key: "k".to_owned(),
@@ -130,4 +130,80 @@ async fn test_multiple_keys_in_bucket() {
         let entry = store.get(&bucket, &format!("key{}", i)).await.unwrap().unwrap();
         assert_eq!(entry.value, vec![i]);
     }
+}
+
+/// Core replay test: data written to one KvBucketStore instance must be
+/// recoverable by a new instance pointing at the same directory after restart.
+#[tokio::test]
+async fn test_replay_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let bucket = BucketId::from("config");
+
+    // Write phase
+    {
+        let store = make_store(&dir).await;
+        store.put(KvPutRequest {
+            bucket: bucket.clone(),
+            key: "setting".to_owned(),
+            value: Bytes::from_static(b"enabled"),
+            expected_revision: None,
+            ttl_secs: None,
+        }).await.unwrap();
+        store.put(KvPutRequest {
+            bucket: bucket.clone(),
+            key: "setting".to_owned(),
+            value: Bytes::from_static(b"disabled"),
+            expected_revision: None,
+            ttl_secs: None,
+        }).await.unwrap();
+        store.put(KvPutRequest {
+            bucket: bucket.clone(),
+            key: "other".to_owned(),
+            value: Bytes::from_static(b"value"),
+            expected_revision: None,
+            ttl_secs: None,
+        }).await.unwrap();
+        store.delete(&bucket, "other", None).await.unwrap();
+    }
+
+    // Restart: new instance, no in-memory state
+    {
+        let log = Arc::new(LocalLog::new(dir.path().join("log")).await.unwrap());
+        log.recover().await.unwrap();
+        let ps = Arc::new(PayloadStore::new(dir.path().join("kv_payloads")).await.unwrap());
+        let store = Arc::new(KvBucketStore::new(log, ps).await.unwrap());
+
+        store.load_snapshot(&bucket).await.unwrap();
+
+        // Latest value for "setting" should be "disabled" (revision 2)
+        let entry = store.get(&bucket, "setting").await.unwrap();
+        assert!(entry.is_some(), "setting should be present after replay");
+        assert_eq!(entry.unwrap().value, b"disabled");
+
+        // "other" was deleted — should be absent
+        let deleted = store.get(&bucket, "other").await.unwrap();
+        assert!(deleted.is_none(), "deleted key should not appear after replay");
+    }
+}
+
+#[tokio::test]
+async fn test_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = make_store(&dir).await;
+    let bucket = BucketId::from("b");
+
+    for i in 0..3u8 {
+        store.put(KvPutRequest {
+            bucket: bucket.clone(),
+            key: "k".to_owned(),
+            value: Bytes::from(vec![i]),
+            expected_revision: None,
+            ttl_secs: None,
+        }).await.unwrap();
+    }
+
+    let history = store.history(&bucket, "k").await.unwrap();
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[0].value, vec![0]);
+    assert_eq!(history[2].value, vec![2]);
 }

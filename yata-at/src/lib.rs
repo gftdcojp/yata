@@ -485,6 +485,9 @@ pub mod firehose {
     }
 }
 
+#[cfg(test)]
+mod tests;
+
 pub mod bridge {
     use super::firehose::AtFirehose;
     use std::sync::Arc;

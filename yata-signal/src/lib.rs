@@ -720,6 +720,9 @@ pub mod store {
     }
 }
 
+#[cfg(test)]
+mod tests;
+
 pub mod payload {
     use super::{Result, SignalError};
     use yata_core::PayloadRef;
