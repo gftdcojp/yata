@@ -1,0 +1,25 @@
+[package]
+name = "yata-graph"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+yata-cypher = { path = "../yata-cypher" }
+lance = "0.20"
+arrow = { version = "53", features = ["ipc"] }
+arrow-array = "53"
+arrow-schema = "53"
+async-trait.workspace = true
+tokio.workspace = true
+futures.workspace = true
+indexmap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

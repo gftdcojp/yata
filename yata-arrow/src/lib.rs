@@ -173,7 +173,11 @@ impl LazyArrowBatchHandle {
 
     /// Returns IPC stream bytes, serializing on first call (subsequent calls are free).
     pub fn ipc_bytes(&self) -> Result<&Bytes> {
-        self.ipc_bytes.get_or_try_init(|| batch_to_ipc(&self.batch))
+        if self.ipc_bytes.get().is_none() {
+            let bytes = batch_to_ipc(&self.batch)?;
+            let _ = self.ipc_bytes.set(bytes);
+        }
+        Ok(self.ipc_bytes.get().expect("just initialised"))
     }
 
     pub fn content_hash(&self) -> Result<Blake3Hash> {

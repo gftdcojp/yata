@@ -168,7 +168,7 @@ pub(crate) fn read_uvarint(data: &[u8]) -> Option<(u64, &[u8])> {
 /// Compute the byte length of a CID's raw binary representation.
 fn cid_byte_len(cid: &Cid) -> usize {
     let mut buf = Vec::new();
-    cid.write_bytes(&mut buf).unwrap_or(());
+    cid.write_bytes(&mut buf).unwrap_or(0);
     buf.len()
 }
 

@@ -13,6 +13,7 @@ async fn test_broker(dir: &tempfile::TempDir) -> Arc<Broker> {
         data_dir: dir.path().join("data"),
         lance_uri: dir.path().join("lance").to_str().unwrap().to_owned(),
         lance_flush_interval_ms: 60_000, // no auto-flush in tests
+        ..Default::default()
     };
     Arc::new(Broker::new(config).await.unwrap())
 }
@@ -164,4 +165,24 @@ async fn test_client_object_store() {
 
     let retrieved = client.get_object(&manifest.object_id).await.unwrap();
     assert_eq!(retrieved, data);
+}
+
+#[tokio::test]
+async fn test_broker_graph_integration() {
+    // Verify that Broker initializes LanceGraphStore when graph_uri is set.
+    let dir = tempfile::tempdir().unwrap();
+    let config = BrokerConfig {
+        data_dir: dir.path().join("data"),
+        lance_uri: dir.path().join("lance").to_str().unwrap().to_owned(),
+        lance_flush_interval_ms: 60_000,
+        graph_uri: Some(dir.path().join("graph").to_str().unwrap().to_owned()),
+        ..Default::default()
+    };
+    let broker = Arc::new(Broker::new(config).await.unwrap());
+    assert!(broker.graph.is_some());
+
+    // Verify that graph store is absent when graph_uri is None.
+    let dir2 = tempfile::tempdir().unwrap();
+    let broker2 = test_broker(&dir2).await;
+    assert!(broker2.graph.is_none());
 }

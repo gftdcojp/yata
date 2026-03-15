@@ -21,6 +21,7 @@ yata-b2.workspace = true
 yata-ocel.workspace = true
 yata-lance.workspace = true
 yata-client.workspace = true
+yata-graph.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 serde.workspace = true

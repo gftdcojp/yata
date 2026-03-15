@@ -34,6 +34,8 @@ pub struct BrokerConfig {
     pub b2: Option<B2Config>,
     /// How often to sync log/kv_payloads/lance dirs to B2 (milliseconds).
     pub b2_sync_interval_ms: u64,
+    /// Graph store base URI. When set, initializes a LanceGraphStore at this path.
+    pub graph_uri: Option<String>,
 }
 
 impl Default for BrokerConfig {
@@ -44,6 +46,7 @@ impl Default for BrokerConfig {
             lance_flush_interval_ms: 5000,
             b2: None,
             b2_sync_interval_ms: 30_000,
+            graph_uri: None,
         }
     }
 }
@@ -57,6 +60,8 @@ pub struct Broker {
     pub objects: Arc<dyn ObjectStorage>,
     pub ocel: Arc<MemoryOcelProjector>,
     pub lance: Arc<LocalLanceSink>,
+    /// Graph store — initialized when `BrokerConfig.graph_uri` is set.
+    pub graph: Option<Arc<yata_graph::LanceGraphStore>>,
     /// B2 sync handle; used by background tasks for log/kv/lance dir sync.
     b2_sync: Option<Arc<B2Sync>>,
 }
@@ -95,6 +100,11 @@ impl Broker {
         let ocel = Arc::new(MemoryOcelProjector::new());
         let lance = Arc::new(LocalLanceSink::new(&config.lance_uri).await?);
 
+        let graph = config
+            .graph_uri
+            .as_deref()
+            .map(|uri| Arc::new(yata_graph::LanceGraphStore::new(uri)));
+
         Ok(Self {
             config,
             log,
@@ -102,6 +112,7 @@ impl Broker {
             objects,
             ocel,
             lance,
+            graph,
             b2_sync,
         })
     }

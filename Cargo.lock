@@ -6651,6 +6651,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "yata-graph"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "chrono",
+ "futures",
+ "indexmap 2.13.0",
+ "lance",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+ "yata-cypher",
+]
+
+[[package]]
 name = "yata-kv"
 version = "0.1.0"
 dependencies = [
@@ -6775,6 +6797,7 @@ dependencies = [
  "yata-b2",
  "yata-client",
  "yata-core",
+ "yata-graph",
  "yata-kv",
  "yata-lance",
  "yata-log",
