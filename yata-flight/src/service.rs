@@ -368,3 +368,143 @@ impl FlightService for YataFlightService {
         Ok(Response::new(Box::pin(futures::stream::empty())))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_flight::decode::FlightRecordBatchStream;
+    use arrow_schema::DataType;
+    use futures::TryStreamExt;
+    use indexmap::IndexMap;
+    use yata_graph::LanceGraphStore;
+
+    /// Write a simple 2-node 1-edge graph to a temp dir and verify Cypher round-trip.
+    #[tokio::test]
+    async fn test_execute_cypher_scan_arrow_ipc_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_uri = dir.path().to_str().unwrap();
+
+        // --- Write test graph to Lance ---
+        let store = LanceGraphStore::new(graph_uri).await.unwrap();
+
+        let mut alice_props = IndexMap::new();
+        alice_props.insert("name".into(), yata_graph::json_to_cypher(&serde_json::json!("Alice")));
+        let mut bob_props = IndexMap::new();
+        bob_props.insert("name".into(), yata_graph::json_to_cypher(&serde_json::json!("Bob")));
+
+        store.write_vertices(&[
+            yata_cypher::NodeRef { id: "alice".into(), labels: vec!["Person".into()], props: alice_props },
+            yata_cypher::NodeRef { id: "bob".into(),   labels: vec!["Person".into()], props: bob_props },
+        ]).await.unwrap();
+
+        store.write_edges(&[yata_cypher::RelRef {
+            id:       "e1".into(),
+            src:      "alice".into(),
+            dst:      "bob".into(),
+            rel_type: "KNOWS".into(),
+            props:    IndexMap::new(),
+        }]).await.unwrap();
+
+        // --- execute_cypher_scan ---
+        let ticket = CypherTicket {
+            kind:      "cypher".into(),
+            cypher:    "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS aname, b.name AS bname".into(),
+            params:    vec![],
+            graph_uri: Some(graph_uri.to_string()),
+        };
+
+        let flight_stream = YataFlightService::execute_cypher_scan(ticket, None)
+            .await
+            .unwrap();
+
+        // Decode Arrow IPC from the flight stream.
+        let decoded: Vec<RecordBatch> = FlightRecordBatchStream::new_from_flight_data(
+            flight_stream.map_err(|e| arrow_flight::error::FlightError::Tonic(e)),
+        )
+        .try_collect()
+        .await
+        .unwrap();
+
+        // Exactly 1 batch, 1 row.
+        assert_eq!(decoded.len(), 1, "expected 1 record batch");
+        let batch = &decoded[0];
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 2);
+
+        // Column names come from RETURN clause aliases — transmitted once in schema.
+        let schema = batch.schema();
+        assert_eq!(schema.field(0).name(), "aname");
+        assert_eq!(schema.field(1).name(), "bname");
+        // All columns are Utf8 (JSON-encoded values).
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+
+        // Row values.
+        let col_a = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let col_b = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        // Values are JSON-encoded strings → `"Alice"` and `"Bob"`.
+        assert_eq!(col_a.value(0), r#""Alice""#);
+        assert_eq!(col_b.value(0), r#""Bob""#);
+    }
+
+    /// Empty Cypher result returns a zero-column schema stream (no panic).
+    #[tokio::test]
+    async fn test_execute_cypher_scan_empty_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_uri = dir.path().to_str().unwrap();
+
+        // Empty graph — MATCH finds nothing.
+        let ticket = CypherTicket {
+            kind:      "cypher".into(),
+            cypher:    "MATCH (n:Ghost) RETURN n.name".into(),
+            params:    vec![],
+            graph_uri: Some(graph_uri.to_string()),
+        };
+
+        let flight_stream = YataFlightService::execute_cypher_scan(ticket, None)
+            .await
+            .unwrap();
+
+        let decoded: Vec<RecordBatch> = FlightRecordBatchStream::new_from_flight_data(
+            flight_stream.map_err(|e| arrow_flight::error::FlightError::Tonic(e)),
+        )
+        .try_collect()
+        .await
+        .unwrap();
+
+        // Empty graph → 0 columns in schema, 0 batches.
+        assert!(decoded.is_empty() || decoded.iter().all(|b| b.num_rows() == 0));
+    }
+
+    /// QueryableGraph.query() rows align with cypher-result { columns, rows } encoding.
+    #[tokio::test]
+    async fn test_queryable_graph_column_row_alignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceGraphStore::new(dir.path().to_str().unwrap()).await.unwrap();
+
+        let mut props = IndexMap::new();
+        props.insert("age".into(), yata_cypher::Value::Int(25));
+        props.insert("active".into(), yata_cypher::Value::Bool(true));
+
+        store.write_vertices(&[
+            yata_cypher::NodeRef { id: "u1".into(), labels: vec!["User".into()], props },
+        ]).await.unwrap();
+
+        let mut g = store.to_memory_graph().await.unwrap();
+        let rows = g.query(
+            "MATCH (u:User) RETURN u.age AS age, u.active AS active",
+            &[],
+        ).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        // cypher-result layout: columns[0]="age", columns[1]="active"; rows[0][0] / rows[0][1]
+        let cols: Vec<&str> = rows[0].iter().map(|(c, _)| c.as_str()).collect();
+        assert!(cols.contains(&"age"),    "missing age column");
+        assert!(cols.contains(&"active"), "missing active column");
+
+        let age_val = rows[0].iter().find(|(c, _)| c == "age").map(|(_, v)| v.as_str()).unwrap_or("");
+        let active_val = rows[0].iter().find(|(c, _)| c == "active").map(|(_, v)| v.as_str()).unwrap_or("");
+        assert_eq!(age_val,    "25");
+        assert_eq!(active_val, "true");
+    }
+}
