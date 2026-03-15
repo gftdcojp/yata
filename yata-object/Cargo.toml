@@ -1,22 +1,21 @@
 [package]
-name = "yata-kv"
+name = "yata-object"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 yata-core.workspace = true
-yata-log.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ciborium.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true }
-tokio-stream.workspace = true
 futures.workspace = true
 tracing.workspace = true
 chrono.workspace = true
-ciborium.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

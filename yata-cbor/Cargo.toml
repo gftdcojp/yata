@@ -1,0 +1,11 @@
+[package]
+name = "yata-cbor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+yata-core.workspace = true
+ciborium.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+bytes.workspace = true

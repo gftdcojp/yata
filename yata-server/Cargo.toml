@@ -1,0 +1,40 @@
+[package]
+name = "yata-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "yata-server"
+path = "src/main.rs"
+
+[lib]
+name = "yata_server"
+path = "src/lib.rs"
+
+[dependencies]
+yata-core.workspace = true
+yata-arrow.workspace = true
+yata-log.workspace = true
+yata-kv.workspace = true
+yata-object.workspace = true
+yata-ocel.workspace = true
+yata-lance.workspace = true
+yata-client.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio = { workspace = true }
+uuid.workspace = true
+futures.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+arrow = { version = "53", features = ["ipc"] }
+arrow-array = "53"
+arrow-schema = "53"

@@ -1,0 +1,22 @@
+[package]
+name = "yata-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "yata"
+path = "src/main.rs"
+
+[dependencies]
+yata-core.workspace = true
+yata-lance.workspace = true
+yata-ocel.workspace = true
+yata-server.workspace = true
+yata-client.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+tracing-subscriber.workspace = true

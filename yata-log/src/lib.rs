@@ -1,9 +1,5 @@
 #![allow(dead_code)]
 
-pub mod segment;
-pub mod local_log;
-pub mod payload_store;
-
 pub use local_log::LocalLog;
 pub use payload_store::PayloadStore;
 
@@ -420,3 +416,6 @@ pub mod payload_store {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -12,6 +12,11 @@ members = [
     "yata-server",
     "yata-client",
     "yata-cli",
+    "yata-cbor",
+    "yata-cas",
+    "yata-at",
+    "yata-signal",
+    "yata-bench",
 ]
 
 [workspace.package]
@@ -36,7 +41,7 @@ object_store = { version = "=0.10.2", features = ["aws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "io-util", "fs", "sync", "time"] }
 futures = "0.3"
 async-trait = "0.1"
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -63,6 +68,24 @@ chrono = { version = "0.4", features = ["serde"] }
 smallvec = "1"
 indexmap = { version = "2", features = ["serde"] }
 
+# HTTP / WebSocket (for yata-at)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+
+# Signal Protocol crypto (for yata-signal)
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+
+# Encoding utilities
+hex = "0.4"
+serde_bytes = "0.11"
+
 # Internal crates
 yata-core = { path = "yata-core" }
 yata-arrow = { path = "yata-arrow" }
@@ -72,3 +95,12 @@ yata-object = { path = "yata-object" }
 yata-ocel = { path = "yata-ocel" }
 yata-lance = { path = "yata-lance" }
 yata-b2 = { path = "yata-b2" }
+yata-server = { path = "yata-server" }
+yata-client = { path = "yata-client" }
+
+# Internal crates (new)
+yata-cbor = { path = "yata-cbor" }
+yata-cas = { path = "yata-cas" }
+yata-at = { path = "yata-at" }
+yata-signal = { path = "yata-signal" }
+yata-bench = { path = "yata-bench" }

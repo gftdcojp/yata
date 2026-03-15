@@ -1,11 +1,16 @@
 [package]
-name = "yata-kv"
+name = "yata-client"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "yata_client"
+path = "src/lib.rs"
+
 [dependencies]
 yata-core.workspace = true
-yata-log.workspace = true
+yata-arrow.workspace = true
+yata-ocel.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 serde.workspace = true
@@ -16,8 +21,3 @@ tokio-stream.workspace = true
 futures.workspace = true
 tracing.workspace = true
 chrono.workspace = true
-ciborium.workspace = true
-
-[dev-dependencies]
-tempfile = "3"
-tokio = { workspace = true }

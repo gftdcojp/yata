@@ -1,30 +1,19 @@
 #![allow(dead_code)]
 
-pub mod ids;
-pub mod hash;
-pub mod envelope;
-pub mod payload;
-pub mod log;
-pub mod object;
-pub mod kv;
-pub mod ack;
-pub mod publish;
-pub mod traits;
-pub mod error;
+// ---- Forward declarations for inline modules ---------------------------
+// All modules are defined inline below; pub use re-exports at crate root.
 
-pub use ids::*;
-pub use hash::*;
-pub use envelope::*;
-pub use payload::*;
-pub use log::*;
-pub use object::*;
-pub use kv::*;
-pub use ack::*;
-pub use publish::*;
-pub use error::*;
-
-// Re-export traits module items
-pub use traits::{AppendLog, KvStore, ObjectStorage};
+pub use self::ids::*;
+pub use self::hash::*;
+pub use self::envelope::*;
+pub use self::payload::*;
+pub use self::log::*;
+pub use self::object::*;
+pub use self::kv::*;
+pub use self::ack::*;
+pub use self::publish::*;
+pub use self::error::*;
+pub use self::traits::{AppendLog, KvStore, ObjectStorage};
 
 // ---- ids ---------------------------------------------------------------
 
@@ -283,7 +272,7 @@ pub mod payload {
     use crate::hash::Blake3Hash;
     use crate::ids::ObjectId;
 
-    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub enum PayloadKind {
         InlineBytes,
         ArrowIpc,
@@ -402,7 +391,7 @@ pub mod kv {
         pub bucket: BucketId,
         pub key: String,
         pub revision: Revision,
-        pub value: bytes::Bytes,
+        pub value: Vec<u8>,
         pub ts_ns: i64,
         pub op: KvOp,
     }

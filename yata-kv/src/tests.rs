@@ -1,0 +1,133 @@
+use bytes::Bytes;
+use std::sync::Arc;
+use yata_core::{BucketId, KvOp, KvPutRequest, KvStore, Revision};
+use yata_log::LocalLog;
+use crate::KvBucketStore;
+
+async fn make_store(dir: &tempfile::TempDir) -> Arc<KvBucketStore> {
+    let log = Arc::new(LocalLog::new(dir.path().join("log")).await.unwrap());
+    Arc::new(KvBucketStore::new(log).await.unwrap())
+}
+
+#[tokio::test]
+async fn test_put_and_get() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = make_store(&dir).await;
+
+    let req = KvPutRequest {
+        bucket: BucketId::from("config"),
+        key: "foo".to_owned(),
+        value: Bytes::from_static(b"bar"),
+        expected_revision: None,
+        ttl_secs: None,
+    };
+    let ack = store.put(req).await.unwrap();
+    assert_eq!(ack.revision, Revision(1));
+
+    let entry = store.get(&BucketId::from("config"), "foo").await.unwrap().unwrap();
+    assert_eq!(entry.value, b"bar");
+    assert_eq!(entry.revision, Revision(1));
+    assert!(matches!(entry.op, KvOp::Put));
+}
+
+#[tokio::test]
+async fn test_put_overwrite_increments_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = make_store(&dir).await;
+
+    let bucket = BucketId::from("config");
+
+    store.put(KvPutRequest {
+        bucket: bucket.clone(),
+        key: "key1".to_owned(),
+        value: Bytes::from_static(b"v1"),
+        expected_revision: None,
+        ttl_secs: None,
+    }).await.unwrap();
+
+    let ack2 = store.put(KvPutRequest {
+        bucket: bucket.clone(),
+        key: "key1".to_owned(),
+        value: Bytes::from_static(b"v2"),
+        expected_revision: None,
+        ttl_secs: None,
+    }).await.unwrap();
+    assert_eq!(ack2.revision, Revision(2));
+
+    let entry = store.get(&bucket, "key1").await.unwrap().unwrap();
+    assert_eq!(entry.value, b"v2");
+}
+
+#[tokio::test]
+async fn test_revision_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = make_store(&dir).await;
+
+    let bucket = BucketId::from("b");
+    store.put(KvPutRequest {
+        bucket: bucket.clone(),
+        key: "k".to_owned(),
+        value: Bytes::from_static(b"v"),
+        expected_revision: None,
+        ttl_secs: None,
+    }).await.unwrap();
+
+    // Expect revision 99 but actual is 1 → conflict
+    let result = store.put(KvPutRequest {
+        bucket: bucket.clone(),
+        key: "k".to_owned(),
+        value: Bytes::from_static(b"v2"),
+        expected_revision: Some(Revision(99)),
+        ttl_secs: None,
+    }).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_get_missing_returns_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = make_store(&dir).await;
+    let result = store.get(&BucketId::from("b"), "no-such-key").await.unwrap();
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn test_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = make_store(&dir).await;
+
+    let bucket = BucketId::from("b");
+    store.put(KvPutRequest {
+        bucket: bucket.clone(),
+        key: "k".to_owned(),
+        value: Bytes::from_static(b"v"),
+        expected_revision: None,
+        ttl_secs: None,
+    }).await.unwrap();
+
+    store.delete(&bucket, "k", None).await.unwrap();
+    let result = store.get(&bucket, "k").await.unwrap();
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn test_multiple_keys_in_bucket() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = make_store(&dir).await;
+
+    let bucket = BucketId::from("b");
+    for i in 0..5u8 {
+        store.put(KvPutRequest {
+            bucket: bucket.clone(),
+            key: format!("key{}", i),
+            value: Bytes::from(vec![i]),
+            expected_revision: None,
+            ttl_secs: None,
+        }).await.unwrap();
+    }
+
+    for i in 0..5u8 {
+        let entry = store.get(&bucket, &format!("key{}", i)).await.unwrap().unwrap();
+        assert_eq!(entry.value, vec![i]);
+    }
+}

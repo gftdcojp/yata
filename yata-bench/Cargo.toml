@@ -1,0 +1,31 @@
+[package]
+name = "yata-bench"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "yata-bench"
+path = "src/main.rs"
+
+[dependencies]
+yata-core.workspace = true
+yata-arrow.workspace = true
+yata-log.workspace = true
+yata-kv.workspace = true
+yata-object.workspace = true
+yata-ocel.workspace = true
+yata-server.workspace = true
+yata-client.workspace = true
+arrow.workspace = true
+arrow-array = "53"
+arrow-schema = "53"
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio = { workspace = true }
+futures.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+tempfile = "3"

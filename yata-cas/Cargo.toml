@@ -1,0 +1,17 @@
+[package]
+name = "yata-cas"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+yata-core.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }
