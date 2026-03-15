@@ -98,3 +98,141 @@ impl AnyTicket {
         }
     }
 }
+
+// ---- Write tickets (do_put / do_action) ---------------------------------
+
+/// Ticket for `do_put`: direct Lance table batch append.
+///
+/// Client sends Arrow IPC RecordBatches matching the target table's schema.
+/// Server collects all batches and appends in a single Lance write (batch-optimized).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteTicket {
+    /// Discriminant — must be "write".
+    pub kind: String,
+    /// Target Lance table name (e.g. "yata_messages").
+    pub table: String,
+}
+
+impl WriteTicket {
+    pub fn new(table: impl Into<String>) -> Self {
+        Self {
+            kind: "write".into(),
+            table: table.into(),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Bytes {
+        Bytes::from(serde_json::to_vec(self).unwrap_or_default())
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(b)
+    }
+}
+
+/// Ticket for `do_put`: batch write to graph tables (vertices or edges).
+///
+/// - `target = "vertices"`: client sends RecordBatches matching `graph_vertices` schema.
+/// - `target = "edges"`: client sends RecordBatches matching `graph_edges` schema.
+///   Server auto-generates `graph_adj` rows from edge data.
+///
+/// Arrow-optimized: all batches collected → single Lance append per table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphWriteTicket {
+    /// Discriminant — must be "graph_write".
+    pub kind: String,
+    /// Target: "vertices" or "edges".
+    pub target: String,
+    /// Graph store base URI override. Falls back to server-configured graph_base_uri.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_uri: Option<String>,
+}
+
+impl GraphWriteTicket {
+    pub fn vertices() -> Self {
+        Self {
+            kind: "graph_write".into(),
+            target: "vertices".into(),
+            graph_uri: None,
+        }
+    }
+
+    pub fn edges() -> Self {
+        Self {
+            kind: "graph_write".into(),
+            target: "edges".into(),
+            graph_uri: None,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Bytes {
+        Bytes::from(serde_json::to_vec(self).unwrap_or_default())
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(b)
+    }
+}
+
+/// Ticket for `do_action` type `"cypher_mutate"`: execute a Cypher mutation.
+///
+/// Flow: load graph from Lance → execute Cypher (CREATE/MERGE/DELETE/SET) →
+/// diff before/after MemoryGraph → batch write delta vertices + edges to Lance.
+///
+/// Returns `CypherMutateResult` as JSON in the action result body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CypherMutateTicket {
+    /// Cypher mutation string (e.g. "CREATE (n:Person {name: $name})").
+    pub cypher: String,
+    /// Query parameters as (name, JSON-encoded value) pairs.
+    #[serde(default)]
+    pub params: Vec<(String, String)>,
+    /// Graph store base URI override. Falls back to server-configured graph_base_uri.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_uri: Option<String>,
+}
+
+impl CypherMutateTicket {
+    pub fn new(cypher: impl Into<String>, params: Vec<(String, String)>) -> Self {
+        Self {
+            cypher: cypher.into(),
+            params,
+            graph_uri: None,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Bytes {
+        Bytes::from(serde_json::to_vec(self).unwrap_or_default())
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(b)
+    }
+}
+
+/// Result returned by `cypher_mutate` action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CypherMutateResult {
+    pub nodes_created: usize,
+    pub nodes_modified: usize,
+    pub nodes_deleted: usize,
+    pub edges_created: usize,
+    pub edges_modified: usize,
+    pub edges_deleted: usize,
+}
+
+/// Unified put-ticket — dispatches `do_put` to Lance write or graph batch write.
+pub enum AnyPutTicket {
+    Write(WriteTicket),
+    GraphWrite(GraphWriteTicket),
+}
+
+impl AnyPutTicket {
+    pub fn from_bytes(b: &[u8]) -> Result<Self, serde_json::Error> {
+        let v: serde_json::Value = serde_json::from_slice(b)?;
+        match v.get("kind").and_then(|k| k.as_str()) {
+            Some("graph_write") => Ok(AnyPutTicket::GraphWrite(serde_json::from_value(v)?)),
+            _ => Ok(AnyPutTicket::Write(serde_json::from_value(v)?)),
+        }
+    }
+}

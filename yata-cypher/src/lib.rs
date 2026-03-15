@@ -253,6 +253,10 @@ pub mod ast {
             whens: Vec<(Expr, Expr)>,
             else_: Option<Box<Expr>>,
         },
+        StartsWith(Box<Expr>, Box<Expr>),
+        EndsWith(Box<Expr>, Box<Expr>),
+        Contains(Box<Expr>, Box<Expr>),
+        RegexMatch(Box<Expr>, Box<Expr>),
     }
 
     #[derive(Clone, Debug)]
@@ -423,7 +427,8 @@ pub mod lexer {
         Star,
         Slash,
         Percent,
-        PlusEq, // +=
+        PlusEq,      // +=
+        RegexMatch,  // =~
         // Literals
         Ident(String),
         IntLit(i64),
@@ -674,8 +679,7 @@ pub mod lexer {
                 '=' => {
                     if self.cur() == Some('~') {
                         self.advance();
-                        // regex match — treat as Eq for now
-                        Ok(Token::Eq)
+                        Ok(Token::RegexMatch)
                     } else {
                         Ok(Token::Eq)
                     }
@@ -1421,6 +1425,28 @@ pub mod parser {
                         Ok(Expr::IsNull(Box::new(lhs)))
                     }
                 }
+                Token::RegexMatch => {
+                    self.next()?;
+                    let rhs = self.parse_concat()?;
+                    Ok(Expr::RegexMatch(Box::new(lhs), Box::new(rhs)))
+                }
+                Token::Ident(s) if s.eq_ignore_ascii_case("starts") => {
+                    self.next()?;
+                    self.expect(&Token::With)?;
+                    let rhs = self.parse_concat()?;
+                    Ok(Expr::StartsWith(Box::new(lhs), Box::new(rhs)))
+                }
+                Token::Ident(s) if s.eq_ignore_ascii_case("ends") => {
+                    self.next()?;
+                    self.expect(&Token::With)?;
+                    let rhs = self.parse_concat()?;
+                    Ok(Expr::EndsWith(Box::new(lhs), Box::new(rhs)))
+                }
+                Token::Ident(s) if s.eq_ignore_ascii_case("contains") => {
+                    self.next()?;
+                    let rhs = self.parse_concat()?;
+                    Ok(Expr::Contains(Box::new(lhs), Box::new(rhs)))
+                }
                 _ => Ok(lhs),
             }
         }
@@ -1692,6 +1718,9 @@ pub mod graph {
         fn add_node(&mut self, node: NodeRef);
         fn add_rel(&mut self, rel: RelRef);
         fn set_node_prop(&mut self, id: &str, key: &str, val: Value);
+        fn set_node_labels(&mut self, id: &str, labels: &[String]) {
+            let _ = (id, labels);
+        }
         fn delete_node(&mut self, id: &str);
         fn delete_rel(&mut self, id: &str);
     }
@@ -1810,6 +1839,16 @@ pub mod graph {
         fn set_node_prop(&mut self, id: &str, key: &str, val: Value) {
             if let Some(node) = self.nodes.get_mut(id) {
                 node.props.insert(key.to_owned(), val);
+            }
+        }
+
+        fn set_node_labels(&mut self, id: &str, labels: &[String]) {
+            if let Some(node) = self.nodes.get_mut(id) {
+                for l in labels {
+                    if !node.labels.contains(l) {
+                        node.labels.push(l.clone());
+                    }
+                }
             }
         }
 
@@ -2103,6 +2142,11 @@ pub mod executor {
             binding: &Binding,
             graph: &dyn Graph,
         ) -> Result<Vec<Binding>> {
+            // Variable-hop: dispatch to BFS traversal
+            if rp.min_hops.is_some() || rp.max_hops.is_some() {
+                return self.match_variable_hop(rp, next_np, src_node, binding, graph);
+            }
+
             let mut result = Vec::new();
 
             // Determine candidate rels based on direction
@@ -2181,6 +2225,81 @@ pub mod executor {
                 result.push(nb);
             }
 
+            Ok(result)
+        }
+
+        fn match_variable_hop(
+            &self,
+            rp: &RelPattern,
+            next_np: &NodePattern,
+            src_node: &NodeRef,
+            binding: &Binding,
+            graph: &dyn Graph,
+        ) -> Result<Vec<Binding>> {
+            let min = rp.min_hops.unwrap_or(1) as usize;
+            let max = rp.max_hops.unwrap_or(min.max(10) as u32) as usize;
+            let mut result = Vec::new();
+
+            // BFS: (current_node, collected_rels, depth)
+            let mut frontier: Vec<(NodeRef, Vec<RelRef>, usize)> =
+                vec![(src_node.clone(), vec![], 0)];
+
+            while let Some((node, rels, depth)) = frontier.pop() {
+                if depth >= min && depth <= max {
+                    if self.node_matches(next_np, &node, binding)? {
+                        let mut nb = binding.clone();
+                        if let Some(rv) = &rp.var {
+                            nb.insert(
+                                rv.clone(),
+                                Value::List(
+                                    rels.iter().map(|r| Value::Rel(r.clone())).collect(),
+                                ),
+                            );
+                        }
+                        if let Some(nv) = &next_np.var {
+                            nb.insert(nv.clone(), Value::Node(node.clone()));
+                        }
+                        result.push(nb);
+                    }
+                }
+                if depth < max {
+                    let candidates: Vec<RelRef> = match rp.dir {
+                        RelDir::Right | RelDir::Both => {
+                            let mut v = graph.rels_from(&node.id);
+                            if matches!(rp.dir, RelDir::Both) {
+                                v.extend(graph.rels_to(&node.id));
+                            }
+                            v
+                        }
+                        RelDir::Left => graph.rels_to(&node.id),
+                    };
+                    for rel in candidates {
+                        if !rp.types.is_empty() && !rp.types.contains(&rel.rel_type) {
+                            continue;
+                        }
+                        // Avoid cycles within same path
+                        if rels.iter().any(|r| r.id == rel.id) {
+                            continue;
+                        }
+                        let next_id = match rp.dir {
+                            RelDir::Right => &rel.dst,
+                            RelDir::Left => &rel.src,
+                            RelDir::Both => {
+                                if rel.src == node.id {
+                                    &rel.dst
+                                } else {
+                                    &rel.src
+                                }
+                            }
+                        };
+                        if let Some(next_node) = graph.node_by_id(next_id) {
+                            let mut new_rels = rels.clone();
+                            new_rels.push(rel);
+                            frontier.push((next_node, new_rels, depth + 1));
+                        }
+                    }
+                }
+            }
             Ok(result)
         }
 
@@ -2338,9 +2457,10 @@ pub mod executor {
                                 _ => {}
                             }
                         }
-                        SetItem::LabelSet(_var, _labels) => {
-                            // Label setting — not supported in MemoryGraph directly
-                            // Would need to extend Graph trait
+                        SetItem::LabelSet(var, labels) => {
+                            if let Some(Value::Node(n)) = binding.get(var) {
+                                graph.set_node_labels(&n.id, labels);
+                            }
                         }
                     }
                 }
@@ -2950,6 +3070,51 @@ pub mod executor {
                         Ok(Value::Null)
                     }
                 }
+
+                Expr::StartsWith(lhs, rhs) => {
+                    let lv = self.eval(lhs, binding)?;
+                    let rv = self.eval(rhs, binding)?;
+                    match (lv, rv) {
+                        (Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a.starts_with(&*b))),
+                        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                        _ => Ok(Value::Bool(false)),
+                    }
+                }
+
+                Expr::EndsWith(lhs, rhs) => {
+                    let lv = self.eval(lhs, binding)?;
+                    let rv = self.eval(rhs, binding)?;
+                    match (lv, rv) {
+                        (Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a.ends_with(&*b))),
+                        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                        _ => Ok(Value::Bool(false)),
+                    }
+                }
+
+                Expr::Contains(lhs, rhs) => {
+                    let lv = self.eval(lhs, binding)?;
+                    let rv = self.eval(rhs, binding)?;
+                    match (lv, rv) {
+                        (Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a.contains(&*b))),
+                        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                        _ => Ok(Value::Bool(false)),
+                    }
+                }
+
+                Expr::RegexMatch(lhs, rhs) => {
+                    let lv = self.eval(lhs, binding)?;
+                    let rv = self.eval(rhs, binding)?;
+                    match (lv, rv) {
+                        (Value::Str(a), Value::Str(pattern)) => {
+                            let re = regex::Regex::new(&pattern).map_err(|e| {
+                                CypherError::TypeError(format!("invalid regex: {}", e))
+                            })?;
+                            Ok(Value::Bool(re.is_match(&a)))
+                        }
+                        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                        _ => Ok(Value::Bool(false)),
+                    }
+                }
             }
         }
 
@@ -3293,6 +3458,141 @@ pub mod executor {
                     }
                     let v = self.eval_arg(args, 0, binding)?;
                     Ok(Value::Int(if matches!(v, Value::Null) { 0 } else { 1 }))
+                }
+                "tofloat" => {
+                    let v = self.eval_arg(args, 0, binding)?;
+                    match v {
+                        Value::Float(f) => Ok(Value::Float(f)),
+                        Value::Int(n) => Ok(Value::Float(n as f64)),
+                        Value::Str(s) => s
+                            .parse::<f64>()
+                            .map(Value::Float)
+                            .map_err(|_| CypherError::TypeError(format!("cannot parse '{}' as float", s))),
+                        Value::Null => Ok(Value::Null),
+                        _ => Err(CypherError::TypeError("toFloat() requires numeric or string".into())),
+                    }
+                }
+                "ceil" => {
+                    let v = self.eval_arg(args, 0, binding)?;
+                    match v {
+                        Value::Float(f) => Ok(Value::Float(f.ceil())),
+                        Value::Int(n) => Ok(Value::Int(n)),
+                        Value::Null => Ok(Value::Null),
+                        _ => Err(CypherError::TypeError("ceil() requires numeric".into())),
+                    }
+                }
+                "floor" => {
+                    let v = self.eval_arg(args, 0, binding)?;
+                    match v {
+                        Value::Float(f) => Ok(Value::Float(f.floor())),
+                        Value::Int(n) => Ok(Value::Int(n)),
+                        Value::Null => Ok(Value::Null),
+                        _ => Err(CypherError::TypeError("floor() requires numeric".into())),
+                    }
+                }
+                "round" => {
+                    let v = self.eval_arg(args, 0, binding)?;
+                    match v {
+                        Value::Float(f) => Ok(Value::Float(f.round())),
+                        Value::Int(n) => Ok(Value::Int(n)),
+                        Value::Null => Ok(Value::Null),
+                        _ => Err(CypherError::TypeError("round() requires numeric".into())),
+                    }
+                }
+                "sign" => {
+                    let v = self.eval_arg(args, 0, binding)?;
+                    match v {
+                        Value::Int(n) => Ok(Value::Int(n.signum())),
+                        Value::Float(f) => Ok(Value::Float(if f > 0.0 { 1.0 } else if f < 0.0 { -1.0 } else { 0.0 })),
+                        Value::Null => Ok(Value::Null),
+                        _ => Err(CypherError::TypeError("sign() requires numeric".into())),
+                    }
+                }
+                "sqrt" => {
+                    let v = self.eval_arg(args, 0, binding)?;
+                    match v {
+                        Value::Int(n) => Ok(Value::Float((n as f64).sqrt())),
+                        Value::Float(f) => Ok(Value::Float(f.sqrt())),
+                        Value::Null => Ok(Value::Null),
+                        _ => Err(CypherError::TypeError("sqrt() requires numeric".into())),
+                    }
+                }
+                "replace" => {
+                    let s = match self.eval_arg(args, 0, binding)? {
+                        Value::Str(s) => s,
+                        Value::Null => return Ok(Value::Null),
+                        _ => return Err(CypherError::TypeError("replace() requires string".into())),
+                    };
+                    let search = match self.eval_arg(args, 1, binding)? {
+                        Value::Str(s) => s,
+                        _ => return Err(CypherError::TypeError("replace() search must be string".into())),
+                    };
+                    let replacement = match self.eval_arg(args, 2, binding)? {
+                        Value::Str(s) => s,
+                        _ => return Err(CypherError::TypeError("replace() replacement must be string".into())),
+                    };
+                    Ok(Value::Str(s.replace(&*search, &replacement)))
+                }
+                "left" => {
+                    let s = match self.eval_arg(args, 0, binding)? {
+                        Value::Str(s) => s,
+                        Value::Null => return Ok(Value::Null),
+                        _ => return Err(CypherError::TypeError("left() requires string".into())),
+                    };
+                    let n = match self.eval_arg(args, 1, binding)? {
+                        Value::Int(n) => n as usize,
+                        _ => return Err(CypherError::TypeError("left() length must be integer".into())),
+                    };
+                    Ok(Value::Str(s.chars().take(n).collect()))
+                }
+                "right" => {
+                    let s = match self.eval_arg(args, 0, binding)? {
+                        Value::Str(s) => s,
+                        Value::Null => return Ok(Value::Null),
+                        _ => return Err(CypherError::TypeError("right() requires string".into())),
+                    };
+                    let n = match self.eval_arg(args, 1, binding)? {
+                        Value::Int(n) => n as usize,
+                        _ => return Err(CypherError::TypeError("right() length must be integer".into())),
+                    };
+                    let chars: Vec<char> = s.chars().collect();
+                    let start = chars.len().saturating_sub(n);
+                    Ok(Value::Str(chars[start..].iter().collect()))
+                }
+                "split" => {
+                    let s = match self.eval_arg(args, 0, binding)? {
+                        Value::Str(s) => s,
+                        Value::Null => return Ok(Value::Null),
+                        _ => return Err(CypherError::TypeError("split() requires string".into())),
+                    };
+                    let delim = match self.eval_arg(args, 1, binding)? {
+                        Value::Str(s) => s,
+                        _ => return Err(CypherError::TypeError("split() delimiter must be string".into())),
+                    };
+                    Ok(Value::List(
+                        s.split(&*delim).map(|p| Value::Str(p.to_owned())).collect(),
+                    ))
+                }
+                "reverse" => {
+                    let v = self.eval_arg(args, 0, binding)?;
+                    match v {
+                        Value::Str(s) => Ok(Value::Str(s.chars().rev().collect())),
+                        Value::List(mut l) => {
+                            l.reverse();
+                            Ok(Value::List(l))
+                        }
+                        Value::Null => Ok(Value::Null),
+                        _ => Err(CypherError::TypeError("reverse() requires string or list".into())),
+                    }
+                }
+                "length" => {
+                    let v = self.eval_arg(args, 0, binding)?;
+                    match v {
+                        Value::List(l) => Ok(Value::Int(l.len() as i64)),
+                        Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
+                        Value::Null => Ok(Value::Null),
+                        _ => Err(CypherError::TypeError("length() requires list or string".into())),
+                    }
                 }
                 other => {
                     // Unknown function — return null rather than error to be lenient
