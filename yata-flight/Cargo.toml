@@ -15,7 +15,10 @@ path = "src/lib.rs"
 [dependencies]
 yata-core.workspace = true
 yata-lance.workspace = true
+yata-cypher.workspace = true
+yata-graph.workspace = true
 arrow = { workspace = true }
+arrow-array.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
 arrow-flight = { workspace = true }

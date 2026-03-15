@@ -4,7 +4,7 @@ mod error;
 mod service;
 
 pub use catalog::YataTableCatalog;
-pub use codec::ScanTicket;
+pub use codec::{CypherTicket, ScanTicket};
 pub use error::FlightError;
 pub use service::YataFlightService;
 
@@ -21,8 +21,18 @@ use std::net::SocketAddr;
 /// - `yata_object_object_edges`
 /// - `yata_kv_history`
 /// - `yata_blobs`
-pub async fn serve(lance_base_uri: impl Into<String>, addr: SocketAddr) -> anyhow::Result<()> {
-    let service = YataFlightService::new(lance_base_uri.into());
+///
+/// When `graph_base_uri` is Some, Cypher queries via `CypherTicket` are enabled,
+/// backed by `graph_vertices` / `graph_edges` Lance tables at that URI.
+pub async fn serve(
+    lance_base_uri: impl Into<String>,
+    addr: SocketAddr,
+    graph_base_uri: Option<String>,
+) -> anyhow::Result<()> {
+    let service = match graph_base_uri {
+        Some(g) => YataFlightService::new_with_graph(lance_base_uri.into(), g),
+        None => YataFlightService::new(lance_base_uri.into()),
+    };
     let svc = FlightServiceServer::new(service);
     tracing::info!(%addr, "yata-flight listening");
     tonic::transport::Server::builder()

@@ -2,6 +2,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
+use arrow_array::StringArray;
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
@@ -9,21 +10,36 @@ use arrow_flight::{
     error::{FlightError, Result as FlightResult},
     flight_service_server::FlightService,
 };
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Field, Schema};
 use futures::{Stream, TryStreamExt};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::catalog::YataTableCatalog;
-use crate::codec::ScanTicket;
+use crate::codec::{AnyTicket, CypherTicket, ScanTicket};
 
 pub struct YataFlightService {
     catalog: Arc<YataTableCatalog>,
+    /// Base URI for graph_vertices / graph_edges Lance tables.
+    /// When set, enables Cypher queries via `CypherTicket`.
+    graph_base_uri: Option<String>,
 }
 
 impl YataFlightService {
     pub fn new(lance_base_uri: impl Into<String>) -> Self {
         Self {
             catalog: Arc::new(YataTableCatalog::new(lance_base_uri)),
+            graph_base_uri: None,
+        }
+    }
+
+    /// Create service with graph store support for Cypher queries.
+    pub fn new_with_graph(
+        lance_base_uri: impl Into<String>,
+        graph_base_uri: impl Into<String>,
+    ) -> Self {
+        Self {
+            catalog: Arc::new(YataTableCatalog::new(lance_base_uri)),
+            graph_base_uri: Some(graph_base_uri.into()),
         }
     }
 
@@ -128,6 +144,91 @@ impl YataFlightService {
 
         Ok(Box::pin(flight_stream))
     }
+
+    /// Execute a Cypher query against the tiered graph store (LanceGraph → Lance → B2).
+    ///
+    /// Steps:
+    ///   1. Load graph_vertices + graph_edges from Lance into MemoryGraph.
+    ///   2. Execute Cypher with yata-cypher executor.
+    ///   3. Infer Arrow schema from result column names (all Utf8 — JSON-encoded values).
+    ///   4. Return as Arrow IPC stream via FlightDataEncoderBuilder.
+    ///
+    /// Shannon efficiency: column names transmitted once in schema, not per row.
+    /// For N rows with M columns of avg name length L: saves (N-1)×M×L bytes vs JSON rows.
+    async fn execute_cypher_scan(
+        ticket: CypherTicket,
+        default_graph_base_uri: Option<&str>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>, Status>
+    {
+        use yata_cypher::Graph;
+
+        let graph_uri = ticket
+            .graph_uri
+            .as_deref()
+            .or(default_graph_base_uri)
+            .ok_or_else(|| Status::failed_precondition("no graph_base_uri configured"))?;
+
+        let store = yata_graph::LanceGraphStore::new(graph_uri);
+
+        let graph = store
+            .to_memory_graph()
+            .await
+            .map_err(|e| Status::internal(format!("graph load: {e}")))?;
+
+        let raw_rows = graph
+            .query(&ticket.cypher, &ticket.params)
+            .map_err(|e| Status::internal(format!("cypher: {e}")))?;
+
+        if raw_rows.is_empty() {
+            // Empty result — return empty stream with zero-column schema.
+            let schema = Arc::new(Schema::empty());
+            let empty = futures::stream::empty::<FlightResult<RecordBatch>>();
+            let stream = FlightDataEncoderBuilder::new()
+                .with_schema(schema)
+                .build(empty)
+                .map_err(tonic::Status::from);
+            return Ok(Box::pin(stream));
+        }
+
+        // Collect column names from the first row (defines the schema).
+        // All columns are Utf8 — values are JSON-encoded Cypher values.
+        let col_names: Vec<String> = raw_rows[0].iter().map(|(name, _)| name.clone()).collect();
+        let fields: Vec<Field> = col_names
+            .iter()
+            .map(|name| Field::new(name.as_str(), DataType::Utf8, true))
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+
+        // Build columnar arrays (one StringArray per column).
+        let n_rows = raw_rows.len();
+        let mut columns: Vec<Vec<Option<String>>> = vec![vec![None; n_rows]; col_names.len()];
+
+        for (row_idx, row) in raw_rows.iter().enumerate() {
+            for (col_name, json_val) in row {
+                if let Some(col_idx) = col_names.iter().position(|c| c == col_name) {
+                    columns[col_idx][row_idx] = Some(json_val.clone());
+                }
+            }
+        }
+
+        let arrays: Vec<Arc<dyn arrow_array::Array>> = columns
+            .into_iter()
+            .map(|col| {
+                let arr: StringArray = col.into_iter().collect();
+                Arc::new(arr) as Arc<dyn arrow_array::Array>
+            })
+            .collect();
+
+        let batch = RecordBatch::try_new(schema.clone(), arrays)
+            .map_err(|e| Status::internal(format!("arrow batch: {e}")))?;
+
+        let stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(futures::stream::once(async move { Ok(batch) }))
+            .map_err(tonic::Status::from);
+
+        Ok(Box::pin(stream))
+    }
 }
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -213,18 +314,30 @@ impl FlightService for YataFlightService {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let raw_ticket = request.into_inner();
-        let ticket = ScanTicket::from_bytes(&raw_ticket.ticket)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-
-        tracing::debug!(
-            table = %ticket.table,
-            filter = ?ticket.filter,
-            limit = ?ticket.limit,
-            "do_get"
-        );
-
-        let stream = Self::execute_scan(self.catalog.clone(), ticket).await?;
-        Ok(Response::new(stream))
+        match AnyTicket::from_bytes(&raw_ticket.ticket)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?
+        {
+            AnyTicket::Scan(ticket) => {
+                tracing::debug!(
+                    table = %ticket.table,
+                    filter = ?ticket.filter,
+                    limit = ?ticket.limit,
+                    "do_get scan"
+                );
+                let stream = Self::execute_scan(self.catalog.clone(), ticket).await?;
+                Ok(Response::new(stream))
+            }
+            AnyTicket::Cypher(ticket) => {
+                tracing::debug!(
+                    cypher = %ticket.cypher,
+                    params = ?ticket.params,
+                    "do_get cypher"
+                );
+                let stream =
+                    Self::execute_cypher_scan(ticket, self.graph_base_uri.as_deref()).await?;
+                Ok(Response::new(stream))
+            }
+        }
     }
 
     async fn do_put(

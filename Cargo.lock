@@ -7804,6 +7804,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "arrow-array",
  "arrow-flight",
  "arrow-ipc",
  "arrow-schema",
@@ -7818,6 +7819,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "yata-core",
+ "yata-cypher",
+ "yata-graph",
  "yata-lance",
 ]
 
