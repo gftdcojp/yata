@@ -6,14 +6,15 @@ yata broker — NATS JetStream 互換 event store。magatama-host から `YataCl
 
 | Crate | 役割 |
 |---|---|
-| `yata-core` | 共通型 (`YataError`, `PayloadRef`, etc.) |
+| `yata-core` | 共通型 (`YataError`, `PayloadRef`, traits: `AppendLog`, `KvStore`, `ObjectStorage`) |
 | `yata-client` | `YataClient` trait — KV / Log / Lance への async API |
-| `yata-server` | `Broker` + `BrokerBackend` — embedded broker (magatama-server に埋め込み) |
-| `yata-kv` | KV store (sled/RocksDB backed) |
-| `yata-log` | Append log (Lance backed) |
-| `yata-lance` | Lance table I/O ヘルパー (Arrow RecordBatch 変換) |
-| `yata-arrow` | Arrow schema utilities |
-| `yata-cypher` | **Cypher パーサ + 実行エンジン** (pure Rust, Lance 非依存) |
+| `yata-server` | `Broker` + `BrokerBackend` — embedded broker (magatama-server に埋め込み)。NATS 有無で backend 自動切替 |
+| `yata-nats` | **NATS JetStream backend** — `AppendLog`/`KvStore`/`ObjectStorage` の NATS 実装 + Arrow IPC produce/consume + `NatsLanceWriter` |
+| `yata-kv` | KV store (local: in-memory snapshot + append-only log) |
+| `yata-log` | Append log (local: filesystem segment files + CBOR + CRC32) |
+| `yata-lance` | Lance table I/O ヘルパー (Arrow RecordBatch 変換、`pub` conversion functions) |
+| `yata-arrow` | Arrow IPC encode/decode (`batch_to_ipc`, `ipc_to_batch`) |
+| `yata-cypher` | **Cypher パーサ + 実行エンジン** (pure Rust, Lance 非依存。variable-hop, regex, STARTS WITH/ENDS WITH/CONTAINS) |
 | `yata-graph` | **Lance-backed graph store** (`LanceGraphStore` + `QueryableGraph`) |
 | `yata-flight` | Arrow Flight gRPC サービス — `ScanTicket` (Lance scan) + `CypherTicket` (Cypher via graph) |
 | `yata-at` | AT Protocol types, Firehose client, `AtFirehoseBridge` |
@@ -68,3 +69,49 @@ query: func(cypher: string, params: list<cypher-param>) -> result<cypher-result,
 | `graph_adj` | `vid`, `direction` (OUT/IN), `edge_label`, `neighbor_vid`, `eid`, `created_ns` |
 
 すべて append-only。`to_memory_graph()` でロード時に dedup は `vid`/`eid` 単位で行われる。
+
+## yata-nats: NATS JetStream Arrow payload transport
+
+`BrokerConfig.nats` が設定されると全 write path が NATS Arrow IPC 経由になる。
+
+### Producer → NATS → Consumer → LanceDB
+
+```
+Producer (Broker.flush_lance / KvStore.put / ObjectStore.put)
+  → Arrow IPC batch (yata_arrow::batch_to_ipc)
+  → NATS publish: yata.arrow.<table> (fire-and-forget, ack pipeline)
+  → Header: Yata-Lance-Table, Yata-Arrow-Rows
+      ↓
+NatsLanceWriter (consumer, durable: yata-lance-writer)
+  → subscribe: yata.arrow.>  (WorkQueue retention)
+  → batch accumulation: 4096 rows or 1s flush interval
+  → concat_batches → lance_conn.open_table(table).add(merged_batch)
+  → table handle cache (HashMap)
+```
+
+### Subject → Lance テーブル mapping
+
+| NATS Subject | Lance Table | Producer |
+|---|---|---|
+| `yata.arrow.yata_events` | `yata_events` | `flush_lance` |
+| `yata.arrow.yata_objects` | `yata_objects` | `flush_lance` |
+| `yata.arrow.yata_event_object_edges` | `yata_event_object_edges` | `flush_lance` |
+| `yata.arrow.yata_object_object_edges` | `yata_object_object_edges` | `flush_lance` |
+| `yata.arrow.yata_messages` | `yata_messages` | `publish_arrow` |
+| `yata.arrow.kv_history` | `yata_kv_history` | `NatsKvStore` (buffered 64 entries / 500ms) |
+| `yata.arrow.blobs` | `yata_blobs` | `NatsObjectStore` |
+| `yata.arrow.graph_vertices` | `graph_vertices` | graph write path |
+| `yata.arrow.graph_edges` | `graph_edges` | graph write path |
+
+### 最適化ルール (CRITICAL)
+
+- **1行/batch 禁止**: Arrow IPC schema overhead は ~1.9KB/batch。1行 batch は 2% efficiency。最低 64 行で batch すること
+- **NatsLanceWriter の batch accumulation**: 4096行 or 1秒で flush。1 msg = 1 Lance `add()` は fragment 爆発 (183x 性能差)
+- **Publisher fire-and-forget**: `publish_batch()` は ack を await しない。durability は JetStream が保証
+- **Table handle cache**: `open_table` を毎回呼ばない。`HashMap<String, lancedb::Table>` でキャッシュ
+- **Bucket/stream ensure cache**: `NatsKvStore` は bucket handle を `HashMap` でキャッシュ
+
+### Dual-write architecture (KV / Object)
+
+`NatsKvStore`: JetStream KV (point read/watch) + Arrow IPC batch (Lance history)
+`NatsObjectStore`: JetStream Object Store (blob get/put) + Arrow IPC manifest (Lance index)
