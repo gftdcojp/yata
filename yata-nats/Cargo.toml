@@ -28,5 +28,8 @@ arrow-array = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
 
+# LanceDB (for NatsLanceWriter consumer)
+lancedb = { workspace = true }
+
 # time crate (async-nats uses time, not chrono, for timestamps)
 time = "0.3"

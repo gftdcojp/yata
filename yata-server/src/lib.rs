@@ -177,6 +177,19 @@ impl Broker {
             });
         }
 
+        // NATS → Lance consumer: subscribes to yata.arrow.> and writes to LanceDB
+        if let Some(ref nats) = self.nats {
+            let writer = yata_nats::NatsLanceWriter::new(
+                nats.jetstream.clone(),
+                self.lance.connection().clone(),
+            );
+            tokio::spawn(async move {
+                if let Err(e) = writer.run().await {
+                    tracing::error!("NatsLanceWriter stopped: {e}");
+                }
+            });
+        }
+
         // B2 data sync loop: log segments, kv_payloads, lance datasets
         if let Some(ref b2) = self.b2_sync {
             let b2 = b2.clone();
@@ -214,12 +227,27 @@ impl Broker {
     }
 
     /// Publish an Arrow batch to a stream.
+    ///
+    /// When NATS is configured, also publishes as Arrow IPC to
+    /// `yata.arrow.yata_messages` for Lance ingestion.
     pub async fn publish_arrow(
         &self,
         stream: &str,
         subject: &str,
         batch: ArrowBatchHandle,
     ) -> Result<Ack> {
+        // Produce to NATS Arrow subject for Lance consumer
+        if let Some(ref nats) = self.nats {
+            let publisher = nats.arrow_publisher();
+            let _ = publisher
+                .publish_batch(
+                    "yata.arrow.yata_messages",
+                    &batch.batch,
+                    Some("yata_messages"),
+                )
+                .await;
+        }
+
         let stream_id = StreamId::from(stream);
         let subject_id = Subject::from(subject);
         let payload = batch.as_payload_ref();
@@ -302,29 +330,79 @@ impl Broker {
         self.log.append(req).await
     }
 
-    /// Flush pending OCEL projection + KV history to Lance.
+    /// Flush pending OCEL projection + KV history.
+    ///
+    /// When NATS is configured: produce Arrow IPC batches to NATS subjects.
+    /// NatsLanceWriter consumer subscribes and writes to LanceDB.
+    ///
+    /// When NATS is not configured: write directly to Lance (original path).
     pub async fn flush_lance(&self) -> Result<SyncStats> {
         let snapshot = self.ocel.snapshot().await?;
 
-        if !snapshot.events.is_empty() {
-            self.lance.write_ocel_events(&snapshot.events).await?;
-        }
-        if !snapshot.objects.is_empty() {
-            self.lance.write_ocel_objects(&snapshot.objects).await?;
-        }
-        if !snapshot.event_object_edges.is_empty() {
-            self.lance.write_e2o_edges(&snapshot.event_object_edges).await?;
-        }
-        if !snapshot.object_object_edges.is_empty() {
-            self.lance.write_o2o_edges(&snapshot.object_object_edges).await?;
-        }
+        if let Some(ref nats) = self.nats {
+            // NATS path: produce Arrow IPC batches to NATS subjects.
+            // NatsLanceWriter consumer handles the Lance append.
+            let publisher = nats.arrow_publisher();
+            use yata_lance::sink::*;
 
-        // Flush KV history — drains the pending buffer (local backend only).
-        // When using NATS, KV history is tracked by JetStream natively.
-        if let Some(ref local_kv) = self.local_kv {
-            let kv_entries = local_kv.drain_pending();
-            if !kv_entries.is_empty() {
-                self.lance.write_kv_history(&kv_entries).await?;
+            if !snapshot.events.is_empty() {
+                let batch = ocel_events_to_batch(&snapshot.events)?;
+                let _ = publisher
+                    .publish_batch("yata.arrow.yata_events", &batch, Some("yata_events"))
+                    .await;
+            }
+            if !snapshot.objects.is_empty() {
+                let batch = ocel_objects_to_batch(&snapshot.objects)?;
+                let _ = publisher
+                    .publish_batch("yata.arrow.yata_objects", &batch, Some("yata_objects"))
+                    .await;
+            }
+            if !snapshot.event_object_edges.is_empty() {
+                let batch = e2o_edges_to_batch(&snapshot.event_object_edges)?;
+                let _ = publisher
+                    .publish_batch(
+                        "yata.arrow.yata_event_object_edges",
+                        &batch,
+                        Some("yata_event_object_edges"),
+                    )
+                    .await;
+            }
+            if !snapshot.object_object_edges.is_empty() {
+                let batch = o2o_edges_to_batch(&snapshot.object_object_edges)?;
+                let _ = publisher
+                    .publish_batch(
+                        "yata.arrow.yata_object_object_edges",
+                        &batch,
+                        Some("yata_object_object_edges"),
+                    )
+                    .await;
+            }
+            // KV history is already published per-operation via NatsKvStore dual-write
+        } else {
+            // Direct Lance path (no NATS)
+            if !snapshot.events.is_empty() {
+                self.lance.write_ocel_events(&snapshot.events).await?;
+            }
+            if !snapshot.objects.is_empty() {
+                self.lance.write_ocel_objects(&snapshot.objects).await?;
+            }
+            if !snapshot.event_object_edges.is_empty() {
+                self.lance
+                    .write_e2o_edges(&snapshot.event_object_edges)
+                    .await?;
+            }
+            if !snapshot.object_object_edges.is_empty() {
+                self.lance
+                    .write_o2o_edges(&snapshot.object_object_edges)
+                    .await?;
+            }
+
+            // Local KV history drain
+            if let Some(ref local_kv) = self.local_kv {
+                let kv_entries = local_kv.drain_pending();
+                if !kv_entries.is_empty() {
+                    self.lance.write_kv_history(&kv_entries).await?;
+                }
             }
         }
 

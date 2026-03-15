@@ -7688,6 +7688,7 @@ dependencies = [
  "ciborium",
  "futures",
  "indexmap 2.13.0",
+ "lancedb",
  "serde",
  "serde_json",
  "time",

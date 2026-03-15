@@ -293,7 +293,7 @@ pub mod sink {
         }
     }
 
-    fn ocel_events_to_batch(events: &[OcelEvent]) -> Result<RecordBatch> {
+    pub fn ocel_events_to_batch(events: &[OcelEvent]) -> Result<RecordBatch> {
         let schema = ocel_events_schema();
         let event_ids: Vec<&str> = events.iter().map(|e| e.event_id.as_str()).collect();
         let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -328,7 +328,7 @@ pub mod sink {
         .map_err(|e| YataError::Arrow(e.to_string()))
     }
 
-    fn ocel_objects_to_batch(objects: &[OcelObject]) -> Result<RecordBatch> {
+    pub fn ocel_objects_to_batch(objects: &[OcelObject]) -> Result<RecordBatch> {
         let schema = ocel_objects_schema();
         let object_ids: Vec<&str> = objects.iter().map(|o| o.object_id.as_str()).collect();
         let object_types: Vec<&str> = objects.iter().map(|o| o.object_type.as_str()).collect();
@@ -363,7 +363,7 @@ pub mod sink {
         .map_err(|e| YataError::Arrow(e.to_string()))
     }
 
-    fn e2o_edges_to_batch(edges: &[OcelEventObjectEdge]) -> Result<RecordBatch> {
+    pub fn e2o_edges_to_batch(edges: &[OcelEventObjectEdge]) -> Result<RecordBatch> {
         let schema = event_object_edges_schema();
         let event_ids: Vec<&str> = edges.iter().map(|e| e.event_id.as_str()).collect();
         let object_ids: Vec<&str> = edges.iter().map(|e| e.object_id.as_str()).collect();
@@ -382,7 +382,7 @@ pub mod sink {
         .map_err(|e| YataError::Arrow(e.to_string()))
     }
 
-    fn o2o_edges_to_batch(edges: &[OcelObjectObjectEdge]) -> Result<RecordBatch> {
+    pub fn o2o_edges_to_batch(edges: &[OcelObjectObjectEdge]) -> Result<RecordBatch> {
         let schema = object_object_edges_schema();
         let src_ids: Vec<&str> = edges.iter().map(|e| e.src_object_id.as_str()).collect();
         let dst_ids: Vec<&str> = edges.iter().map(|e| e.dst_object_id.as_str()).collect();
@@ -412,7 +412,7 @@ pub mod sink {
         .map_err(|e| YataError::Arrow(e.to_string()))
     }
 
-    fn kv_entries_to_batch(entries: &[KvEntry]) -> Result<RecordBatch> {
+    pub fn kv_entries_to_batch(entries: &[KvEntry]) -> Result<RecordBatch> {
         let schema = kv_history_schema();
         let buckets: Vec<&str> = entries.iter().map(|e| e.bucket.0.as_str()).collect();
         let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();

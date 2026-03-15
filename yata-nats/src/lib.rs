@@ -27,12 +27,14 @@ pub mod log;
 pub mod kv;
 pub mod object;
 pub mod arrow_payload;
+pub mod lance_writer;
 
 pub use config::NatsConfig;
 pub use log::NatsAppendLog;
 pub use kv::NatsKvStore;
 pub use object::NatsObjectStore;
 pub use arrow_payload::NatsArrowPublisher;
+pub use lance_writer::NatsLanceWriter;
 
 /// Shared NATS connection handle.
 #[derive(Clone)]
