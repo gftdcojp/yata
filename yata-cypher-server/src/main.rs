@@ -298,7 +298,7 @@ async fn main() -> anyhow::Result<()> {
     let models_table =
         env::var("MODELS_TABLE").unwrap_or_else(|_| "shinshi_models".to_string());
     let follows_table =
-        env::var("FOLLOWS_TABLE").unwrap_or_else(|_| "shinshi_model_follows".to_string());
+        env::var("FOLLOWS_TABLE").unwrap_or_else(|_| "shinshi_follows".to_string());
     let sync_interval_secs: u64 = env::var("SYNC_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
