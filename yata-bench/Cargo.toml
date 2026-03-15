@@ -15,6 +15,10 @@ path = "src/cypher_bench.rs"
 name = "cypher-transport-bench"
 path = "src/cypher_transport_bench.rs"
 
+[[bin]]
+name = "cypher-storage-bench"
+path = "src/cypher_storage_bench.rs"
+
 [dependencies]
 yata-core.workspace = true
 yata-arrow.workspace = true
@@ -22,11 +26,14 @@ yata-log.workspace = true
 yata-kv.workspace = true
 yata-object.workspace = true
 yata-ocel.workspace = true
+yata-lance.workspace = true
 yata-server.workspace = true
 yata-client.workspace = true
+yata-cypher.workspace = true
+lance.workspace = true
 arrow.workspace = true
-arrow-array = "53"
-arrow-schema = "53"
+arrow-array.workspace = true
+arrow-schema.workspace = true
 bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -37,8 +44,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
 tempfile = "3"
-yata-cypher.workspace = true
 neo4rs = "0.8"
 rand = { workspace = true }
 memmap2 = "0.9"
 libc = "0.2"
+aws-config = { version = "1", default-features = false, features = ["rustls"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rustls"] }

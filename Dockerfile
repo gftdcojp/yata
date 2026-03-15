@@ -9,7 +9,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libclang-dev \
     cmake \
     protobuf-compiler \
+    libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Make protobuf well-known types visible to prost-build / tonic-build
+ENV PROTOC=/usr/bin/protoc
+ENV PROTOC_INCLUDE=/usr/include
 
 WORKDIR /build
 
@@ -35,13 +40,14 @@ COPY yata-bench/Cargo.toml      yata-bench/Cargo.toml
 # Stub src/ for each crate so Cargo can resolve the dependency graph
 RUN for d in yata-core yata-arrow yata-log yata-kv yata-object yata-ocel \
              yata-lance yata-b2 yata-server yata-client yata-cli yata-cbor \
-             yata-cas yata-at yata-signal yata-bench; do \
-      mkdir -p $d/src && \
-      case "$d" in \
-        yata-bench) echo 'fn main(){}' > $d/src/main.rs ;; \
-        *)           echo '' > $d/src/lib.rs ;; \
-      esac; \
-    done
+             yata-cas yata-at yata-signal yata-cypher; do \
+      mkdir -p $d/src && echo '' > $d/src/lib.rs; \
+    done && \
+    mkdir -p yata-bench/src && \
+    echo 'fn main(){}' > yata-bench/src/main.rs && \
+    echo 'fn main(){}' > yata-bench/src/cypher_bench.rs && \
+    echo 'fn main(){}' > yata-bench/src/cypher_transport_bench.rs && \
+    echo 'fn main(){}' > yata-bench/src/cypher_storage_bench.rs
 
 RUN cargo build --release -p yata-bench 2>&1 | tail -5 || true
 
