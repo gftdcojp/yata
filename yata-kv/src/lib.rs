@@ -287,27 +287,30 @@ impl KvStore for KvBucketStore {
         let mut history = Vec::new();
         while let Some(entry_result) = stream.next().await {
             let log_entry = entry_result?;
-            if let Some(kv_entry) = decode_kv_entry(&log_entry, bucket) {
-                if kv_entry.key == key {
-                    history.push(kv_entry);
-                }
+            if log_entry.payload_kind != PayloadKind::InlineBytes {
+                continue;
+            }
+            let hash_hex = log_entry.payload_ref_str
+                .strip_prefix("inline:")
+                .unwrap_or("");
+            let hash: Blake3Hash = match hash_hex.parse() {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            let bytes = match self.payload_store.get(&hash).await.map_err(YataError::Io)? {
+                Some(b) => b,
+                None => continue,
+            };
+            let kv_entry: KvEntry = match ciborium::from_reader(std::io::Cursor::new(&bytes[..])) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if kv_entry.key == key {
+                history.push(kv_entry);
             }
         }
         Ok(history)
     }
-}
-
-fn decode_kv_entry(log_entry: &LogEntry, bucket: &BucketId) -> Option<KvEntry> {
-    if log_entry.payload_kind != PayloadKind::InlineBytes {
-        return None;
-    }
-    // payload_ref_str is "inline:<hash>" — we can't recover raw bytes from hash alone
-    // In a real implementation we'd store inline bytes separately; for Phase 1 we rely
-    // on re-serialization from snapshot. This function is a no-op placeholder that
-    // signals "we have a log entry for this bucket/key".
-    // Real decoding would require PayloadStore lookup; handled in load_snapshot via
-    // a different path when bytes are embedded.
-    None
 }
 
 #[cfg(test)]
