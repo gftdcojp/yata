@@ -19,6 +19,7 @@ members = [
     "yata-bench",
     "yata-cypher",
     "yata-cypher-server",
+    "yata-flight",
 ]
 
 [workspace.package]
@@ -70,6 +71,10 @@ chrono = { version = "0.4", features = ["serde"] }
 smallvec = "1"
 indexmap = { version = "2", features = ["serde"] }
 
+# Arrow Flight / gRPC
+arrow-flight = { version = "53" }
+tonic = { version = "0.12", features = ["transport"] }
+
 # HTTP / WebSocket (for yata-at)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
@@ -107,3 +112,4 @@ yata-at = { path = "yata-at" }
 yata-signal = { path = "yata-signal" }
 yata-bench = { path = "yata-bench" }
 yata-cypher = { path = "yata-cypher" }
+yata-flight = { path = "yata-flight" }

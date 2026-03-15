@@ -18,7 +18,7 @@ yata-lance.workspace = true
 arrow = { workspace = true }
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
-arrow-flight = { version = "53", features = ["tonic"] }
+arrow-flight = { workspace = true }
 tonic = { version = "0.12", features = ["transport"] }
 lance.workspace = true
 tokio = { workspace = true }
