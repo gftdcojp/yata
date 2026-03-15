@@ -21,7 +21,7 @@ spec:
         - name: ghcr-pull-secret
       containers:
         - name: flight
-          image: ghcr.io/gftdcojp/yata-flight:20260315-ec6169475a-amd64
+          image: ghcr.io/gftdcojp/yata-flight:20260315-6bd85c45a8-amd64
           ports:
             - name: grpc
               containerPort: 32010
