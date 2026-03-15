@@ -1,0 +1,15 @@
+[package]
+name = "yata-arrow"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+yata-core.workspace = true
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-ipc.workspace = true
+arrow-cast.workspace = true
+bytes.workspace = true
+serde.workspace = true
+thiserror.workspace = true

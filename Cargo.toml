@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = [
+    "yata-core",
+    "yata-arrow",
+    "yata-log",
+    "yata-kv",
+    "yata-object",
+    "yata-ocel",
+    "yata-lance",
+    "yata-b2",
+    "yata-server",
+    "yata-client",
+    "yata-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Arrow
+arrow = { version = "53", features = ["ipc"] }
+arrow-array = "53"
+arrow-schema = "53"
+arrow-ipc = "53"
+arrow-cast = "53"
+
+# Lance / LanceDB
+lance = "0.20"
+lance-table = "0.20"
+object_store = { version = "=0.10.2", features = ["aws"] }
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "io-util", "fs", "sync", "time"] }
+futures = "0.3"
+async-trait = "0.1"
+tokio-stream = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ciborium = "0.2"
+
+# Hashing / IDs
+blake3 = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Bytes / IO
+bytes = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Utils
+chrono = { version = "0.4", features = ["serde"] }
+smallvec = "1"
+indexmap = { version = "2", features = ["serde"] }
+
+# Internal crates
+yata-core = { path = "yata-core" }
+yata-arrow = { path = "yata-arrow" }
+yata-log = { path = "yata-log" }
+yata-kv = { path = "yata-kv" }
+yata-object = { path = "yata-object" }
+yata-ocel = { path = "yata-ocel" }
+yata-lance = { path = "yata-lance" }
+yata-b2 = { path = "yata-b2" }
