@@ -19,8 +19,19 @@ path = "src/cypher_transport_bench.rs"
 name = "cypher-storage-bench"
 path = "src/cypher_storage_bench.rs"
 
+[[bin]]
+name = "at-bench"
+path = "src/at_bench.rs"
+
+[[bin]]
+name = "signal-bench"
+path = "src/signal_bench.rs"
+
 [dependencies]
 yata-core.workspace = true
+yata-at.workspace = true
+yata-signal.workspace = true
+x25519-dalek.workspace = true
 yata-arrow.workspace = true
 yata-log.workspace = true
 yata-kv.workspace = true

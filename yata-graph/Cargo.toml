@@ -19,6 +19,7 @@ thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+lancedb = "0.14"
 
 [dev-dependencies]
 tempfile = "3"
