@@ -1,0 +1,68 @@
+# ── Stage 1: builder ──────────────────────────────────────────────────────────
+FROM rust:1.85-slim-bookworm AS builder
+
+# UCX dev headers + runtime libs needed at link time
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    libucx-dev \
+    libclang-dev \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Cache dependency compilation by copying manifests first
+COPY Cargo.toml Cargo.lock ./
+COPY yata-core/Cargo.toml       yata-core/Cargo.toml
+COPY yata-arrow/Cargo.toml      yata-arrow/Cargo.toml
+COPY yata-log/Cargo.toml        yata-log/Cargo.toml
+COPY yata-kv/Cargo.toml         yata-kv/Cargo.toml
+COPY yata-object/Cargo.toml     yata-object/Cargo.toml
+COPY yata-ocel/Cargo.toml       yata-ocel/Cargo.toml
+COPY yata-lance/Cargo.toml      yata-lance/Cargo.toml
+COPY yata-b2/Cargo.toml         yata-b2/Cargo.toml
+COPY yata-server/Cargo.toml     yata-server/Cargo.toml
+COPY yata-client/Cargo.toml     yata-client/Cargo.toml
+COPY yata-cli/Cargo.toml        yata-cli/Cargo.toml
+COPY yata-cbor/Cargo.toml       yata-cbor/Cargo.toml
+COPY yata-cas/Cargo.toml        yata-cas/Cargo.toml
+COPY yata-at/Cargo.toml         yata-at/Cargo.toml
+COPY yata-signal/Cargo.toml     yata-signal/Cargo.toml
+COPY yata-bench/Cargo.toml      yata-bench/Cargo.toml
+
+# Stub src/ for each crate so Cargo can resolve the dependency graph
+RUN for d in yata-core yata-arrow yata-log yata-kv yata-object yata-ocel \
+             yata-lance yata-b2 yata-server yata-client yata-cli yata-cbor \
+             yata-cas yata-at yata-signal yata-bench; do \
+      mkdir -p $d/src && \
+      case "$d" in \
+        yata-bench) echo 'fn main(){}' > $d/src/main.rs ;; \
+        *)           echo '' > $d/src/lib.rs ;; \
+      esac; \
+    done
+
+RUN cargo build --release -p yata-bench 2>&1 | tail -5 || true
+
+# Now copy the full source and do the real build
+COPY . .
+
+# Touch all lib.rs / main.rs to invalidate the stub cache
+RUN find . -name 'lib.rs' -o -name 'main.rs' | xargs touch
+
+RUN cargo build --release -p yata-bench
+
+# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+# UCX runtime libraries (same version as builder)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libucx0 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/yata-bench /usr/local/bin/yata-bench
+
+# Default: run all scenarios; override with e.g. "log", "kv", "object", "e2e"
+ENTRYPOINT ["/usr/local/bin/yata-bench"]
+CMD ["all"]
