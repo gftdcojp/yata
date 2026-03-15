@@ -100,10 +100,15 @@ impl Broker {
         let ocel = Arc::new(MemoryOcelProjector::new());
         let lance = Arc::new(LocalLanceSink::new(&config.lance_uri).await?);
 
-        let graph = config
-            .graph_uri
-            .as_deref()
-            .map(|uri| Arc::new(yata_graph::LanceGraphStore::new(uri)));
+        let graph = if let Some(ref graph_uri) = config.graph_uri {
+            Some(Arc::new(
+                yata_graph::LanceGraphStore::new(graph_uri)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("graph store init: {e}"))?,
+            ))
+        } else {
+            None
+        };
 
         Ok(Self {
             config,

@@ -13,7 +13,7 @@ fn int_val(i: i64) -> yata_cypher::Value {
 #[tokio::test]
 async fn test_write_and_load_vertices() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LanceGraphStore::new(dir.path().to_str().unwrap());
+    let store = LanceGraphStore::new(dir.path().to_str().unwrap()).await.unwrap();
 
     let mut props = IndexMap::new();
     props.insert("name".into(), str_val("Alice"));
@@ -37,7 +37,7 @@ async fn test_write_and_load_vertices() {
 #[tokio::test]
 async fn test_write_and_load_edges_with_adj() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LanceGraphStore::new(dir.path().to_str().unwrap());
+    let store = LanceGraphStore::new(dir.path().to_str().unwrap()).await.unwrap();
 
     let rels = vec![RelRef {
         id: "e1".into(),
@@ -59,7 +59,7 @@ async fn test_write_and_load_edges_with_adj() {
 #[tokio::test]
 async fn test_to_memory_graph_and_cypher_match() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LanceGraphStore::new(dir.path().to_str().unwrap());
+    let store = LanceGraphStore::new(dir.path().to_str().unwrap()).await.unwrap();
 
     // Write nodes
     let mut alice_props = IndexMap::new();
@@ -95,10 +95,10 @@ async fn test_to_memory_graph_and_cypher_match() {
 async fn test_cypher_create_then_persist() {
     // Tests the full write-back cycle:
     // 1. Create nodes via Cypher (MemoryGraph)
-    // 2. Persist to Lance (write_vertices / write_edges)
+    // 2. Persist to LanceDB (write_vertices / write_edges)
     // 3. Reload and verify
     let dir = tempfile::tempdir().unwrap();
-    let store = LanceGraphStore::new(dir.path().to_str().unwrap());
+    let store = LanceGraphStore::new(dir.path().to_str().unwrap()).await.unwrap();
 
     // Step 1: CREATE via Cypher on MemoryGraph
     let mut g = MemoryGraph::new();
@@ -123,7 +123,7 @@ async fn test_cypher_create_then_persist() {
 #[tokio::test]
 async fn test_multi_label_nodes() {
     let dir = tempfile::tempdir().unwrap();
-    let store = LanceGraphStore::new(dir.path().to_str().unwrap());
+    let store = LanceGraphStore::new(dir.path().to_str().unwrap()).await.unwrap();
 
     let mut props = IndexMap::new();
     props.insert("name".into(), str_val("Charlie"));
@@ -144,7 +144,7 @@ async fn test_multi_label_nodes() {
 async fn test_schemaless_mixed_prop_types() {
     // Verify that different prop types round-trip correctly
     let dir = tempfile::tempdir().unwrap();
-    let store = LanceGraphStore::new(dir.path().to_str().unwrap());
+    let store = LanceGraphStore::new(dir.path().to_str().unwrap()).await.unwrap();
 
     let mut props = IndexMap::new();
     props.insert("name".into(), str_val("Dave"));

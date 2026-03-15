@@ -10,10 +10,11 @@
 //! Phase 2 (planned): per-label typed Arrow columns, schema registry in KV.
 
 use std::sync::Arc;
-use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::Schema;
 use futures::TryStreamExt;
 use indexmap::IndexMap;
+use lancedb::query::ExecutableQuery;
 
 // ---- Schema registry types -----------------------------------------------
 
@@ -142,20 +143,20 @@ pub mod graph_arrow {
 // ---- LanceGraphStore ----------------------------------------------------
 
 pub struct LanceGraphStore {
-    base_uri: String,
+    conn: lancedb::Connection,
     pub schema: GraphSchema,
 }
 
 impl LanceGraphStore {
-    pub fn new(base_uri: impl Into<String>) -> Self {
-        Self {
-            base_uri: base_uri.into(),
+    pub async fn new(base_uri: impl Into<String>) -> GraphResult<Self> {
+        let conn = lancedb::connect(&base_uri.into())
+            .execute()
+            .await
+            .map_err(|e| GraphError::Storage(e.to_string()))?;
+        Ok(Self {
+            conn,
             schema: GraphSchema::default(),
-        }
-    }
-
-    fn uri(&self, table: &str) -> String {
-        format!("{}/{}", self.base_uri.trim_end_matches('/'), table)
+        })
     }
 
     /// Write vertices to graph_vertices table (append).
@@ -292,16 +293,15 @@ impl LanceGraphStore {
         self.append_batch("graph_adj", adj_schema, adj_batch).await
     }
 
-    /// Load all vertices from Lance.
+    /// Load all vertices from LanceDB.
     pub async fn load_vertices(&self) -> GraphResult<Vec<yata_cypher::NodeRef>> {
-        let uri = self.uri("graph_vertices");
-        let dataset = match lance::dataset::Dataset::open(&uri).await {
-            Ok(ds) => ds,
+        let table = match self.conn.open_table("graph_vertices").execute().await {
+            Ok(t) => t,
             Err(_) => return Ok(Vec::new()),
         };
-        let scanner = dataset.scan();
-        let stream = scanner
-            .try_into_stream()
+        let stream = table
+            .query()
+            .execute()
             .await
             .map_err(|e| GraphError::Storage(e.to_string()))?;
         let batches: Vec<RecordBatch> = stream
@@ -335,16 +335,15 @@ impl LanceGraphStore {
         Ok(nodes)
     }
 
-    /// Load all edges from Lance.
+    /// Load all edges from LanceDB.
     pub async fn load_edges(&self) -> GraphResult<Vec<yata_cypher::RelRef>> {
-        let uri = self.uri("graph_edges");
-        let dataset = match lance::dataset::Dataset::open(&uri).await {
-            Ok(ds) => ds,
+        let table = match self.conn.open_table("graph_edges").execute().await {
+            Ok(t) => t,
             Err(_) => return Ok(Vec::new()),
         };
-        let scanner = dataset.scan();
-        let stream = scanner
-            .try_into_stream()
+        let stream = table
+            .query()
+            .execute()
             .await
             .map_err(|e| GraphError::Storage(e.to_string()))?;
         let batches: Vec<RecordBatch> = stream
@@ -383,8 +382,8 @@ impl LanceGraphStore {
         Ok(rels)
     }
 
-    /// Load all vertices + edges into a MemoryGraph for Cypher queries.
-    pub async fn to_memory_graph(&self) -> GraphResult<yata_cypher::MemoryGraph> {
+    /// Load all vertices + edges into a QueryableGraph for Cypher queries.
+    pub async fn to_memory_graph(&self) -> GraphResult<QueryableGraph> {
         use yata_cypher::Graph;
         let nodes = self.load_vertices().await?;
         let rels = self.load_edges().await?;
@@ -395,27 +394,35 @@ impl LanceGraphStore {
         for rel in rels {
             g.add_rel(rel);
         }
-        Ok(g)
+        Ok(QueryableGraph(g))
     }
 
     async fn append_batch(
         &self,
-        table: &str,
+        table_name: &str,
         schema: Arc<Schema>,
         batch: RecordBatch,
     ) -> GraphResult<()> {
-        let uri = self.uri(table);
-        let write_params = lance::dataset::WriteParams {
-            mode: lance::dataset::WriteMode::Append,
-            ..Default::default()
-        };
-        let reader = arrow::record_batch::RecordBatchIterator::new(
+        let reader = RecordBatchIterator::new(
             std::iter::once(Ok::<_, arrow::error::ArrowError>(batch)),
             schema,
         );
-        lance::dataset::Dataset::write(reader, &uri, Some(write_params))
-            .await
-            .map_err(|e| GraphError::Storage(e.to_string()))?;
+        match self.conn.open_table(table_name).execute().await {
+            Ok(table) => {
+                table
+                    .add(reader)
+                    .execute()
+                    .await
+                    .map_err(|e| GraphError::Storage(e.to_string()))?;
+            }
+            Err(_) => {
+                self.conn
+                    .create_table(table_name, reader)
+                    .execute()
+                    .await
+                    .map_err(|e| GraphError::Storage(e.to_string()))?;
+            }
+        }
         Ok(())
     }
 }
@@ -472,6 +479,45 @@ pub fn json_to_cypher(v: &serde_json::Value) -> yata_cypher::Value {
             }
             yata_cypher::Value::Map(map)
         }
+    }
+}
+
+// ---- QueryableGraph -----------------------------------------------------
+
+/// Wraps a loaded MemoryGraph and exposes a `.query()` convenience method
+/// that parses and executes a Cypher string, returning rows as
+/// `Vec<Vec<(col_name, json_encoded_value)>>`.
+pub struct QueryableGraph(pub yata_cypher::MemoryGraph);
+
+impl QueryableGraph {
+    pub fn query(
+        &mut self,
+        cypher: &str,
+        params: &[(String, String)],
+    ) -> Result<Vec<Vec<(String, String)>>, yata_cypher::CypherError> {
+        let query = yata_cypher::parse(cypher)?;
+        let mut param_map = IndexMap::new();
+        for (k, v) in params {
+            let val: serde_json::Value =
+                serde_json::from_str(v).unwrap_or(serde_json::Value::String(v.clone()));
+            param_map.insert(k.clone(), json_to_cypher(&val));
+        }
+        let result = yata_cypher::Executor::with_params(param_map).execute(&query, &mut self.0)?;
+        let rows = result
+            .rows
+            .into_iter()
+            .map(|row| {
+                row.0
+                    .into_iter()
+                    .map(|(col, val)| {
+                        let json = serde_json::to_string(&cypher_to_json(&val))
+                            .unwrap_or_default();
+                        (col, json)
+                    })
+                    .collect()
+            })
+            .collect();
+        Ok(rows)
     }
 }
 

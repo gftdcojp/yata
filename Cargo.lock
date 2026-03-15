@@ -7835,7 +7835,6 @@ dependencies = [
  "chrono",
  "futures",
  "indexmap 2.13.0",
- "lance 0.20.0",
  "lancedb",
  "serde",
  "serde_json",

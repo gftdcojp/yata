@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 yata-cypher = { path = "../yata-cypher" }
-lance = "0.20"
+lancedb = "0.14"
 arrow = { version = "53", features = ["ipc"] }
 arrow-array = "53"
 arrow-schema = "53"
@@ -19,7 +19,6 @@ thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 uuid.workspace = true
-lancedb = "0.14"
 
 [dev-dependencies]
 tempfile = "3"

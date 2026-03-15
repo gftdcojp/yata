@@ -168,7 +168,9 @@ impl YataFlightService {
             .or(default_graph_base_uri)
             .ok_or_else(|| Status::failed_precondition("no graph_base_uri configured"))?;
 
-        let store = yata_graph::LanceGraphStore::new(graph_uri);
+        let store = yata_graph::LanceGraphStore::new(graph_uri)
+            .await
+            .map_err(|e| Status::internal(format!("graph store: {e}")))?;
 
         let graph = store
             .to_memory_graph()
