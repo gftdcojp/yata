@@ -200,7 +200,7 @@ impl LanceGraphStore {
         )
         .map_err(|e| GraphError::Storage(e.to_string()))?;
 
-        self.upsert_batch("graph_vertices", "vid", schema, batch).await
+        self.append_batch("graph_vertices", schema, batch).await
     }
 
     /// Write edges to graph_edges + adjacency rows to graph_adj (append).
@@ -243,7 +243,7 @@ impl LanceGraphStore {
             ],
         )
         .map_err(|e| GraphError::Storage(e.to_string()))?;
-        self.upsert_batch("graph_edges", "eid", edge_schema, edge_batch).await?;
+        self.append_batch("graph_edges", edge_schema, edge_batch).await?;
 
         // --- graph_adj (2 rows per edge: OUT and IN) ---
         let mut adj_vids: Vec<String> = Vec::new();
@@ -431,45 +431,6 @@ impl LanceGraphStore {
         Ok(())
     }
 
-    /// Upsert write keyed by `key_col` (merge_insert: update if exists, insert if not).
-    /// Used for `graph_vertices` (key=vid) and `graph_edges` (key=eid).
-    /// Prevents row accumulation for repeated writes of the same vertex/edge.
-    async fn upsert_batch(
-        &self,
-        table_name: &str,
-        key_col: &str,
-        schema: Arc<Schema>,
-        batch: RecordBatch,
-    ) -> GraphResult<()> {
-        match self.conn.open_table(table_name).execute().await {
-            Ok(table) => {
-                let reader = Box::new(RecordBatchIterator::new(
-                    std::iter::once(Ok::<_, arrow::error::ArrowError>(batch)),
-                    schema,
-                ));
-                table
-                    .merge_insert(&[key_col])
-                    .when_matched_update_all(None)
-                    .when_not_matched_insert_all()
-                    .execute(reader)
-                    .await
-                    .map_err(|e| GraphError::Storage(e.to_string()))?;
-            }
-            Err(_) => {
-                // Table doesn't exist yet — create it (first write ever).
-                let reader = RecordBatchIterator::new(
-                    std::iter::once(Ok::<_, arrow::error::ArrowError>(batch)),
-                    schema,
-                );
-                self.conn
-                    .create_table(table_name, reader)
-                    .execute()
-                    .await
-                    .map_err(|e| GraphError::Storage(e.to_string()))?;
-            }
-        }
-        Ok(())
-    }
 }
 
 // ---- Helper: column accessor -------------------------------------------

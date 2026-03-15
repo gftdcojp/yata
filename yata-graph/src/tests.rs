@@ -179,3 +179,67 @@ async fn test_schemaless_mixed_prop_types() {
         panic!("expected List for tags");
     }
 }
+
+#[tokio::test]
+async fn test_upsert_vertex_last_write_wins() {
+    // Write same vid twice — load_vertices should return exactly 1 node (last write).
+    let dir = tempfile::tempdir().unwrap();
+    let store = LanceGraphStore::new(dir.path().to_str().unwrap()).await.unwrap();
+
+    let mut props_v1 = IndexMap::new();
+    props_v1.insert("name".into(), str_val("Alice"));
+    props_v1.insert("age".into(), int_val(25));
+
+    store.write_vertices(&[NodeRef {
+        id: "alice".into(),
+        labels: vec!["Person".into()],
+        props: props_v1,
+    }]).await.unwrap();
+
+    // Second write — age updated to 30.
+    let mut props_v2 = IndexMap::new();
+    props_v2.insert("name".into(), str_val("Alice"));
+    props_v2.insert("age".into(), int_val(30));
+
+    store.write_vertices(&[NodeRef {
+        id: "alice".into(),
+        labels: vec!["Person".into()],
+        props: props_v2,
+    }]).await.unwrap();
+
+    let loaded = store.load_vertices().await.unwrap();
+    assert_eq!(loaded.len(), 1, "dedup: should have exactly 1 vertex");
+    assert_eq!(loaded[0].id, "alice");
+    assert_eq!(loaded[0].props.get("age"), Some(&int_val(30)), "last-write-wins: age=30");
+}
+
+#[tokio::test]
+async fn test_upsert_edge_last_write_wins() {
+    // Write same eid twice — load_edges should return exactly 1 edge.
+    let dir = tempfile::tempdir().unwrap();
+    let store = LanceGraphStore::new(dir.path().to_str().unwrap()).await.unwrap();
+
+    store.write_edges(&[RelRef {
+        id: "e1".into(),
+        src: "alice".into(),
+        dst: "bob".into(),
+        rel_type: "KNOWS".into(),
+        props: IndexMap::new(),
+    }]).await.unwrap();
+
+    let mut props2 = IndexMap::new();
+    props2.insert("since".into(), int_val(2024));
+
+    store.write_edges(&[RelRef {
+        id: "e1".into(),
+        src: "alice".into(),
+        dst: "bob".into(),
+        rel_type: "KNOWS".into(),
+        props: props2,
+    }]).await.unwrap();
+
+    let loaded = store.load_edges().await.unwrap();
+    assert_eq!(loaded.len(), 1, "dedup: should have exactly 1 edge");
+    assert_eq!(loaded[0].id, "e1");
+    assert_eq!(loaded[0].props.get("since"), Some(&int_val(2024)), "last-write-wins: since=2024");
+}
