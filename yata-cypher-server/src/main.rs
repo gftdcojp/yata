@@ -470,21 +470,34 @@ async fn main() -> anyhow::Result<()> {
     let port = env::var("PORT").unwrap_or_else(|_| "8090".to_string());
     let tonbo_url = env::var("TONBO_BASE_URL")
         .unwrap_or_else(|_| "http://tonbo.spinkube.svc.cluster.local:8084".to_string());
+    let domain = env::var("DOMAIN").unwrap_or_else(|_| "shinshi".to_string());
     let models_table =
         env::var("MODELS_TABLE").unwrap_or_else(|_| "shinshi_models".to_string());
     let follows_table =
         env::var("FOLLOWS_TABLE").unwrap_or_else(|_| "shinshi_follows".to_string());
+    let machines_table =
+        env::var("MACHINES_TABLE").unwrap_or_else(|_| "pachinko_machines".to_string());
+    let stores_table =
+        env::var("STORES_TABLE").unwrap_or_else(|_| "pachinko_stores".to_string());
     let sync_interval_secs: u64 = env::var("SYNC_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
 
-    info!("yata-cypher-server starting on :{port}");
-    info!(
-        "tonbo_url={tonbo_url} models={models_table} follows={follows_table} sync_every={sync_interval_secs}s"
-    );
+    info!("yata-cypher-server starting on :{port} domain={domain}");
+    info!("tonbo_url={tonbo_url} sync_every={sync_interval_secs}s");
 
-    let graph = match load_graph(&tonbo_url, &models_table, &follows_table).await {
+    let state_proto = AppState {
+        graph: RwLock::new(MemoryGraph::new()),
+        tonbo_url: tonbo_url.clone(),
+        domain: domain.clone(),
+        models_table: models_table.clone(),
+        follows_table: follows_table.clone(),
+        machines_table: machines_table.clone(),
+        stores_table: stores_table.clone(),
+    };
+
+    let graph = match load_graph_for_domain(&state_proto).await {
         Ok(g) => {
             info!("initial load: {} nodes, {} rels", g.nodes().len(), g.rels().len());
             g
@@ -497,9 +510,12 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(AppState {
         graph: RwLock::new(graph),
-        tonbo_url: tonbo_url.clone(),
-        models_table: models_table.clone(),
-        follows_table: follows_table.clone(),
+        tonbo_url,
+        domain,
+        models_table,
+        follows_table,
+        machines_table,
+        stores_table,
     });
 
     // Background sync task
@@ -509,7 +525,7 @@ async fn main() -> anyhow::Result<()> {
         ticker.tick().await; // skip first immediate fire
         loop {
             ticker.tick().await;
-            match load_graph(&bg.tonbo_url, &bg.models_table, &bg.follows_table).await {
+            match load_graph_for_domain(&bg).await {
                 Ok(g) => {
                     let nc = g.nodes().len();
                     let rc = g.rels().len();
