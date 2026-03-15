@@ -146,6 +146,11 @@ pub mod sink {
     }
 
     impl LocalLanceSink {
+        /// Access the underlying lancedb Connection (for SQL queries / upserts).
+        pub fn connection(&self) -> &lancedb::Connection {
+            &self.conn
+        }
+
         pub async fn new(base_uri: impl Into<String>) -> Result<Self> {
             let base_uri = base_uri.into();
             // Ensure base directory exists for local paths
