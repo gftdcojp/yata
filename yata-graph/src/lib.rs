@@ -200,7 +200,7 @@ impl LanceGraphStore {
         )
         .map_err(|e| GraphError::Storage(e.to_string()))?;
 
-        self.append_batch("graph_vertices", schema, batch).await
+        self.upsert_batch("graph_vertices", "vid", schema, batch).await
     }
 
     /// Write edges to graph_edges + adjacency rows to graph_adj (append).
@@ -243,7 +243,7 @@ impl LanceGraphStore {
             ],
         )
         .map_err(|e| GraphError::Storage(e.to_string()))?;
-        self.append_batch("graph_edges", edge_schema, edge_batch).await?;
+        self.upsert_batch("graph_edges", "eid", edge_schema, edge_batch).await?;
 
         // --- graph_adj (2 rows per edge: OUT and IN) ---
         let mut adj_vids: Vec<String> = Vec::new();
@@ -309,7 +309,9 @@ impl LanceGraphStore {
             .await
             .map_err(|e| GraphError::Storage(e.to_string()))?;
 
-        let mut nodes = Vec::new();
+        // last-write-wins dedup: append-only table may have multiple rows per vid.
+        // Rows are in insertion order (created_ns ascending), so later entries override.
+        let mut seen: IndexMap<String, yata_cypher::NodeRef> = IndexMap::new();
         for batch in &batches {
             let vids = col_str(batch, "vid");
             let labels_jsons = col_str(batch, "labels_json");
@@ -329,10 +331,10 @@ impl LanceGraphStore {
                     .into_iter()
                     .map(|(k, v)| (k, json_to_cypher(&v)))
                     .collect();
-                nodes.push(yata_cypher::NodeRef { id: vid, labels, props });
+                seen.insert(vid.clone(), yata_cypher::NodeRef { id: vid, labels, props });
             }
         }
-        Ok(nodes)
+        Ok(seen.into_values().collect())
     }
 
     /// Load all edges from LanceDB.
@@ -351,7 +353,8 @@ impl LanceGraphStore {
             .await
             .map_err(|e| GraphError::Storage(e.to_string()))?;
 
-        let mut rels = Vec::new();
+        // last-write-wins dedup on eid.
+        let mut seen: IndexMap<String, yata_cypher::RelRef> = IndexMap::new();
         for batch in &batches {
             let eids = col_str(batch, "eid");
             let srcs = col_str(batch, "src");
@@ -364,14 +367,15 @@ impl LanceGraphStore {
                 continue;
             };
             for i in 0..batch.num_rows() {
+                let eid = eids.value(i).to_owned();
                 let json_props: serde_json::Map<String, serde_json::Value> =
                     serde_json::from_str(props_jsons.value(i)).unwrap_or_default();
                 let props: IndexMap<String, yata_cypher::Value> = json_props
                     .into_iter()
                     .map(|(k, v)| (k, json_to_cypher(&v)))
                     .collect();
-                rels.push(yata_cypher::RelRef {
-                    id: eids.value(i).to_owned(),
+                seen.insert(eid.clone(), yata_cypher::RelRef {
+                    id: eid,
                     src: srcs.value(i).to_owned(),
                     dst: dsts.value(i).to_owned(),
                     rel_type: rel_types.value(i).to_owned(),
@@ -379,7 +383,7 @@ impl LanceGraphStore {
                 });
             }
         }
-        Ok(rels)
+        Ok(seen.into_values().collect())
     }
 
     /// Load all vertices + edges into a QueryableGraph for Cypher queries.
@@ -397,6 +401,7 @@ impl LanceGraphStore {
         Ok(QueryableGraph(g))
     }
 
+    /// Append-only write (used for `graph_adj`).
     async fn append_batch(
         &self,
         table_name: &str,
@@ -416,6 +421,46 @@ impl LanceGraphStore {
                     .map_err(|e| GraphError::Storage(e.to_string()))?;
             }
             Err(_) => {
+                self.conn
+                    .create_table(table_name, reader)
+                    .execute()
+                    .await
+                    .map_err(|e| GraphError::Storage(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Upsert write keyed by `key_col` (merge_insert: update if exists, insert if not).
+    /// Used for `graph_vertices` (key=vid) and `graph_edges` (key=eid).
+    /// Prevents row accumulation for repeated writes of the same vertex/edge.
+    async fn upsert_batch(
+        &self,
+        table_name: &str,
+        key_col: &str,
+        schema: Arc<Schema>,
+        batch: RecordBatch,
+    ) -> GraphResult<()> {
+        match self.conn.open_table(table_name).execute().await {
+            Ok(table) => {
+                let reader = Box::new(RecordBatchIterator::new(
+                    std::iter::once(Ok::<_, arrow::error::ArrowError>(batch)),
+                    schema,
+                ));
+                table
+                    .merge_insert(&[key_col])
+                    .when_matched_update_all(None)
+                    .when_not_matched_insert_all()
+                    .execute(reader)
+                    .await
+                    .map_err(|e| GraphError::Storage(e.to_string()))?;
+            }
+            Err(_) => {
+                // Table doesn't exist yet — create it (first write ever).
+                let reader = RecordBatchIterator::new(
+                    std::iter::once(Ok::<_, arrow::error::ArrowError>(batch)),
+                    schema,
+                );
                 self.conn
                     .create_table(table_name, reader)
                     .execute()
