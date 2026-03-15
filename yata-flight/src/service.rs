@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use arrow_array::StringArray;
+use lancedb::query::{ExecutableQuery, QueryBase};
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
@@ -136,7 +137,7 @@ impl YataFlightService {
         // Note: projection and offset are not supported in this lancedb query path.
 
         let batch_stream = q
-            .execute_stream()
+            .execute()
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 

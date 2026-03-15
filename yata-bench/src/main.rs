@@ -66,6 +66,9 @@ async fn make_broker(dir: &tempfile::TempDir) -> Arc<yata_server::Broker> {
         data_dir: dir.path().join("data"),
         lance_uri: dir.path().join("lance").to_str().unwrap().to_owned(),
         lance_flush_interval_ms: 999_999,
+        b2: None,
+        b2_sync_interval_ms: 999_999,
+        graph_uri: None,
     };
     Arc::new(yata_server::Broker::new(config).await.unwrap())
 }

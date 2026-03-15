@@ -18,6 +18,7 @@
 use anyhow::Result;
 use arrow_array::{Int64Array, StringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
+use lancedb::query::ExecutableQuery;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -133,7 +134,7 @@ async fn load_lance_to_memory(base_uri: &str) -> Result<MemoryGraph> {
     // scan nodes
     let nd = conn.open_table("graph_nodes").execute().await
         .map_err(|e| anyhow::anyhow!("open graph_nodes: {e}"))?;
-    let nbatches: Vec<RecordBatch> = nd.query().execute_stream().await
+    let nbatches: Vec<RecordBatch> = nd.query().execute().await
         .map_err(|e| anyhow::anyhow!("stream graph_nodes: {e}"))?
         .try_collect().await
         .map_err(|e| anyhow::anyhow!("collect graph_nodes: {e}"))?;
@@ -158,7 +159,7 @@ async fn load_lance_to_memory(base_uri: &str) -> Result<MemoryGraph> {
     // scan edges
     let ed = conn.open_table("graph_edges").execute().await
         .map_err(|e| anyhow::anyhow!("open graph_edges: {e}"))?;
-    let ebatches: Vec<RecordBatch> = ed.query().execute_stream().await
+    let ebatches: Vec<RecordBatch> = ed.query().execute().await
         .map_err(|e| anyhow::anyhow!("stream graph_edges: {e}"))?
         .try_collect().await
         .map_err(|e| anyhow::anyhow!("collect graph_edges: {e}"))?;
