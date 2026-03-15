@@ -24,6 +24,7 @@ reqwest.workspace = true
 tokio-tungstenite.workspace = true
 hex.workspace = true
 serde_bytes.workspace = true
+cid.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }

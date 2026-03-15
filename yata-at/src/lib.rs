@@ -5,6 +5,12 @@ pub use client::{AtClient, AtError, resolve_did, resolve_handle};
 pub use firehose::AtFirehose;
 pub use bridge::AtFirehoseBridge;
 
+pub mod car;
+pub mod dagcbor;
+
+pub use car::{CarBlock, CarHeader, CarError, decode_car};
+pub use dagcbor::{dagcbor_to_json, cbor_value_to_json};
+
 pub mod types {
     /// AT Protocol DID identifier.
     #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -66,6 +72,7 @@ pub mod types {
     pub struct AtRepoOp {
         pub action: String,
         pub path: String,
+        /// Raw CID bytes. May be tag-42 identity-prefixed (`0x00, ...`) or bare multihash bytes.
         pub cid: Option<Vec<u8>>,
     }
     impl AtRepoOp {
@@ -77,6 +84,15 @@ pub mod types {
             parts.next();
             parts.next().unwrap_or("")
         }
+        /// Parse `self.cid` bytes into a CID string (e.g. `"bafyrei..."`).
+        ///
+        /// Handles both the tag-42 identity-prefixed form (`0x00 || cid_bytes`) used in
+        /// dag-cbor firehose messages and bare CID bytes.
+        pub fn cid_string(&self) -> Option<String> {
+            let bytes = self.cid.as_ref()?;
+            let cid_bytes = if bytes.first() == Some(&0x00) { &bytes[1..] } else { bytes.as_slice() };
+            cid::Cid::read_bytes(std::io::Cursor::new(cid_bytes)).ok().map(|c| c.to_string())
+        }
     }
 
     /// A decoded AT Protocol commit event from the firehose.
@@ -86,8 +102,32 @@ pub mod types {
         pub repo: String,
         pub rev: String,
         pub ops: Vec<AtRepoOp>,
+        /// Raw CARv1 bytes from the firehose `blocks` field.
         pub blocks: Vec<u8>,
         pub ts: String,
+    }
+    impl AtCommit {
+        /// Decode `self.blocks` as CARv1 and return a map of CID string → decoded JSON record.
+        ///
+        /// Useful to get the actual record body for each op without a separate XRPC call.
+        /// Returns an empty map (not an error) when blocks is empty or not a valid CAR.
+        pub fn decode_car_blocks(&self) -> std::collections::HashMap<String, serde_json::Value> {
+            use crate::car::decode_car;
+            use crate::dagcbor::dagcbor_to_json;
+
+            if self.blocks.is_empty() {
+                return std::collections::HashMap::new();
+            }
+            let (_, blocks) = match decode_car(&self.blocks) {
+                Ok(v) => v,
+                Err(_) => return std::collections::HashMap::new(),
+            };
+            blocks.into_iter().filter_map(|block| {
+                let cid_str = block.cid.to_string();
+                let json = dagcbor_to_json(&block.data).ok()?;
+                Some((cid_str, json))
+            }).collect()
+        }
     }
 
     /// A fully resolved AT Protocol record.
@@ -469,7 +509,19 @@ pub mod firehose {
                 let cid = op_map.iter().find_map(|(k, v)| {
                     if let Value::Text(kstr) = k {
                         if kstr == "cid" {
-                            if let Value::Bytes(b) = v { return Some(b.clone()); }
+                            return match v {
+                                // Bare bytes (legacy / test encoding)
+                                Value::Bytes(b) => Some(b.clone()),
+                                // dag-cbor CID link: tag 42, bytes = [0x00, ...cid_bytes...]
+                                Value::Tag(42, inner) => {
+                                    if let Value::Bytes(b) = inner.as_ref() {
+                                        Some(b.clone())
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            };
                         }
                     }
                     None
@@ -548,6 +600,9 @@ pub mod bridge {
                 };
                 if commit.repo.is_empty() { continue; }
 
+                // Decode CARv1 blocks once per commit (all ops share the same blocks).
+                let decoded_blocks = commit.decode_car_blocks();
+
                 for op in &commit.ops {
                     let collection = op.collection();
                     if !col_filter.is_empty() && !col_filter.contains(collection) {
@@ -557,6 +612,12 @@ pub mod bridge {
                     let subject = Subject(format!("at.{}.{}", collection, rkey));
                     let stream_id = StreamId::from(self.stream_prefix.as_str());
 
+                    // Resolve the record body from the decoded CAR blocks using the op CID.
+                    let cid_str = op.cid_string();
+                    let record = cid_str.as_deref()
+                        .and_then(|c| decoded_blocks.get(c))
+                        .cloned();
+
                     let payload_bytes = serde_json::to_vec(&serde_json::json!({
                         "seq": commit.seq,
                         "repo": commit.repo,
@@ -564,8 +625,9 @@ pub mod bridge {
                         "action": op.action,
                         "collection": collection,
                         "rkey": rkey,
-                        "cid": op.cid.as_ref().map(|b| hex::encode(b)),
+                        "cid": cid_str,
                         "ts": commit.ts,
+                        "record": record,
                     })).unwrap_or_default();
 
                     let content_hash = Blake3Hash::of(&payload_bytes);
@@ -575,6 +637,9 @@ pub mod bridge {
                     envelope.headers.insert("at.collection".to_owned(), collection.to_owned());
                     envelope.headers.insert("at.rkey".to_owned(), rkey.to_owned());
                     envelope.headers.insert("at.action".to_owned(), op.action.clone());
+                    if let Some(c) = &cid_str {
+                        envelope.headers.insert("at.cid".to_owned(), c.clone());
+                    }
 
                     let req = PublishRequest {
                         stream: stream_id,
