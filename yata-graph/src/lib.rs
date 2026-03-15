@@ -102,6 +102,17 @@ pub enum GraphError {
 
 pub type GraphResult<T> = std::result::Result<T, GraphError>;
 
+/// Statistics from a graph delta write operation.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DeltaStats {
+    pub nodes_created: usize,
+    pub nodes_modified: usize,
+    pub nodes_deleted: usize,
+    pub edges_created: usize,
+    pub edges_modified: usize,
+    pub edges_deleted: usize,
+}
+
 // ---- Arrow schemas for graph tables ------------------------------------
 
 pub mod graph_arrow {
@@ -399,6 +410,199 @@ impl LanceGraphStore {
             g.add_rel(rel);
         }
         Ok(QueryableGraph(g))
+    }
+
+    /// Write pre-built Arrow RecordBatch directly to `graph_vertices`.
+    ///
+    /// Schema must match `graph_arrow::vertices_schema()` (vid, labels_json, props_json, created_ns).
+    /// Skips NodeRef→Arrow conversion — zero-copy path for Arrow Flight `do_put`.
+    pub async fn write_vertices_batch(&self, batch: RecordBatch) -> GraphResult<()> {
+        let schema = graph_arrow::vertices_schema();
+        self.append_batch("graph_vertices", schema, batch).await
+    }
+
+    /// Write pre-built Arrow RecordBatch directly to `graph_edges` + auto-generate `graph_adj`.
+    ///
+    /// Schema must match `graph_arrow::edges_schema()` (eid, src, dst, rel_type, props_json, created_ns).
+    /// Adjacency index rows are derived from the edge batch columns.
+    pub async fn write_edges_batch(&self, batch: RecordBatch) -> GraphResult<()> {
+        let adj_batch = self.derive_adj_from_edge_batch(&batch)?;
+
+        let edge_schema = graph_arrow::edges_schema();
+        self.append_batch("graph_edges", edge_schema, batch).await?;
+
+        let adj_schema = graph_arrow::adj_schema();
+        self.append_batch("graph_adj", adj_schema, adj_batch).await
+    }
+
+    /// Derive `graph_adj` rows from an edge RecordBatch.
+    /// For each edge: 2 adjacency rows (OUT from src, IN to dst).
+    fn derive_adj_from_edge_batch(&self, batch: &RecordBatch) -> GraphResult<RecordBatch> {
+        let eids = col_str(batch, "eid")
+            .ok_or_else(|| GraphError::Schema("missing eid column".into()))?;
+        let srcs = col_str(batch, "src")
+            .ok_or_else(|| GraphError::Schema("missing src column".into()))?;
+        let dsts = col_str(batch, "dst")
+            .ok_or_else(|| GraphError::Schema("missing dst column".into()))?;
+        let rel_types = col_str(batch, "rel_type")
+            .ok_or_else(|| GraphError::Schema("missing rel_type column".into()))?;
+        let created_ns_col = batch
+            .column_by_name("created_ns")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| GraphError::Schema("missing created_ns column".into()))?;
+
+        let n = batch.num_rows();
+        let mut adj_vids = Vec::with_capacity(n * 2);
+        let mut adj_dirs = Vec::with_capacity(n * 2);
+        let mut adj_labels = Vec::with_capacity(n * 2);
+        let mut adj_neighbors = Vec::with_capacity(n * 2);
+        let mut adj_eids = Vec::with_capacity(n * 2);
+        let mut adj_nses = Vec::with_capacity(n * 2);
+
+        for i in 0..n {
+            let eid = eids.value(i);
+            let src = srcs.value(i);
+            let dst = dsts.value(i);
+            let rt = rel_types.value(i);
+            let ns = created_ns_col.value(i);
+
+            // OUT direction
+            adj_vids.push(src);
+            adj_dirs.push("OUT");
+            adj_labels.push(rt);
+            adj_neighbors.push(dst);
+            adj_eids.push(eid);
+            adj_nses.push(ns);
+
+            // IN direction
+            adj_vids.push(dst);
+            adj_dirs.push("IN");
+            adj_labels.push(rt);
+            adj_neighbors.push(src);
+            adj_eids.push(eid);
+            adj_nses.push(ns);
+        }
+
+        let adj_schema = graph_arrow::adj_schema();
+        RecordBatch::try_new(
+            adj_schema,
+            vec![
+                Arc::new(StringArray::from(adj_vids)) as Arc<dyn arrow_array::Array>,
+                Arc::new(StringArray::from(adj_dirs)) as Arc<dyn arrow_array::Array>,
+                Arc::new(StringArray::from(adj_labels)) as Arc<dyn arrow_array::Array>,
+                Arc::new(StringArray::from(adj_neighbors)) as Arc<dyn arrow_array::Array>,
+                Arc::new(StringArray::from(adj_eids)) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int64Array::from(adj_nses)) as Arc<dyn arrow_array::Array>,
+            ],
+        )
+        .map_err(|e| GraphError::Storage(e.to_string()))
+    }
+
+    /// Compute graph delta between before/after state and write to Lance.
+    ///
+    /// Efficient batch write: collects all new/modified nodes and edges into
+    /// single RecordBatches, then appends once per table.
+    /// Deleted entities are written as tombstones (props_json = `{"_deleted":true}`).
+    pub async fn write_delta(
+        &self,
+        before_nodes: &indexmap::IndexMap<String, yata_cypher::NodeRef>,
+        before_edges: &indexmap::IndexMap<String, yata_cypher::RelRef>,
+        after_graph: &yata_cypher::MemoryGraph,
+    ) -> GraphResult<DeltaStats> {
+        use yata_cypher::Graph;
+
+        let after_nodes = after_graph.nodes();
+        let after_edges = after_graph.rels();
+
+        // Classify nodes: new, modified, deleted
+        let mut upsert_nodes: Vec<yata_cypher::NodeRef> = Vec::new();
+        let mut deleted_node_count: usize = 0;
+
+        for node in &after_nodes {
+            match before_nodes.get(&node.id) {
+                None => upsert_nodes.push(node.clone()),
+                Some(old) if old != node => upsert_nodes.push(node.clone()),
+                _ => {}
+            }
+        }
+
+        // Deleted nodes: in before but not in after
+        let mut tombstone_nodes: Vec<yata_cypher::NodeRef> = Vec::new();
+        for (id, _) in before_nodes {
+            if after_graph.node_by_id(id).is_none() {
+                deleted_node_count += 1;
+                tombstone_nodes.push(yata_cypher::NodeRef {
+                    id: id.clone(),
+                    labels: vec![],
+                    props: {
+                        let mut m = indexmap::IndexMap::new();
+                        m.insert("_deleted".into(), yata_cypher::Value::Bool(true));
+                        m
+                    },
+                });
+            }
+        }
+
+        // Classify edges
+        let mut upsert_edges: Vec<yata_cypher::RelRef> = Vec::new();
+        let mut deleted_edge_count: usize = 0;
+
+        for edge in &after_edges {
+            match before_edges.get(&edge.id) {
+                None => upsert_edges.push(edge.clone()),
+                Some(old) if old != edge => upsert_edges.push(edge.clone()),
+                _ => {}
+            }
+        }
+
+        let mut tombstone_edges: Vec<yata_cypher::RelRef> = Vec::new();
+        for (id, old) in before_edges {
+            if after_graph.rel_by_id(id).is_none() {
+                deleted_edge_count += 1;
+                tombstone_edges.push(yata_cypher::RelRef {
+                    id: id.clone(),
+                    src: old.src.clone(),
+                    dst: old.dst.clone(),
+                    rel_type: old.rel_type.clone(),
+                    props: {
+                        let mut m = indexmap::IndexMap::new();
+                        m.insert("_deleted".into(), yata_cypher::Value::Bool(true));
+                        m
+                    },
+                });
+            }
+        }
+
+        let nodes_created = upsert_nodes
+            .iter()
+            .filter(|n| !before_nodes.contains_key(&n.id))
+            .count();
+        let nodes_modified = upsert_nodes.len() - nodes_created;
+        let edges_created = upsert_edges
+            .iter()
+            .filter(|e| !before_edges.contains_key(&e.id))
+            .count();
+        let edges_modified = upsert_edges.len() - edges_created;
+
+        // Merge upserts + tombstones and batch write
+        upsert_nodes.extend(tombstone_nodes);
+        upsert_edges.extend(tombstone_edges);
+
+        if !upsert_nodes.is_empty() {
+            self.write_vertices(&upsert_nodes).await?;
+        }
+        if !upsert_edges.is_empty() {
+            self.write_edges(&upsert_edges).await?;
+        }
+
+        Ok(DeltaStats {
+            nodes_created,
+            nodes_modified,
+            nodes_deleted: deleted_node_count,
+            edges_created,
+            edges_modified,
+            edges_deleted: deleted_edge_count,
+        })
     }
 
     /// Append-only write (used for `graph_adj`).

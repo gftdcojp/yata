@@ -7,16 +7,20 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
+    decode::FlightRecordBatchStream,
     encode::FlightDataEncoderBuilder,
     error::{FlightError, Result as FlightResult},
     flight_service_server::FlightService,
 };
 use arrow_schema::{DataType, Field, Schema};
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
+use indexmap::IndexMap;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::catalog::YataTableCatalog;
-use crate::codec::{AnyTicket, CypherTicket, ScanTicket};
+use crate::codec::{
+    AnyPutTicket, AnyTicket, CypherMutateResult, CypherMutateTicket, CypherTicket, ScanTicket,
+};
 
 pub struct YataFlightService {
     catalog: Arc<YataTableCatalog>,
@@ -235,6 +239,172 @@ impl YataFlightService {
     }
 }
 
+    // ---- Write operations -------------------------------------------------
+
+    /// Collect all RecordBatches from a FlightData stream (after descriptor extraction).
+    async fn collect_batches(
+        data: Vec<FlightData>,
+    ) -> Result<Vec<RecordBatch>, Status> {
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+        let stream = FlightRecordBatchStream::new_from_flight_data(
+            futures::stream::iter(data.into_iter().map(Ok::<_, FlightError>)),
+        );
+        stream
+            .try_collect()
+            .await
+            .map_err(|e| Status::internal(format!("decode flight data: {e}")))
+    }
+
+    /// Concatenate multiple RecordBatches into one (same schema required).
+    fn concat_batches(batches: &[RecordBatch]) -> Result<RecordBatch, Status> {
+        if batches.is_empty() {
+            return Err(Status::invalid_argument("no record batches in put stream"));
+        }
+        arrow::compute::concat_batches(&batches[0].schema(), batches)
+            .map_err(|e| Status::internal(format!("concat batches: {e}")))
+    }
+
+    /// Execute Lance table append: collect all batches → single append.
+    async fn execute_lance_write(
+        conn: lancedb::Connection,
+        table: &str,
+        batches: Vec<RecordBatch>,
+    ) -> Result<usize, Status> {
+        if batches.is_empty() {
+            return Ok(0);
+        }
+        let merged = Self::concat_batches(&batches)?;
+        let row_count = merged.num_rows();
+        let schema = merged.schema();
+
+        let reader = arrow_array::RecordBatchIterator::new(
+            std::iter::once(Ok::<_, arrow::error::ArrowError>(merged)),
+            schema,
+        );
+
+        match conn.open_table(table).execute().await {
+            Ok(tbl) => {
+                tbl.add(reader)
+                    .execute()
+                    .await
+                    .map_err(|e| Status::internal(format!("lance append: {e}")))?;
+            }
+            Err(_) => {
+                conn.create_table(table, reader)
+                    .execute()
+                    .await
+                    .map_err(|e| Status::internal(format!("lance create: {e}")))?;
+            }
+        }
+
+        Ok(row_count)
+    }
+
+    /// Execute graph vertex/edge batch write via LanceGraphStore.
+    async fn execute_graph_write(
+        graph_uri: &str,
+        target: &str,
+        batches: Vec<RecordBatch>,
+    ) -> Result<usize, Status> {
+        if batches.is_empty() {
+            return Ok(0);
+        }
+        let merged = Self::concat_batches(&batches)?;
+        let row_count = merged.num_rows();
+
+        let store = yata_graph::LanceGraphStore::new(graph_uri)
+            .await
+            .map_err(|e| Status::internal(format!("graph store: {e}")))?;
+
+        match target {
+            "vertices" => {
+                store
+                    .write_vertices_batch(merged)
+                    .await
+                    .map_err(|e| Status::internal(format!("write vertices: {e}")))?;
+            }
+            "edges" => {
+                store
+                    .write_edges_batch(merged)
+                    .await
+                    .map_err(|e| Status::internal(format!("write edges: {e}")))?;
+            }
+            other => return Err(Status::invalid_argument(format!("unknown target: {other}"))),
+        }
+
+        Ok(row_count)
+    }
+
+    /// Execute a Cypher mutation: load graph → exec → diff → batch write delta.
+    async fn execute_cypher_mutate(
+        ticket: CypherMutateTicket,
+        default_graph_base_uri: Option<&str>,
+    ) -> Result<CypherMutateResult, Status> {
+        use yata_cypher::Graph;
+
+        let graph_uri = ticket
+            .graph_uri
+            .as_deref()
+            .or(default_graph_base_uri)
+            .ok_or_else(|| Status::failed_precondition("no graph_base_uri configured"))?;
+
+        let store = yata_graph::LanceGraphStore::new(graph_uri)
+            .await
+            .map_err(|e| Status::internal(format!("graph store: {e}")))?;
+
+        let mut graph = store
+            .to_memory_graph()
+            .await
+            .map_err(|e| Status::internal(format!("graph load: {e}")))?;
+
+        // Snapshot before mutation
+        let before_nodes: IndexMap<String, yata_cypher::NodeRef> = graph
+            .0
+            .nodes()
+            .into_iter()
+            .map(|n| (n.id.clone(), n))
+            .collect();
+        let before_edges: IndexMap<String, yata_cypher::RelRef> = graph
+            .0
+            .rels()
+            .into_iter()
+            .map(|r| (r.id.clone(), r))
+            .collect();
+
+        // Parse + execute Cypher mutation
+        let query = yata_cypher::parse(&ticket.cypher)
+            .map_err(|e| Status::invalid_argument(format!("cypher parse: {e}")))?;
+
+        let mut param_map = IndexMap::new();
+        for (k, v) in &ticket.params {
+            let val: serde_json::Value =
+                serde_json::from_str(v).unwrap_or(serde_json::Value::String(v.clone()));
+            param_map.insert(k.clone(), yata_graph::json_to_cypher(&val));
+        }
+
+        let _result = yata_cypher::Executor::with_params(param_map)
+            .execute(&query, &mut graph.0)
+            .map_err(|e| Status::internal(format!("cypher exec: {e}")))?;
+
+        // Diff + batch write delta
+        let stats = store
+            .write_delta(&before_nodes, &before_edges, &graph.0)
+            .await
+            .map_err(|e| Status::internal(format!("write delta: {e}")))?;
+
+        Ok(CypherMutateResult {
+            nodes_created: stats.nodes_created,
+            nodes_modified: stats.nodes_modified,
+            nodes_deleted: stats.nodes_deleted,
+            edges_created: stats.edges_created,
+            edges_modified: stats.edges_modified,
+            edges_deleted: stats.edges_deleted,
+        })
+    }
+}
+
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
 #[tonic::async_trait]
@@ -346,9 +516,62 @@ impl FlightService for YataFlightService {
 
     async fn do_put(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        Err(Status::unimplemented("do_put not supported"))
+        let mut stream = request.into_inner();
+
+        // Collect all FlightData; extract descriptor from first message.
+        let mut all_data: Vec<FlightData> = Vec::new();
+        let mut descriptor: Option<FlightDescriptor> = None;
+
+        while let Some(data) = stream.message().await? {
+            if descriptor.is_none() {
+                descriptor = data.flight_descriptor.clone();
+            }
+            all_data.push(data);
+        }
+
+        let desc = descriptor
+            .ok_or_else(|| Status::invalid_argument("empty do_put stream"))?;
+
+        let put_ticket = AnyPutTicket::from_bytes(&desc.cmd)
+            .map_err(|e| Status::invalid_argument(format!("invalid put ticket: {e}")))?;
+
+        // Decode FlightData → RecordBatches
+        let batches = Self::collect_batches(all_data).await?;
+
+        let row_count = match put_ticket {
+            AnyPutTicket::Write(ticket) => {
+                tracing::debug!(table = %ticket.table, batches = batches.len(), "do_put write");
+                Self::execute_lance_write(self.conn.clone(), &ticket.table, batches).await?
+            }
+            AnyPutTicket::GraphWrite(ticket) => {
+                let graph_uri = ticket
+                    .graph_uri
+                    .as_deref()
+                    .or(self.graph_base_uri.as_deref())
+                    .ok_or_else(|| {
+                        Status::failed_precondition("no graph_base_uri configured")
+                    })?;
+                tracing::debug!(
+                    target = %ticket.target,
+                    graph_uri = %graph_uri,
+                    batches = batches.len(),
+                    "do_put graph_write"
+                );
+                Self::execute_graph_write(graph_uri, &ticket.target, batches).await?
+            }
+        };
+
+        let result_meta = serde_json::json!({ "rows_written": row_count });
+        let put_result = PutResult {
+            app_metadata: serde_json::to_vec(&result_meta)
+                .unwrap_or_default()
+                .into(),
+        };
+        Ok(Response::new(Box::pin(futures::stream::once(async {
+            Ok(put_result)
+        }))))
     }
 
     async fn do_exchange(
@@ -360,22 +583,48 @@ impl FlightService for YataFlightService {
 
     async fn do_action(
         &self,
-        _request: Request<Action>,
+        request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        Err(Status::unimplemented("do_action not supported"))
+        let action = request.into_inner();
+        match action.r#type.as_str() {
+            "cypher_mutate" => {
+                let ticket: CypherMutateTicket =
+                    serde_json::from_slice(&action.body).map_err(|e| {
+                        Status::invalid_argument(format!("bad cypher_mutate body: {e}"))
+                    })?;
+                tracing::debug!(
+                    cypher = %ticket.cypher,
+                    params = ?ticket.params,
+                    "do_action cypher_mutate"
+                );
+                let result =
+                    Self::execute_cypher_mutate(ticket, self.graph_base_uri.as_deref()).await?;
+                let body = serde_json::to_vec(&result).unwrap_or_default();
+                let flight_result = arrow_flight::Result { body: body.into() };
+                Ok(Response::new(Box::pin(futures::stream::once(async {
+                    Ok(flight_result)
+                }))))
+            }
+            other => Err(Status::unimplemented(format!("unknown action: {other}"))),
+        }
     }
 
     async fn list_actions(
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        Ok(Response::new(Box::pin(futures::stream::empty())))
+        let actions = vec![Ok(ActionType {
+            r#type: "cypher_mutate".into(),
+            description: "Execute Cypher CREATE/MERGE/DELETE/SET with delta persistence".into(),
+        })];
+        Ok(Response::new(Box::pin(futures::stream::iter(actions))))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::Int64Array;
     use arrow_flight::decode::FlightRecordBatchStream;
     use arrow_schema::DataType;
     use futures::TryStreamExt;
