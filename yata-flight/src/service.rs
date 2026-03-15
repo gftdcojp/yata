@@ -172,7 +172,7 @@ impl YataFlightService {
             .await
             .map_err(|e| Status::internal(format!("graph store: {e}")))?;
 
-        let graph = store
+        let mut graph = store
             .to_memory_graph()
             .await
             .map_err(|e| Status::internal(format!("graph load: {e}")))?;
