@@ -2370,11 +2370,17 @@ pub mod executor {
                     pattern_bindings = next;
                 }
 
-                // Apply WHERE
+                // Apply WHERE (use eval_with_graph if EXISTS subqueries present)
                 if let Some(where_expr) = where_ {
+                    let has_exists = self.contains_exists(where_expr);
                     let mut filtered = Vec::new();
                     for b in pattern_bindings {
-                        if self.eval(where_expr, &b)?.is_truthy() {
+                        let matches = if has_exists {
+                            self.eval_with_graph(where_expr, &b, graph)?.is_truthy()
+                        } else {
+                            self.eval(where_expr, &b)?.is_truthy()
+                        };
+                        if matches {
                             filtered.push(b);
                         }
                     }
@@ -2458,7 +2464,39 @@ pub mod executor {
                 }
             }
 
+            // Bind named path variable if present
+            if let Some(path_var) = &pattern.path_var {
+                for b in &mut current_bindings {
+                    let path = self.build_path_value(elements, b);
+                    b.insert(path_var.clone(), path);
+                }
+            }
+
             Ok(current_bindings)
+        }
+
+        /// Build a path value (list of alternating nodes and rels) from bound pattern elements
+        fn build_path_value(&self, elements: &[PatternElement], binding: &Binding) -> Value {
+            let mut path = Vec::new();
+            for elem in elements {
+                match elem {
+                    PatternElement::Node(np) => {
+                        if let Some(var) = &np.var {
+                            if let Some(val) = binding.get(var) {
+                                path.push(val.clone());
+                            }
+                        }
+                    }
+                    PatternElement::Rel(rp) => {
+                        if let Some(var) = &rp.var {
+                            if let Some(val) = binding.get(var) {
+                                path.push(val.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            Value::List(path)
         }
 
         fn get_last_node_in_binding(
@@ -3031,6 +3069,60 @@ pub mod executor {
             Ok(())
         }
 
+        // ---- CALL {} subquery -------------------------------------------------
+
+        fn execute_call(
+            &self,
+            subquery: &[Clause],
+            bindings: &[Binding],
+            graph: &mut dyn Graph,
+        ) -> Result<Vec<Binding>> {
+            let mut result = Vec::new();
+            let clause_refs: Vec<&Clause> = subquery.iter().collect();
+            for binding in bindings {
+                // Execute subquery with current binding as starting context
+                let mut inner_bindings: Vec<Binding> = vec![binding.clone()];
+                let mut inner_result = ResultSet::empty();
+
+                for clause in &clause_refs {
+                    match clause {
+                        Clause::Match { patterns, where_ } => {
+                            inner_bindings = self.execute_match(patterns, where_, &inner_bindings, graph, false)?;
+                        }
+                        Clause::OptionalMatch { patterns, where_ } => {
+                            inner_bindings = self.execute_match(patterns, where_, &inner_bindings, graph, true)?;
+                        }
+                        Clause::With { items, where_ } => {
+                            inner_bindings = self.execute_with(items, where_, &inner_bindings)?;
+                        }
+                        Clause::Unwind { expr, alias } => {
+                            inner_bindings = self.execute_unwind(expr, alias, &inner_bindings)?;
+                        }
+                        Clause::Return { items, distinct, order_by, limit, skip } => {
+                            inner_result = self.execute_return(items, *distinct, order_by, limit, skip, &inner_bindings)?;
+                            // Convert returned rows back to bindings
+                            inner_bindings = inner_result.rows.iter().map(|r| {
+                                let mut nb = binding.clone();
+                                for (k, v) in &r.0 {
+                                    nb.insert(k.clone(), v.clone());
+                                }
+                                nb
+                            }).collect();
+                        }
+                        _ => {}
+                    }
+                }
+
+                if inner_result.columns.is_empty() {
+                    // No RETURN in subquery — just merge bindings
+                    result.extend(inner_bindings);
+                } else {
+                    result.extend(inner_bindings);
+                }
+            }
+            Ok(result)
+        }
+
         // ---- UNWIND ---------------------------------------------------------
 
         fn execute_unwind(
@@ -3244,7 +3336,7 @@ pub mod executor {
             match expr {
                 Expr::FnCall(name, _) => matches!(
                     name.as_str(),
-                    "count" | "collect" | "sum" | "avg" | "min" | "max"
+                    "count" | "count_distinct" | "collect" | "sum" | "avg" | "min" | "max"
                 ),
                 Expr::BinOp(_, a, b) => self.expr_has_agg(a) || self.expr_has_agg(b),
                 Expr::UnOp(_, a) => self.expr_has_agg(a),
@@ -3336,6 +3428,23 @@ pub mod executor {
                             })
                             .count();
                         Ok(Value::Int(count as i64))
+                    }
+                    "count_distinct" => {
+                        let arg = args
+                            .first()
+                            .ok_or_else(|| CypherError::TypeError("count(DISTINCT) requires arg".into()))?;
+                        let mut seen: Vec<String> = Vec::new();
+                        for b in group {
+                            let v = self.eval(arg, b)?;
+                            if matches!(v, Value::Null) {
+                                continue;
+                            }
+                            let key = v.to_string();
+                            if !seen.contains(&key) {
+                                seen.push(key);
+                            }
+                        }
+                        Ok(Value::Int(seen.len() as i64))
                     }
                     "collect" => {
                         let arg = args
@@ -3692,6 +3801,141 @@ pub mod executor {
                         _ => Err(CypherError::TypeError("list comprehension requires list".into())),
                     }
                 }
+
+                Expr::MapProjection { base, entries } => {
+                    let base_val = self.eval(base, binding)?;
+                    let base_props = match &base_val {
+                        Value::Node(n) => &n.props,
+                        Value::Map(m) => m,
+                        Value::Rel(r) => &r.props,
+                        _ => return Err(CypherError::TypeError(
+                            "map projection requires node, rel, or map".into(),
+                        )),
+                    };
+                    let mut result = IndexMap::new();
+                    for entry in entries {
+                        match entry {
+                            MapProjEntry::Prop(name) => {
+                                let val = base_props.get(name).cloned().unwrap_or(Value::Null);
+                                result.insert(name.clone(), val);
+                            }
+                            MapProjEntry::Literal(key, expr) => {
+                                let val = self.eval(expr, binding)?;
+                                result.insert(key.clone(), val);
+                            }
+                            MapProjEntry::AllProps => {
+                                for (k, v) in base_props {
+                                    result.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                    }
+                    Ok(Value::Map(result))
+                }
+
+                Expr::ExistsSubquery(_) => {
+                    // EXISTS { subquery } requires graph access — use eval_with_graph instead
+                    Err(CypherError::TypeError(
+                        "EXISTS { subquery } requires graph context; use eval_with_graph".into(),
+                    ))
+                }
+
+                Expr::ListPredicate { kind, var, list_expr, pred } => {
+                    let list_val = self.eval(list_expr, binding)?;
+                    match list_val {
+                        Value::List(items) => {
+                            let mut count = 0usize;
+                            let total = items.len();
+                            for item in &items {
+                                let mut nb = binding.clone();
+                                nb.insert(var.clone(), item.clone());
+                                if self.eval(pred, &nb)?.is_truthy() {
+                                    count += 1;
+                                }
+                            }
+                            let result = match kind {
+                                ListPredicateKind::All => count == total,
+                                ListPredicateKind::Any => count > 0,
+                                ListPredicateKind::None => count == 0,
+                                ListPredicateKind::Single => count == 1,
+                            };
+                            Ok(Value::Bool(result))
+                        }
+                        Value::Null => Ok(Value::Null),
+                        _ => Err(CypherError::TypeError("list predicate requires list".into())),
+                    }
+                }
+            }
+        }
+
+        /// Evaluate expression with graph access (needed for EXISTS subquery)
+        pub fn eval_with_graph(&self, expr: &Expr, binding: &Binding, graph: &dyn Graph) -> Result<Value> {
+            match expr {
+                Expr::ExistsSubquery(clauses) => {
+                    let mut current: Vec<Binding> = vec![binding.clone()];
+                    for clause in clauses {
+                        match clause {
+                            Clause::Match { patterns, where_ } => {
+                                current = self.execute_match(patterns, where_, &current, graph, false)?;
+                            }
+                            Clause::OptionalMatch { patterns, where_ } => {
+                                current = self.execute_match(patterns, where_, &current, graph, true)?;
+                            }
+                            Clause::With { items, where_ } => {
+                                current = self.execute_with(items, where_, &current)?;
+                            }
+                            _ => {}
+                        }
+                        if current.is_empty() {
+                            return Ok(Value::Bool(false));
+                        }
+                    }
+                    Ok(Value::Bool(!current.is_empty()))
+                }
+                // For all other expressions, delegate to eval but recursively handle sub-expressions
+                // that may contain EXISTS
+                Expr::BinOp(op, lhs, rhs) => {
+                    // Check if sub-expressions contain EXISTS
+                    if self.contains_exists(expr) {
+                        let lv = self.eval_with_graph(lhs, binding, graph)?;
+                        let rv = self.eval_with_graph(rhs, binding, graph)?;
+                        // Re-evaluate with resolved values
+                        let lhs_lit = self.value_to_expr(&lv);
+                        let rhs_lit = self.value_to_expr(&rv);
+                        self.eval_binop(op, &lhs_lit, &rhs_lit, binding)
+                    } else {
+                        self.eval(expr, binding)
+                    }
+                }
+                Expr::UnOp(UnOp::Not, inner) => {
+                    if self.contains_exists(inner) {
+                        let v = self.eval_with_graph(inner, binding, graph)?;
+                        Ok(Value::Bool(!v.is_truthy()))
+                    } else {
+                        self.eval(expr, binding)
+                    }
+                }
+                _ => self.eval(expr, binding),
+            }
+        }
+
+        fn contains_exists(&self, expr: &Expr) -> bool {
+            match expr {
+                Expr::ExistsSubquery(_) => true,
+                Expr::BinOp(_, a, b) => self.contains_exists(a) || self.contains_exists(b),
+                Expr::UnOp(_, a) => self.contains_exists(a),
+                _ => false,
+            }
+        }
+
+        fn value_to_expr(&self, v: &Value) -> Expr {
+            match v {
+                Value::Null => Expr::Lit(Literal::Null),
+                Value::Bool(b) => Expr::Lit(Literal::Bool(*b)),
+                Value::Int(n) => Expr::Lit(Literal::Int(*n)),
+                Value::Float(f) => Expr::Lit(Literal::Float(*f)),
+                Value::Str(s) => Expr::Lit(Literal::Str(s.clone())),
+                _ => Expr::Lit(Literal::Null),
             }
         }
 
@@ -4371,6 +4615,16 @@ pub mod executor {
                         Value::Null => Ok(Value::Null),
                         _ => Ok(Value::Null),
                     }
+                }
+                // shortestPath requires graph — handled in shortestpath_fn; return null in plain eval context
+                "shortestpath" | "allshortestpaths" => {
+                    // These require graph access. Return null when called outside graph context.
+                    Ok(Value::Null)
+                }
+                // count_distinct is handled in aggregation; if used in non-agg context, count unique
+                "count_distinct" => {
+                    let v = self.eval_arg(args, 0, binding)?;
+                    Ok(Value::Int(if matches!(v, Value::Null) { 0 } else { 1 }))
                 }
                 other => {
                     // Unknown function — return null rather than error to be lenient
