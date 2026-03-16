@@ -365,10 +365,14 @@ impl LanceGraphStore {
             };
             for i in 0..batch.num_rows() {
                 let vid = vids.value(i).to_owned();
+                let raw_props = props_jsons.value(i);
+                if i == 0 || raw_props.len() < 5 {
+                    tracing::debug!(vid = %vid, props_len = raw_props.len(), props_preview = &raw_props[..raw_props.len().min(100)], "load_vertices: raw props_json");
+                }
                 let labels: Vec<String> =
                     serde_json::from_str(labels_jsons.value(i)).unwrap_or_default();
                 let json_props: serde_json::Map<String, serde_json::Value> =
-                    serde_json::from_str(props_jsons.value(i)).unwrap_or_default();
+                    serde_json::from_str(raw_props).unwrap_or_default();
                 let props: IndexMap<String, yata_cypher::Value> = json_props
                     .into_iter()
                     .map(|(k, v)| (k, json_to_cypher(&v)))

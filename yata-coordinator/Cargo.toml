@@ -1,0 +1,11 @@
+[package]
+name = "yata-coordinator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+yata-grin = { path = "../yata-grin" }
+yata-store = { path = "../yata-store" }
+yata-gie = { path = "../yata-gie" }
+
+[dev-dependencies]

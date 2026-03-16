@@ -1,8 +1,10 @@
 //! GRIN: Graph Retrieval INterface — storage-agnostic graph access traits.
 //! Inspired by GraphScope's GRIN C API, implemented as Rust traits for zero-cost abstraction.
 
+use serde::{Deserialize, Serialize};
+
 /// Value type for graph properties.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PropValue {
     Null,
     Bool(bool),

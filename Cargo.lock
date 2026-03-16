@@ -7532,6 +7532,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "yata-coordinator"
+version = "0.1.0"
+dependencies = [
+ "yata-gie",
+ "yata-grin",
+ "yata-store",
+]
+
+[[package]]
 name = "yata-core"
 version = "0.1.0"
 dependencies = [
@@ -7629,6 +7638,9 @@ dependencies = [
 [[package]]
 name = "yata-grin"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "yata-kv"
@@ -7838,6 +7850,8 @@ name = "yata-store"
 version = "0.1.0"
 dependencies = [
  "indexmap 2.13.0",
+ "serde",
+ "serde_json",
  "yata-cypher",
  "yata-grin",
 ]
