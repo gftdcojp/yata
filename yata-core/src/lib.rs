@@ -394,6 +394,10 @@ pub mod kv {
         pub value: Vec<u8>,
         pub ts_ns: i64,
         pub op: KvOp,
+        /// Absolute expiry timestamp (nanoseconds since epoch).
+        /// `None` means the entry never expires.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ttl_expires_at_ns: Option<i64>,
     }
 
     #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

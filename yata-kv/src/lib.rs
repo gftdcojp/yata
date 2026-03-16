@@ -5,6 +5,12 @@
 //! Each bucket maps to a dedicated stream: `_kv.<bucket_id>`.
 //! Entries are LogEntry with payload_kind=InlineBytes.
 //! Current value for each key is maintained in an in-memory snapshot.
+//!
+//! ## TTL Enforcement
+//!
+//! - `KvPutRequest.ttl_secs` → computed into `KvEntry.ttl_expires_at_ns` at write time.
+//! - `get()` lazy-checks: expired entries return `None` and enqueue a delete.
+//! - `run_reaper()` background task sweeps all buckets on a configurable interval.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -23,6 +29,10 @@ use yata_core::{
 use yata_log::{LocalLog, PayloadStore};
 
 const WATCHER_CAPACITY: usize = 256;
+
+fn now_ns() -> i64 {
+    chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+}
 
 pub struct KvBucketStore {
     log: Arc<LocalLog>,
@@ -93,6 +103,40 @@ impl KvBucketStore {
         Ok(())
     }
 
+    /// Run TTL reaper: sweep all buckets and remove expired entries.
+    /// Call this periodically from a background task (e.g., every 5 seconds).
+    pub async fn reap_expired(&self) {
+        let current_ns = now_ns();
+        let mut expired: Vec<(BucketId, String, Revision)> = Vec::new();
+
+        {
+            let snapshots = self.snapshots.read().await;
+            for (bucket_name, bucket_snap) in snapshots.iter() {
+                for (key, entry) in bucket_snap.iter() {
+                    if let Some(expires_at) = entry.ttl_expires_at_ns {
+                        if current_ns >= expires_at {
+                            expired.push((
+                                BucketId(bucket_name.clone()),
+                                key.clone(),
+                                entry.revision,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        for (bucket, key, rev) in expired {
+            if let Err(e) = self.delete(&bucket, &key, Some(rev)).await {
+                tracing::debug!(
+                    bucket = %bucket,
+                    key = %key,
+                    "TTL reap delete failed (likely already removed): {e}"
+                );
+            }
+        }
+    }
+
     fn stream_id_for(bucket: &BucketId) -> StreamId {
         StreamId(format!("_kv.{}", bucket.0))
     }
@@ -117,44 +161,27 @@ impl KvBucketStore {
         }
         Revision(0)
     }
-}
 
-#[async_trait]
-impl KvStore for KvBucketStore {
-    async fn put(&self, req: KvPutRequest) -> Result<KvAck> {
-        // Check expected revision
-        let current_rev = self.current_revision(&req.bucket, &req.key).await;
-        if let Some(expected) = req.expected_revision {
-            if current_rev != expected {
-                return Err(YataError::RevisionConflict {
-                    expected: expected.0,
-                    actual: current_rev.0,
-                });
-            }
+    /// Check if entry is expired (returns true if expired).
+    fn is_expired(entry: &KvEntry) -> bool {
+        if let Some(expires_at) = entry.ttl_expires_at_ns {
+            now_ns() >= expires_at
+        } else {
+            false
         }
+    }
 
-        let next_rev = Revision(current_rev.0 + 1);
-        let ts_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-
-        let kv_entry = KvEntry {
-            bucket: req.bucket.clone(),
-            key: req.key.clone(),
-            revision: next_rev,
-            value: req.value.to_vec(),
-            ts_ns,
-            op: KvOp::Put,
-        };
-
-        // Encode as CBOR payload and persist for replay
+    /// Persist a KvEntry to the append-only log.
+    async fn persist_entry(&self, bucket: &BucketId, kv_entry: &KvEntry) -> Result<()> {
         let mut cbor_buf = Vec::new();
-        ciborium::into_writer(&kv_entry, &mut cbor_buf)
+        ciborium::into_writer(kv_entry, &mut cbor_buf)
             .map_err(|e| YataError::Serialization(e.to_string()))?;
         let cbor_bytes = Bytes::from(cbor_buf);
         self.payload_store.put(&cbor_bytes).await.map_err(YataError::Io)?;
         let payload = PayloadRef::InlineBytes(cbor_bytes);
         let content_hash = payload.content_hash();
-        let stream_id = Self::stream_id_for(&req.bucket);
-        let subject = Subject(format!("{}.{}", req.bucket.0, req.key));
+        let stream_id = Self::stream_id_for(bucket);
+        let subject = Subject(format!("{}.{}", bucket.0, kv_entry.key));
         let schema_id = SchemaId("yata.kv.entry".to_string());
         let envelope = Envelope::new(subject.clone(), schema_id, content_hash);
 
@@ -166,6 +193,39 @@ impl KvStore for KvBucketStore {
             expected_last_seq: None,
         };
         self.log.append(publish_req).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl KvStore for KvBucketStore {
+    async fn put(&self, req: KvPutRequest) -> Result<KvAck> {
+        let current_rev = self.current_revision(&req.bucket, &req.key).await;
+        if let Some(expected) = req.expected_revision {
+            if current_rev != expected {
+                return Err(YataError::RevisionConflict {
+                    expected: expected.0,
+                    actual: current_rev.0,
+                });
+            }
+        }
+
+        let next_rev = Revision(current_rev.0 + 1);
+        let ts_ns = now_ns();
+
+        let ttl_expires_at_ns = req.ttl_secs.map(|ttl| ts_ns + (ttl as i64) * 1_000_000_000);
+
+        let kv_entry = KvEntry {
+            bucket: req.bucket.clone(),
+            key: req.key.clone(),
+            revision: next_rev,
+            value: req.value.to_vec(),
+            ts_ns,
+            op: KvOp::Put,
+            ttl_expires_at_ns,
+        };
+
+        self.persist_entry(&req.bucket, &kv_entry).await?;
 
         // Update snapshot
         {
@@ -195,7 +255,12 @@ impl KvStore for KvBucketStore {
     async fn get(&self, bucket: &BucketId, key: &str) -> Result<Option<KvEntry>> {
         let snapshots = self.snapshots.read().await;
         if let Some(bucket_snap) = snapshots.get(&bucket.0) {
-            return Ok(bucket_snap.get(key).cloned());
+            if let Some(entry) = bucket_snap.get(key) {
+                if Self::is_expired(entry) {
+                    return Ok(None);
+                }
+                return Ok(Some(entry.clone()));
+            }
         }
         Ok(None)
     }
@@ -217,7 +282,7 @@ impl KvStore for KvBucketStore {
         }
 
         let next_rev = Revision(current_rev.0 + 1);
-        let ts_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let ts_ns = now_ns();
 
         let kv_entry = KvEntry {
             bucket: bucket.clone(),
@@ -226,28 +291,10 @@ impl KvStore for KvBucketStore {
             value: Vec::new(),
             ts_ns,
             op: KvOp::Delete,
+            ttl_expires_at_ns: None,
         };
 
-        let mut cbor_buf = Vec::new();
-        ciborium::into_writer(&kv_entry, &mut cbor_buf)
-            .map_err(|e| YataError::Serialization(e.to_string()))?;
-        let cbor_bytes = Bytes::from(cbor_buf);
-        self.payload_store.put(&cbor_bytes).await.map_err(YataError::Io)?;
-        let payload = PayloadRef::InlineBytes(cbor_bytes);
-        let content_hash = payload.content_hash();
-        let stream_id = Self::stream_id_for(bucket);
-        let subject = Subject(format!("{}.{}", bucket.0, key));
-        let schema_id = SchemaId("yata.kv.entry".to_string());
-        let envelope = Envelope::new(subject.clone(), schema_id, content_hash);
-
-        let publish_req = PublishRequest {
-            stream: stream_id,
-            subject,
-            envelope,
-            payload,
-            expected_last_seq: None,
-        };
-        self.log.append(publish_req).await?;
+        self.persist_entry(bucket, &kv_entry).await?;
 
         // Update snapshot
         {
@@ -331,4 +378,3 @@ impl KvStore for KvBucketStore {
 
 #[cfg(test)]
 mod tests;
-

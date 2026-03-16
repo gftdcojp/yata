@@ -86,6 +86,7 @@ pub mod schema {
             Field::new("value_bytes", DataType::LargeBinary, true),
             Field::new("ts_ns", DataType::Int64, false),
             Field::new("op", DataType::Utf8, false),
+            Field::new("ttl_expires_at_ns", DataType::Int64, true),
         ]))
     }
 
@@ -427,6 +428,10 @@ pub mod sink {
                 KvOp::Purge => "purge",
             })
             .collect();
+        let ttl_expires: Vec<Option<i64>> = entries
+            .iter()
+            .map(|e| e.ttl_expires_at_ns)
+            .collect();
 
         RecordBatch::try_new(
             schema,
@@ -437,6 +442,7 @@ pub mod sink {
                 Arc::new(LargeBinaryArray::from_opt_vec(values)),
                 Arc::new(Int64Array::from(ts_ns)),
                 Arc::new(StringArray::from(ops)),
+                Arc::new(Int64Array::from(ttl_expires)),
             ],
         )
         .map_err(|e| YataError::Arrow(e.to_string()))
