@@ -558,6 +558,33 @@ pub mod consumer {
 
 pub use self::consumer::*;
 
+// ---- cdc ----------------------------------------------------------------
+
+pub mod cdc {
+    /// CDC operation type.
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub enum CdcOp {
+        Insert,
+        Update,
+        Delete,
+    }
+
+    /// A single CDC event describing a change to a Lance table.
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    pub struct CdcEvent {
+        /// Table that was modified.
+        pub table: String,
+        /// Operation type.
+        pub op: CdcOp,
+        /// Number of rows affected.
+        pub row_count: usize,
+        /// Timestamp (nanoseconds since epoch).
+        pub ts_ns: i64,
+    }
+}
+
+pub use self::cdc::*;
+
 // ---- error --------------------------------------------------------------
 
 pub mod error {

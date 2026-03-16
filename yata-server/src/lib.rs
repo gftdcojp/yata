@@ -68,6 +68,7 @@ pub struct Broker {
     pub config: BrokerConfig,
     pub log: Arc<dyn AppendLog>,
     pub kv: Arc<dyn KvStore>,
+    pub schema_registry: Arc<tokio::sync::RwLock<yata_arrow::SchemaRegistry>>,
     /// ObjectStore — NATS / TieredObjectStore / LocalObjectStore.
     pub objects: Arc<dyn ObjectStorage>,
     pub ocel: Arc<MemoryOcelProjector>,
@@ -147,6 +148,17 @@ impl Broker {
         let ocel = Arc::new(MemoryOcelProjector::new());
         let lance = Arc::new(LocalLanceSink::new(&config.lance_uri).await?);
 
+        // Initialize schema registry with built-in table schemas.
+        let mut registry = yata_arrow::SchemaRegistry::new();
+        let _ = registry.register("yata_messages", yata_lance::messages_schema());
+        let _ = registry.register("yata_events", yata_lance::ocel_events_schema());
+        let _ = registry.register("yata_objects", yata_lance::ocel_objects_schema());
+        let _ = registry.register("yata_event_object_edges", yata_lance::event_object_edges_schema());
+        let _ = registry.register("yata_object_object_edges", yata_lance::object_object_edges_schema());
+        let _ = registry.register("yata_kv_history", yata_lance::kv_history_schema());
+        let _ = registry.register("yata_blobs", yata_lance::blobs_schema());
+        let schema_registry = Arc::new(tokio::sync::RwLock::new(registry));
+
         let graph = if let Some(ref graph_uri) = config.graph_uri {
             Some(Arc::new(
                 yata_graph::LanceGraphStore::new(graph_uri)
@@ -161,6 +173,7 @@ impl Broker {
             config,
             log,
             kv,
+            schema_registry,
             objects,
             ocel,
             lance,

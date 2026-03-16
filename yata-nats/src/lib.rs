@@ -29,6 +29,7 @@ pub mod object;
 pub mod arrow_payload;
 pub mod lance_writer;
 pub mod consumer;
+pub mod cdc;
 
 pub use config::NatsConfig;
 pub use log::NatsAppendLog;
@@ -37,6 +38,7 @@ pub use object::NatsObjectStore;
 pub use arrow_payload::NatsArrowPublisher;
 pub use lance_writer::NatsLanceWriter;
 pub use consumer::NatsConsumerGroup;
+pub use cdc::{NatsCdcPublisher, NatsCdcConsumer};
 
 /// Shared NATS connection handle.
 #[derive(Clone)]
@@ -83,5 +85,13 @@ impl NatsBackend {
 
     pub fn consumer_group(&self) -> NatsConsumerGroup {
         NatsConsumerGroup::new(self.jetstream.clone())
+    }
+
+    pub fn cdc_publisher(&self) -> NatsCdcPublisher {
+        NatsCdcPublisher::new(self.jetstream.clone())
+    }
+
+    pub fn cdc_consumer(&self) -> NatsCdcConsumer {
+        NatsCdcConsumer::new(self.jetstream.clone())
     }
 }
