@@ -1,7 +1,4 @@
 #![allow(dead_code)]
-
-pub mod hints;
-
 //! JanusGraph-equivalent graph store on Arrow + LanceDB.
 //!
 //! Phase 1 (verification): single-table schemaless storage.
@@ -9,7 +6,9 @@ pub mod hints;
 //!   graph_edges    — all edge data (eid, src, dst, rel_type, props as JSON)
 //!   graph_adj      — adjacency index (vid, direction OUT/IN, edge_label, neighbor_vid, eid)
 //!
-//! Phase 2 (planned): per-label typed Arrow columns, schema registry in KV.
+//! Phase 2: Lance SQL pushdown for label/property/adjacency-driven filtered loading.
+
+pub mod hints;
 
 use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray, Float32Array, FixedSizeListArray};
@@ -324,7 +323,11 @@ impl LanceGraphStore {
         let tables = self.conn.table_names().execute().await.unwrap_or_default();
         let table = match self.conn.open_table("graph_vertices").execute().await {
             Ok(t) => {
-                // checkout_latest removed — may cause deadlock in block_on context
+                // Refresh to latest version so cross-request writes are visible.
+                // Requires caller runtime to have >= 2 worker threads.
+                if let Err(e) = t.checkout_latest().await {
+                    tracing::warn!(err = %e, "load_vertices: checkout_latest failed");
+                }
                 tracing::debug!(table_count = tables.len(), "load_vertices: opened graph_vertices");
                 t
             }
@@ -378,7 +381,9 @@ impl LanceGraphStore {
         let _ = self.conn.table_names().execute().await;
         let table = match self.conn.open_table("graph_edges").execute().await {
             Ok(t) => {
-                // checkout_latest removed — may cause deadlock in block_on context
+                if let Err(e) = t.checkout_latest().await {
+                    tracing::warn!(err = %e, "load_edges: checkout_latest failed");
+                }
                 t
             }
             Err(_) => return Ok(Vec::new()),
