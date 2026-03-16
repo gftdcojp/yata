@@ -7520,6 +7520,7 @@ dependencies = [
  "x25519-dalek",
  "yata-arrow",
  "yata-at",
+ "yata-b2",
  "yata-client",
  "yata-core",
  "yata-cypher",

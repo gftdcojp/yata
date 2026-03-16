@@ -40,6 +40,7 @@ yata-object.workspace = true
 yata-ocel.workspace = true
 yata-lance.workspace = true
 yata-server.workspace = true
+yata-b2.workspace = true
 yata-client.workspace = true
 yata-cypher.workspace = true
 lancedb.workspace = true

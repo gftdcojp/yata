@@ -58,8 +58,8 @@ pub struct BrokerConfig {
     pub lance_uri: String,
     /// Lance flush interval (milliseconds).
     pub lance_flush_interval_ms: u64,
-    /// B2 credentials. When set, enables tiered storage for all subsystems.
-    pub b2: Option<B2Config>,
+    /// B2 credentials (REQUIRED). Tiered storage for all subsystems.
+    pub b2: B2Config,
     /// How often to sync log/kv_payloads/lance dirs to B2 (milliseconds).
     pub b2_sync_interval_ms: u64,
     /// Graph store base URI. When set, initializes a LanceGraphStore at this path.
@@ -80,7 +80,14 @@ impl Default for BrokerConfig {
             data_dir: PathBuf::from("./yata-data"),
             lance_uri: "./yata-lance".to_string(),
             lance_flush_interval_ms: 5000,
-            b2: None,
+            b2: B2Config {
+                endpoint: "https://s3.us-west-004.backblazeb2.com".to_string(),
+                bucket: "ai-gftd-lanceb".to_string(),
+                key_id: String::new(),
+                application_key: String::new(),
+                region: "us-west-004".to_string(),
+                prefix: "yata/".to_string(),
+            },
             b2_sync_interval_ms: 30_000,
             graph_uri: None,
             raft: RaftConfig::default(),
@@ -105,8 +112,8 @@ pub struct Broker {
     pub local_kv: Arc<KvBucketStore>,
     /// Local log handle for compaction.
     local_log: Arc<LocalLog>,
-    /// B2 sync handle; used by background tasks for log/kv/lance dir sync.
-    b2_sync: Option<Arc<B2Sync>>,
+    /// B2 sync handle (REQUIRED); used by background tasks for log/kv/lance dir sync.
+    b2_sync: Arc<B2Sync>,
     /// Raft consensus node. Single-node starts as leader immediately.
     pub raft: Arc<yata_raft::RaftNode>,
 }
@@ -134,17 +141,14 @@ impl Broker {
         let local_objects =
             Arc::new(LocalObjectStore::new(data_dir.join("objects")).await?);
 
-        let (objects, b2_sync): (Arc<dyn ObjectStorage>, Option<Arc<B2Sync>>) =
-            if let Some(ref b2_cfg) = config.b2 {
-                let b2 = Arc::new(
-                    B2Sync::new(b2_cfg.clone(), local_objects.clone())
-                        .map_err(anyhow::Error::from)?,
-                );
-                let tiered = Arc::new(TieredObjectStore::new(local_objects, b2.clone()));
-                (tiered, Some(b2))
-            } else {
-                (local_objects as Arc<dyn ObjectStorage>, None)
-            };
+        // B2 tiered storage (REQUIRED)
+        let b2 = Arc::new(
+            B2Sync::new(config.b2.clone(), local_objects.clone())
+                .map_err(anyhow::Error::from)?,
+        );
+        let objects: Arc<dyn ObjectStorage> =
+            Arc::new(TieredObjectStore::new(local_objects, b2.clone()));
+        let b2_sync = b2;
 
         let ocel = Arc::new(MemoryOcelProjector::new());
         let lance = Arc::new(LocalLanceSink::new(&config.lance_uri).await?);
@@ -272,9 +276,9 @@ impl Broker {
             });
         }
 
-        // B2 data sync loop
-        if let Some(ref b2) = self.b2_sync {
-            let b2 = b2.clone();
+        // B2 data sync loop (REQUIRED — tiered storage)
+        {
+            let b2 = self.b2_sync.clone();
             let data_dir = self.config.data_dir.clone();
             let lance_uri = self.config.lance_uri.clone();
             let sync_ms = self.config.b2_sync_interval_ms;
@@ -283,6 +287,7 @@ impl Broker {
                     tokio::time::interval(tokio::time::Duration::from_millis(sync_ms));
                 loop {
                     interval.tick().await;
+                    tracing::info!("b2 sync cycle start");
                     if let Err(e) = b2.sync_dir(&data_dir.join("log"), "log/").await {
                         tracing::warn!("b2 log sync error: {}", e);
                     }
@@ -293,8 +298,9 @@ impl Broker {
                     }
                     if !lance_uri.starts_with("s3://") && !lance_uri.starts_with("gs://") {
                         let lance_path = std::path::Path::new(&lance_uri);
-                        if let Err(e) = b2.sync_dir(lance_path, "lance/").await {
-                            tracing::warn!("b2 lance sync error: {}", e);
+                        match b2.sync_dir(lance_path, "lance/").await {
+                            Ok(n) => if n > 0 { tracing::info!(uploaded = n, "b2 lance sync"); },
+                            Err(e) => tracing::warn!("b2 lance sync error: {}", e),
                         }
                     }
                 }

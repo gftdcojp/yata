@@ -10,11 +10,11 @@
 //! Phase 2 (planned): per-label typed Arrow columns, schema registry in KV.
 
 use std::sync::Arc;
-use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray};
-use arrow_schema::Schema;
+use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray, Float32Array, FixedSizeListArray};
+use arrow_schema::{Schema, DataType, Field};
 use futures::TryStreamExt;
 use indexmap::IndexMap;
-use lancedb::query::ExecutableQuery;
+use lancedb::query::{ExecutableQuery, QueryBase};
 
 // ---- Schema registry types -----------------------------------------------
 
@@ -125,6 +125,19 @@ pub mod graph_arrow {
             Field::new("labels_json", DataType::Utf8, false),
             Field::new("props_json", DataType::Utf8, false),
             Field::new("created_ns", DataType::Int64, false),
+        ]))
+    }
+
+    pub fn vertices_with_embedding_schema(dim: usize) -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("vid", DataType::Utf8, false),
+            Field::new("labels_json", DataType::Utf8, false),
+            Field::new("props_json", DataType::Utf8, false),
+            Field::new("created_ns", DataType::Int64, false),
+            Field::new("embedding", DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, false)),
+                dim as i32,
+            ), true),
         ]))
     }
 
@@ -603,6 +616,172 @@ impl LanceGraphStore {
             edges_modified,
             edges_deleted: deleted_edge_count,
         })
+    }
+
+    /// Write vertices with embedding vectors to graph_vertices table.
+    ///
+    /// Extracts the embedding property from each node's props, builds a FixedSizeList column,
+    /// and writes with the extended schema including the `embedding` column.
+    pub async fn write_vertices_with_embeddings(
+        &self,
+        nodes: &[yata_cypher::NodeRef],
+        embedding_key: &str,
+        dim: usize,
+    ) -> GraphResult<()> {
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+        let vids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        let labels_jsons: Vec<String> = nodes
+            .iter()
+            .map(|n| serde_json::to_string(&n.labels).unwrap_or_else(|_| "[]".into()))
+            .collect();
+        // Build props_json without the embedding key (stored in dedicated column)
+        let props_jsons: Vec<String> = nodes
+            .iter()
+            .map(|n| {
+                let m: serde_json::Map<String, serde_json::Value> = n
+                    .props
+                    .iter()
+                    .filter(|(k, _)| k.as_str() != embedding_key)
+                    .map(|(k, v)| (k.clone(), cypher_to_json(v)))
+                    .collect();
+                serde_json::to_string(&m).unwrap_or_else(|_| "{}".into())
+            })
+            .collect();
+        let created_nses = vec![now_ns; nodes.len()];
+
+        // Build embedding FixedSizeList column
+        let mut all_values: Vec<f32> = Vec::with_capacity(nodes.len() * dim);
+        let mut valid = vec![true; nodes.len()];
+        for (i, node) in nodes.iter().enumerate() {
+            if let Some(val) = node.props.get(embedding_key) {
+                if let Some(vec) = yata_cypher::graph::extract_f32_vec(val) {
+                    if vec.len() == dim {
+                        all_values.extend_from_slice(&vec);
+                        continue;
+                    }
+                }
+            }
+            // Null embedding — fill zeros and mark null
+            all_values.extend(std::iter::repeat(0.0f32).take(dim));
+            valid[i] = false;
+        }
+
+        let values_array = Float32Array::from(all_values);
+        let embedding_array = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, false)),
+            dim as i32,
+            Arc::new(values_array),
+            Some(valid.into()),
+        ).map_err(|e| GraphError::Storage(e.to_string()))?;
+
+        let schema = graph_arrow::vertices_with_embedding_schema(dim);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vids)) as Arc<dyn arrow_array::Array>,
+                Arc::new(StringArray::from(
+                    labels_jsons.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )) as Arc<dyn arrow_array::Array>,
+                Arc::new(StringArray::from(
+                    props_jsons.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int64Array::from(created_nses)) as Arc<dyn arrow_array::Array>,
+                Arc::new(embedding_array) as Arc<dyn arrow_array::Array>,
+            ],
+        )
+        .map_err(|e| GraphError::Storage(e.to_string()))?;
+
+        self.append_batch("graph_vertices", schema, batch).await
+    }
+
+    /// Vector search over graph_vertices using the `embedding` column.
+    ///
+    /// Returns nodes sorted by distance (ascending), along with distance scores.
+    pub async fn vector_search_vertices(
+        &self,
+        query_vector: Vec<f32>,
+        limit: usize,
+        label_filter: Option<&str>,
+        prop_filter: Option<&str>,
+    ) -> GraphResult<Vec<(yata_cypher::NodeRef, f32)>> {
+        let table = match self.conn.open_table("graph_vertices").execute().await {
+            Ok(t) => t,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut search = table.vector_search(query_vector)
+            .map_err(|e| GraphError::Storage(format!("vector_search setup: {e}")))?;
+        search = search.column("embedding").limit(limit);
+
+        if let Some(filter) = prop_filter {
+            search = search.only_if(filter);
+        }
+
+        let stream = search
+            .execute()
+            .await
+            .map_err(|e| GraphError::Storage(format!("vector_search exec: {e}")))?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| GraphError::Storage(format!("vector_search collect: {e}")))?;
+
+        let mut results = Vec::new();
+        for batch in &batches {
+            let vids = col_str(batch, "vid");
+            let labels_jsons = col_str(batch, "labels_json");
+            let props_jsons = col_str(batch, "props_json");
+            let distances = batch
+                .column_by_name("_distance")
+                .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+            let (Some(vids), Some(labels_jsons), Some(props_jsons)) =
+                (vids, labels_jsons, props_jsons)
+            else {
+                continue;
+            };
+            for i in 0..batch.num_rows() {
+                let vid = vids.value(i).to_owned();
+                let labels: Vec<String> =
+                    serde_json::from_str(labels_jsons.value(i)).unwrap_or_default();
+
+                // Apply label filter
+                if let Some(lf) = label_filter {
+                    if !labels.contains(&lf.to_owned()) {
+                        continue;
+                    }
+                }
+
+                let json_props: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_str(props_jsons.value(i)).unwrap_or_default();
+                let props: IndexMap<String, yata_cypher::Value> = json_props
+                    .into_iter()
+                    .map(|(k, v)| (k, json_to_cypher(&v)))
+                    .collect();
+                let distance = distances.map(|d| d.value(i)).unwrap_or(0.0);
+                results.push((
+                    yata_cypher::NodeRef { id: vid, labels, props },
+                    distance,
+                ));
+            }
+        }
+        Ok(results)
+    }
+
+    /// Create an IVF-PQ vector index on the `embedding` column of graph_vertices.
+    pub async fn create_embedding_index(&self) -> GraphResult<()> {
+        let table = self.conn.open_table("graph_vertices")
+            .execute()
+            .await
+            .map_err(|e| GraphError::Storage(e.to_string()))?;
+        table.create_index(&["embedding"], lancedb::index::Index::Auto)
+            .execute()
+            .await
+            .map_err(|e| GraphError::Storage(format!("create_embedding_index: {e}")))?;
+        Ok(())
     }
 
     /// Append-only write (used for `graph_adj`).

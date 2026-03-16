@@ -95,14 +95,28 @@ peers = []  # empty = single-node
 - **1行/batch 禁止**: Arrow IPC schema overhead は ~1.9KB/batch。1行 batch は 2% efficiency。最低 64 行で batch すること
 - **Table handle cache**: `open_table` を毎回呼ばない
 
-## 永続化: PVC + B2 tiered storage
+## 永続化: PVC + B2 tiered storage (CRITICAL — B2 は必須)
 
-k8s デプロイは PVC (`linode-block-storage-retain`) で yata データを永続化。Pod 再起動でもデータ保持。
+k8s デプロイは PVC (`linode-block-storage-retain`) で yata データを永続化。B2 tiered storage は必須 (`BrokerConfig.b2: B2Config`)。
 
 | Deployment | PVC | サイズ |
 |---|---|---|
 | `isco-mt-magatama` | `isco-mt-yata-pvc` | 10Gi |
 | `states-mt-magatama` | `states-mt-yata-pvc` | 20Gi |
+
+### B2 sync (30s interval, always active)
+
+- `log/` → B2 log segments
+- `kv_payloads/` → B2 KV payload blobs
+- `lance/` → B2 Lance datasets
+- `cas/` + `manifests/` → B2 via TieredObjectStore (write-through async)
+
+### Storage 実装基盤
+
+| Store | yata-log (event bus) 上? | 詳細 |
+|---|---|---|
+| **yata-kv** | **YES** | 全 put/delete は `_kv.<bucket>` ストリームに append。in-memory snapshot は log replay で再構築。Raft replication 対象 |
+| **yata-object** | **NO** | 直接 filesystem CAS (`cas/<hash>`) + manifest CBOR。B2 TieredObjectStore で write-through |
 
 ## KV TTL Enforcement
 

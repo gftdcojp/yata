@@ -243,3 +243,143 @@ async fn test_upsert_edge_last_write_wins() {
     assert_eq!(loaded[0].id, "e1");
     assert_eq!(loaded[0].props.get("since"), Some(&int_val(2024)), "last-write-wins: since=2024");
 }
+
+#[tokio::test]
+async fn test_write_vertices_with_embeddings() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LanceGraphStore::new(dir.path().to_str().unwrap()).await.unwrap();
+
+    let nodes = vec![
+        NodeRef {
+            id: "d1".into(),
+            labels: vec!["Doc".into()],
+            props: {
+                let mut p = IndexMap::new();
+                p.insert("title".into(), str_val("rust"));
+                p.insert("embedding".into(), yata_cypher::Value::List(vec![
+                    yata_cypher::Value::Float(1.0),
+                    yata_cypher::Value::Float(0.0),
+                    yata_cypher::Value::Float(0.0),
+                ]));
+                p
+            },
+        },
+        NodeRef {
+            id: "d2".into(),
+            labels: vec!["Doc".into()],
+            props: {
+                let mut p = IndexMap::new();
+                p.insert("title".into(), str_val("python"));
+                p.insert("embedding".into(), yata_cypher::Value::List(vec![
+                    yata_cypher::Value::Float(0.0),
+                    yata_cypher::Value::Float(1.0),
+                    yata_cypher::Value::Float(0.0),
+                ]));
+                p
+            },
+        },
+    ];
+
+    store.write_vertices_with_embeddings(&nodes, "embedding", 3).await.unwrap();
+
+    // Verify we can load them back (standard load won't include embedding column but props are preserved)
+    let loaded = store.load_vertices().await.unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(loaded[0].props.get("title"), Some(&str_val("rust")));
+    // embedding should NOT be in props_json (it was extracted to dedicated column)
+    assert!(loaded[0].props.get("embedding").is_none(), "embedding should be in dedicated column, not props");
+}
+
+#[tokio::test]
+async fn test_vector_search_vertices() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LanceGraphStore::new(dir.path().to_str().unwrap()).await.unwrap();
+
+    let nodes = vec![
+        NodeRef {
+            id: "d1".into(),
+            labels: vec!["Doc".into()],
+            props: {
+                let mut p = IndexMap::new();
+                p.insert("title".into(), str_val("rust"));
+                p.insert("embedding".into(), yata_cypher::Value::List(vec![
+                    yata_cypher::Value::Float(1.0),
+                    yata_cypher::Value::Float(0.0),
+                ]));
+                p
+            },
+        },
+        NodeRef {
+            id: "d2".into(),
+            labels: vec!["Doc".into()],
+            props: {
+                let mut p = IndexMap::new();
+                p.insert("title".into(), str_val("python"));
+                p.insert("embedding".into(), yata_cypher::Value::List(vec![
+                    yata_cypher::Value::Float(0.0),
+                    yata_cypher::Value::Float(1.0),
+                ]));
+                p
+            },
+        },
+    ];
+
+    store.write_vertices_with_embeddings(&nodes, "embedding", 2).await.unwrap();
+
+    // Search for vector closest to [1.0, 0.0]
+    let results = store.vector_search_vertices(
+        vec![1.0, 0.0],
+        2,
+        None,
+        None,
+    ).await.unwrap();
+    assert!(!results.is_empty(), "should find at least 1 result");
+    // First result should be d1 (closest to query)
+    assert_eq!(results[0].0.id, "d1");
+}
+
+#[tokio::test]
+async fn test_vector_search_cosine_ranking() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LanceGraphStore::new(dir.path().to_str().unwrap()).await.unwrap();
+
+    let nodes = vec![
+        NodeRef {
+            id: "close".into(),
+            labels: vec!["V".into()],
+            props: {
+                let mut p = IndexMap::new();
+                p.insert("embedding".into(), yata_cypher::Value::List(vec![
+                    yata_cypher::Value::Float(0.9),
+                    yata_cypher::Value::Float(0.1),
+                ]));
+                p
+            },
+        },
+        NodeRef {
+            id: "far".into(),
+            labels: vec!["V".into()],
+            props: {
+                let mut p = IndexMap::new();
+                p.insert("embedding".into(), yata_cypher::Value::List(vec![
+                    yata_cypher::Value::Float(0.0),
+                    yata_cypher::Value::Float(1.0),
+                ]));
+                p
+            },
+        },
+    ];
+
+    store.write_vertices_with_embeddings(&nodes, "embedding", 2).await.unwrap();
+
+    let results = store.vector_search_vertices(
+        vec![1.0, 0.0],
+        2,
+        None,
+        None,
+    ).await.unwrap();
+    assert_eq!(results.len(), 2);
+    // "close" should have smaller distance than "far"
+    assert!(results[0].1 < results[1].1, "close should have smaller distance: {} vs {}", results[0].1, results[1].1);
+    assert_eq!(results[0].0.id, "close");
+}
