@@ -7823,6 +7823,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "yata-raft"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "yata-server"
 version = "0.1.0"
 dependencies = [
@@ -7852,9 +7864,9 @@ dependencies = [
  "yata-kv",
  "yata-lance",
  "yata-log",
- "yata-nats",
  "yata-object",
  "yata-ocel",
+ "yata-raft",
 ]
 
 [[package]]

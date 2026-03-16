@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-//! YATA broker/runtime — wires together log, kv, object, ocel, lance.
+//! YATA broker/runtime — wires together log, kv, object, ocel, lance + Raft consensus.
 //!
 //! Tiered storage is always active when `BrokerConfig.b2` is set:
 //! - ObjectStore: local CAS + async B2 sync, read-through fallback
@@ -24,6 +24,32 @@ use yata_log::{LocalLog, PayloadStore};
 use yata_object::LocalObjectStore;
 use yata_ocel::{MemoryOcelProjector, OcelEventDraft, OcelProjector};
 
+/// Raft cluster peer configuration.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RaftPeer {
+    pub node_id: u64,
+    pub addr: String,
+}
+
+/// Raft configuration.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RaftConfig {
+    /// This node's ID. 0 = standalone (no Raft).
+    pub node_id: u64,
+    /// Peer nodes for Raft cluster. Empty = single-node.
+    #[serde(default)]
+    pub peers: Vec<RaftPeer>,
+}
+
+impl Default for RaftConfig {
+    fn default() -> Self {
+        Self {
+            node_id: 1,
+            peers: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BrokerConfig {
     /// Base directory for log segments and CAS.
@@ -38,8 +64,9 @@ pub struct BrokerConfig {
     pub b2_sync_interval_ms: u64,
     /// Graph store base URI. When set, initializes a LanceGraphStore at this path.
     pub graph_uri: Option<String>,
-    /// NATS config. When set, uses NATS JetStream for log/kv/object instead of local.
-    pub nats: Option<yata_nats::NatsConfig>,
+    /// Raft consensus config.
+    #[serde(default)]
+    pub raft: RaftConfig,
     /// Log segment rotation and compaction config.
     #[serde(default)]
     pub log: yata_log::config::LogConfig,
@@ -56,33 +83,32 @@ impl Default for BrokerConfig {
             b2: None,
             b2_sync_interval_ms: 30_000,
             graph_uri: None,
-            nats: None,
+            raft: RaftConfig::default(),
             log: yata_log::config::LogConfig::default(),
             log_compact_interval_ms: 60_000,
         }
     }
 }
 
-/// The central broker: owns all subsystems.
+/// The central broker: owns all subsystems + Raft node.
 pub struct Broker {
     pub config: BrokerConfig,
     pub log: Arc<dyn AppendLog>,
     pub kv: Arc<dyn KvStore>,
     pub schema_registry: Arc<tokio::sync::RwLock<yata_arrow::SchemaRegistry>>,
-    /// ObjectStore — NATS / TieredObjectStore / LocalObjectStore.
     pub objects: Arc<dyn ObjectStorage>,
     pub ocel: Arc<MemoryOcelProjector>,
     pub lance: Arc<LocalLanceSink>,
     /// Graph store — initialized when `BrokerConfig.graph_uri` is set.
     pub graph: Option<Arc<yata_graph::LanceGraphStore>>,
-    /// Local KV handle for drain_pending and snapshot loading (None when NATS is used).
-    pub local_kv: Option<Arc<KvBucketStore>>,
-    /// Local log handle for compaction (None when NATS is used).
-    local_log: Option<Arc<LocalLog>>,
+    /// Local KV handle for drain_pending and snapshot loading.
+    pub local_kv: Arc<KvBucketStore>,
+    /// Local log handle for compaction.
+    local_log: Arc<LocalLog>,
     /// B2 sync handle; used by background tasks for log/kv/lance dir sync.
     b2_sync: Option<Arc<B2Sync>>,
-    /// NATS backend (for Arrow pub/sub when NATS is enabled).
-    pub nats: Option<Arc<yata_nats::NatsBackend>>,
+    /// Raft consensus node. Single-node starts as leader immediately.
+    pub raft: Arc<yata_raft::RaftNode>,
 }
 
 impl Broker {
@@ -91,59 +117,34 @@ impl Broker {
         let data_dir = &config.data_dir;
         tokio::fs::create_dir_all(data_dir).await?;
 
-        // NATS backend (when configured, replaces local log/kv/object)
-        let nats_backend = if let Some(ref nats_cfg) = config.nats {
-            Some(Arc::new(
-                yata_nats::NatsBackend::connect(nats_cfg)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("nats connect: {e}"))?,
-            ))
-        } else {
-            None
-        };
+        // Local backends (always — NATS removed)
+        let local_log = Arc::new(
+            LocalLog::with_config(data_dir.join("log"), config.log.clone()).await?,
+        );
+        local_log.recover().await?;
 
-        let (log, kv, local_kv_handle, local_log_handle, objects, b2_sync): (
-            Arc<dyn AppendLog>,
-            Arc<dyn KvStore>,
-            Option<Arc<KvBucketStore>>,
-            Option<Arc<LocalLog>>,
-            Arc<dyn ObjectStorage>,
-            Option<Arc<B2Sync>>,
-        ) = if let Some(ref nats) = nats_backend {
-            // NATS JetStream backends
-            let log: Arc<dyn AppendLog> = Arc::new(nats.append_log());
-            let kv: Arc<dyn KvStore> = Arc::new(nats.kv_store());
-            let objects: Arc<dyn ObjectStorage> = Arc::new(nats.object_store());
-            (log, kv, None, None, objects, None)
-        } else {
-            // Local backends (original path)
-            let local_log = Arc::new(LocalLog::with_config(data_dir.join("log"), config.log.clone()).await?);
-            local_log.recover().await?;
+        let kv_payload_store = Arc::new(
+            PayloadStore::new(data_dir.join("kv_payloads"))
+                .await
+                .map_err(anyhow::Error::from)?,
+        );
+        let local_kv =
+            Arc::new(KvBucketStore::new(local_log.clone(), kv_payload_store).await?);
 
-            let kv_payload_store = Arc::new(
-                PayloadStore::new(data_dir.join("kv_payloads"))
-                    .await
-                    .map_err(anyhow::Error::from)?,
-            );
-            let local_kv = Arc::new(KvBucketStore::new(local_log.clone(), kv_payload_store).await?);
+        let local_objects =
+            Arc::new(LocalObjectStore::new(data_dir.join("objects")).await?);
 
-            let local_objects =
-                Arc::new(LocalObjectStore::new(data_dir.join("objects")).await?);
-
-            let (objects, b2_sync): (Arc<dyn ObjectStorage>, Option<Arc<B2Sync>>) =
-                if let Some(ref b2_cfg) = config.b2 {
-                    let b2 = Arc::new(
-                        B2Sync::new(b2_cfg.clone(), local_objects.clone())
-                            .map_err(anyhow::Error::from)?,
-                    );
-                    let tiered = Arc::new(TieredObjectStore::new(local_objects, b2.clone()));
-                    (tiered, Some(b2))
-                } else {
-                    (local_objects as Arc<dyn ObjectStorage>, None)
-                };
-
-            (local_log.clone() as Arc<dyn AppendLog>, local_kv.clone() as Arc<dyn KvStore>, Some(local_kv), Some(local_log), objects, b2_sync)
-        };
+        let (objects, b2_sync): (Arc<dyn ObjectStorage>, Option<Arc<B2Sync>>) =
+            if let Some(ref b2_cfg) = config.b2 {
+                let b2 = Arc::new(
+                    B2Sync::new(b2_cfg.clone(), local_objects.clone())
+                        .map_err(anyhow::Error::from)?,
+                );
+                let tiered = Arc::new(TieredObjectStore::new(local_objects, b2.clone()));
+                (tiered, Some(b2))
+            } else {
+                (local_objects as Arc<dyn ObjectStorage>, None)
+            };
 
         let ocel = Arc::new(MemoryOcelProjector::new());
         let lance = Arc::new(LocalLanceSink::new(&config.lance_uri).await?);
@@ -153,8 +154,14 @@ impl Broker {
         let _ = registry.register("yata_messages", yata_lance::messages_schema());
         let _ = registry.register("yata_events", yata_lance::ocel_events_schema());
         let _ = registry.register("yata_objects", yata_lance::ocel_objects_schema());
-        let _ = registry.register("yata_event_object_edges", yata_lance::event_object_edges_schema());
-        let _ = registry.register("yata_object_object_edges", yata_lance::object_object_edges_schema());
+        let _ = registry.register(
+            "yata_event_object_edges",
+            yata_lance::event_object_edges_schema(),
+        );
+        let _ = registry.register(
+            "yata_object_object_edges",
+            yata_lance::object_object_edges_schema(),
+        );
         let _ = registry.register("yata_kv_history", yata_lance::kv_history_schema());
         let _ = registry.register("yata_blobs", yata_lance::blobs_schema());
         let schema_registry = Arc::new(tokio::sync::RwLock::new(registry));
@@ -169,24 +176,55 @@ impl Broker {
             None
         };
 
+        // Initialize Raft node
+        let peers: Vec<yata_raft::PeerAddr> = config
+            .raft
+            .peers
+            .iter()
+            .map(|p| yata_raft::PeerAddr {
+                node_id: p.node_id,
+                addr: p.addr.clone(),
+            })
+            .collect();
+
+        // NoopApplier for now — Broker methods handle storage directly.
+        // Raft consensus gates write operations: only leader can write.
+        let applier = Arc::new(NoopApplier);
+        let raft = Arc::new(yata_raft::RaftNode::new(
+            config.raft.node_id,
+            peers,
+            applier,
+        ));
+
         Ok(Self {
             config,
-            log,
-            kv,
+            log: local_log.clone() as Arc<dyn AppendLog>,
+            kv: local_kv.clone() as Arc<dyn KvStore>,
             schema_registry,
             objects,
             ocel,
             lance,
             graph,
-            local_kv: local_kv_handle,
-            local_log: local_log_handle,
+            local_kv,
+            local_log,
             b2_sync,
-            nats: nats_backend,
+            raft,
         })
     }
 
-    /// Start background tasks: Lance flush, B2 data sync.
+    /// Start background tasks: Raft, Lance flush, log compaction, TTL reaper, B2 sync.
     pub async fn start_background_tasks(self: Arc<Self>) -> anyhow::Result<()> {
+        // Start Raft node (single-node becomes leader immediately)
+        self.raft
+            .start()
+            .await
+            .map_err(|e| anyhow::anyhow!("raft start: {e}"))?;
+        tracing::info!(
+            node_id = self.config.raft.node_id,
+            is_leader = self.raft.is_leader(),
+            "raft node started"
+        );
+
         // Lance flush loop
         {
             let broker = self.clone();
@@ -203,11 +241,11 @@ impl Broker {
             });
         }
 
-        // Log compaction (local log only — NATS handles retention natively)
-        if let Some(ref local_log) = self.local_log {
+        // Log compaction
+        {
             let compact_ms = self.config.log_compact_interval_ms;
             if compact_ms > 0 {
-                let log = local_log.clone();
+                let log = self.local_log.clone();
                 tokio::spawn(async move {
                     let mut interval =
                         tokio::time::interval(tokio::time::Duration::from_millis(compact_ms));
@@ -221,9 +259,9 @@ impl Broker {
             }
         }
 
-        // TTL reaper (local KV only — NATS KV handles TTL natively)
-        if let Some(ref local_kv) = self.local_kv {
-            let kv = local_kv.clone();
+        // TTL reaper
+        {
+            let kv = self.local_kv.clone();
             tokio::spawn(async move {
                 let mut interval =
                     tokio::time::interval(tokio::time::Duration::from_secs(5));
@@ -234,20 +272,7 @@ impl Broker {
             });
         }
 
-        // NATS → Lance consumer: subscribes to yata.arrow.> and writes to LanceDB
-        if let Some(ref nats) = self.nats {
-            let writer = yata_nats::NatsLanceWriter::new(
-                nats.jetstream.clone(),
-                self.lance.connection().clone(),
-            );
-            tokio::spawn(async move {
-                if let Err(e) = writer.run().await {
-                    tracing::error!("NatsLanceWriter stopped: {e}");
-                }
-            });
-        }
-
-        // B2 data sync loop: log segments, kv_payloads, lance datasets
+        // B2 data sync loop
         if let Some(ref b2) = self.b2_sync {
             let b2 = b2.clone();
             let data_dir = self.config.data_dir.clone();
@@ -258,18 +283,14 @@ impl Broker {
                     tokio::time::interval(tokio::time::Duration::from_millis(sync_ms));
                 loop {
                     interval.tick().await;
-
-                    // Sync append-only log segments
                     if let Err(e) = b2.sync_dir(&data_dir.join("log"), "log/").await {
                         tracing::warn!("b2 log sync error: {}", e);
                     }
-                    // Sync KV payload blobs
                     if let Err(e) =
                         b2.sync_dir(&data_dir.join("kv_payloads"), "kv_payloads/").await
                     {
                         tracing::warn!("b2 kv_payloads sync error: {}", e);
                     }
-                    // Sync Lance datasets (when lance_uri is a local path)
                     if !lance_uri.starts_with("s3://") && !lance_uri.starts_with("gs://") {
                         let lance_path = std::path::Path::new(&lance_uri);
                         if let Err(e) = b2.sync_dir(lance_path, "lance/").await {
@@ -283,28 +304,13 @@ impl Broker {
         Ok(())
     }
 
-    /// Publish an Arrow batch to a stream.
-    ///
-    /// When NATS is configured, also publishes as Arrow IPC to
-    /// `yata.arrow.yata_messages` for Lance ingestion.
+    /// Publish an Arrow batch to a stream (local write).
     pub async fn publish_arrow(
         &self,
         stream: &str,
         subject: &str,
         batch: ArrowBatchHandle,
     ) -> Result<Ack> {
-        // Produce to NATS Arrow subject for Lance consumer
-        if let Some(ref nats) = self.nats {
-            let publisher = nats.arrow_publisher();
-            let _ = publisher
-                .publish_batch(
-                    "yata.arrow.yata_messages",
-                    &batch.batch,
-                    Some("yata_messages"),
-                )
-                .await;
-        }
-
         let stream_id = StreamId::from(stream);
         let subject_id = Subject::from(subject);
         let payload = batch.as_payload_ref();
@@ -332,7 +338,6 @@ impl Broker {
         let ts_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let event_id = uuid::Uuid::new_v4().to_string();
 
-        // Build OCEL event and project it
         let ocel_event = yata_ocel::OcelEvent {
             event_id: event_id.clone(),
             event_type: event.event_type.clone(),
@@ -344,7 +349,6 @@ impl Broker {
         };
         self.ocel.project_event(ocel_event).await?;
 
-        // Build E2O edges
         for obj_ref in &event.object_refs {
             let edge = yata_ocel::OcelEventObjectEdge {
                 event_id: event_id.clone(),
@@ -387,82 +391,32 @@ impl Broker {
         self.log.append(req).await
     }
 
-    /// Flush pending OCEL projection + KV history.
-    ///
-    /// When NATS is configured: produce Arrow IPC batches to NATS subjects.
-    /// NatsLanceWriter consumer subscribes and writes to LanceDB.
-    ///
-    /// When NATS is not configured: write directly to Lance (original path).
+    /// Flush pending OCEL projection + KV history to Lance (direct path).
     pub async fn flush_lance(&self) -> Result<SyncStats> {
         let start = std::time::Instant::now();
         ::metrics::counter!(crate::metrics::names::LANCE_FLUSHES).increment(1);
         let snapshot = self.ocel.snapshot().await?;
 
-        if let Some(ref nats) = self.nats {
-            // NATS path: produce Arrow IPC batches to NATS subjects.
-            // NatsLanceWriter consumer handles the Lance append.
-            let publisher = nats.arrow_publisher();
-            use yata_lance::sink::*;
+        if !snapshot.events.is_empty() {
+            self.lance.write_ocel_events(&snapshot.events).await?;
+        }
+        if !snapshot.objects.is_empty() {
+            self.lance.write_ocel_objects(&snapshot.objects).await?;
+        }
+        if !snapshot.event_object_edges.is_empty() {
+            self.lance
+                .write_e2o_edges(&snapshot.event_object_edges)
+                .await?;
+        }
+        if !snapshot.object_object_edges.is_empty() {
+            self.lance
+                .write_o2o_edges(&snapshot.object_object_edges)
+                .await?;
+        }
 
-            if !snapshot.events.is_empty() {
-                let batch = ocel_events_to_batch(&snapshot.events)?;
-                let _ = publisher
-                    .publish_batch("yata.arrow.yata_events", &batch, Some("yata_events"))
-                    .await;
-            }
-            if !snapshot.objects.is_empty() {
-                let batch = ocel_objects_to_batch(&snapshot.objects)?;
-                let _ = publisher
-                    .publish_batch("yata.arrow.yata_objects", &batch, Some("yata_objects"))
-                    .await;
-            }
-            if !snapshot.event_object_edges.is_empty() {
-                let batch = e2o_edges_to_batch(&snapshot.event_object_edges)?;
-                let _ = publisher
-                    .publish_batch(
-                        "yata.arrow.yata_event_object_edges",
-                        &batch,
-                        Some("yata_event_object_edges"),
-                    )
-                    .await;
-            }
-            if !snapshot.object_object_edges.is_empty() {
-                let batch = o2o_edges_to_batch(&snapshot.object_object_edges)?;
-                let _ = publisher
-                    .publish_batch(
-                        "yata.arrow.yata_object_object_edges",
-                        &batch,
-                        Some("yata_object_object_edges"),
-                    )
-                    .await;
-            }
-            // KV history is already published per-operation via NatsKvStore dual-write
-        } else {
-            // Direct Lance path (no NATS)
-            if !snapshot.events.is_empty() {
-                self.lance.write_ocel_events(&snapshot.events).await?;
-            }
-            if !snapshot.objects.is_empty() {
-                self.lance.write_ocel_objects(&snapshot.objects).await?;
-            }
-            if !snapshot.event_object_edges.is_empty() {
-                self.lance
-                    .write_e2o_edges(&snapshot.event_object_edges)
-                    .await?;
-            }
-            if !snapshot.object_object_edges.is_empty() {
-                self.lance
-                    .write_o2o_edges(&snapshot.object_object_edges)
-                    .await?;
-            }
-
-            // Local KV history drain
-            if let Some(ref local_kv) = self.local_kv {
-                let kv_entries = local_kv.drain_pending();
-                if !kv_entries.is_empty() {
-                    self.lance.write_kv_history(&kv_entries).await?;
-                }
-            }
+        let kv_entries = self.local_kv.drain_pending();
+        if !kv_entries.is_empty() {
+            self.lance.write_kv_history(&kv_entries).await?;
         }
 
         let stats = self.lance.sync_stats().await?;
@@ -471,6 +425,21 @@ impl Broker {
         tracing::debug!(?stats, elapsed_ms = elapsed * 1000.0, "lance flush complete");
         Ok(stats)
     }
+}
+
+/// No-op applier — Broker handles storage directly; Raft gates write access.
+struct NoopApplier;
+
+#[async_trait::async_trait]
+impl yata_raft::StateMachineApplier for NoopApplier {
+    async fn apply_publish(
+        &self, _: &str, _: u32, _: &str, _: Option<&str>, _: &str, _: Option<&str>, ts_ns: i64, _: &[u8],
+    ) -> std::result::Result<(u64, i64), String> {
+        Ok((0, ts_ns))
+    }
+    async fn apply_create_topic(&self, _: &str, _: u32, _: u32, _: Option<u64>) -> std::result::Result<(), String> { Ok(()) }
+    async fn apply_delete_topic(&self, _: &str) -> std::result::Result<(), String> { Ok(()) }
+    async fn apply_commit_offset(&self, _: &str, _: &str, _: u32, _: u64) -> std::result::Result<(), String> { Ok(()) }
 }
 
 /// In-process ClientBackend backed by a Broker.

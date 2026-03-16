@@ -117,10 +117,8 @@ async fn cmd_kv_get(bucket: &str, key: &str) -> anyhow::Result<()> {
     let broker = open_broker().await?;
     let bucket_id = BucketId::from(bucket);
 
-    // Load snapshot first (local KV only)
-    if let Some(ref local_kv) = broker.local_kv {
-        local_kv.load_snapshot(&bucket_id).await?;
-    }
+    // Load snapshot first
+    broker.local_kv.load_snapshot(&bucket_id).await?;
 
     match broker.kv.get(&bucket_id, key).await? {
         Some(entry) => {
