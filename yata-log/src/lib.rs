@@ -92,12 +92,11 @@ pub mod local_log {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
-    use std::sync::Arc;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::sync::Mutex;
     use yata_core::{
-        Ack, AppendLog, Blake3Hash, Envelope, LogEntry, MessageId, PayloadKind, PayloadRef,
-        PublishRequest, Result, Sequence, StreamId, Subject, YataError,
+        Ack, AppendLog, Blake3Hash, Envelope, LogEntry,
+        PublishRequest, Result, Sequence, StreamId, YataError,
     };
 
     struct StreamState {

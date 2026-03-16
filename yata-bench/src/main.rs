@@ -69,6 +69,9 @@ async fn make_broker(dir: &tempfile::TempDir) -> Arc<yata_server::Broker> {
         b2: None,
         b2_sync_interval_ms: 999_999,
         graph_uri: None,
+        nats: None,
+        log: yata_log::config::LogConfig::default(),
+        log_compact_interval_ms: 0,
     };
     Arc::new(yata_server::Broker::new(config).await.unwrap())
 }

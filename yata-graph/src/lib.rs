@@ -662,8 +662,31 @@ pub fn cypher_to_json(v: &yata_cypher::Value) -> serde_json::Value {
         yata_cypher::Value::Map(m) => serde_json::Value::Object(
             m.iter().map(|(k, v)| (k.clone(), cypher_to_json(v))).collect(),
         ),
-        yata_cypher::Value::Node(n) => serde_json::json!({ "__vid": n.id }),
-        yata_cypher::Value::Rel(r) => serde_json::json!({ "__eid": r.id }),
+        yata_cypher::Value::Node(n) => {
+            let mut obj: serde_json::Map<String, serde_json::Value> = n
+                .props
+                .iter()
+                .map(|(k, v)| (k.clone(), cypher_to_json(v)))
+                .collect();
+            obj.insert("__vid".into(), serde_json::Value::String(n.id.clone()));
+            obj.insert(
+                "__labels".into(),
+                serde_json::Value::Array(
+                    n.labels.iter().map(|l| serde_json::Value::String(l.clone())).collect(),
+                ),
+            );
+            serde_json::Value::Object(obj)
+        }
+        yata_cypher::Value::Rel(r) => {
+            let mut obj: serde_json::Map<String, serde_json::Value> = r
+                .props
+                .iter()
+                .map(|(k, v)| (k.clone(), cypher_to_json(v)))
+                .collect();
+            obj.insert("__eid".into(), serde_json::Value::String(r.id.clone()));
+            obj.insert("__type".into(), serde_json::Value::String(r.rel_type.clone()));
+            serde_json::Value::Object(obj)
+        }
     }
 }
 

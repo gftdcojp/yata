@@ -1,14 +1,14 @@
 #![allow(dead_code)]
 
 //! YATA broker/runtime — wires together log, kv, object, ocel, lance.
-
-pub mod metrics;
 //!
 //! Tiered storage is always active when `BrokerConfig.b2` is set:
 //! - ObjectStore: local CAS + async B2 sync, read-through fallback
 //! - KV: flushed to Lance `yata_kv_history` + log segments synced to B2
 //! - Flight/Lance: datasets synced to B2 periodically
 //! - Cypher: implicitly tiered via OCEL → Lance → B2
+
+pub mod metrics;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -75,8 +75,8 @@ pub struct Broker {
     pub lance: Arc<LocalLanceSink>,
     /// Graph store — initialized when `BrokerConfig.graph_uri` is set.
     pub graph: Option<Arc<yata_graph::LanceGraphStore>>,
-    /// Local KV handle for drain_pending (None when NATS is used).
-    local_kv: Option<Arc<KvBucketStore>>,
+    /// Local KV handle for drain_pending and snapshot loading (None when NATS is used).
+    pub local_kv: Option<Arc<KvBucketStore>>,
     /// Local log handle for compaction (None when NATS is used).
     local_log: Option<Arc<LocalLog>>,
     /// B2 sync handle; used by background tasks for log/kv/lance dir sync.
@@ -395,7 +395,7 @@ impl Broker {
     /// When NATS is not configured: write directly to Lance (original path).
     pub async fn flush_lance(&self) -> Result<SyncStats> {
         let start = std::time::Instant::now();
-        metrics::counter!(metrics::names::LANCE_FLUSHES).increment(1);
+        ::metrics::counter!(crate::metrics::names::LANCE_FLUSHES).increment(1);
         let snapshot = self.ocel.snapshot().await?;
 
         if let Some(ref nats) = self.nats {
@@ -467,7 +467,7 @@ impl Broker {
 
         let stats = self.lance.sync_stats().await?;
         let elapsed = start.elapsed().as_secs_f64();
-        metrics::histogram!(metrics::names::LANCE_FLUSH_DURATION).record(elapsed);
+        ::metrics::histogram!(crate::metrics::names::LANCE_FLUSH_DURATION).record(elapsed);
         tracing::debug!(?stats, elapsed_ms = elapsed * 1000.0, "lance flush complete");
         Ok(stats)
     }
