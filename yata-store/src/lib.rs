@@ -71,11 +71,19 @@ pub struct MutableCsrStore {
     known_vertex_labels: Vec<String>,
     known_edge_labels: Vec<String>,
     vertex_pk: HashMap<String, String>,
+
+    // Partition
+    partition_id: u32,
 }
 
 impl MutableCsrStore {
-    /// Create an empty store.
+    /// Create an empty store (partition 0).
     pub fn new() -> Self {
+        Self::new_partition(0)
+    }
+
+    /// Create an empty store for a specific partition.
+    pub fn new_partition(partition_id: u32) -> Self {
         Self {
             vertex_labels: Vec::new(),
             vertex_alive: Vec::new(),
@@ -95,6 +103,7 @@ impl MutableCsrStore {
             known_vertex_labels: Vec::new(),
             known_edge_labels: Vec::new(),
             vertex_pk: HashMap::new(),
+            partition_id,
         }
     }
 
@@ -750,6 +759,24 @@ impl Mutable for MutableCsrStore {
         self.rebuild_csr();
         let ver = self.version.fetch_add(1, Ordering::Relaxed) + 1;
         ver
+    }
+}
+
+impl Partitioned for MutableCsrStore {
+    fn partition_id(&self) -> u32 {
+        self.partition_id
+    }
+
+    fn partition_count(&self) -> u32 {
+        1 // single-store: overridden by coordinator
+    }
+
+    fn vertex_partition(&self, _vid: u32) -> u32 {
+        self.partition_id
+    }
+
+    fn is_master(&self, _vid: u32) -> bool {
+        true // single-store: all vertices are master
     }
 }
 
