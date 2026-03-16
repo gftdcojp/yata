@@ -891,6 +891,148 @@ impl FlightSqlService for YataFlightService {
         })])
     }
 
+    // ---- Substrait (not supported — Cypher-based) --------------------------
+
+    async fn get_flight_info_substrait_plan(
+        &self,
+        _query: arrow_flight::sql::CommandStatementSubstraitPlan,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        Err(Status::unimplemented(
+            "Substrait plans are not supported; use Cypher via CommandStatementQuery",
+        ))
+    }
+
+    async fn do_put_substrait_plan(
+        &self,
+        _query: arrow_flight::sql::CommandStatementSubstraitPlan,
+        _request: Request<PeekableFlightDataStream>,
+    ) -> Result<i64, Status> {
+        Err(Status::unimplemented(
+            "Substrait plans are not supported; use Cypher via CommandStatementUpdate",
+        ))
+    }
+
+    async fn do_action_create_prepared_substrait_plan(
+        &self,
+        _query: arrow_flight::sql::ActionCreatePreparedSubstraitPlanRequest,
+        _request: Request<Action>,
+    ) -> Result<arrow_flight::sql::ActionCreatePreparedStatementResult, Status> {
+        Err(Status::unimplemented(
+            "Substrait plans are not supported; use CreatePreparedStatement with Cypher",
+        ))
+    }
+
+    // ---- Transactions (not supported — Lance is append-only) ---------------
+
+    async fn do_action_begin_transaction(
+        &self,
+        _query: arrow_flight::sql::ActionBeginTransactionRequest,
+        _request: Request<Action>,
+    ) -> Result<arrow_flight::sql::ActionBeginTransactionResult, Status> {
+        Err(Status::unimplemented(
+            "Transactions are not supported; Lance storage is append-only",
+        ))
+    }
+
+    async fn do_action_end_transaction(
+        &self,
+        _query: arrow_flight::sql::ActionEndTransactionRequest,
+        _request: Request<Action>,
+    ) -> Result<(), Status> {
+        Err(Status::unimplemented(
+            "Transactions are not supported; Lance storage is append-only",
+        ))
+    }
+
+    async fn do_action_begin_savepoint(
+        &self,
+        _query: arrow_flight::sql::ActionBeginSavepointRequest,
+        _request: Request<Action>,
+    ) -> Result<arrow_flight::sql::ActionBeginSavepointResult, Status> {
+        Err(Status::unimplemented(
+            "Savepoints are not supported; Lance storage is append-only",
+        ))
+    }
+
+    async fn do_action_end_savepoint(
+        &self,
+        _query: arrow_flight::sql::ActionEndSavepointRequest,
+        _request: Request<Action>,
+    ) -> Result<(), Status> {
+        Err(Status::unimplemented(
+            "Savepoints are not supported; Lance storage is append-only",
+        ))
+    }
+
+    // ---- Cancel query (not supported — synchronous execution) --------------
+
+    async fn do_action_cancel_query(
+        &self,
+        _query: arrow_flight::sql::ActionCancelQueryRequest,
+        _request: Request<Action>,
+    ) -> Result<arrow_flight::sql::ActionCancelQueryResult, Status> {
+        Err(Status::unimplemented(
+            "Cancel query is not supported; queries execute synchronously",
+        ))
+    }
+
+    // ---- Prepared statement bind/update (not supported — stateless) --------
+
+    async fn do_put_prepared_statement_query(
+        &self,
+        _query: CommandPreparedStatementQuery,
+        _request: Request<PeekableFlightDataStream>,
+    ) -> Result<arrow_flight::sql::DoPutPreparedStatementResult, Status> {
+        Err(Status::unimplemented(
+            "Parameter binding is not supported; prepared statements are stateless",
+        ))
+    }
+
+    async fn do_put_prepared_statement_update(
+        &self,
+        _query: arrow_flight::sql::CommandPreparedStatementUpdate,
+        _request: Request<PeekableFlightDataStream>,
+    ) -> Result<i64, Status> {
+        Err(Status::unimplemented(
+            "Parameter binding is not supported; prepared statements are stateless",
+        ))
+    }
+
+    // ---- Bulk ingest (not supported) ---------------------------------------
+
+    async fn do_put_statement_ingest(
+        &self,
+        _ticket: arrow_flight::sql::CommandStatementIngest,
+        _request: Request<PeekableFlightDataStream>,
+    ) -> Result<i64, Status> {
+        Err(Status::unimplemented(
+            "Bulk ingest is not supported; use do_put with WriteTicket",
+        ))
+    }
+
+    // ---- do_exchange (not supported) ---------------------------------------
+
+    async fn do_exchange_fallback(
+        &self,
+        _request: Request<Streaming<FlightData>>,
+    ) -> Result<Response<<Self as FlightService>::DoExchangeStream>, Status> {
+        Err(Status::unimplemented("do_exchange is not supported"))
+    }
+
+    // ---- get_flight_info_fallback ------------------------------------------
+
+    async fn get_flight_info_fallback(
+        &self,
+        cmd: arrow_flight::sql::Command,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        Err(Status::unimplemented(format!(
+            "get_flight_info: unsupported command: {}",
+            cmd.type_url()
+        )))
+    }
+
     // ---- register_sql_info ------------------------------------------------
 
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {
