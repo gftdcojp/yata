@@ -2124,6 +2124,16 @@ pub mod graph {
             Self::default()
         }
 
+        /// Retain only nodes for which the predicate returns true.
+        pub fn retain_nodes(&mut self, f: impl Fn(&NodeRef) -> bool) {
+            self.nodes.retain(|_, n| f(n));
+        }
+
+        /// Retain only rels for which the predicate returns true.
+        pub fn retain_rels(&mut self, f: impl Fn(&RelRef) -> bool) {
+            self.rels.retain(|_, r| f(r));
+        }
+
         pub fn from_ocel(
             objects: &[yata_ocel::OcelObject],
             edges: &[yata_ocel::OcelObjectObjectEdge],
