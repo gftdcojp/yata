@@ -38,6 +38,11 @@ pub struct BrokerConfig {
     pub graph_uri: Option<String>,
     /// NATS config. When set, uses NATS JetStream for log/kv/object instead of local.
     pub nats: Option<yata_nats::NatsConfig>,
+    /// Log segment rotation and compaction config.
+    #[serde(default)]
+    pub log: yata_log::config::LogConfig,
+    /// Log compaction interval (milliseconds). 0 = disabled.
+    pub log_compact_interval_ms: u64,
 }
 
 impl Default for BrokerConfig {
@@ -50,6 +55,8 @@ impl Default for BrokerConfig {
             b2_sync_interval_ms: 30_000,
             graph_uri: None,
             nats: None,
+            log: yata_log::config::LogConfig::default(),
+            log_compact_interval_ms: 60_000,
         }
     }
 }
@@ -67,6 +74,8 @@ pub struct Broker {
     pub graph: Option<Arc<yata_graph::LanceGraphStore>>,
     /// Local KV handle for drain_pending (None when NATS is used).
     local_kv: Option<Arc<KvBucketStore>>,
+    /// Local log handle for compaction (None when NATS is used).
+    local_log: Option<Arc<LocalLog>>,
     /// B2 sync handle; used by background tasks for log/kv/lance dir sync.
     b2_sync: Option<Arc<B2Sync>>,
     /// NATS backend (for Arrow pub/sub when NATS is enabled).
@@ -90,10 +99,11 @@ impl Broker {
             None
         };
 
-        let (log, kv, local_kv_handle, objects, b2_sync): (
+        let (log, kv, local_kv_handle, local_log_handle, objects, b2_sync): (
             Arc<dyn AppendLog>,
             Arc<dyn KvStore>,
             Option<Arc<KvBucketStore>>,
+            Option<Arc<LocalLog>>,
             Arc<dyn ObjectStorage>,
             Option<Arc<B2Sync>>,
         ) = if let Some(ref nats) = nats_backend {
@@ -101,10 +111,10 @@ impl Broker {
             let log: Arc<dyn AppendLog> = Arc::new(nats.append_log());
             let kv: Arc<dyn KvStore> = Arc::new(nats.kv_store());
             let objects: Arc<dyn ObjectStorage> = Arc::new(nats.object_store());
-            (log, kv, None, objects, None)
+            (log, kv, None, None, objects, None)
         } else {
             // Local backends (original path)
-            let local_log = Arc::new(LocalLog::new(data_dir.join("log")).await?);
+            let local_log = Arc::new(LocalLog::with_config(data_dir.join("log"), config.log.clone()).await?);
             local_log.recover().await?;
 
             let kv_payload_store = Arc::new(
@@ -129,7 +139,7 @@ impl Broker {
                     (local_objects as Arc<dyn ObjectStorage>, None)
                 };
 
-            (local_log as Arc<dyn AppendLog>, local_kv.clone() as Arc<dyn KvStore>, Some(local_kv), objects, b2_sync)
+            (local_log.clone() as Arc<dyn AppendLog>, local_kv.clone() as Arc<dyn KvStore>, Some(local_kv), Some(local_log), objects, b2_sync)
         };
 
         let ocel = Arc::new(MemoryOcelProjector::new());
@@ -154,6 +164,7 @@ impl Broker {
             lance,
             graph,
             local_kv: local_kv_handle,
+            local_log: local_log_handle,
             b2_sync,
             nats: nats_backend,
         })
@@ -173,6 +184,19 @@ impl Broker {
                     if let Err(e) = broker.flush_lance().await {
                         tracing::warn!("lance flush error: {}", e);
                     }
+                }
+            });
+        }
+
+        // TTL reaper (local KV only — NATS KV handles TTL natively)
+        if let Some(ref local_kv) = self.local_kv {
+            let kv = local_kv.clone();
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(tokio::time::Duration::from_secs(5));
+                loop {
+                    interval.tick().await;
+                    kv.reap_expired().await;
                 }
             });
         }
