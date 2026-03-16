@@ -7605,6 +7605,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "indexmap 2.13.0",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -7757,6 +7758,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
+ "indexmap 2.13.0",
  "metrics",
  "metrics-exporter-prometheus",
  "serde",
@@ -7768,6 +7770,7 @@ dependencies = [
  "tracing-subscriber",
  "yata-b2",
  "yata-bolt",
+ "yata-cypher",
  "yata-flight",
  "yata-graph",
  "yata-server",

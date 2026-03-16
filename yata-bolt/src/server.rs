@@ -195,8 +195,42 @@ async fn handle_run(
     // Load graph from Lance and execute Cypher
     let query_result = graph.to_memory_graph().await;
     match query_result {
-        Ok(mut qg) => match qg.query(cypher, &params) {
+        Ok(mut qg) => {
+            use yata_cypher::Graph;
+
+            // Snapshot before state for delta detection on mutations
+            let before_nodes: indexmap::IndexMap<String, yata_cypher::NodeRef> = qg
+                .0
+                .nodes()
+                .into_iter()
+                .map(|n| (n.id.clone(), n))
+                .collect();
+            let before_edges: indexmap::IndexMap<String, yata_cypher::RelRef> = qg
+                .0
+                .rels()
+                .into_iter()
+                .map(|e| (e.id.clone(), e))
+                .collect();
+
+            match qg.query(cypher, &params) {
             Ok(rows) => {
+                // Write-back delta for mutations
+                let upper = cypher.to_uppercase();
+                if upper.contains("CREATE")
+                    || upper.contains("MERGE")
+                    || upper.contains("DELETE")
+                    || upper.contains("SET ")
+                    || upper.contains("REMOVE ")
+                {
+                    match graph
+                        .write_delta(&before_nodes, &before_edges, &qg.0)
+                        .await
+                    {
+                        Ok(stats) => tracing::info!(?stats, "bolt: graph delta written"),
+                        Err(e) => tracing::warn!("bolt: write_delta failed: {e}"),
+                    }
+                }
+
                 // Extract column names from first row (or empty)
                 let columns: Vec<String> = rows
                     .first()
@@ -234,7 +268,7 @@ async fn handle_run(
                 send_failure(stream, "Neo.ClientError.Statement.SyntaxError", &e.to_string())
                     .await?;
             }
-        },
+        }},
         Err(e) => {
             send_failure(stream, "Neo.DatabaseError.General.UnknownError", &e.to_string())
                 .await?;
