@@ -7535,6 +7535,7 @@ dependencies = [
 name = "yata-coordinator"
 version = "0.1.0"
 dependencies = [
+ "rayon",
  "yata-gie",
  "yata-grin",
  "yata-store",

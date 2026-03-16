@@ -12,6 +12,44 @@ use serde::{Deserialize, Serialize};
 use yata_grin::*;
 use yata_cypher::Graph;
 
+/// Orderable wrapper for PropValue (used as BTreeMap key in property indexes).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropValueOrd(pub PropValue);
+
+impl Eq for PropValueOrd {}
+
+impl Ord for PropValueOrd {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (&self.0, &other.0) {
+            (PropValue::Int(a), PropValue::Int(b)) => a.cmp(b),
+            (PropValue::Str(a), PropValue::Str(b)) => a.cmp(b),
+            (PropValue::Bool(a), PropValue::Bool(b)) => a.cmp(b),
+            (PropValue::Float(a), PropValue::Float(b)) => {
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            }
+            (PropValue::Null, PropValue::Null) => std::cmp::Ordering::Equal,
+            // Different types: order by discriminant index
+            (a, b) => discriminant_index(a).cmp(&discriminant_index(b)),
+        }
+    }
+}
+
+impl PartialOrd for PropValueOrd {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn discriminant_index(v: &PropValue) -> u8 {
+    match v {
+        PropValue::Null => 0,
+        PropValue::Bool(_) => 1,
+        PropValue::Int(_) => 2,
+        PropValue::Float(_) => 3,
+        PropValue::Str(_) => 4,
+    }
+}
+
 // ── WAL (Write-Ahead Log) for graph mutations ────────────────────────
 
 /// WAL entry for graph mutations.
@@ -172,6 +210,14 @@ pub struct MutableCsrStore {
 
     // WAL (optional, enabled via enable_wal())
     wal: Option<GraphWal>,
+
+    /// Label bitmap index: label -> list of alive VIDs with that label.
+    /// Rebuilt on commit(). O(popcount) scan instead of O(V).
+    label_index: HashMap<String, Vec<u32>>,
+
+    /// Property equality index: (label, prop_key) -> HashMap<debug_value_string, Vec<u32>>
+    /// Enables O(1) lookup for Eq predicates. Rebuilt on commit().
+    prop_eq_index: HashMap<(String, String), HashMap<String, Vec<u32>>>,
 }
 
 impl MutableCsrStore {
@@ -203,6 +249,8 @@ impl MutableCsrStore {
             vertex_pk: HashMap::new(),
             partition_id,
             wal: None,
+            label_index: HashMap::new(),
+            prop_eq_index: HashMap::new(),
         }
     }
 
@@ -366,6 +414,59 @@ impl MutableCsrStore {
         }
     }
 
+    // ── Index methods ───────────────────────────────────────────────
+
+    /// Rebuild label bitmap index from vertex data.
+    fn rebuild_label_index(&mut self) {
+        self.label_index.clear();
+        for vid in 0..self.vertex_count {
+            if !self.vertex_alive[vid as usize] {
+                continue;
+            }
+            for label in &self.vertex_labels[vid as usize] {
+                self.label_index
+                    .entry(label.clone())
+                    .or_default()
+                    .push(vid);
+            }
+        }
+    }
+
+    /// Rebuild all registered property equality indexes.
+    fn rebuild_prop_indexes(&mut self) {
+        let keys: Vec<(String, String)> = self.prop_eq_index.keys().cloned().collect();
+        for (label, prop) in keys {
+            self.rebuild_single_prop_index(&label, &prop);
+        }
+    }
+
+    /// Rebuild a single property equality index.
+    fn rebuild_single_prop_index(&mut self, label: &str, prop_key: &str) {
+        let mut idx: HashMap<String, Vec<u32>> = HashMap::new();
+        let vids = self.label_index.get(label).cloned().unwrap_or_default();
+        for vid in vids {
+            if let Some(val) = self.vertex_prop_value(vid, prop_key) {
+                let key = format!("{:?}", val);
+                idx.entry(key).or_default().push(vid);
+            }
+        }
+        self.prop_eq_index
+            .insert((label.to_string(), prop_key.to_string()), idx);
+    }
+
+    /// Create an equality index on a (label, property) pair for faster Eq lookups.
+    /// The index is rebuilt automatically on each commit().
+    pub fn create_index(&mut self, label: &str, prop_key: &str) {
+        // Insert empty entry to register; rebuild immediately if label_index exists
+        self.prop_eq_index
+            .entry((label.to_string(), prop_key.to_string()))
+            .or_default();
+        // If label_index is populated, rebuild now
+        if !self.label_index.is_empty() {
+            self.rebuild_single_prop_index(label, prop_key);
+        }
+    }
+
     // ── WAL methods ──────────────────────────────────────────────────
 
     /// Enable WAL tracking. After this, all mutations are recorded.
@@ -419,6 +520,8 @@ impl Clone for MutableCsrStore {
             vertex_pk: self.vertex_pk.clone(),
             partition_id: self.partition_id,
             wal: None, // WAL is not cloned into snapshots
+            label_index: self.label_index.clone(),
+            prop_eq_index: self.prop_eq_index.clone(),
         }
     }
 }
@@ -806,22 +909,41 @@ impl Schema for MutableCsrStore {
 
 impl Scannable for MutableCsrStore {
     fn scan_vertices(&self, label: &str, predicate: &Predicate) -> Vec<u32> {
-        let mut result = Vec::new();
-        for (vid, labels) in self.vertex_labels.iter().enumerate() {
-            if !self.vertex_alive[vid] {
-                continue;
-            }
-            if !labels.contains(&label.to_string()) {
-                continue;
-            }
-            if self.predicate_matches(vid as u32, predicate) {
-                result.push(vid as u32);
+        // Fast path: property equality index
+        if let Predicate::Eq(key, value) = predicate {
+            if let Some(idx) = self.prop_eq_index.get(&(label.to_string(), key.clone())) {
+                let lookup_key = format!("{:?}", value);
+                return idx.get(&lookup_key).cloned().unwrap_or_default();
             }
         }
-        result
+
+        // Use label index if available, otherwise linear scan
+        let candidates = if let Some(vids) = self.label_index.get(label) {
+            vids.clone()
+        } else {
+            // Fallback: linear scan (before first commit)
+            let mut vids = Vec::new();
+            for (vid, labels) in self.vertex_labels.iter().enumerate() {
+                if self.vertex_alive[vid] && labels.contains(&label.to_string()) {
+                    vids.push(vid as u32);
+                }
+            }
+            vids
+        };
+
+        // Apply predicate filter on candidates
+        candidates
+            .into_iter()
+            .filter(|&vid| self.predicate_matches(vid, predicate))
+            .collect()
     }
 
     fn scan_vertices_by_label(&self, label: &str) -> Vec<u32> {
+        // Fast path: use label index if available
+        if let Some(vids) = self.label_index.get(label) {
+            return vids.clone();
+        }
+        // Fallback: linear scan (before first commit)
         self.scan_vertices(label, &Predicate::True)
     }
 
@@ -948,6 +1070,8 @@ impl Mutable for MutableCsrStore {
 
     fn commit(&mut self) -> u64 {
         self.rebuild_csr();
+        self.rebuild_label_index();
+        self.rebuild_prop_indexes();
         let ver = self.version.fetch_add(1, Ordering::Relaxed) + 1;
         // WAL
         if let Some(ref mut wal) = self.wal {
@@ -1751,5 +1875,156 @@ mod bench {
         println!("Add {} vertices: {:?} ({:.0} vertices/sec)", n, vertex_elapsed, n as f64 / vertex_elapsed.as_secs_f64());
         println!("Add {} edges: {:?} ({:.0} edges/sec)", e, edge_elapsed, e as f64 / edge_elapsed.as_secs_f64());
         println!("Commit (CSR rebuild): {:?}", commit_elapsed);
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn test_label_index_scan() {
+        let mut store = MutableCsrStore::new();
+        store.add_vertex("Person", &[("name", PropValue::Str("Alice".into()))]);
+        store.add_vertex("Person", &[("name", PropValue::Str("Bob".into()))]);
+        store.add_vertex("Company", &[("name", PropValue::Str("GFTD".into()))]);
+        store.commit();
+
+        let persons = store.scan_vertices_by_label("Person");
+        assert_eq!(persons.len(), 2);
+        assert!(persons.contains(&0));
+        assert!(persons.contains(&1));
+
+        let companies = store.scan_vertices_by_label("Company");
+        assert_eq!(companies.len(), 1);
+        assert!(companies.contains(&2));
+
+        let unknown = store.scan_vertices_by_label("Unknown");
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn test_label_index_after_delete() {
+        let mut store = MutableCsrStore::new();
+        store.add_vertex("Person", &[("name", PropValue::Str("Alice".into()))]);
+        store.add_vertex("Person", &[("name", PropValue::Str("Bob".into()))]);
+        store.add_vertex("Person", &[("name", PropValue::Str("Charlie".into()))]);
+        store.commit();
+
+        assert_eq!(store.scan_vertices_by_label("Person").len(), 3);
+
+        // Delete Bob (vid=1)
+        store.delete_vertex(1);
+        store.commit();
+
+        let persons = store.scan_vertices_by_label("Person");
+        assert_eq!(persons.len(), 2);
+        assert!(persons.contains(&0)); // Alice
+        assert!(!persons.contains(&1)); // Bob deleted
+        assert!(persons.contains(&2)); // Charlie
+    }
+
+    #[test]
+    fn test_prop_eq_index() {
+        let mut store = MutableCsrStore::new();
+        store.add_vertex("Person", &[
+            ("name", PropValue::Str("Alice".into())),
+            ("age", PropValue::Int(30)),
+        ]);
+        store.add_vertex("Person", &[
+            ("name", PropValue::Str("Bob".into())),
+            ("age", PropValue::Int(25)),
+        ]);
+        store.add_vertex("Person", &[
+            ("name", PropValue::Str("Charlie".into())),
+            ("age", PropValue::Int(30)),
+        ]);
+        store.create_index("Person", "name");
+        store.create_index("Person", "age");
+        store.commit();
+
+        // Eq lookup via index
+        let result = store.scan_vertices(
+            "Person",
+            &Predicate::Eq("name".into(), PropValue::Str("Bob".into())),
+        );
+        assert_eq!(result, vec![1]);
+
+        // Eq lookup for age=30 via index
+        let result = store.scan_vertices(
+            "Person",
+            &Predicate::Eq("age".into(), PropValue::Int(30)),
+        );
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&0));
+        assert!(result.contains(&2));
+
+        // Non-existent value
+        let result = store.scan_vertices(
+            "Person",
+            &Predicate::Eq("name".into(), PropValue::Str("Nobody".into())),
+        );
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_prop_index_after_mutation() {
+        let mut store = MutableCsrStore::new();
+        store.add_vertex("Person", &[("name", PropValue::Str("Alice".into()))]);
+        store.create_index("Person", "name");
+        store.commit();
+
+        let result = store.scan_vertices(
+            "Person",
+            &Predicate::Eq("name".into(), PropValue::Str("Alice".into())),
+        );
+        assert_eq!(result, vec![0]);
+
+        // Add more vertices and recommit
+        store.add_vertex("Person", &[("name", PropValue::Str("Bob".into()))]);
+        store.add_vertex("Person", &[("name", PropValue::Str("Alice".into()))]);
+        store.commit();
+
+        // Index should now include new vertices
+        let result = store.scan_vertices(
+            "Person",
+            &Predicate::Eq("name".into(), PropValue::Str("Alice".into())),
+        );
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&0));
+        assert!(result.contains(&2));
+
+        let result = store.scan_vertices(
+            "Person",
+            &Predicate::Eq("name".into(), PropValue::Str("Bob".into())),
+        );
+        assert_eq!(result, vec![1]);
+    }
+
+    #[test]
+    fn test_scan_uses_label_index() {
+        let mut store = MutableCsrStore::new();
+        let n = 10_000;
+        for i in 0..n {
+            let label = if i % 10 == 0 { "Target" } else { "Other" };
+            store.add_vertex(label, &[("id", PropValue::Int(i))]);
+        }
+        store.commit();
+
+        // Measure indexed scan
+        let start = Instant::now();
+        let iters = 1_000;
+        let mut total = 0;
+        for _ in 0..iters {
+            total += store.scan_vertices_by_label("Target").len();
+        }
+        let indexed_elapsed = start.elapsed();
+
+        // Verify correctness
+        assert_eq!(total / iters, 1_000); // 10K / 10 = 1K Target vertices
+
+        println!("\n=== INDEX BENCH: Label index scan ({} vertices, {} iters) ===", n, iters);
+        println!("Total: {:?}, Per scan: {:?}", indexed_elapsed, indexed_elapsed / iters as u32);
     }
 }

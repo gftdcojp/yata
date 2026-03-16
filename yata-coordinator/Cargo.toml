@@ -7,6 +7,7 @@ edition = "2021"
 yata-grin = { path = "../yata-grin" }
 yata-store = { path = "../yata-store" }
 yata-gie = { path = "../yata-gie" }
+rayon = { workspace = true }
 
 [[bench]]
 name = "distributed_bench"

@@ -7,6 +7,7 @@
 //! - Cross-shard edges handled via a "default" shard
 
 use std::collections::HashMap;
+use rayon::prelude::*;
 use yata_grin::*;
 use yata_store::MutableCsrStore;
 
@@ -382,19 +383,20 @@ pub fn execute_sharded(
         return yata_gie::executor::execute(plan, shard);
     }
 
-    // Multi-shard: execute on each, merge results
-    let mut all_results = Vec::new();
-    for &sid in &shard_ids {
-        let shard = store.shard(sid).unwrap();
-        let mut results = yata_gie::executor::execute(plan, shard);
-        all_results.append(&mut results);
-    }
-    all_results
+    // Multi-shard: parallel execution via rayon
+    let shard_results: Vec<Vec<yata_gie::executor::Record>> = shard_ids
+        .par_iter()
+        .filter_map(|&sid| store.shard(sid))
+        .map(|shard| yata_gie::executor::execute(plan, shard))
+        .collect();
+
+    shard_results.into_iter().flatten().collect()
 }
 
 /// Execute a GIE plan across shards with proper aggregation result merging.
 /// If the plan ends with an Aggregate op, shard-local results are merged
 /// (count/sum → sum, min → global min, max → global max).
+/// Uses rayon for parallel shard execution when multiple shards are involved.
 pub fn execute_sharded_merged(
     plan: &yata_gie::ir::QueryPlan,
     store: &ShardedGraphStore,
@@ -412,13 +414,12 @@ pub fn execute_sharded_merged(
         matches!(op, yata_gie::ir::LogicalOp::Aggregate { .. })
     });
 
-    // Execute on each shard
-    let mut shard_results: Vec<Vec<yata_gie::executor::Record>> = Vec::new();
-    for &sid in &shard_ids {
-        let shard = store.shard(sid).unwrap();
-        let results = yata_gie::executor::execute(plan, shard);
-        shard_results.push(results);
-    }
+    // Parallel execution across shards using rayon
+    let shard_results: Vec<Vec<yata_gie::executor::Record>> = shard_ids
+        .par_iter()
+        .filter_map(|&sid| store.shard(sid))
+        .map(|shard| yata_gie::executor::execute(plan, shard))
+        .collect();
 
     if has_final_agg {
         merge_aggregation_results(shard_results, plan)
@@ -986,5 +987,98 @@ mod tests {
         let results = execute_sharded_merged(&plan, &store, &["Person".into()]);
         // Person shard: 2, default shard: 0 => concatenated = 2
         assert_eq!(results.len(), 2);
+    }
+
+    // --- Test: parallel execution produces same results as sequential ---
+
+    #[test]
+    fn test_parallel_execution() {
+        let mut store = ShardedGraphStore::with_label_partitions(&[
+            vec!["Person".into()],
+            vec!["Company".into()],
+            vec!["Project".into()],
+        ]);
+
+        // Populate multiple shards
+        for i in 0..10 {
+            store.add_vertex("Person", &[("name", PropValue::Str(format!("P{}", i)))]);
+        }
+        for i in 0..5 {
+            store.add_vertex("Company", &[("name", PropValue::Str(format!("C{}", i)))]);
+        }
+        for i in 0..3 {
+            store.add_vertex("Project", &[("name", PropValue::Str(format!("Proj{}", i)))]);
+        }
+        store.commit_all();
+
+        // Scan Person across shards (Person shard + default)
+        let plan = PlanBuilder::new().scan("Person", "n").build();
+
+        // Execute multiple times to exercise rayon
+        for _ in 0..10 {
+            let results = execute_sharded(&plan, &store, &["Person".into()]);
+            assert_eq!(results.len(), 10);
+        }
+    }
+
+    // --- Test: parallel count merge ---
+
+    #[test]
+    fn test_parallel_count_merge() {
+        let mut store = ShardedGraphStore::with_label_partitions(&[
+            vec!["Person".into()],
+            vec!["Company".into()],
+        ]);
+
+        for i in 0..100 {
+            store.add_vertex("Person", &[("id", PropValue::Int(i))]);
+        }
+        store.commit_all();
+
+        let plan = PlanBuilder::new()
+            .scan("Person", "n")
+            .aggregate(
+                vec![],
+                vec![("cnt".into(), yata_gie::AggOp::Count, yata_gie::ir::Expr::Var("n".into()))],
+            )
+            .build();
+
+        let results = execute_sharded_merged(&plan, &store, &["Person".into()]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].values[0], PropValue::Int(100));
+    }
+
+    // --- Test: parallel large graph ---
+
+    #[test]
+    fn test_parallel_large_graph() {
+        let mut store = ShardedGraphStore::with_label_partitions(&[
+            vec!["A".into()],
+            vec!["B".into()],
+            vec!["C".into()],
+            vec!["D".into()],
+        ]);
+
+        // 1000 vertices per shard
+        for i in 0..1000 {
+            store.add_vertex("A", &[("id", PropValue::Int(i))]);
+            store.add_vertex("B", &[("id", PropValue::Int(i))]);
+            store.add_vertex("C", &[("id", PropValue::Int(i))]);
+            store.add_vertex("D", &[("id", PropValue::Int(i))]);
+        }
+        store.commit_all();
+
+        let plan = PlanBuilder::new().scan("A", "n").build();
+
+        let start = std::time::Instant::now();
+        let iters = 100;
+        for _ in 0..iters {
+            let results = execute_sharded(&plan, &store, &["A".into()]);
+            assert_eq!(results.len(), 1000);
+        }
+        let elapsed = start.elapsed();
+
+        println!("\n=== BENCH: Parallel shard execution (4K vertices, {} iters) ===", iters);
+        println!("Total: {:?}, Per query: {:?}", elapsed, elapsed / iters as u32);
     }
 }
