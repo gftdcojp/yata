@@ -322,7 +322,7 @@ impl LanceGraphStore {
         let tables = self.conn.table_names().execute().await.unwrap_or_default();
         let table = match self.conn.open_table("graph_vertices").execute().await {
             Ok(t) => {
-                let _ = t.checkout_latest().await;
+                // checkout_latest removed — may cause deadlock in block_on context
                 tracing::debug!(table_count = tables.len(), "load_vertices: opened graph_vertices");
                 t
             }
@@ -340,6 +340,8 @@ impl LanceGraphStore {
             .try_collect()
             .await
             .map_err(|e| GraphError::Storage(e.to_string()))?;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        tracing::debug!(batches = batches.len(), total_rows, "load_vertices: read from Lance");
 
         // last-write-wins dedup: append-only table may have multiple rows per vid.
         // Rows are in insertion order (created_ns ascending), so later entries override.
@@ -374,7 +376,7 @@ impl LanceGraphStore {
         let _ = self.conn.table_names().execute().await;
         let table = match self.conn.open_table("graph_edges").execute().await {
             Ok(t) => {
-                let _ = t.checkout_latest().await;
+                // checkout_latest removed — may cause deadlock in block_on context
                 t
             }
             Err(_) => return Ok(Vec::new()),
