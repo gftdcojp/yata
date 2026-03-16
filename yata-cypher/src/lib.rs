@@ -4837,6 +4837,170 @@ pub mod executor {
                         _ => Ok(Value::Null),
                     }
                 }
+                "gds.similarity.jaccard" | "jaccard" => {
+                    let a = self.eval_arg(args, 0, binding)?;
+                    let b = self.eval_arg(args, 1, binding)?;
+                    match (a, b) {
+                        (Value::List(la), Value::List(lb)) => {
+                            let set_a: std::collections::HashSet<String> =
+                                la.iter().map(|v| format!("{:?}", v)).collect();
+                            let set_b: std::collections::HashSet<String> =
+                                lb.iter().map(|v| format!("{:?}", v)).collect();
+                            let intersection = set_a.intersection(&set_b).count() as f64;
+                            let union = set_a.union(&set_b).count() as f64;
+                            if union == 0.0 {
+                                Ok(Value::Float(0.0))
+                            } else {
+                                Ok(Value::Float(intersection / union))
+                            }
+                        }
+                        _ => Ok(Value::Null),
+                    }
+                }
+                "gds.similarity.overlap" | "overlap" => {
+                    let a = self.eval_arg(args, 0, binding)?;
+                    let b = self.eval_arg(args, 1, binding)?;
+                    match (a, b) {
+                        (Value::List(la), Value::List(lb)) => {
+                            let set_a: std::collections::HashSet<String> =
+                                la.iter().map(|v| format!("{:?}", v)).collect();
+                            let set_b: std::collections::HashSet<String> =
+                                lb.iter().map(|v| format!("{:?}", v)).collect();
+                            let intersection = set_a.intersection(&set_b).count() as f64;
+                            let min_size = (set_a.len().min(set_b.len())) as f64;
+                            if min_size == 0.0 {
+                                Ok(Value::Float(0.0))
+                            } else {
+                                Ok(Value::Float(intersection / min_size))
+                            }
+                        }
+                        _ => Ok(Value::Null),
+                    }
+                }
+                "gds.similarity.pearson" | "pearson" => {
+                    let a = self.eval_arg(args, 0, binding)?;
+                    let b = self.eval_arg(args, 1, binding)?;
+                    match (a, b) {
+                        (Value::List(la), Value::List(lb))
+                            if la.len() == lb.len() && !la.is_empty() =>
+                        {
+                            let va: Vec<f64> = la
+                                .iter()
+                                .filter_map(|v| match v {
+                                    Value::Float(f) => Some(*f),
+                                    Value::Int(i) => Some(*i as f64),
+                                    _ => None,
+                                })
+                                .collect();
+                            let vb: Vec<f64> = lb
+                                .iter()
+                                .filter_map(|v| match v {
+                                    Value::Float(f) => Some(*f),
+                                    Value::Int(i) => Some(*i as f64),
+                                    _ => None,
+                                })
+                                .collect();
+                            if va.len() != vb.len() || va.is_empty() {
+                                return Ok(Value::Null);
+                            }
+                            let n = va.len() as f64;
+                            let mean_a = va.iter().sum::<f64>() / n;
+                            let mean_b = vb.iter().sum::<f64>() / n;
+                            let cov: f64 = va
+                                .iter()
+                                .zip(&vb)
+                                .map(|(a, b)| (a - mean_a) * (b - mean_b))
+                                .sum();
+                            let std_a: f64 =
+                                va.iter().map(|a| (a - mean_a).powi(2)).sum::<f64>().sqrt();
+                            let std_b: f64 =
+                                vb.iter().map(|b| (b - mean_b).powi(2)).sum::<f64>().sqrt();
+                            if std_a == 0.0 || std_b == 0.0 {
+                                Ok(Value::Float(0.0))
+                            } else {
+                                Ok(Value::Float(cov / (std_a * std_b)))
+                            }
+                        }
+                        _ => Ok(Value::Null),
+                    }
+                }
+                // GDS utility functions
+                "gds.util.nan" => Ok(Value::Float(f64::NAN)),
+                "gds.util.infinity" => Ok(Value::Float(f64::INFINITY)),
+                "gds.util.isfinite" => {
+                    let v = self.eval_arg(args, 0, binding)?;
+                    match v {
+                        Value::Float(f) => Ok(Value::Bool(f.is_finite())),
+                        Value::Int(_) => Ok(Value::Bool(true)),
+                        Value::Null => Ok(Value::Bool(false)),
+                        _ => Ok(Value::Bool(false)),
+                    }
+                }
+                "gds.util.isinfinite" => {
+                    let v = self.eval_arg(args, 0, binding)?;
+                    match v {
+                        Value::Float(f) => Ok(Value::Bool(!f.is_finite())),
+                        Value::Int(_) => Ok(Value::Bool(false)),
+                        Value::Null => Ok(Value::Bool(true)),
+                        _ => Ok(Value::Bool(true)),
+                    }
+                }
+                "gds.util.asnode" => {
+                    let v = self.eval_arg(args, 0, binding)?;
+                    if let Value::Str(id) = v {
+                        for (_, val) in binding.iter() {
+                            if let Value::Node(n) = val {
+                                if n.id == id {
+                                    return Ok(Value::Node(n.clone()));
+                                }
+                            }
+                        }
+                    }
+                    Ok(Value::Null)
+                }
+                "gds.util.asnodes" => {
+                    let v = self.eval_arg(args, 0, binding)?;
+                    if let Value::List(ids) = v {
+                        let nodes: Vec<Value> = ids
+                            .into_iter()
+                            .filter_map(|id| {
+                                if let Value::Str(ref s) = id {
+                                    for (_, val) in binding.iter() {
+                                        if let Value::Node(n) = val {
+                                            if &n.id == s {
+                                                return Some(Value::Node(n.clone()));
+                                            }
+                                        }
+                                    }
+                                }
+                                None
+                            })
+                            .collect();
+                        Ok(Value::List(nodes))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                "gds.util.nodepropertyname" => {
+                    let v = self.eval_arg(args, 0, binding)?;
+                    Ok(v)
+                }
+                // GDS link prediction (require graph context — return null in scalar eval)
+                "gds.alpha.linkprediction.adamicadar" | "adamic_adar" => Ok(Value::Null),
+                "gds.alpha.linkprediction.commonneighbors" | "common_neighbors" => {
+                    Ok(Value::Null)
+                }
+                "gds.alpha.linkprediction.preferentialattachment"
+                | "preferential_attachment" => Ok(Value::Null),
+                "gds.alpha.linkprediction.resourceallocation" | "resource_allocation" => {
+                    Ok(Value::Null)
+                }
+                "gds.alpha.linkprediction.totalneighbors" | "total_neighbors" => {
+                    Ok(Value::Null)
+                }
+                "gds.alpha.linkprediction.samecommunity" | "same_community" => {
+                    Ok(Value::Null)
+                }
                 // count_distinct is handled in aggregation; if used in non-agg context, count unique
                 "count_distinct" => {
                     let v = self.eval_arg(args, 0, binding)?;

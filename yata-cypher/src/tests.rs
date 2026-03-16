@@ -104,6 +104,21 @@ mod tests {
         ex.execute(&q, g).expect("execute failed")
     }
 
+    fn get_f64(rs: &crate::types::ResultSet, col: &str) -> f64 {
+        match rs.rows[0].0.get(col).unwrap() {
+            Value::Float(f) => *f,
+            Value::Int(i) => *i as f64,
+            _ => panic!("expected float for {}", col),
+        }
+    }
+
+    fn get_bool(rs: &crate::types::ResultSet, col: &str) -> bool {
+        match rs.rows[0].0.get(col).unwrap() {
+            Value::Bool(b) => *b,
+            _ => panic!("expected bool for {}", col),
+        }
+    }
+
     fn exec_with_params(
         cypher: &str,
         params: indexmap::IndexMap<String, Value>,
@@ -2706,5 +2721,69 @@ mod tests {
         assert_eq!(node.id, "a");
         // cosine([1,0], [0.5,0.5]) = 0.5/sqrt(0.5) ~= 0.707
         assert!(*score > 0.7 && *score < 0.72, "score={}", score);
+    }
+
+    // ========================================================================
+    // GDS Similarity Functions
+    // ========================================================================
+
+    #[test]
+    fn test_jaccard_similarity() {
+        let mut g = make_graph();
+        let rs = exec(
+            "RETURN gds.similarity.jaccard([1,2,3], [2,3,4]) AS j",
+            &mut g,
+        );
+        let j = get_f64(&rs, "j");
+        assert!((j - 0.5).abs() < 0.01); // {2,3} / {1,2,3,4} = 2/4 = 0.5
+    }
+
+    #[test]
+    fn test_overlap_similarity() {
+        let mut g = make_graph();
+        let rs = exec(
+            "RETURN gds.similarity.overlap([1,2,3], [2,3,4]) AS o",
+            &mut g,
+        );
+        let o = get_f64(&rs, "o");
+        assert!((o - 0.6666).abs() < 0.01); // 2/min(3,3) = 2/3
+    }
+
+    #[test]
+    fn test_pearson_similarity() {
+        let mut g = make_graph();
+        let rs = exec(
+            "RETURN gds.similarity.pearson([1.0, 2.0, 3.0], [1.0, 2.0, 3.0]) AS p",
+            &mut g,
+        );
+        let p = get_f64(&rs, "p");
+        assert!((p - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_gds_util_nan() {
+        let mut g = make_graph();
+        let rs = exec(
+            "RETURN gds.util.isFinite(gds.util.NaN()) AS f",
+            &mut g,
+        );
+        assert_eq!(get_bool(&rs, "f"), false);
+    }
+
+    #[test]
+    fn test_gds_util_infinity() {
+        let mut g = make_graph();
+        let rs = exec(
+            "RETURN gds.util.isInfinite(gds.util.infinity()) AS i",
+            &mut g,
+        );
+        assert_eq!(get_bool(&rs, "i"), true);
+    }
+
+    #[test]
+    fn test_gds_util_isfinite() {
+        let mut g = make_graph();
+        let rs = exec("RETURN gds.util.isFinite(42) AS f", &mut g);
+        assert_eq!(get_bool(&rs, "f"), true);
     }
 }
