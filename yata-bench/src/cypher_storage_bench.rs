@@ -438,7 +438,7 @@ async fn main() -> Result<()> {
     let neo4j_user = std::env::var("NEO4J_USER").unwrap_or("neo4j".into());
     let neo4j_pass = std::env::var("NEO4J_PASS").unwrap_or("benchmark".into());
     let s3_endpoint = std::env::var("S3_ENDPOINT").ok();
-    let s3_bucket   = std::env::var("S3_BUCKET").unwrap_or("ai-gftd-lanceb".into());
+    let s3_bucket   = std::env::var("S3_BUCKET").unwrap_or("ai-gftd-lancedb".into());
     let s3_key      = std::env::var("S3_KEY").unwrap_or("minioadmin".into());
     let s3_secret   = std::env::var("S3_SECRET").unwrap_or("minioadmin".into());
 

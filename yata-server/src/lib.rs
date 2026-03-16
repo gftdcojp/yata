@@ -89,7 +89,7 @@ impl Default for BrokerConfig {
             lance_flush_interval_ms: 5000,
             b2: B2Config {
                 endpoint: "https://s3.us-west-004.backblazeb2.com".to_string(),
-                bucket: "ai-gftd-lanceb".to_string(),
+                bucket: "ai-gftd-lancedb".to_string(),
                 key_id: String::new(),
                 application_key: String::new(),
                 region: "us-west-004".to_string(),

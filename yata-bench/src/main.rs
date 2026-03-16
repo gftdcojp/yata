@@ -68,7 +68,7 @@ async fn make_broker(dir: &tempfile::TempDir) -> Arc<yata_server::Broker> {
         lance_flush_interval_ms: 999_999,
         b2: yata_b2::B2Config {
             endpoint: "https://s3.us-west-004.backblazeb2.com".into(),
-            bucket: "ai-gftd-lanceb".into(),
+            bucket: "ai-gftd-lancedb".into(),
             key_id: std::env::var("YATA_B2_KEY_ID").unwrap_or_default(),
             application_key: std::env::var("YATA_B2_APPLICATION_KEY").unwrap_or_default(),
             region: "us-west-004".into(),
