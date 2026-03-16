@@ -2047,4 +2047,436 @@ mod tests {
             Some(Value::Int(30))
         );
     }
+
+    // ========================================================================
+    // UNION execution
+    // ========================================================================
+
+    #[test]
+    fn test_union_all() {
+        let mut g = make_graph();
+        let rs = exec(
+            "MATCH (n:Person) WHERE n.name = 'Alice' RETURN n.name AS name \
+             UNION ALL \
+             MATCH (n:Person) WHERE n.name = 'Bob' RETURN n.name AS name",
+            &mut g,
+        );
+        assert_eq!(rs.rows.len(), 2);
+        let names: Vec<String> = rs
+            .rows
+            .iter()
+            .map(|r| match r.0.get("name").unwrap() {
+                Value::Str(s) => s.clone(),
+                _ => panic!("expected string"),
+            })
+            .collect();
+        assert!(names.contains(&"Alice".to_string()));
+        assert!(names.contains(&"Bob".to_string()));
+    }
+
+    #[test]
+    fn test_union_dedup() {
+        let mut g = make_graph();
+        // Both sub-queries return Alice, UNION (not ALL) should deduplicate
+        let rs = exec(
+            "MATCH (n:Person) WHERE n.name = 'Alice' RETURN n.name AS name \
+             UNION \
+             MATCH (n:Person) WHERE n.name = 'Alice' RETURN n.name AS name",
+            &mut g,
+        );
+        assert_eq!(rs.rows.len(), 1);
+    }
+
+    #[test]
+    fn test_union_three_segments() {
+        let mut g = make_graph();
+        let rs = exec(
+            "MATCH (n:Person) WHERE n.name = 'Alice' RETURN n.name AS name \
+             UNION ALL \
+             MATCH (n:Person) WHERE n.name = 'Bob' RETURN n.name AS name \
+             UNION ALL \
+             MATCH (n:Company) RETURN n.name AS name",
+            &mut g,
+        );
+        assert_eq!(rs.rows.len(), 3);
+    }
+
+    // ========================================================================
+    // Named paths
+    // ========================================================================
+
+    #[test]
+    fn test_named_path() {
+        let mut g = make_graph();
+        let rs = exec(
+            "MATCH p = (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person) RETURN p",
+            &mut g,
+        );
+        assert_eq!(rs.rows.len(), 1);
+        match rs.rows[0].0.get("p").unwrap() {
+            Value::List(path) => {
+                // Should contain [Node(Alice), Rel(KNOWS), Node(Bob)]
+                assert_eq!(path.len(), 3);
+                assert!(matches!(&path[0], Value::Node(n) if n.id == "n1"));
+                assert!(matches!(&path[1], Value::Rel(r) if r.rel_type == "KNOWS"));
+                assert!(matches!(&path[2], Value::Node(n) if n.id == "n2"));
+            }
+            other => panic!("expected list path, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_named_path_length() {
+        let mut g = make_graph();
+        let rs = exec(
+            "MATCH p = (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person) RETURN length(p) AS len",
+            &mut g,
+        );
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0].0.get("len").cloned(), Some(Value::Int(3)));
+    }
+
+    // ========================================================================
+    // Map projection
+    // ========================================================================
+
+    #[test]
+    fn test_map_projection_shorthand() {
+        let mut g = make_graph();
+        let rs = exec(
+            "MATCH (n:Person {name: 'Alice'}) RETURN n { .name, .age }",
+            &mut g,
+        );
+        assert_eq!(rs.rows.len(), 1);
+        let val = rs.rows[0].0.values().next().unwrap();
+        match val {
+            Value::Map(m) => {
+                assert_eq!(m.get("name"), Some(&Value::Str("Alice".into())));
+                assert_eq!(m.get("age"), Some(&Value::Int(30)));
+                assert_eq!(m.len(), 2);
+            }
+            other => panic!("expected map, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_projection_all_props() {
+        let mut g = make_graph();
+        let rs = exec(
+            "MATCH (n:Person {name: 'Alice'}) RETURN n { .* }",
+            &mut g,
+        );
+        assert_eq!(rs.rows.len(), 1);
+        let val = rs.rows[0].0.values().next().unwrap();
+        match val {
+            Value::Map(m) => {
+                assert_eq!(m.get("name"), Some(&Value::Str("Alice".into())));
+                assert_eq!(m.get("age"), Some(&Value::Int(30)));
+            }
+            other => panic!("expected map, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_projection_literal_key() {
+        let mut g = make_graph();
+        let rs = exec(
+            "MATCH (n:Person {name: 'Alice'}) RETURN n { .name, status: 'active' }",
+            &mut g,
+        );
+        assert_eq!(rs.rows.len(), 1);
+        let val = rs.rows[0].0.values().next().unwrap();
+        match val {
+            Value::Map(m) => {
+                assert_eq!(m.get("name"), Some(&Value::Str("Alice".into())));
+                assert_eq!(m.get("status"), Some(&Value::Str("active".into())));
+            }
+            other => panic!("expected map, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // EXISTS { subquery }
+    // ========================================================================
+
+    #[test]
+    fn test_exists_subquery_true() {
+        let mut g = make_graph();
+        let rs = exec(
+            "MATCH (n:Person) WHERE EXISTS { MATCH (n)-[:KNOWS]->() } RETURN n.name",
+            &mut g,
+        );
+        // Only Alice knows someone
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(
+            rs.rows[0].0.get("n.name").cloned(),
+            Some(Value::Str("Alice".into()))
+        );
+    }
+
+    #[test]
+    fn test_exists_subquery_false() {
+        let mut g = make_graph();
+        let rs = exec(
+            "MATCH (n:Person) WHERE EXISTS { MATCH (n)-[:LIKES]->() } RETURN n.name",
+            &mut g,
+        );
+        assert_eq!(rs.rows.len(), 0);
+    }
+
+    // ========================================================================
+    // count(DISTINCT x)
+    // ========================================================================
+
+    #[test]
+    fn test_count_distinct() {
+        let mut g = make_graph();
+        // Both persons have label "Person" so labels are same
+        // But names are distinct
+        let rs = exec(
+            "MATCH (n:Person) RETURN count(DISTINCT n.name) AS cnt",
+            &mut g,
+        );
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0].0.get("cnt").cloned(), Some(Value::Int(2)));
+    }
+
+    #[test]
+    fn test_count_distinct_with_dupes() {
+        let mut g = MemoryGraph::new();
+        for i in 0..5 {
+            g.add_node(NodeRef {
+                id: format!("n{}", i),
+                labels: vec!["Item".into()],
+                props: [("cat".into(), Value::Str(if i % 2 == 0 { "A" } else { "B" }.into()))]
+                    .into_iter()
+                    .collect(),
+            });
+        }
+        let rs = exec(
+            "MATCH (n:Item) RETURN count(DISTINCT n.cat) AS cnt",
+            &mut g,
+        );
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0].0.get("cnt").cloned(), Some(Value::Int(2)));
+    }
+
+    // ========================================================================
+    // CALL {} subquery
+    // ========================================================================
+
+    #[test]
+    fn test_call_subquery() {
+        let mut g = make_graph();
+        let rs = exec(
+            "MATCH (n:Person) CALL { WITH n MATCH (n)-[:KNOWS]->(m) RETURN m.name AS friend } RETURN n.name, friend",
+            &mut g,
+        );
+        // Alice knows Bob, Bob knows nobody
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(
+            rs.rows[0].0.get("n.name").cloned(),
+            Some(Value::Str("Alice".into()))
+        );
+        assert_eq!(
+            rs.rows[0].0.get("friend").cloned(),
+            Some(Value::Str("Bob".into()))
+        );
+    }
+
+    // ========================================================================
+    // List predicate functions: ALL, ANY, NONE, SINGLE
+    // ========================================================================
+
+    #[test]
+    fn test_all_predicate_true() {
+        let mut g = MemoryGraph::new();
+        let rs = exec(
+            "RETURN ALL(x IN [2, 4, 6] WHERE x % 2 = 0) AS result",
+            &mut g,
+        );
+        assert_eq!(rs.rows[0].0.get("result").cloned(), Some(Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_all_predicate_false() {
+        let mut g = MemoryGraph::new();
+        let rs = exec(
+            "RETURN ALL(x IN [2, 3, 6] WHERE x % 2 = 0) AS result",
+            &mut g,
+        );
+        assert_eq!(rs.rows[0].0.get("result").cloned(), Some(Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_any_predicate_true() {
+        let mut g = MemoryGraph::new();
+        let rs = exec(
+            "RETURN ANY(x IN [1, 3, 6] WHERE x % 2 = 0) AS result",
+            &mut g,
+        );
+        assert_eq!(rs.rows[0].0.get("result").cloned(), Some(Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_any_predicate_false() {
+        let mut g = MemoryGraph::new();
+        let rs = exec(
+            "RETURN ANY(x IN [1, 3, 5] WHERE x % 2 = 0) AS result",
+            &mut g,
+        );
+        assert_eq!(rs.rows[0].0.get("result").cloned(), Some(Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_none_predicate_true() {
+        let mut g = MemoryGraph::new();
+        let rs = exec(
+            "RETURN NONE(x IN [1, 3, 5] WHERE x % 2 = 0) AS result",
+            &mut g,
+        );
+        assert_eq!(rs.rows[0].0.get("result").cloned(), Some(Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_none_predicate_false() {
+        let mut g = MemoryGraph::new();
+        let rs = exec(
+            "RETURN NONE(x IN [1, 2, 5] WHERE x % 2 = 0) AS result",
+            &mut g,
+        );
+        assert_eq!(rs.rows[0].0.get("result").cloned(), Some(Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_single_predicate_true() {
+        let mut g = MemoryGraph::new();
+        let rs = exec(
+            "RETURN SINGLE(x IN [1, 2, 5] WHERE x % 2 = 0) AS result",
+            &mut g,
+        );
+        assert_eq!(rs.rows[0].0.get("result").cloned(), Some(Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_single_predicate_false() {
+        let mut g = MemoryGraph::new();
+        let rs = exec(
+            "RETURN SINGLE(x IN [2, 4, 5] WHERE x % 2 = 0) AS result",
+            &mut g,
+        );
+        assert_eq!(rs.rows[0].0.get("result").cloned(), Some(Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_list_predicate_with_graph() {
+        let mut g = make_graph();
+        // ANY person with age > 28
+        let rs = exec(
+            "MATCH (n:Person) WITH collect(n.age) AS ages RETURN ANY(a IN ages WHERE a > 28) AS result",
+            &mut g,
+        );
+        assert_eq!(rs.rows[0].0.get("result").cloned(), Some(Value::Bool(true)));
+    }
+
+    // ========================================================================
+    // Mixed features
+    // ========================================================================
+
+    #[test]
+    fn test_union_with_count() {
+        let mut g = make_graph();
+        let rs = exec(
+            "MATCH (n:Person) RETURN count(*) AS cnt \
+             UNION ALL \
+             MATCH (n:Company) RETURN count(*) AS cnt",
+            &mut g,
+        );
+        assert_eq!(rs.rows.len(), 2);
+        let counts: Vec<i64> = rs
+            .rows
+            .iter()
+            .map(|r| match r.0.get("cnt").unwrap() {
+                Value::Int(n) => *n,
+                _ => panic!("expected int"),
+            })
+            .collect();
+        assert!(counts.contains(&2)); // 2 persons
+        assert!(counts.contains(&1)); // 1 company
+    }
+
+    #[test]
+    fn test_named_path_no_rel_var() {
+        let mut g = make_graph();
+        // Path without rel variable should still work (rel won't be in path)
+        let rs = exec(
+            "MATCH p = (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person) RETURN p",
+            &mut g,
+        );
+        assert_eq!(rs.rows.len(), 1);
+        match rs.rows[0].0.get("p").unwrap() {
+            Value::List(path) => {
+                // Without rel variable, path contains only nodes
+                assert_eq!(path.len(), 2);
+            }
+            other => panic!("expected list path, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_projection_empty() {
+        let mut g = make_graph();
+        let rs = exec(
+            "MATCH (n:Person {name: 'Alice'}) RETURN n {} AS m",
+            &mut g,
+        );
+        assert_eq!(rs.rows.len(), 1);
+        match rs.rows[0].0.get("m").unwrap() {
+            Value::Map(m) => assert_eq!(m.len(), 0),
+            other => panic!("expected empty map, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_exists_subquery_negated() {
+        let mut g = make_graph();
+        let rs = exec(
+            "MATCH (n:Person) WHERE NOT EXISTS { MATCH (n)-[:KNOWS]->() } RETURN n.name",
+            &mut g,
+        );
+        // Bob doesn't know anyone
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(
+            rs.rows[0].0.get("n.name").cloned(),
+            Some(Value::Str("Bob".into()))
+        );
+    }
+
+    #[test]
+    fn test_count_distinct_all_same() {
+        let mut g = MemoryGraph::new();
+        for i in 0..3 {
+            g.add_node(NodeRef {
+                id: format!("n{}", i),
+                labels: vec!["X".into()],
+                props: [("val".into(), Value::Int(42))].into_iter().collect(),
+            });
+        }
+        let rs = exec("MATCH (n:X) RETURN count(DISTINCT n.val) AS cnt", &mut g);
+        assert_eq!(rs.rows[0].0.get("cnt").cloned(), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn test_list_predicate_empty_list() {
+        let mut g = MemoryGraph::new();
+        // ALL on empty list is true (vacuous truth)
+        let rs = exec("RETURN ALL(x IN [] WHERE x > 0) AS result", &mut g);
+        assert_eq!(rs.rows[0].0.get("result").cloned(), Some(Value::Bool(true)));
+        // ANY on empty list is false
+        let rs = exec("RETURN ANY(x IN [] WHERE x > 0) AS result", &mut g);
+        assert_eq!(rs.rows[0].0.get("result").cloned(), Some(Value::Bool(false)));
+        // NONE on empty list is true
+        let rs = exec("RETURN NONE(x IN [] WHERE x > 0) AS result", &mut g);
+        assert_eq!(rs.rows[0].0.get("result").cloned(), Some(Value::Bool(true)));
+    }
 }
