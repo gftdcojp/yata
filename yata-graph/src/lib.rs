@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod hints;
+
 //! JanusGraph-equivalent graph store on Arrow + LanceDB.
 //!
 //! Phase 1 (verification): single-table schemaless storage.
