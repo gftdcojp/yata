@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod csr;
+
 pub use error::*;
 pub use types::*;
 pub use ast::*;
@@ -2103,6 +2105,8 @@ pub mod graph {
         }
         fn delete_node(&mut self, id: &str);
         fn delete_rel(&mut self, id: &str);
+        /// Build adjacency index for O(degree) neighbor lookup. Default no-op.
+        fn ensure_adjacency_index(&mut self) {}
         /// Vector search: return nodes matching labels sorted by similarity (descending).
         fn vector_search(&self, _query: &[f32], _limit: usize, _labels: &[String]) -> Vec<(NodeRef, f64)> {
             vec![]
@@ -2113,10 +2117,18 @@ pub mod graph {
         }
     }
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     pub struct MemoryGraph {
         nodes: IndexMap<String, NodeRef>,
         rels: IndexMap<String, RelRef>,
+        /// CSR adjacency index — built lazily, invalidated on mutation.
+        csr: Option<crate::csr::CsrIndex>,
+    }
+
+    impl Default for MemoryGraph {
+        fn default() -> Self {
+            Self { nodes: IndexMap::new(), rels: IndexMap::new(), csr: None }
+        }
     }
 
     impl MemoryGraph {
@@ -2124,14 +2136,36 @@ pub mod graph {
             Self::default()
         }
 
+        /// Build (or rebuild) the CSR adjacency index from current edges.
+        pub fn build_csr(&mut self) {
+            let edges: Vec<(String, String, String)> = self.rels.values()
+                .map(|r| (r.src.clone(), r.dst.clone(), r.id.clone()))
+                .collect();
+            self.csr = Some(crate::csr::CsrIndex::build(&edges));
+        }
+
+        /// Ensure CSR is built. No-op if already built.
+        pub fn ensure_csr(&mut self) {
+            if self.csr.is_none() {
+                self.build_csr();
+            }
+        }
+
+        /// Invalidate CSR (call after any mutation).
+        fn invalidate_csr(&mut self) {
+            self.csr = None;
+        }
+
         /// Retain only nodes for which the predicate returns true.
         pub fn retain_nodes(&mut self, f: impl Fn(&NodeRef) -> bool) {
             self.nodes.retain(|_, n| f(n));
+            self.invalidate_csr();
         }
 
         /// Retain only rels for which the predicate returns true.
         pub fn retain_rels(&mut self, f: impl Fn(&RelRef) -> bool) {
             self.rels.retain(|_, r| f(r));
+            self.invalidate_csr();
         }
 
         pub fn from_ocel(
@@ -2211,19 +2245,35 @@ pub mod graph {
         }
 
         fn rels_from(&self, node_id: &str) -> Vec<RelRef> {
-            self.rels
-                .values()
-                .filter(|r| r.src == node_id)
-                .cloned()
-                .collect()
+            if let Some(csr) = &self.csr {
+                let rel_values: Vec<&RelRef> = self.rels.values().collect();
+                csr.out_edge_indices(node_id)
+                    .iter()
+                    .filter_map(|&idx| rel_values.get(idx).map(|r| (*r).clone()))
+                    .collect()
+            } else {
+                self.rels
+                    .values()
+                    .filter(|r| r.src == node_id)
+                    .cloned()
+                    .collect()
+            }
         }
 
         fn rels_to(&self, node_id: &str) -> Vec<RelRef> {
-            self.rels
-                .values()
-                .filter(|r| r.dst == node_id)
-                .cloned()
-                .collect()
+            if let Some(csr) = &self.csr {
+                let rel_values: Vec<&RelRef> = self.rels.values().collect();
+                csr.in_edge_indices(node_id)
+                    .iter()
+                    .filter_map(|&idx| rel_values.get(idx).map(|r| (*r).clone()))
+                    .collect()
+            } else {
+                self.rels
+                    .values()
+                    .filter(|r| r.dst == node_id)
+                    .cloned()
+                    .collect()
+            }
         }
 
         fn add_node(&mut self, node: NodeRef) {
@@ -2232,6 +2282,7 @@ pub mod graph {
 
         fn add_rel(&mut self, rel: RelRef) {
             self.rels.insert(rel.id.clone(), rel);
+            self.invalidate_csr();
         }
 
         fn set_node_prop(&mut self, id: &str, key: &str, val: Value) {
@@ -2252,10 +2303,16 @@ pub mod graph {
 
         fn delete_node(&mut self, id: &str) {
             self.nodes.shift_remove(id);
+            self.invalidate_csr();
         }
 
         fn delete_rel(&mut self, id: &str) {
             self.rels.shift_remove(id);
+            self.invalidate_csr();
+        }
+
+        fn ensure_adjacency_index(&mut self) {
+            self.ensure_csr();
         }
 
         fn vector_search(&self, query: &[f32], limit: usize, labels: &[String]) -> Vec<(NodeRef, f64)> {
@@ -2336,6 +2393,9 @@ pub mod executor {
         }
 
         pub fn execute(&self, query: &Query, graph: &mut dyn Graph) -> Result<ResultSet> {
+            // Build CSR adjacency index for O(degree) neighbor lookup during MATCH.
+            graph.ensure_adjacency_index();
+
             // Split clauses at UNION boundaries and execute each sub-query
             let mut segments: Vec<(Vec<&Clause>, bool)> = Vec::new(); // (clauses, union_all)
             let mut current_segment: Vec<&Clause> = Vec::new();

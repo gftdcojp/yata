@@ -9,6 +9,8 @@
 //! Phase 2: Lance SQL pushdown for label/property/adjacency-driven filtered loading.
 
 pub mod hints;
+pub mod pipeline;
+pub mod coordinator;
 
 use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray, Float32Array, FixedSizeListArray};
@@ -168,7 +170,8 @@ pub mod graph_arrow {
 // ---- LanceGraphStore ----------------------------------------------------
 
 pub struct LanceGraphStore {
-    conn: lancedb::Connection,
+    /// Lance DB connection. Public for filtered query access from graph_host.
+    pub conn: lancedb::Connection,
     pub schema: GraphSchema,
 }
 
@@ -467,6 +470,8 @@ impl LanceGraphStore {
         for rel in rels {
             g.add_rel(rel);
         }
+        // Pre-build CSR adjacency index for O(degree) neighbor lookup.
+        g.build_csr();
         Ok(QueryableGraph(g))
     }
 
