@@ -255,13 +255,18 @@ impl NatsLanceWriter {
         batch: RecordBatch,
     ) -> Result<(), YataError> {
         let schema = batch.schema();
-        let reader = arrow::record_batch::RecordBatchIterator::new(
-            std::iter::once(Ok::<_, arrow::error::ArrowError>(batch)),
-            schema,
-        );
+
+        // Helper closure to create a fresh RecordBatchIterator (reader is consumed on each use).
+        let make_reader = |b: RecordBatch| {
+            let s = b.schema();
+            arrow::record_batch::RecordBatchIterator::new(
+                std::iter::once(Ok::<_, arrow::error::ArrowError>(b)),
+                s,
+            )
+        };
 
         if let Some(tbl) = table_cache.get(table_name) {
-            match tbl.add(reader).execute().await {
+            match tbl.add(make_reader(batch.clone())).execute().await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     tracing::debug!(
@@ -275,7 +280,7 @@ impl NatsLanceWriter {
 
         match conn.open_table(table_name).execute().await {
             Ok(tbl) => {
-                tbl.add(reader)
+                tbl.add(make_reader(batch.clone()))
                     .execute()
                     .await
                     .map_err(|e| YataError::Storage(format!("lance add: {e}")))?;
@@ -283,7 +288,7 @@ impl NatsLanceWriter {
             }
             Err(_) => {
                 let tbl = conn
-                    .create_table(table_name, reader)
+                    .create_table(table_name, make_reader(batch))
                     .execute()
                     .await
                     .map_err(|e| YataError::Storage(format!("lance create_table: {e}")))?;

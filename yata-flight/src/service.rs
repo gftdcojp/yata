@@ -20,6 +20,7 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::catalog::YataTableCatalog;
 use crate::codec::{
     AnyPutTicket, AnyTicket, CypherMutateResult, CypherMutateTicket, CypherTicket, ScanTicket,
+    VectorSearchTicket,
 };
 
 pub struct YataFlightService {
@@ -236,6 +237,57 @@ impl YataFlightService {
             .map_err(tonic::Status::from);
 
         Ok(Box::pin(stream))
+    }
+
+    /// Execute a vector nearest-neighbor search on a Lance table.
+    async fn execute_vector_search(
+        conn: lancedb::Connection,
+        ticket: VectorSearchTicket,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>, Status>
+    {
+        let tbl = conn
+            .open_table(&ticket.table)
+            .execute()
+            .await
+            .map_err(|e| Status::not_found(format!("table: {e}")))?;
+
+        let mut q = tbl
+            .vector_search(ticket.vector)
+            .map_err(|e| Status::internal(format!("vector_search: {e}")))?
+            .column(&ticket.column)
+            .limit(ticket.limit);
+
+        if let Some(np) = ticket.nprobes {
+            q = q.nprobes(np);
+        }
+        if let Some(ref f) = ticket.filter {
+            q = q.only_if(f.as_str());
+        }
+
+        let batch_stream = q
+            .execute()
+            .await
+            .map_err(|e| Status::internal(format!("vector exec: {e}")))?;
+
+        let first_batch = batch_stream
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| Status::internal(format!("vector stream: {e}")))?;
+
+        let schema = if let Some(b) = first_batch.first() {
+            b.schema()
+        } else {
+            Arc::new(Schema::empty())
+        };
+
+        let flight_stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(futures::stream::iter(
+                first_batch.into_iter().map(|b| Ok::<_, FlightError>(b)),
+            ))
+            .map_err(tonic::Status::from);
+
+        Ok(Box::pin(flight_stream))
     }
 
     // ---- Write operations -------------------------------------------------
@@ -508,6 +560,17 @@ impl FlightService for YataFlightService {
                 );
                 let stream =
                     Self::execute_cypher_scan(ticket, self.graph_base_uri.as_deref()).await?;
+                Ok(Response::new(stream))
+            }
+            AnyTicket::VectorSearch(ticket) => {
+                tracing::debug!(
+                    table = %ticket.table,
+                    column = %ticket.column,
+                    limit = ticket.limit,
+                    "do_get vector_search"
+                );
+                let stream =
+                    Self::execute_vector_search(self.conn.clone(), ticket).await?;
                 Ok(Response::new(stream))
             }
         }

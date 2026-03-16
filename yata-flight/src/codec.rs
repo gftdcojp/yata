@@ -81,20 +81,65 @@ impl CypherTicket {
     }
 }
 
-/// Unified ticket — dispatches to Lance scan or Cypher query based on the `kind` field.
+/// Ticket for vector nearest-neighbor search via Arrow Flight do_get.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorSearchTicket {
+    /// Discriminant — must be "vector_search".
+    pub kind: String,
+    /// Lance table name.
+    pub table: String,
+    /// Column containing vectors.
+    pub column: String,
+    /// Query vector.
+    pub vector: Vec<f32>,
+    /// Maximum results to return.
+    pub limit: usize,
+    /// Optional SQL-style filter expression.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// Number of probes for IVF indices.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nprobes: Option<usize>,
+}
+
+impl VectorSearchTicket {
+    pub fn new(
+        table: impl Into<String>,
+        column: impl Into<String>,
+        vector: Vec<f32>,
+        limit: usize,
+    ) -> Self {
+        Self {
+            kind: "vector_search".into(),
+            table: table.into(),
+            column: column.into(),
+            vector,
+            limit,
+            filter: None,
+            nprobes: None,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Bytes {
+        Bytes::from(serde_json::to_vec(self).unwrap_or_default())
+    }
+}
+
+/// Unified ticket — dispatches to Lance scan, Cypher query, or vector search based on `kind`.
 pub enum AnyTicket {
     Scan(ScanTicket),
     Cypher(CypherTicket),
+    VectorSearch(VectorSearchTicket),
 }
 
 impl AnyTicket {
     /// Parse ticket bytes, routing by presence of `"kind":"cypher"`.
     pub fn from_bytes(b: &[u8]) -> Result<Self, serde_json::Error> {
         let v: serde_json::Value = serde_json::from_slice(b)?;
-        if v.get("kind").and_then(|k| k.as_str()) == Some("cypher") {
-            Ok(AnyTicket::Cypher(serde_json::from_value(v)?))
-        } else {
-            Ok(AnyTicket::Scan(serde_json::from_value(v)?))
+        match v.get("kind").and_then(|k| k.as_str()) {
+            Some("cypher") => Ok(AnyTicket::Cypher(serde_json::from_value(v)?)),
+            Some("vector_search") => Ok(AnyTicket::VectorSearch(serde_json::from_value(v)?)),
+            _ => Ok(AnyTicket::Scan(serde_json::from_value(v)?)),
         }
     }
 }

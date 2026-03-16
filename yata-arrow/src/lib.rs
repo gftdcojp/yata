@@ -198,25 +198,196 @@ impl std::fmt::Debug for LazyArrowBatchHandle {
     }
 }
 
-/// Schema registry — maps SchemaId to Arc<Schema>.
-/// In Phase 1, this is an in-process HashMap. Phase 2: external registry.
+/// Schema compatibility mode for evolution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SchemaCompatibility {
+    /// New schema can only add nullable fields (readers of old data work).
+    Backward,
+    /// New schema can only remove fields (writers of old data work).
+    Forward,
+    /// Both backward and forward compatible.
+    Full,
+    /// No compatibility check.
+    None,
+}
+
+/// Versioned schema entry.
+#[derive(Clone, Debug)]
+pub struct SchemaEntry {
+    pub schema: Arc<Schema>,
+    pub version: u32,
+}
+
+/// Schema registry — maps SchemaId to versioned schemas.
+///
+/// Supports compatibility checking on registration.
+/// Built-in schemas are pre-registered at broker startup.
 pub struct SchemaRegistry {
-    inner: std::collections::HashMap<String, Arc<Schema>>,
+    inner: std::collections::HashMap<String, SchemaEntry>,
+    compatibility: SchemaCompatibility,
 }
 
 impl SchemaRegistry {
     pub fn new() -> Self {
         Self {
             inner: std::collections::HashMap::new(),
+            compatibility: SchemaCompatibility::Backward,
         }
     }
 
-    pub fn register(&mut self, id: &str, schema: Arc<Schema>) {
-        self.inner.insert(id.to_owned(), schema);
+    pub fn with_compatibility(mut self, compat: SchemaCompatibility) -> Self {
+        self.compatibility = compat;
+        self
+    }
+
+    /// Register a schema. Returns Err if incompatible with the existing version.
+    pub fn register(&mut self, id: &str, schema: Arc<Schema>) -> std::result::Result<u32, String> {
+        if let Some(existing) = self.inner.get(id) {
+            self.check_compatibility(&existing.schema, &schema)?;
+            let new_version = existing.version + 1;
+            self.inner.insert(
+                id.to_owned(),
+                SchemaEntry {
+                    schema,
+                    version: new_version,
+                },
+            );
+            Ok(new_version)
+        } else {
+            self.inner.insert(
+                id.to_owned(),
+                SchemaEntry {
+                    schema,
+                    version: 1,
+                },
+            );
+            Ok(1)
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<&Arc<Schema>> {
-        self.inner.get(id)
+        self.inner.get(id).map(|e| &e.schema)
+    }
+
+    pub fn version(&self, id: &str) -> Option<u32> {
+        self.inner.get(id).map(|e| e.version)
+    }
+
+    pub fn ids(&self) -> Vec<&str> {
+        self.inner.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Check if a RecordBatch is compatible with a registered schema.
+    pub fn validate_batch(&self, schema_id: &str, batch: &RecordBatch) -> std::result::Result<(), String> {
+        let registered = self
+            .get(schema_id)
+            .ok_or_else(|| format!("schema not registered: {schema_id}"))?;
+
+        for field in registered.fields() {
+            if batch.schema().field_with_name(field.name()).is_err() && !field.is_nullable() {
+                return Err(format!(
+                    "batch missing required field: {}",
+                    field.name()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_compatibility(
+        &self,
+        old: &Schema,
+        new: &Schema,
+    ) -> std::result::Result<(), String> {
+        match self.compatibility {
+            SchemaCompatibility::None => Ok(()),
+            SchemaCompatibility::Backward => {
+                // New schema can add nullable fields, cannot remove or change existing.
+                for old_field in old.fields() {
+                    match new.field_with_name(old_field.name()) {
+                        Ok(new_field) => {
+                            if new_field.data_type() != old_field.data_type() {
+                                return Err(format!(
+                                    "backward incompatible: field '{}' type changed from {:?} to {:?}",
+                                    old_field.name(),
+                                    old_field.data_type(),
+                                    new_field.data_type()
+                                ));
+                            }
+                        }
+                        Err(_) => {
+                            return Err(format!(
+                                "backward incompatible: field '{}' removed",
+                                old_field.name()
+                            ));
+                        }
+                    }
+                }
+                // New fields must be nullable
+                for new_field in new.fields() {
+                    if old.field_with_name(new_field.name()).is_err() && !new_field.is_nullable() {
+                        return Err(format!(
+                            "backward incompatible: new field '{}' must be nullable",
+                            new_field.name()
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            SchemaCompatibility::Forward => {
+                // New schema can remove fields, cannot add required.
+                for new_field in new.fields() {
+                    if let Ok(old_field) = old.field_with_name(new_field.name()) {
+                        if new_field.data_type() != old_field.data_type() {
+                            return Err(format!(
+                                "forward incompatible: field '{}' type changed",
+                                old_field.name()
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            SchemaCompatibility::Full => {
+                // Both backward + forward: no removals, new fields must be nullable, no type changes.
+                self.check_compatibility_inner(old, new, "full")
+            }
+        }
+    }
+
+    fn check_compatibility_inner(
+        &self,
+        old: &Schema,
+        new: &Schema,
+        label: &str,
+    ) -> std::result::Result<(), String> {
+        for old_field in old.fields() {
+            match new.field_with_name(old_field.name()) {
+                Ok(new_field) => {
+                    if new_field.data_type() != old_field.data_type() {
+                        return Err(format!(
+                            "{label} incompatible: field '{}' type changed",
+                            old_field.name()
+                        ));
+                    }
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "{label} incompatible: field '{}' removed",
+                        old_field.name()
+                    ));
+                }
+            }
+        }
+        for new_field in new.fields() {
+            if old.field_with_name(new_field.name()).is_err() && !new_field.is_nullable() {
+                return Err(format!(
+                    "{label} incompatible: new field '{}' must be nullable",
+                    new_field.name()
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
