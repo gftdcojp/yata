@@ -314,17 +314,33 @@ async fn run_fullcycle_bench(uri: &str, queries: &[&str], iters: usize, tier: &s
     for &q in queries {
         // warmup: 3 iterations
         for _ in 0..3 {
-            let mut g = load_lance_to_memory(uri).await.unwrap();
-            let parsed = parse(q).unwrap();
-            let _ = Executor::new().execute(&parsed, &mut g);
+            match load_lance_to_memory(uri).await {
+                Ok(mut g) => {
+                    let parsed = parse(q).unwrap();
+                    let _ = Executor::new().execute(&parsed, &mut g);
+                }
+                Err(e) => {
+                    println!("  [{tier}] warmup load failed: {e}");
+                    means.push(0.0);
+                    continue;
+                }
+            }
         }
         let mut lat = Latencies::new();
+        let mut errors = 0usize;
         for _ in 0..iters {
             let t = Instant::now();
-            let mut g = load_lance_to_memory(uri).await.unwrap();
-            let parsed = parse(q).unwrap();
-            let _ = Executor::new().execute(&parsed, &mut g);
-            lat.push(t.elapsed().as_micros() as u64);
+            match load_lance_to_memory(uri).await {
+                Ok(mut g) => {
+                    let parsed = parse(q).unwrap();
+                    let _ = Executor::new().execute(&parsed, &mut g);
+                    lat.push(t.elapsed().as_micros() as u64);
+                }
+                Err(_) => { errors += 1; }
+            }
+        }
+        if errors > 0 {
+            println!("  [{tier}] {q}: {errors}/{iters} load errors");
         }
         let mean = lat.report(tier, q);
         means.push(mean);
