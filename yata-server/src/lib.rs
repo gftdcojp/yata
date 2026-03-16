@@ -39,13 +39,20 @@ pub struct RaftConfig {
     /// Peer nodes for Raft cluster. Empty = single-node.
     #[serde(default)]
     pub peers: Vec<RaftPeer>,
+    /// TCP bind address for Raft RPC listener (e.g., "0.0.0.0:4222").
+    /// Only used when peers is non-empty.
+    #[serde(default = "default_raft_bind")]
+    pub bind_addr: String,
 }
+
+fn default_raft_bind() -> String { "0.0.0.0:4222".to_string() }
 
 impl Default for RaftConfig {
     fn default() -> Self {
         Self {
             node_id: 1,
             peers: Vec::new(),
+            bind_addr: default_raft_bind(),
         }
     }
 }
@@ -191,14 +198,22 @@ impl Broker {
             })
             .collect();
 
-        // NoopApplier for now — Broker methods handle storage directly.
-        // Raft consensus gates write operations: only leader can write.
+        // Raft consensus: TCP transport when peers configured, NoopTransport for single-node.
         let applier = Arc::new(NoopApplier);
-        let raft = Arc::new(yata_raft::RaftNode::new(
-            config.raft.node_id,
-            peers,
-            applier,
-        ));
+        let raft = if peers.is_empty() {
+            Arc::new(yata_raft::RaftNode::new(
+                config.raft.node_id,
+                peers,
+                applier,
+            ))
+        } else {
+            Arc::new(yata_raft::RaftNode::with_transport(
+                config.raft.node_id,
+                peers,
+                applier,
+                Arc::new(yata_raft::TcpRaftTransport::new()),
+            ))
+        };
 
         Ok(Self {
             config,
@@ -228,6 +243,17 @@ impl Broker {
             is_leader = self.raft.is_leader(),
             "raft node started"
         );
+
+        // Start TCP listener for Raft RPC (multi-node only)
+        if !self.config.raft.peers.is_empty() {
+            let raft_node = self.raft.clone();
+            let bind_addr = self.config.raft.bind_addr.clone();
+            tokio::spawn(async move {
+                if let Err(e) = yata_raft::TcpRaftListener::run(&bind_addr, raft_node).await {
+                    tracing::error!("raft TCP listener stopped: {e}");
+                }
+            });
+        }
 
         // Lance flush loop
         {
@@ -397,6 +423,35 @@ impl Broker {
         self.log.append(req).await
     }
 
+    /// Record an object manifest event in the append-only log.
+    /// This makes object puts Raft-replicable (CAS chunks are B2 write-through,
+    /// manifest log enables replay on followers).
+    pub async fn log_object_manifest(
+        &self,
+        manifest: &yata_core::ObjectManifest,
+    ) -> Result<Ack> {
+        let mut cbor_buf = Vec::new();
+        ciborium::into_writer(manifest, &mut cbor_buf)
+            .map_err(|e| yata_core::YataError::Serialization(e.to_string()))?;
+        let payload = PayloadRef::InlineBytes(bytes::Bytes::from(cbor_buf));
+        let content_hash = payload.content_hash();
+        let stream_id = StreamId::from("_objects.manifests");
+        let subject_id = Subject(format!("object.{}", manifest.object_id));
+        let envelope = Envelope::new(
+            subject_id.clone(),
+            SchemaId("yata.object.manifest".to_string()),
+            content_hash,
+        );
+        let req = PublishRequest {
+            stream: stream_id,
+            subject: subject_id,
+            envelope,
+            payload,
+            expected_last_seq: None,
+        };
+        self.log.append(req).await
+    }
+
     /// Flush pending OCEL projection + KV history to Lance (direct path).
     pub async fn flush_lance(&self) -> Result<SyncStats> {
         let start = std::time::Instant::now();
@@ -525,7 +580,10 @@ impl yata_client::ClientBackend for BrokerBackend {
         data: bytes::Bytes,
         meta: yata_core::ObjectMeta,
     ) -> yata_core::Result<yata_core::ObjectManifest> {
-        self.broker.objects.put_object(data, meta).await
+        let manifest = self.broker.objects.put_object(data, meta).await?;
+        // Log manifest to event bus for Raft replication
+        let _ = self.broker.log_object_manifest(&manifest).await;
+        Ok(manifest)
     }
 
     async fn get_object(

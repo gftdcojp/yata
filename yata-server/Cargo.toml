@@ -25,6 +25,7 @@ yata-graph.workspace = true
 yata-raft.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+ciborium.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

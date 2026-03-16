@@ -7846,6 +7846,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "ciborium",
  "futures",
  "metrics",
  "metrics-exporter-prometheus",
