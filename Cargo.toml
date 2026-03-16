@@ -26,6 +26,8 @@ members = [
     "yata-store",
     "yata-gie",
     "yata-coordinator",
+    "yata-bolt",
+    "yata-gateway",
 ]
 
 [workspace.package]
@@ -131,6 +133,8 @@ yata-coordinator = { path = "yata-coordinator" }
 yata-graph = { path = "yata-graph" }
 yata-nats = { path = "yata-nats" }
 yata-raft = { path = "yata-raft" }
+yata-bolt = { path = "yata-bolt" }
+yata-flight = { path = "yata-flight" }
 
 # NATS
 async-nats = "0.38"
@@ -141,3 +145,6 @@ rayon = "1.10"
 # Metrics
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
+
+# Config
+toml = "0.8"

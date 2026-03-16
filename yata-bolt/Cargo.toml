@@ -1,0 +1,20 @@
+[package]
+name = "yata-bolt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "yata_bolt"
+path = "src/lib.rs"
+
+[dependencies]
+yata-cypher.workspace = true
+yata-graph.workspace = true
+yata-lance.workspace = true
+tokio = { workspace = true }
+bytes.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
