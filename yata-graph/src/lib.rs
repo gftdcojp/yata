@@ -320,7 +320,11 @@ impl LanceGraphStore {
     /// Load all vertices from LanceDB.
     pub async fn load_vertices(&self) -> GraphResult<Vec<yata_cypher::NodeRef>> {
         let table = match self.conn.open_table("graph_vertices").execute().await {
-            Ok(t) => t,
+            Ok(t) => {
+                // Ensure we read the latest committed version (not a stale cache).
+                let _ = t.checkout_latest().await;
+                t
+            }
             Err(_) => return Ok(Vec::new()),
         };
         let stream = table
@@ -364,7 +368,10 @@ impl LanceGraphStore {
     /// Load all edges from LanceDB.
     pub async fn load_edges(&self) -> GraphResult<Vec<yata_cypher::RelRef>> {
         let table = match self.conn.open_table("graph_edges").execute().await {
-            Ok(t) => t,
+            Ok(t) => {
+                let _ = t.checkout_latest().await;
+                t
+            }
             Err(_) => return Ok(Vec::new()),
         };
         let stream = table
