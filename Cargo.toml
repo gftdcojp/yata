@@ -22,6 +22,8 @@ members = [
     "yata-graph",
     "yata-nats",
     "yata-raft",
+    "yata-grin",
+    "yata-store",
 ]
 
 [workspace.package]
@@ -119,6 +121,8 @@ yata-at = { path = "yata-at" }
 yata-signal = { path = "yata-signal" }
 yata-bench = { path = "yata-bench" }
 yata-cypher = { path = "yata-cypher" }
+yata-grin = { path = "yata-grin" }
+yata-store = { path = "yata-store" }
 
 yata-graph = { path = "yata-graph" }
 yata-nats = { path = "yata-nats" }
