@@ -426,9 +426,33 @@ impl LanceGraphStore {
 
     /// Load all vertices + edges into a QueryableGraph for Cypher queries.
     pub async fn to_memory_graph(&self) -> GraphResult<QueryableGraph> {
+        self.to_memory_graph_bounded(0, 0).await
+    }
+
+    /// Load vertices + edges with optional size guards.
+    /// `max_nodes=0` / `max_edges=0` means unlimited.
+    /// Returns error if the graph exceeds the bounds (prevents OOM).
+    pub async fn to_memory_graph_bounded(
+        &self,
+        max_nodes: usize,
+        max_edges: usize,
+    ) -> GraphResult<QueryableGraph> {
         use yata_cypher::Graph;
         let nodes = self.load_vertices().await?;
+        if max_nodes > 0 && nodes.len() > max_nodes {
+            return Err(GraphError::Storage(format!(
+                "graph too large: {} vertices exceeds limit {} — use KV for bulk data, graph for relationships only",
+                nodes.len(), max_nodes,
+            )));
+        }
         let rels = self.load_edges().await?;
+        if max_edges > 0 && rels.len() > max_edges {
+            return Err(GraphError::Storage(format!(
+                "graph too large: {} edges exceeds limit {} — use KV for bulk data, graph for relationships only",
+                rels.len(), max_edges,
+            )));
+        }
+        tracing::debug!(nodes = nodes.len(), edges = rels.len(), "graph: loaded into memory");
         let mut g = yata_cypher::MemoryGraph::new();
         for node in nodes {
             g.add_node(node);
