@@ -170,6 +170,7 @@ impl KvStore for NatsKvStore {
             value: req.value.to_vec(),
             ts_ns,
             op: KvOp::Put,
+            ttl_expires_at_ns: None,
         };
         self.publish_arrow_kv(&entry).await?;
 
@@ -198,6 +199,7 @@ impl KvStore for NatsKvStore {
                     value: entry.value.to_vec(),
                     ts_ns: time_to_nanos(entry.created),
                     op: KvOp::Put,
+                    ttl_expires_at_ns: None,
                 }))
             }
             Ok(None) => Ok(None),
@@ -228,6 +230,7 @@ impl KvStore for NatsKvStore {
             value: vec![],
             ts_ns,
             op: KvOp::Delete,
+            ttl_expires_at_ns: None,
         };
         self.publish_arrow_kv(&entry).await?;
 
@@ -279,6 +282,7 @@ impl KvStore for NatsKvStore {
                         value: entry.value.to_vec(),
                         ts_ns: time_to_nanos(entry.created),
                         op,
+                        ttl_expires_at_ns: None,
                     },
                     is_delete,
                 })
@@ -312,6 +316,7 @@ impl KvStore for NatsKvStore {
                 value: entry.value.to_vec(),
                 ts_ns: time_to_nanos(entry.created),
                 op,
+                ttl_expires_at_ns: None,
             });
         }
 

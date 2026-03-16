@@ -20,7 +20,7 @@ use bytes::Bytes;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use yata_core::{
-    Blake3Hash, ChunkRef, ObjectId, ObjectManifest, ObjectMeta, ObjectStorage, Result, SchemaId,
+    Blake3Hash, ChunkRef, ObjectId, ObjectManifest, ObjectMeta, ObjectStorage, Result,
     YataError,
 };
 

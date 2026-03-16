@@ -519,6 +519,45 @@ pub mod traits {
     }
 }
 
+// ---- consumer -----------------------------------------------------------
+
+pub mod consumer {
+    /// Configuration for creating a consumer group subscription.
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    pub struct ConsumerConfig {
+        /// Durable consumer group name.
+        pub group_name: String,
+        /// NATS subject filter (e.g., "yata.arrow.>").
+        pub filter_subject: String,
+        /// Max batch size per pull.
+        pub max_batch: usize,
+        /// Ack wait timeout (seconds) before message redelivery.
+        pub ack_wait_secs: u64,
+    }
+
+    impl Default for ConsumerConfig {
+        fn default() -> Self {
+            Self {
+                group_name: String::new(),
+                filter_subject: "yata.arrow.>".into(),
+                max_batch: 100,
+                ack_wait_secs: 30,
+            }
+        }
+    }
+
+    /// Info about an existing consumer group.
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    pub struct ConsumerInfo {
+        pub group_name: String,
+        pub filter_subject: String,
+        pub num_pending: u64,
+        pub num_ack_pending: u64,
+    }
+}
+
+pub use self::consumer::*;
+
 // ---- error --------------------------------------------------------------
 
 pub mod error {

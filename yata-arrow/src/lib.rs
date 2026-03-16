@@ -20,7 +20,7 @@ use bytes::Bytes;
 use std::sync::Arc;
 use once_cell::sync::OnceCell;
 use std::io::Cursor;
-use yata_core::{Blake3Hash, ObjectMeta, PayloadRef, YataError};
+use yata_core::{Blake3Hash, PayloadRef, YataError};
 
 pub type Result<T> = std::result::Result<T, ArrowError>;
 

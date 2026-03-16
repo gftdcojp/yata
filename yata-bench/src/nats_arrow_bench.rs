@@ -97,6 +97,7 @@ fn make_kv_entries(n: usize) -> Vec<KvEntry> {
             value: b"hello world".to_vec(),
             ts_ns: 1710000000_000_000_000i64,
             op: KvOp::Put,
+            ttl_expires_at_ns: None,
         })
         .collect()
 }

@@ -2,6 +2,7 @@
 
 pub use schema::*;
 pub use sink::*;
+pub use vector::*;
 
 // ---- schema -------------------------------------------------------------
 
@@ -110,7 +111,7 @@ pub mod sink {
     use super::schema::*;
     use arrow::record_batch::{RecordBatch, RecordBatchIterator};
     use arrow_array::{
-        Array, BinaryArray, Int64Array, LargeBinaryArray, StringArray, TimestampMicrosecondArray,
+        Array, Int64Array, LargeBinaryArray, StringArray, TimestampMicrosecondArray,
         UInt32Array, UInt64Array,
     };
     use arrow_schema::Schema;
@@ -446,5 +447,109 @@ pub mod sink {
             ],
         )
         .map_err(|e| YataError::Arrow(e.to_string()))
+    }
+}
+
+// ---- vector -----------------------------------------------------------------
+
+pub mod vector {
+    use arrow::record_batch::RecordBatch;
+    use lancedb::query::{ExecutableQuery, QueryBase};
+    use futures::TryStreamExt;
+    use yata_core::{Result, YataError};
+
+    /// Vector index types supported by LanceDB.
+    #[derive(Clone, Debug)]
+    pub enum VectorIndexType {
+        IvfPq {
+            num_partitions: u32,
+            num_sub_vectors: u32,
+        },
+        IvfHnswSq,
+    }
+
+    impl super::sink::LocalLanceSink {
+        /// Execute nearest-neighbor vector search on a table column.
+        pub async fn vector_search(
+            &self,
+            table: &str,
+            column: &str,
+            query_vector: Vec<f32>,
+            limit: usize,
+            filter: Option<&str>,
+            nprobes: Option<usize>,
+        ) -> Result<Vec<RecordBatch>> {
+            let tbl = self
+                .connection()
+                .open_table(table)
+                .execute()
+                .await
+                .map_err(|e| YataError::Storage(format!("open table: {e}")))?;
+
+            let mut q = tbl
+                .vector_search(query_vector)
+                .map_err(|e| YataError::Storage(format!("vector_search: {e}")))?
+                .column(column)
+                .limit(limit);
+
+            if let Some(np) = nprobes {
+                q = q.nprobes(np);
+            }
+
+            if let Some(f) = filter {
+                q = q.only_if(f);
+            }
+
+            let batches: Vec<RecordBatch> = q
+                .execute()
+                .await
+                .map_err(|e| YataError::Storage(format!("vector search execute: {e}")))?
+                .try_collect()
+                .await
+                .map_err(|e| YataError::Arrow(format!("vector search stream: {e}")))?;
+
+            Ok(batches)
+        }
+
+        /// Create a vector index on a table column.
+        pub async fn create_vector_index(
+            &self,
+            table: &str,
+            column: &str,
+            index_type: VectorIndexType,
+        ) -> Result<()> {
+            let tbl = self
+                .connection()
+                .open_table(table)
+                .execute()
+                .await
+                .map_err(|e| YataError::Storage(format!("open table: {e}")))?;
+
+            match index_type {
+                VectorIndexType::IvfPq {
+                    num_partitions,
+                    num_sub_vectors,
+                } => {
+                    tbl.create_index(&[column], lancedb::index::Index::IvfPq(
+                        lancedb::index::vector::IvfPqIndexBuilder::default()
+                            .num_partitions(num_partitions)
+                            .num_sub_vectors(num_sub_vectors),
+                    ))
+                    .execute()
+                    .await
+                    .map_err(|e| YataError::Storage(format!("create ivf_pq index: {e}")))?;
+                }
+                VectorIndexType::IvfHnswSq => {
+                    tbl.create_index(&[column], lancedb::index::Index::IvfHnswSq(
+                        lancedb::index::vector::IvfHnswSqIndexBuilder::default(),
+                    ))
+                    .execute()
+                    .await
+                    .map_err(|e| YataError::Storage(format!("create ivf_hnsw_sq index: {e}")))?;
+                }
+            }
+
+            Ok(())
+        }
     }
 }

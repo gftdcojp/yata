@@ -3,7 +3,29 @@
 pub use local_log::LocalLog;
 pub use payload_store::PayloadStore;
 
-// ---- segment ------------------------------------------------------------
+// ---- config -----------------------------------------------------------------
+
+pub mod config {
+    /// Configuration for log segment rotation and compaction.
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    pub struct LogConfig {
+        /// Max bytes per segment file before rotation (default: 64 MB).
+        pub max_segment_bytes: u64,
+        /// Number of segments to retain per stream (default: 8).
+        pub retention_count: usize,
+    }
+
+    impl Default for LogConfig {
+        fn default() -> Self {
+            Self {
+                max_segment_bytes: 64 * 1024 * 1024,
+                retention_count: 8,
+            }
+        }
+    }
+}
+
+// ---- segment ----------------------------------------------------------------
 
 pub mod segment {
     use std::path::{Path, PathBuf};
@@ -24,7 +46,6 @@ pub mod segment {
             start_seq: Sequence,
         ) -> tokio::io::Result<Self> {
             let stream_dir = base_dir.join(sanitize_stream_id(&stream.0));
-            // Directory created by caller before write; here we just record the path
             let path = stream_dir.join(format!("{:020}.log", start_seq.0));
             Ok(Self {
                 path,
@@ -62,9 +83,10 @@ pub mod segment {
     }
 }
 
-// ---- local_log ----------------------------------------------------------
+// ---- local_log --------------------------------------------------------------
 
 pub mod local_log {
+    use super::config::LogConfig;
     use super::segment::{sanitize_stream_id, Segment};
     use async_trait::async_trait;
     use std::collections::HashMap;
@@ -82,20 +104,28 @@ pub mod local_log {
         last_seq: u64,
         writer: tokio::fs::File,
         writer_path: PathBuf,
+        /// Bytes written to current segment file.
+        segment_bytes: u64,
     }
 
     pub struct LocalLog {
         base_dir: PathBuf,
         streams: Mutex<HashMap<String, StreamState>>,
+        config: LogConfig,
     }
 
     impl LocalLog {
         pub async fn new(base_dir: impl Into<PathBuf>) -> Result<Self> {
+            Self::with_config(base_dir, LogConfig::default()).await
+        }
+
+        pub async fn with_config(base_dir: impl Into<PathBuf>, config: LogConfig) -> Result<Self> {
             let base_dir = base_dir.into();
             tokio::fs::create_dir_all(&base_dir).await?;
             Ok(Self {
                 base_dir,
                 streams: Mutex::new(HashMap::new()),
+                config,
             })
         }
 
@@ -116,7 +146,6 @@ pub mod local_log {
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .to_owned();
-                // find latest segment
                 let mut seg_files: Vec<PathBuf> = Vec::new();
                 let mut sd = match tokio::fs::read_dir(&stream_dir).await {
                     Ok(d) => d,
@@ -131,6 +160,10 @@ pub mod local_log {
                 seg_files.sort();
                 if let Some(latest) = seg_files.last() {
                     let last_seq = scan_last_seq(latest).await.unwrap_or(0);
+                    let seg_bytes = tokio::fs::metadata(latest)
+                        .await
+                        .map(|m| m.len())
+                        .unwrap_or(0);
                     let writer = tokio::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
@@ -142,11 +175,58 @@ pub mod local_log {
                             last_seq,
                             writer,
                             writer_path: latest.clone(),
+                            segment_bytes: seg_bytes,
                         },
                     );
                 }
             }
             Ok(())
+        }
+
+        /// Compact old segments: retain only the latest `retention_count` per stream.
+        /// Returns the number of segment files removed.
+        pub async fn compact(&self) -> Result<usize> {
+            let mut removed = 0usize;
+            let mut read_dir = match tokio::fs::read_dir(&self.base_dir).await {
+                Ok(rd) => rd,
+                Err(_) => return Ok(0),
+            };
+
+            while let Ok(Some(entry)) = read_dir.next_entry().await {
+                let stream_dir = entry.path();
+                if !stream_dir.is_dir() {
+                    continue;
+                }
+
+                let mut seg_files: Vec<PathBuf> = Vec::new();
+                let mut sd = match tokio::fs::read_dir(&stream_dir).await {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                while let Ok(Some(f)) = sd.next_entry().await {
+                    let p = f.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("log") {
+                        seg_files.push(p);
+                    }
+                }
+                seg_files.sort();
+
+                if seg_files.len() > self.config.retention_count {
+                    let to_remove = seg_files.len() - self.config.retention_count;
+                    for path in &seg_files[..to_remove] {
+                        if let Err(e) = tokio::fs::remove_file(path).await {
+                            tracing::warn!("compact: failed to remove {:?}: {}", path, e);
+                        } else {
+                            removed += 1;
+                        }
+                    }
+                }
+            }
+
+            if removed > 0 {
+                tracing::info!(removed, "log compaction: removed old segments");
+            }
+            Ok(removed)
         }
 
         async fn ensure_stream<'a>(
@@ -170,10 +250,39 @@ pub mod local_log {
                         last_seq: 0,
                         writer,
                         writer_path: seg.path,
+                        segment_bytes: 0,
                     },
                 );
             }
             Ok(streams.get_mut(&key).unwrap())
+        }
+
+        /// Rotate the current segment: close writer, create new segment file.
+        async fn rotate_segment(
+            state: &mut StreamState,
+            base_dir: &Path,
+            stream: &StreamId,
+        ) -> Result<()> {
+            state.writer.flush().await?;
+            let next_start = Sequence(state.last_seq + 1);
+            let seg = Segment::create(base_dir, stream, next_start)?;
+            if let Some(parent) = seg.path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let writer = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&seg.path)
+                .await?;
+            state.writer = writer;
+            state.writer_path = seg.path;
+            state.segment_bytes = 0;
+            tracing::debug!(
+                stream = %stream,
+                seq = next_start.0,
+                "segment rotated"
+            );
+            Ok(())
         }
     }
 
@@ -194,6 +303,11 @@ pub mod local_log {
                 }
             }
 
+            // Check if rotation needed before write
+            if state.segment_bytes >= self.config.max_segment_bytes {
+                Self::rotate_segment(state, &self.base_dir, &req.stream).await?;
+            }
+
             let next_seq = state.last_seq + 1;
             let ts_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
@@ -211,8 +325,9 @@ pub mod local_log {
                 headers: req.envelope.headers.clone(),
             };
 
-            write_entry(&mut state.writer, &entry).await?;
+            let bytes_written = write_entry(&mut state.writer, &entry).await?;
             state.last_seq = next_seq;
+            state.segment_bytes += bytes_written as u64;
 
             Ok(Ack {
                 message_id: req.envelope.message_id.clone(),
@@ -230,7 +345,6 @@ pub mod local_log {
             let key = sanitize_stream_id(&stream.0);
             let stream_dir = self.base_dir.join(&key);
 
-            // Collect segment files
             let mut seg_files: Vec<PathBuf> = Vec::new();
             if let Ok(mut rd) = tokio::fs::read_dir(&stream_dir).await {
                 while let Ok(Some(entry)) = rd.next_entry().await {
@@ -280,7 +394,8 @@ pub mod local_log {
     }
 
     /// Write a LogEntry as [4-byte len LE][CBOR bytes][4-byte crc32].
-    async fn write_entry(file: &mut tokio::fs::File, entry: &LogEntry) -> Result<()> {
+    /// Returns total bytes written (len header + cbor + crc).
+    async fn write_entry(file: &mut tokio::fs::File, entry: &LogEntry) -> Result<usize> {
         let mut cbor_buf = Vec::new();
         ciborium::into_writer(entry, &mut cbor_buf)
             .map_err(|e| YataError::Serialization(e.to_string()))?;
@@ -290,7 +405,7 @@ pub mod local_log {
         file.write_all(&cbor_buf).await?;
         file.write_all(&crc.to_le_bytes()).await?;
         file.flush().await?;
-        Ok(())
+        Ok(4 + cbor_buf.len() + 4)
     }
 
     fn serialize_envelope(env: &Envelope) -> Result<Vec<u8>> {
@@ -369,7 +484,7 @@ pub mod local_log {
     }
 }
 
-// ---- payload_store ------------------------------------------------------
+// ---- payload_store ----------------------------------------------------------
 
 pub mod payload_store {
     use bytes::Bytes;

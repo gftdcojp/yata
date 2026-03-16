@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 //! YATA broker/runtime — wires together log, kv, object, ocel, lance.
+
+pub mod metrics;
 //!
 //! Tiered storage is always active when `BrokerConfig.b2` is set:
 //! - ObjectStore: local CAS + async B2 sync, read-through fallback
@@ -188,6 +190,24 @@ impl Broker {
             });
         }
 
+        // Log compaction (local log only — NATS handles retention natively)
+        if let Some(ref local_log) = self.local_log {
+            let compact_ms = self.config.log_compact_interval_ms;
+            if compact_ms > 0 {
+                let log = local_log.clone();
+                tokio::spawn(async move {
+                    let mut interval =
+                        tokio::time::interval(tokio::time::Duration::from_millis(compact_ms));
+                    loop {
+                        interval.tick().await;
+                        if let Err(e) = log.compact().await {
+                            tracing::warn!("log compaction error: {}", e);
+                        }
+                    }
+                });
+            }
+        }
+
         // TTL reaper (local KV only — NATS KV handles TTL natively)
         if let Some(ref local_kv) = self.local_kv {
             let kv = local_kv.clone();
@@ -361,6 +381,8 @@ impl Broker {
     ///
     /// When NATS is not configured: write directly to Lance (original path).
     pub async fn flush_lance(&self) -> Result<SyncStats> {
+        let start = std::time::Instant::now();
+        metrics::counter!(metrics::names::LANCE_FLUSHES).increment(1);
         let snapshot = self.ocel.snapshot().await?;
 
         if let Some(ref nats) = self.nats {
@@ -431,7 +453,9 @@ impl Broker {
         }
 
         let stats = self.lance.sync_stats().await?;
-        tracing::debug!(?stats, "lance flush complete");
+        let elapsed = start.elapsed().as_secs_f64();
+        metrics::histogram!(metrics::names::LANCE_FLUSH_DURATION).record(elapsed);
+        tracing::debug!(?stats, elapsed_ms = elapsed * 1000.0, "lance flush complete");
         Ok(stats)
     }
 }
