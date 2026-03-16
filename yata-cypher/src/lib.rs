@@ -408,6 +408,12 @@ pub mod ast {
         Call {
             subquery: Vec<Clause>,
         },
+        /// CALL procedure(args) YIELD col1, col2
+        CallProcedure {
+            name: String,
+            args: Vec<Expr>,
+            yields: Vec<String>,
+        },
     }
 
     #[derive(Clone, Debug)]
@@ -457,6 +463,7 @@ pub mod lexer {
         Foreach,
         Remove,
         Call,
+        Yield,
         Exists,
         Case,
         When,
@@ -668,6 +675,7 @@ pub mod lexer {
                 "FOREACH" => Token::Foreach,
                 "REMOVE" => Token::Remove,
                 "CALL" => Token::Call,
+                "YIELD" => Token::Yield,
                 "EXISTS" => Token::Exists,
                 "CASE" => Token::Case,
                 "WHEN" => Token::When,
@@ -895,6 +903,7 @@ pub mod parser {
                 Token::Foreach => Ok("Foreach".into()),
                 Token::Remove => Ok("Remove".into()),
                 Token::Call => Ok("Call".into()),
+                Token::Yield => Ok("Yield".into()),
                 Token::Exists => Ok("Exists".into()),
                 tok => Err(CypherError::ParseError(format!(
                     "expected name, got {:?}",
@@ -1123,13 +1132,47 @@ pub mod parser {
 
         fn parse_call(&mut self) -> Result<Clause> {
             self.next()?; // consume CALL
-            self.expect(&Token::LBrace)?;
-            let mut subquery = Vec::new();
-            while !matches!(self.peek()?, Token::RBrace) {
-                subquery.push(self.parse_clause()?);
+            // Distinguish CALL { subquery } from CALL procedure(args) YIELD ...
+            if matches!(self.peek()?, Token::LBrace) {
+                self.expect(&Token::LBrace)?;
+                let mut subquery = Vec::new();
+                while !matches!(self.peek()?, Token::RBrace) {
+                    subquery.push(self.parse_clause()?);
+                }
+                self.expect(&Token::RBrace)?;
+                Ok(Clause::Call { subquery })
+            } else {
+                // CALL procedure.name(args) YIELD col1, col2
+                let mut name = self.expect_name()?;
+                // Read dotted name: db.index.vector.queryNodes
+                while matches!(self.peek()?, Token::Dot) {
+                    self.next()?; // consume dot
+                    let part = self.expect_name()?;
+                    name.push('.');
+                    name.push_str(&part);
+                }
+                self.expect(&Token::LParen)?;
+                let mut args = Vec::new();
+                if !matches!(self.peek()?, Token::RParen) {
+                    args.push(self.parse_expr()?);
+                    while matches!(self.peek()?, Token::Comma) {
+                        self.next()?;
+                        args.push(self.parse_expr()?);
+                    }
+                }
+                self.expect(&Token::RParen)?;
+                // YIELD is optional
+                let mut yields = Vec::new();
+                if matches!(self.peek()?, Token::Yield) {
+                    self.next()?; // consume YIELD
+                    yields.push(self.expect_name()?);
+                    while matches!(self.peek()?, Token::Comma) {
+                        self.next()?;
+                        yields.push(self.expect_name()?);
+                    }
+                }
+                Ok(Clause::CallProcedure { name, args, yields })
             }
-            self.expect(&Token::RBrace)?;
-            Ok(Clause::Call { subquery })
         }
 
         fn maybe_where(&mut self) -> Result<Option<Expr>> {
@@ -2060,6 +2103,14 @@ pub mod graph {
         }
         fn delete_node(&mut self, id: &str);
         fn delete_rel(&mut self, id: &str);
+        /// Vector search: return nodes matching labels sorted by similarity (descending).
+        fn vector_search(&self, _query: &[f32], _limit: usize, _labels: &[String]) -> Vec<(NodeRef, f64)> {
+            vec![]
+        }
+        /// Store embedding vector for a node.
+        fn set_node_embedding(&mut self, _id: &str, _embedding: &[f32]) {
+            // default no-op
+        }
     }
 
     #[derive(Clone, Default)]
@@ -2196,6 +2247,55 @@ pub mod graph {
         fn delete_rel(&mut self, id: &str) {
             self.rels.shift_remove(id);
         }
+
+        fn vector_search(&self, query: &[f32], limit: usize, labels: &[String]) -> Vec<(NodeRef, f64)> {
+            let mut scored: Vec<(NodeRef, f64)> = self.nodes.values()
+                .filter(|n| labels.is_empty() || labels.iter().any(|l| n.labels.contains(l)))
+                .filter_map(|n| {
+                    let embedding = extract_f32_vec(n.props.get("embedding")?)?;
+                    let score = cosine_similarity(query, &embedding);
+                    Some((n.clone(), score))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(limit);
+            scored
+        }
+
+        fn set_node_embedding(&mut self, id: &str, embedding: &[f32]) {
+            if let Some(node) = self.nodes.get_mut(id) {
+                node.props.insert(
+                    "embedding".into(),
+                    Value::List(embedding.iter().map(|v| Value::Float(*v as f64)).collect()),
+                );
+            }
+        }
+    }
+
+    pub fn extract_f32_vec(val: &Value) -> Option<Vec<f32>> {
+        if let Value::List(items) = val {
+            items.iter().map(|v| match v {
+                Value::Float(f) => Some(*f as f32),
+                Value::Int(i) => Some(*i as f32),
+                _ => None,
+            }).collect()
+        } else {
+            None
+        }
+    }
+
+    pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+        if a.len() != b.len() || a.is_empty() { return 0.0; }
+        let dot: f64 = a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
+        let norm_a: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        let norm_b: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        if norm_a == 0.0 || norm_b == 0.0 { return 0.0; }
+        dot / (norm_a * norm_b)
+    }
+
+    pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f64 {
+        if a.len() != b.len() { return f64::MAX; }
+        a.iter().zip(b).map(|(x, y)| ((*x as f64) - (*y as f64)).powi(2)).sum::<f64>().sqrt()
     }
 }
 
@@ -2325,6 +2425,9 @@ pub mod executor {
                     }
                     Clause::Call { subquery } => {
                         bindings = self.execute_call(subquery, &bindings, graph)?;
+                    }
+                    Clause::CallProcedure { name, args, yields } => {
+                        bindings = self.execute_call_procedure(name, args, yields, &bindings, graph)?;
                     }
                 }
             }
@@ -3121,6 +3224,67 @@ pub mod executor {
                 }
             }
             Ok(result)
+        }
+
+        // ---- CALL procedure(args) YIELD ... ------------------------------------
+
+        fn execute_call_procedure(
+            &self,
+            name: &str,
+            args: &[Expr],
+            yields: &[String],
+            bindings: &[Binding],
+            graph: &dyn Graph,
+        ) -> Result<Vec<Binding>> {
+            match name.to_lowercase().as_str() {
+                "db.index.vector.querynodes" => {
+                    // args: label, embeddingProp, queryVector, k
+                    if args.len() < 4 {
+                        return Err(CypherError::TypeError(
+                            "db.index.vector.queryNodes requires 4 arguments: label, embeddingProp, queryVector, k".into()
+                        ));
+                    }
+                    let mut result = Vec::new();
+                    for binding in bindings {
+                        let label = match self.eval(&args[0], binding)? {
+                            Value::Str(s) => s,
+                            _ => return Err(CypherError::TypeError("queryNodes: label must be string".into())),
+                        };
+                        // args[1] is embedding property name (unused in MemoryGraph — always "embedding")
+                        let query_vec = match self.eval(&args[2], binding)? {
+                            Value::List(items) => {
+                                let mut v = Vec::with_capacity(items.len());
+                                for item in &items {
+                                    match item {
+                                        Value::Float(f) => v.push(*f as f32),
+                                        Value::Int(i) => v.push(*i as f32),
+                                        _ => return Err(CypherError::TypeError("queryNodes: vector elements must be numeric".into())),
+                                    }
+                                }
+                                v
+                            }
+                            _ => return Err(CypherError::TypeError("queryNodes: queryVector must be a list".into())),
+                        };
+                        let k = match self.eval(&args[3], binding)? {
+                            Value::Int(n) => n as usize,
+                            _ => return Err(CypherError::TypeError("queryNodes: k must be integer".into())),
+                        };
+                        let labels = vec![label];
+                        let hits = graph.vector_search(&query_vec, k, &labels);
+                        for (node, score) in hits {
+                            let mut nb = binding.clone();
+                            // Bind YIELD columns: default "node" and "score"
+                            let node_var = yields.first().map(|s| s.as_str()).unwrap_or("node");
+                            let score_var = yields.get(1).map(|s| s.as_str()).unwrap_or("score");
+                            nb.insert(node_var.to_owned(), Value::Node(node));
+                            nb.insert(score_var.to_owned(), Value::Float(score));
+                            result.push(nb);
+                        }
+                    }
+                    Ok(result)
+                }
+                other => Err(CypherError::GraphError(format!("unknown procedure: {}", other))),
+            }
         }
 
         // ---- UNWIND ---------------------------------------------------------
@@ -4620,6 +4784,58 @@ pub mod executor {
                 "shortestpath" | "allshortestpaths" => {
                     // These require graph access. Return null when called outside graph context.
                     Ok(Value::Null)
+                }
+                // Vector distance functions
+                "cosine_distance" | "gds.similarity.cosine" => {
+                    let a = self.eval_arg(args, 0, binding)?;
+                    let b = self.eval_arg(args, 1, binding)?;
+                    match (&a, &b) {
+                        (Value::List(_), Value::List(_)) => {
+                            if let (Some(va), Some(vb)) = (
+                                crate::graph::extract_f32_vec(&a),
+                                crate::graph::extract_f32_vec(&b),
+                            ) {
+                                Ok(Value::Float(1.0 - crate::graph::cosine_similarity(&va, &vb)))
+                            } else {
+                                Ok(Value::Null)
+                            }
+                        }
+                        _ => Ok(Value::Null),
+                    }
+                }
+                "cosine_similarity" => {
+                    let a = self.eval_arg(args, 0, binding)?;
+                    let b = self.eval_arg(args, 1, binding)?;
+                    match (&a, &b) {
+                        (Value::List(_), Value::List(_)) => {
+                            if let (Some(va), Some(vb)) = (
+                                crate::graph::extract_f32_vec(&a),
+                                crate::graph::extract_f32_vec(&b),
+                            ) {
+                                Ok(Value::Float(crate::graph::cosine_similarity(&va, &vb)))
+                            } else {
+                                Ok(Value::Null)
+                            }
+                        }
+                        _ => Ok(Value::Null),
+                    }
+                }
+                "euclidean_distance" | "gds.similarity.euclidean" | "l2_distance" => {
+                    let a = self.eval_arg(args, 0, binding)?;
+                    let b = self.eval_arg(args, 1, binding)?;
+                    match (&a, &b) {
+                        (Value::List(_), Value::List(_)) => {
+                            if let (Some(va), Some(vb)) = (
+                                crate::graph::extract_f32_vec(&a),
+                                crate::graph::extract_f32_vec(&b),
+                            ) {
+                                Ok(Value::Float(crate::graph::euclidean_distance(&va, &vb)))
+                            } else {
+                                Ok(Value::Null)
+                            }
+                        }
+                        _ => Ok(Value::Null),
+                    }
                 }
                 // count_distinct is handled in aggregation; if used in non-agg context, count unique
                 "count_distinct" => {
