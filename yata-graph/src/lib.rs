@@ -319,14 +319,17 @@ impl LanceGraphStore {
 
     /// Load all vertices from LanceDB.
     pub async fn load_vertices(&self) -> GraphResult<Vec<yata_cypher::NodeRef>> {
-        // Force connection to refresh its table list cache before opening.
-        let _ = self.conn.table_names().execute().await;
+        let tables = self.conn.table_names().execute().await.unwrap_or_default();
         let table = match self.conn.open_table("graph_vertices").execute().await {
             Ok(t) => {
                 let _ = t.checkout_latest().await;
+                tracing::debug!(table_count = tables.len(), "load_vertices: opened graph_vertices");
                 t
             }
-            Err(_) => return Ok(Vec::new()),
+            Err(e) => {
+                tracing::debug!(err = %e, tables = ?tables, "load_vertices: graph_vertices not found");
+                return Ok(Vec::new());
+            }
         };
         let stream = table
             .query()
@@ -800,6 +803,7 @@ impl LanceGraphStore {
         schema: Arc<Schema>,
         batch: RecordBatch,
     ) -> GraphResult<()> {
+        let num_rows = batch.num_rows();
         let reader = RecordBatchIterator::new(
             std::iter::once(Ok::<_, arrow::error::ArrowError>(batch)),
             schema,
@@ -811,6 +815,8 @@ impl LanceGraphStore {
                     .execute()
                     .await
                     .map_err(|e| GraphError::Storage(e.to_string()))?;
+                let count = table.count_rows(None).await.unwrap_or(0);
+                tracing::debug!(table = table_name, appended = num_rows, total = count, "lance: appended to existing table");
             }
             Err(_) => {
                 self.conn
@@ -818,8 +824,12 @@ impl LanceGraphStore {
                     .execute()
                     .await
                     .map_err(|e| GraphError::Storage(e.to_string()))?;
+                tracing::debug!(table = table_name, rows = num_rows, "lance: created new table");
             }
         }
+        // Verify table list after write
+        let tables = self.conn.table_names().execute().await.unwrap_or_default();
+        tracing::debug!(tables = ?tables, "lance: table list after write");
         Ok(())
     }
 
