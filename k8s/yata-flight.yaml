@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: yata-flight
+  namespace: spinkube
+  labels:
+    app: yata-flight
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: yata-flight
+  template:
+    metadata:
+      labels:
+        app: yata-flight
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      containers:
+        - name: yata-flight
+          image: ghcr.io/gftdcojp/yata-flight:20260316-043910
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 32010
+              name: grpc
+          env:
+            - name: RUST_LOG
+              value: "info,yata_flight=debug"
+            - name: YATA_LANCE_URI
+              value: "/data/lance"
+            - name: YATA_GRAPH_URI
+              value: "/data/graph"
+            - name: YATA_FLIGHT_ADDR
+              value: "0.0.0.0:32010"
+          volumeMounts:
+            - name: yata-data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          readinessProbe:
+            tcpSocket:
+              port: 32010
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 32010
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      volumes:
+        - name: yata-data
+          persistentVolumeClaim:
+            claimName: yata-flight-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: yata-flight-pvc
+  namespace: spinkube
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: linode-block-storage-retain
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: yata-flight
+  namespace: spinkube
+spec:
+  selector:
+    app: yata-flight
+  ports:
+    - port: 32010
+      targetPort: 32010
+      name: grpc
+  type: ClusterIP
