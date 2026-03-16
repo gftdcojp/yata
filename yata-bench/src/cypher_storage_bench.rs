@@ -307,6 +307,31 @@ fn run_bench(g: &mut dyn Graph, queries: &[&str], iters: usize, tier: &str) -> V
     means
 }
 
+// ── full-cycle benchmark: Lance cold-load + query per iteration ──────────────
+
+async fn run_fullcycle_bench(uri: &str, queries: &[&str], iters: usize, tier: &str) -> Vec<f64> {
+    let mut means = Vec::new();
+    for &q in queries {
+        // warmup: 3 iterations
+        for _ in 0..3 {
+            let mut g = load_lance_to_memory(uri).await.unwrap();
+            let parsed = parse(q).unwrap();
+            let _ = Executor::new().execute(&parsed, &mut g);
+        }
+        let mut lat = Latencies::new();
+        for _ in 0..iters {
+            let t = Instant::now();
+            let mut g = load_lance_to_memory(uri).await.unwrap();
+            let parsed = parse(q).unwrap();
+            let _ = Executor::new().execute(&parsed, &mut g);
+            lat.push(t.elapsed().as_micros() as u64);
+        }
+        let mean = lat.report(tier, q);
+        means.push(mean);
+    }
+    means
+}
+
 // ── Neo4j reference ───────────────────────────────────────────────────────────
 
 async fn bench_neo4j(uri: &str, user: &str, pass: &str, ds: &Dataset, queries: &[&str], iters: usize) -> Option<Vec<f64>> {
@@ -510,13 +535,26 @@ async fn main() -> Result<()> {
     };
     let r_tiered = run_bench(&mut tiered_g, queries, iters, "Tier-T (tiered-50%)");
 
-    // Neo4j reference
-    println!("\n  [loading Neo4j data...]");
-    let r_neo4j = bench_neo4j(&neo4j_uri, &neo4j_user, &neo4j_pass, &ds, queries, iters).await;
+    // Neo4j reference (skip if SKIP_NEO4J=1 or not available)
+    let skip_neo4j = std::env::var("SKIP_NEO4J").unwrap_or_default() == "1";
+    let r_neo4j = if skip_neo4j {
+        println!("\n  [Neo4j skipped (SKIP_NEO4J=1)]");
+        None
+    } else {
+        println!("\n  [loading Neo4j data...]");
+        // Use tokio timeout to avoid hanging on unreachable Neo4j
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bench_neo4j(&neo4j_uri, &neo4j_user, &neo4j_pass, &ds, queries, iters),
+        ).await {
+            Ok(r) => r,
+            Err(_) => { println!("  [Neo4j connection timeout — skipped]"); None }
+        }
+    };
 
-    // ── Summary table ─────────────────────────────────────────────────────────
+    // ── Summary table (warm query after initial load) ─────────────────────────
     println!("\n═══════════════════════════════════════════════════════════════════════════════");
-    println!("  SUMMARY — mean latency µs (overhead vs Tier-M)");
+    println!("  SUMMARY — warm query mean latency µs (overhead vs Tier-M)");
     println!("═══════════════════════════════════════════════════════════════════════════════");
     println!("  {:<44}  {:>10}  {:>14}  {:>13}  {:>14}  {:>14}",
         "query", "Tier-M(mem)", "Tier-D(disk)", "Tier-S(S3)", "Tier-T(50%hot)", "Neo4j-Bolt");
@@ -556,6 +594,39 @@ async fn main() -> Result<()> {
     println!();
     println!("  TieredGraph cache stats: hits={hits} misses={misses} hit_rate={:.1}%%",
         100.0 * hits as f64 / (hits + misses).max(1) as f64);
+
+    // ── Full-cycle benchmark: Lance load + query per iteration ────────────────
+    let fc_iters = 30; // fewer iterations since each includes a full load
+    println!("\n═══════════════════════════════════════════════════════════════════════════════");
+    println!("  FULL-CYCLE: Lance cold-load + query per iteration ({fc_iters} iters)");
+    println!("  (Measures real end-to-end latency including storage I/O)");
+    println!("═══════════════════════════════════════════════════════════════════════════════");
+
+    let fc_disk = run_fullcycle_bench(&lance_local_uri, queries, fc_iters, "FC-Disk (Lance SSD)").await;
+
+    let fc_s3 = if let Some(ref uri) = s3_uri {
+        run_fullcycle_bench(uri, queries, fc_iters, "FC-S3 (Lance→MinIO)").await
+    } else {
+        vec![0.0; queries.len()]
+    };
+
+    // Full-cycle summary
+    println!("\n─── Full-cycle summary (load + query per call) ───────────────────────────────");
+    println!("  {:<44}  {:>14}  {:>14}  {:>10}", "query", "FC-Disk(µs)", "FC-S3(µs)", "S3/Disk");
+    println!("  {}", "─".repeat(90));
+    for (i, &q) in queries.iter().enumerate() {
+        let lbl = if q.len() > 44 { &q[..44] } else { q };
+        let d = fc_disk.get(i).copied().unwrap_or(0.0);
+        let s = fc_s3.get(i).copied().unwrap_or(0.0);
+        let ratio = if d > 0.0 && s > 0.0 { format!("{:.1}x", s / d) } else { "N/A".into() };
+        let s_str = if s > 0.0 { format!("{s:>12.1}") } else { "         N/A".into() };
+        println!("  {lbl:<44}  {d:>12.1}µs  {s_str}µs  {:>10}", ratio);
+    }
+    let avg_fc_d = fc_disk.iter().sum::<f64>() / n;
+    let avg_fc_s = fc_s3.iter().sum::<f64>() / n;
+    println!("  {}", "─".repeat(90));
+    println!("  avg full-cycle: disk={avg_fc_d:.0}µs  S3={:.0}µs  warm-query-only={avg_m:.0}µs",
+        if avg_fc_s > 0.0 { avg_fc_s } else { 0.0 });
 
     // ── Load time + scale ─────────────────────────────────────────────────────
     bench_lance_load_time(&ds, &lance_local_uri, s3_uri.as_deref()).await;
