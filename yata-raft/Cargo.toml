@@ -1,0 +1,16 @@
+[package]
+name = "yata-raft"
+version.workspace = true
+edition.workspace = true
+description = "Raft consensus for yata distributed streaming broker"
+
+[dependencies]
+tokio = { workspace = true }
+async-trait.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+tracing.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }

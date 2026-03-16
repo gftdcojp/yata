@@ -620,8 +620,9 @@ async fn main() -> Result<()> {
 
     let fc_disk = run_fullcycle_bench(&lance_local_uri, queries, fc_iters, "FC-Disk (Lance SSD)").await;
 
+    let fc_s3_iters = 10; // S3 round-trip is ~3s, keep short
     let fc_s3 = if let Some(ref uri) = s3_uri {
-        run_fullcycle_bench(uri, queries, fc_iters, "FC-S3 (Lance→MinIO)").await
+        run_fullcycle_bench(uri, queries, fc_s3_iters, "FC-S3 (Lance→B2)").await
     } else {
         vec![0.0; queries.len()]
     };
