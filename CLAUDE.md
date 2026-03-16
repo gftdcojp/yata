@@ -17,7 +17,7 @@ yata broker — Arrow-native distributed event store with Raft consensus。magat
 | `yata-arrow` | Arrow IPC encode/decode (`batch_to_ipc`, `ipc_to_batch`) + **SchemaRegistry** (versioned, backward/forward/full compatibility) |
 | `yata-cypher` | **Cypher パーサ + 実行エンジン** (pure Rust, Lance 非依存。variable-hop, regex, STARTS WITH/ENDS WITH/CONTAINS) |
 | `yata-graph` | **Lance-backed graph store** (`LanceGraphStore` + `QueryableGraph`) |
-| `yata-flight` | Arrow Flight gRPC サービス — 分散時のみ必要 (single-Pod では embedded broker 利用)。削除済み k8s deploy |
+| `yata-flight` | Arrow Flight SQL gRPC サービス — `FlightSqlService` trait 完全実装 (Catalogs/Schemas/Tables/SqlInfo/PrimaryKeys/ExportedKeys/ImportedKeys/CrossRef/XdbcTypeInfo/Statement/PreparedStatement + custom Cypher/VectorSearch/GraphWrite fallback) |
 | `yata-at` | AT Protocol types, Firehose client, `AtFirehoseBridge` |
 | `yata-signal` | Signal Protocol crypto (X3DH, Double Ratchet, Sender Keys) |
 
@@ -38,13 +38,35 @@ magatama-host        — GraphStore trait を LanceGraphStore で実装。
 
 **CRITICAL**: `yata-cypher` は `yata-graph` を import しない。`yata-graph` は magatama を import しない。
 
-## CypherTicket (embedded broker)
+## yata-flight Flight SQL (arrow-flight `flight-sql-experimental`)
+
+`FlightSqlService` trait を完全実装。標準 Flight SQL クライアント (JDBC Flight SQL driver 等) から接続可能。
+
+| Flight SQL RPC | 実装 |
+|---|---|
+| `CommandStatementQuery` / `TicketStatementQuery` | Cypher query → Arrow IPC |
+| `CommandStatementUpdate` | Cypher mutation (CREATE/MERGE/DELETE/SET) |
+| `CommandGetCatalogs` | `"yata"` |
+| `CommandGetDbSchemas` | `"yata"."public"` |
+| `CommandGetTables` | 7 known + graph tables |
+| `CommandGetTableTypes` | `"TABLE"` |
+| `CommandGetSqlInfo` | server name/version/capabilities |
+| `CommandGetPrimaryKeys` | empty (Lance has none) |
+| `CommandGetExportedKeys/ImportedKeys/CrossReference` | empty |
+| `CommandGetXdbcTypeInfo` | empty |
+| `PreparedStatement` (create/close/get) | stateless (handle = Cypher text) |
+| `Handshake` | no-auth (returns empty token) |
+| Custom `do_get_fallback` | `ScanTicket` / `CypherTicket` / `VectorSearchTicket` |
+| Custom `do_put_fallback` | `WriteTicket` / `GraphWriteTicket` |
+| Custom `do_action_fallback` | `cypher_mutate` |
+
+## CypherTicket (custom fallback)
 
 ```json
 {"kind":"cypher","cypher":"MATCH (n:Person) RETURN n.name","params":[]}
 ```
 
-- `kind="cypher"` で `AnyTicket::Cypher` にルーティング
+- `kind="cypher"` で `AnyTicket::Cypher` にルーティング (do_get_fallback)
 - `execute_cypher_scan`: `LanceGraphStore` → `to_memory_graph()` → `QueryableGraph.query()` → Arrow IPC stream
 - 列名はスキーマに1回だけ送信 (Shannon 最適: N行×M列×L bytes の冗長排除)
 - 全列 `Utf8` (JSON エンコード値)
