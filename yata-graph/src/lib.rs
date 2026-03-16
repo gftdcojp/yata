@@ -319,9 +319,10 @@ impl LanceGraphStore {
 
     /// Load all vertices from LanceDB.
     pub async fn load_vertices(&self) -> GraphResult<Vec<yata_cypher::NodeRef>> {
+        // Force connection to refresh its table list cache before opening.
+        let _ = self.conn.table_names().execute().await;
         let table = match self.conn.open_table("graph_vertices").execute().await {
             Ok(t) => {
-                // Ensure we read the latest committed version (not a stale cache).
                 let _ = t.checkout_latest().await;
                 t
             }
@@ -367,6 +368,7 @@ impl LanceGraphStore {
 
     /// Load all edges from LanceDB.
     pub async fn load_edges(&self) -> GraphResult<Vec<yata_cypher::RelRef>> {
+        let _ = self.conn.table_names().execute().await;
         let table = match self.conn.open_table("graph_edges").execute().await {
             Ok(t) => {
                 let _ = t.checkout_latest().await;
