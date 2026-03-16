@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use yata_grin::*;
+use yata_cypher::Graph;
 
 /// Per-label compressed sparse row segment.
 struct CsrSegment {
@@ -255,6 +256,181 @@ impl MutableCsrStore {
         if !self.known_edge_labels.contains(&label.to_string()) {
             self.known_edge_labels.push(label.to_string());
         }
+    }
+}
+
+// ── Cypher bridge: MutableCsrStore → MemoryGraph ─────────────────────
+
+impl MutableCsrStore {
+    /// Add a vertex with multiple labels.
+    pub fn add_vertex_with_labels(
+        &mut self,
+        labels: &[String],
+        props: &[(&str, PropValue)],
+    ) -> u32 {
+        let vid = self.vid_alloc.fetch_add(1, Ordering::Relaxed);
+        let vid_usize = vid as usize;
+        while self.vertex_labels.len() <= vid_usize {
+            self.vertex_labels.push(Vec::new());
+            self.vertex_alive.push(false);
+            self.vertex_props_map.push(HashMap::new());
+        }
+        self.vertex_labels[vid_usize] = labels.to_vec();
+        self.vertex_alive[vid_usize] = true;
+        let mut prop_map = HashMap::new();
+        for &(k, ref v) in props {
+            prop_map.insert(k.to_string(), v.clone());
+        }
+        self.vertex_props_map[vid_usize] = prop_map;
+        self.vertex_count = self.vid_alloc.load(Ordering::Relaxed);
+        for l in labels {
+            self.register_vertex_label(l);
+        }
+        vid
+    }
+
+    /// Build a MemoryGraph from ALL data in the CSR store (no disk I/O).
+    pub fn to_full_memory_graph(&self) -> yata_cypher::MemoryGraph {
+        let mut g = yata_cypher::MemoryGraph::new();
+        // Add all alive vertices
+        for vid in 0..self.vertex_alive.len() {
+            if !self.vertex_alive[vid] {
+                continue;
+            }
+            let labels = self.vertex_labels.get(vid).cloned().unwrap_or_default();
+            let props = self.vertex_props_map.get(vid)
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), prop_to_cypher(v))).collect())
+                .unwrap_or_default();
+            // Use vid as string ID for round-trip fidelity
+            let id = self.vertex_string_id(vid as u32);
+            g.add_node(yata_cypher::NodeRef { id, labels, props });
+        }
+        // Add all alive edges
+        for eid in 0..self.edge_alive.len() {
+            if !self.edge_alive[eid] {
+                continue;
+            }
+            let src = self.vertex_string_id(self.edge_src[eid]);
+            let dst = self.vertex_string_id(self.edge_dst[eid]);
+            let rel_type = self.edge_labels[eid].clone();
+            let props = self.edge_props.get(eid)
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), prop_to_cypher(v))).collect())
+                .unwrap_or_default();
+            let id = format!("e{}", eid);
+            g.add_rel(yata_cypher::RelRef { id, rel_type, src, dst, props });
+        }
+        g.build_csr();
+        g
+    }
+
+    /// Build a MemoryGraph from a filtered subset of the CSR store.
+    /// Only includes vertices matching `labels` and their incident edges
+    /// (optionally filtered by `rel_types`), plus 1-hop neighbor vertices.
+    pub fn to_filtered_memory_graph(
+        &self,
+        labels: &[String],
+        rel_types: &[String],
+    ) -> yata_cypher::MemoryGraph {
+        let mut g = yata_cypher::MemoryGraph::new();
+
+        // Step 1: Collect matching vertex IDs
+        let mut seed_vids: Vec<u32> = Vec::new();
+        for vid in 0..self.vertex_alive.len() {
+            if !self.vertex_alive[vid] { continue; }
+            let vlabels = match self.vertex_labels.get(vid) {
+                Some(l) => l,
+                None => continue,
+            };
+            if labels.is_empty() || labels.iter().any(|l| vlabels.contains(l)) {
+                seed_vids.push(vid as u32);
+            }
+        }
+
+        // Step 2: Add seed vertices to graph
+        let mut added_vids = std::collections::HashSet::new();
+        for &vid in &seed_vids {
+            let id = self.vertex_string_id(vid);
+            let vlabels = self.vertex_labels.get(vid as usize).cloned().unwrap_or_default();
+            let props = self.vertex_props_map.get(vid as usize)
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), prop_to_cypher(v))).collect())
+                .unwrap_or_default();
+            g.add_node(yata_cypher::NodeRef { id, labels: vlabels, props });
+            added_vids.insert(vid);
+        }
+
+        // Step 3: Collect edges incident to seed vertices, optionally filtered by rel_types
+        let mut neighbor_vids = std::collections::HashSet::new();
+        for eid in 0..self.edge_alive.len() {
+            if !self.edge_alive[eid] { continue; }
+            let src = self.edge_src[eid];
+            let dst = self.edge_dst[eid];
+            let touches_seed = added_vids.contains(&src) || added_vids.contains(&dst);
+            if !touches_seed { continue; }
+            if !rel_types.is_empty() && !rel_types.contains(&self.edge_labels[eid]) { continue; }
+
+            let src_id = self.vertex_string_id(src);
+            let dst_id = self.vertex_string_id(dst);
+            let rel_type = self.edge_labels[eid].clone();
+            let props = self.edge_props.get(eid)
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), prop_to_cypher(v))).collect())
+                .unwrap_or_default();
+            g.add_rel(yata_cypher::RelRef {
+                id: format!("e{}", eid), rel_type, src: src_id, dst: dst_id, props,
+            });
+            if !added_vids.contains(&src) { neighbor_vids.insert(src); }
+            if !added_vids.contains(&dst) { neighbor_vids.insert(dst); }
+        }
+
+        // Step 4: Add 1-hop neighbor vertices
+        for &vid in &neighbor_vids {
+            let id = self.vertex_string_id(vid);
+            let vlabels = self.vertex_labels.get(vid as usize).cloned().unwrap_or_default();
+            let props = self.vertex_props_map.get(vid as usize)
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), prop_to_cypher(v))).collect())
+                .unwrap_or_default();
+            g.add_node(yata_cypher::NodeRef { id, labels: vlabels, props });
+        }
+
+        g.build_csr();
+        g
+    }
+
+    /// Get the string ID for a vertex. Uses the first property that looks like
+    /// a primary key (vid/id/eid), falling back to "v{vid}".
+    fn vertex_string_id(&self, vid: u32) -> String {
+        if let Some(props) = self.vertex_props_map.get(vid as usize) {
+            // Check for explicit string IDs used by graph_host
+            for key in &["vid", "id", "_vid"] {
+                if let Some(PropValue::Str(s)) = props.get(*key) {
+                    return s.clone();
+                }
+            }
+        }
+        format!("v{}", vid)
+    }
+}
+
+/// Convert PropValue (yata-grin) → Value (yata-cypher).
+pub fn prop_to_cypher(v: &PropValue) -> yata_cypher::types::Value {
+    match v {
+        PropValue::Null => yata_cypher::types::Value::Null,
+        PropValue::Bool(b) => yata_cypher::types::Value::Bool(*b),
+        PropValue::Int(i) => yata_cypher::types::Value::Int(*i),
+        PropValue::Float(f) => yata_cypher::types::Value::Float(*f),
+        PropValue::Str(s) => yata_cypher::types::Value::Str(s.clone()),
+    }
+}
+
+/// Convert Value (yata-cypher) → PropValue (yata-grin).
+pub fn cypher_to_prop(v: &yata_cypher::types::Value) -> PropValue {
+    match v {
+        yata_cypher::types::Value::Null => PropValue::Null,
+        yata_cypher::types::Value::Bool(b) => PropValue::Bool(*b),
+        yata_cypher::types::Value::Int(i) => PropValue::Int(*i),
+        yata_cypher::types::Value::Float(f) => PropValue::Float(*f),
+        yata_cypher::types::Value::Str(s) => PropValue::Str(s.clone()),
+        // Complex types degrade to JSON string
+        other => PropValue::Str(format!("{}", other)),
     }
 }
 

@@ -1,11 +1,10 @@
 [package]
-name = "yata-store"
+name = "yata-gie"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 yata-grin = { path = "../yata-grin" }
-yata-cypher = { path = "../yata-cypher" }
-indexmap.workspace = true
+yata-store = { path = "../yata-store" }
 
 [dev-dependencies]

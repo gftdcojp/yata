@@ -7597,6 +7597,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "yata-gie"
+version = "0.1.0"
+dependencies = [
+ "yata-grin",
+ "yata-store",
+]
+
+[[package]]
 name = "yata-graph"
 version = "0.1.0"
 dependencies = [
@@ -7829,6 +7837,8 @@ dependencies = [
 name = "yata-store"
 version = "0.1.0"
 dependencies = [
+ "indexmap 2.13.0",
+ "yata-cypher",
  "yata-grin",
 ]
 
