@@ -18,8 +18,37 @@ yata broker — Arrow-native distributed event store with Raft consensus。magat
 | `yata-cypher` | **Cypher パーサ + 実行エンジン** (pure Rust, Lance 非依存。variable-hop, regex, STARTS WITH/ENDS WITH/CONTAINS) |
 | `yata-graph` | **Lance-backed graph store** (`LanceGraphStore` + `QueryableGraph`) |
 | `yata-flight` | Arrow Flight SQL gRPC サービス — `FlightSqlService` trait 完全実装 (Catalogs/Schemas/Tables/SqlInfo/PrimaryKeys/ExportedKeys/ImportedKeys/CrossRef/XdbcTypeInfo/Statement/PreparedStatement + custom Cypher/VectorSearch/GraphWrite fallback) |
+| `yata-grin` | **GRIN trait** — storage-agnostic graph access (Topology/Property/Schema/Scannable/Mutable/Partitioned). Zero dependencies |
+| `yata-store` | **MutableCSR** — GraphScope Flex-inspired in-memory graph store. CSR adjacency O(degree), label bitmap index, property eq index, WAL, MVCC snapshots |
+| `yata-gie` | **Graph Interactive Engine** — IR operators, predicate pushdown optimizer, push-based streaming executor. Depends on yata-grin + yata-store |
+| `yata-coordinator` | **ShardedGraphStore** — label-based partitioning, Rayon parallel shard execution, cross-shard aggregation merge |
 | `yata-at` | AT Protocol types, Firehose client, `AtFirehoseBridge` |
 | `yata-signal` | Signal Protocol crypto (X3DH, Double Ratchet, Sender Keys) |
+
+## GraphScope Flex-class Graph Engine (yata-grin / yata-store / yata-gie / yata-coordinator)
+
+Design doc: `docs/260316-yata-graphscope-flex-design.md`
+
+```
+yata-grin          — GRIN trait (Topology/Property/Schema/Scannable/Mutable/Partitioned)
+                     ストレージ非依存。zero dependencies。
+
+yata-store         — MutableCSR (GraphScope Flex MutableCSR 相当)
+                     CSR adjacency O(degree), label bitmap index, property eq index
+                     WAL (replay + serialize), MVCC snapshot, Clone
+                     Perf: 304ns property lookup, 463ns 1-hop, 1.07M writes/sec
+
+yata-gie           — Graph Interactive Engine (GraphScope GIE 相当)
+                     IR operators (Scan/Expand/PathExpand/Filter/Project/Aggregate/OrderBy/Limit/Distinct)
+                     Predicate pushdown optimizer, push-based streaming executor
+
+yata-coordinator   — Coordinator (GraphScope Coordinator 相当)
+                     ShardedGraphStore: label-based partitioning
+                     Rayon parallel shard execution, cross-shard aggregation merge
+                     Linear scaling: 8 shards → 8.5x speedup (measured)
+```
+
+**CRITICAL**: `yata-grin` has zero dependencies. `yata-store` depends only on `yata-grin`. `yata-gie` depends on `yata-grin` + `yata-store`. `yata-coordinator` depends on all three. No circular deps.
 
 ## yata-cypher / yata-graph の分離原則
 
