@@ -1,0 +1,42 @@
+[package]
+name = "yata-flight"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yata-flight"
+path = "src/main.rs"
+
+[lib]
+name = "yata_flight"
+path = "src/lib.rs"
+
+[dependencies]
+yata-core.workspace = true
+yata-lance.workspace = true
+yata-cypher.workspace = true
+yata-graph.workspace = true
+arrow = { workspace = true }
+arrow-array.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+arrow-flight = { workspace = true }
+tonic = { version = "0.12", features = ["transport"] }
+prost.workspace = true
+once_cell.workspace = true
+lancedb.workspace = true
+tokio = { workspace = true }
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+bytes.workspace = true
+indexmap.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+chrono.workspace = true
