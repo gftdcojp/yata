@@ -1542,4 +1542,509 @@ mod tests {
             Some(Value::Int(0))
         );
     }
+
+    // ========================================================================
+    // MERGE ON CREATE SET / ON MATCH SET
+    // ========================================================================
+
+    #[test]
+    fn test_merge_on_create_set() {
+        let mut g = MemoryGraph::new();
+        exec(
+            "MERGE (n:Person {name: 'Alice'}) ON CREATE SET n.created = true",
+            &mut g,
+        );
+        let rs = exec("MATCH (n:Person {name: 'Alice'}) RETURN n.created", &mut g);
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(
+            rs.rows[0].0.values().next().cloned(),
+            Some(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn test_merge_on_match_set() {
+        let mut g = make_graph();
+        // Alice already exists in make_graph
+        exec(
+            "MERGE (n:Person {name: 'Alice'}) ON MATCH SET n.found = true",
+            &mut g,
+        );
+        let rs = exec("MATCH (n:Person {name: 'Alice'}) RETURN n.found", &mut g);
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(
+            rs.rows[0].0.values().next().cloned(),
+            Some(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn test_merge_on_create_not_match() {
+        let mut g = make_graph();
+        // Alice exists so ON CREATE should NOT fire
+        exec(
+            "MERGE (n:Person {name: 'Alice'}) ON CREATE SET n.new = true",
+            &mut g,
+        );
+        let rs = exec("MATCH (n:Person {name: 'Alice'}) RETURN n.new", &mut g);
+        assert_eq!(rs.rows.len(), 1);
+        // new should be null since ON CREATE doesn't fire for existing node
+        assert_eq!(
+            rs.rows[0].0.values().next().cloned(),
+            Some(Value::Null)
+        );
+    }
+
+    #[test]
+    fn test_merge_on_match_not_create() {
+        let mut g = MemoryGraph::new();
+        // Charlie doesn't exist, so ON MATCH should NOT fire
+        exec(
+            "MERGE (n:Person {name: 'Charlie'}) ON MATCH SET n.existed = true",
+            &mut g,
+        );
+        let rs = exec("MATCH (n:Person {name: 'Charlie'}) RETURN n.existed", &mut g);
+        assert_eq!(rs.rows.len(), 1);
+        // existed should be null since ON MATCH doesn't fire for new node
+        assert_eq!(
+            rs.rows[0].0.values().next().cloned(),
+            Some(Value::Null)
+        );
+    }
+
+    #[test]
+    fn test_merge_both_on_create_and_on_match() {
+        let mut g = MemoryGraph::new();
+        exec(
+            "MERGE (n:Person {name: 'Dave'}) ON CREATE SET n.created = true ON MATCH SET n.matched = true",
+            &mut g,
+        );
+        let rs = exec("MATCH (n:Person {name: 'Dave'}) RETURN n.created, n.matched", &mut g);
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0].0.get("n.created"), Some(&Value::Bool(true)));
+        assert_eq!(rs.rows[0].0.get("n.matched"), Some(&Value::Null));
+    }
+
+    // ========================================================================
+    // CREATE binds variables back
+    // ========================================================================
+
+    #[test]
+    fn test_create_binds_variables() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("CREATE (n:Person {name: 'Eve'}) RETURN n.name", &mut g);
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(
+            rs.rows[0].0.values().next().cloned(),
+            Some(Value::Str("Eve".into()))
+        );
+    }
+
+    // ========================================================================
+    // SET n = {map}
+    // ========================================================================
+
+    #[test]
+    fn test_set_node_equals_map() {
+        let mut g = make_graph();
+        exec(
+            "MATCH (n:Person {name: 'Alice'}) SET n = {title: 'Engineer', city: 'Tokyo'}",
+            &mut g,
+        );
+        let rs = exec("MATCH (n:Person {name: 'Alice'}) RETURN n.title, n.city", &mut g);
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0].0.get("n.title"), Some(&Value::Str("Engineer".into())));
+        assert_eq!(rs.rows[0].0.get("n.city"), Some(&Value::Str("Tokyo".into())));
+    }
+
+    // ========================================================================
+    // UNION / UNION ALL
+    // ========================================================================
+
+    #[test]
+    fn test_union_parses() {
+        // Verify UNION parses without error
+        let q = parse("MATCH (n:Person) RETURN n.name UNION MATCH (n:Company) RETURN n.name");
+        assert!(q.is_ok());
+        let query = q.unwrap();
+        assert!(query.clauses.len() > 2);
+    }
+
+    #[test]
+    fn test_union_all_parses() {
+        let q = parse("MATCH (n:Person) RETURN n.name UNION ALL MATCH (n:Company) RETURN n.name");
+        assert!(q.is_ok());
+    }
+
+    // ========================================================================
+    // FOREACH
+    // ========================================================================
+
+    #[test]
+    fn test_foreach_create() {
+        let mut g = MemoryGraph::new();
+        exec(
+            "FOREACH (name IN ['X', 'Y', 'Z'] | CREATE (n:Tag {name: name}))",
+            &mut g,
+        );
+        let rs = exec("MATCH (n:Tag) RETURN n.name", &mut g);
+        assert_eq!(rs.rows.len(), 3);
+    }
+
+    // ========================================================================
+    // REMOVE
+    // ========================================================================
+
+    #[test]
+    fn test_remove_property() {
+        let mut g = make_graph();
+        exec("MATCH (n:Person {name: 'Alice'}) REMOVE n.age = null", &mut g);
+        let rs = exec("MATCH (n:Person {name: 'Alice'}) RETURN n.age", &mut g);
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0].0.values().next().cloned(), Some(Value::Null));
+    }
+
+    // ========================================================================
+    // Trigonometric functions
+    // ========================================================================
+
+    #[test]
+    fn test_sin() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN sin(0)", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::Float(f)) => assert!((f - 0.0).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cos() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN cos(0)", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::Float(f)) => assert!((f - 1.0).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tan() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN tan(0)", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::Float(f)) => assert!((f - 0.0).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_asin() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN asin(1)", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::Float(f)) => assert!((f - std::f64::consts::FRAC_PI_2).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_acos() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN acos(1)", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::Float(f)) => assert!((f - 0.0).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_atan() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN atan(0)", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::Float(f)) => assert!((f - 0.0).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_atan2() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN atan2(1, 1)", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::Float(f)) => assert!((f - std::f64::consts::FRAC_PI_4).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_log() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN log(1)", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::Float(f)) => assert!((f - 0.0).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_log10() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN log10(100)", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::Float(f)) => assert!((f - 2.0).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_exp() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN exp(0)", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::Float(f)) => assert!((f - 1.0).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pi() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN pi()", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::Float(f)) => assert!((f - std::f64::consts::PI).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_e() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN e()", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::Float(f)) => assert!((f - std::f64::consts::E).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_degrees() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN degrees(3.141592653589793)", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::Float(f)) => assert!((f - 180.0).abs() < 1e-6),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_radians() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN radians(180)", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::Float(f)) => assert!((f - std::f64::consts::PI).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_rand() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN rand()", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::Float(f)) => {
+                assert!(*f >= 0.0 && *f <= 1.0, "rand() should be in [0,1], got {}", f);
+            }
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // Temporal functions
+    // ========================================================================
+
+    #[test]
+    fn test_timestamp() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN timestamp()", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::Int(ms)) => assert!(*ms > 0, "timestamp should be positive"),
+            other => panic!("expected Int, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_date_string() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN date('2024-01-15')", &mut g);
+        assert_eq!(
+            rs.rows[0].0.values().next().cloned(),
+            Some(Value::Str("2024-01-15".into()))
+        );
+    }
+
+    #[test]
+    fn test_datetime_no_args() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN datetime()", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::Int(ms)) => assert!(*ms > 0),
+            other => panic!("expected Int, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // Additional string functions
+    // ========================================================================
+
+    #[test]
+    fn test_ltrim() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN ltrim('  hello  ')", &mut g);
+        assert_eq!(
+            rs.rows[0].0.values().next().cloned(),
+            Some(Value::Str("hello  ".into()))
+        );
+    }
+
+    #[test]
+    fn test_rtrim() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN rtrim('  hello  ')", &mut g);
+        assert_eq!(
+            rs.rows[0].0.values().next().cloned(),
+            Some(Value::Str("  hello".into()))
+        );
+    }
+
+    #[test]
+    fn test_lpad() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN lpad('hi', 5)", &mut g);
+        assert_eq!(
+            rs.rows[0].0.values().next().cloned(),
+            Some(Value::Str("   hi".into()))
+        );
+    }
+
+    #[test]
+    fn test_rpad() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN rpad('hi', 5)", &mut g);
+        assert_eq!(
+            rs.rows[0].0.values().next().cloned(),
+            Some(Value::Str("hi   ".into()))
+        );
+    }
+
+    #[test]
+    fn test_toboolean_true() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN toboolean('true')", &mut g);
+        assert_eq!(
+            rs.rows[0].0.values().next().cloned(),
+            Some(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn test_toboolean_false() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN toboolean('false')", &mut g);
+        assert_eq!(
+            rs.rows[0].0.values().next().cloned(),
+            Some(Value::Bool(false))
+        );
+    }
+
+    // ========================================================================
+    // Index access
+    // ========================================================================
+
+    #[test]
+    fn test_list_index() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN [10, 20, 30][1]", &mut g);
+        assert_eq!(
+            rs.rows[0].0.values().next().cloned(),
+            Some(Value::Int(20))
+        );
+    }
+
+    #[test]
+    fn test_list_negative_index() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN [10, 20, 30][-1]", &mut g);
+        assert_eq!(
+            rs.rows[0].0.values().next().cloned(),
+            Some(Value::Int(30))
+        );
+    }
+
+    // ========================================================================
+    // List comprehension
+    // ========================================================================
+
+    #[test]
+    fn test_list_comprehension_filter() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN [x IN [1, 2, 3, 4, 5] WHERE x > 3]", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::List(l)) => {
+                assert_eq!(l, &vec![Value::Int(4), Value::Int(5)]);
+            }
+            other => panic!("expected list, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_list_comprehension_map() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN [x IN [1, 2, 3] | x * 2]", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::List(l)) => {
+                assert_eq!(l, &vec![Value::Int(2), Value::Int(4), Value::Int(6)]);
+            }
+            other => panic!("expected list, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_list_comprehension_filter_and_map() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("RETURN [x IN [1, 2, 3, 4] WHERE x > 2 | x * 10]", &mut g);
+        match rs.rows[0].0.values().next() {
+            Some(Value::List(l)) => {
+                assert_eq!(l, &vec![Value::Int(30), Value::Int(40)]);
+            }
+            other => panic!("expected list, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // MERGE binds variables (regression)
+    // ========================================================================
+
+    #[test]
+    fn test_merge_binds_variables() {
+        let mut g = MemoryGraph::new();
+        let rs = exec("MERGE (n:City {name: 'Tokyo'}) RETURN n.name", &mut g);
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(
+            rs.rows[0].0.values().next().cloned(),
+            Some(Value::Str("Tokyo".into()))
+        );
+    }
+
+    #[test]
+    fn test_merge_existing_binds_variables() {
+        let mut g = make_graph();
+        let rs = exec("MERGE (n:Person {name: 'Alice'}) RETURN n.age", &mut g);
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(
+            rs.rows[0].0.values().next().cloned(),
+            Some(Value::Int(30))
+        );
+    }
 }

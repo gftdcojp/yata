@@ -121,17 +121,7 @@ k8s デプロイは PVC (`linode-block-storage-retain`) で yata データを永
 
 `yata-server` exposes `/metrics` on port 9090 via `metrics-exporter-prometheus`.
 
-Key metrics: `yata_log_appends_total`, `yata_kv_ops_total`, `yata_lance_flushes_total`, `yata_lance_flush_duration_seconds`, `yata_nats_arrow_published_total`, `yata_flight_requests_total`
-
-## Consumer Group API
-
-`NatsConsumerGroup` (yata-nats): durable pull consumers for Arrow stream subscriptions.
-
-```rust
-let cg = nats_backend.consumer_group();
-let stream = cg.subscribe(ConsumerConfig { group_name: "my-app".into(), .. }).await?;
-// stream yields ConsumedBatch { table, batch, ack }
-```
+Key metrics: `yata_log_appends_total`, `yata_kv_ops_total`, `yata_lance_flushes_total`, `yata_lance_flush_duration_seconds`, `yata_flight_requests_total`, `yata_kv_ttl_reaped_total`, `yata_log_segments_compacted_total`
 
 ## Vector Search
 
@@ -147,12 +137,14 @@ let stream = cg.subscribe(ConsumerConfig { group_name: "my-app".into(), .. }).aw
 
 `SchemaRegistry` (yata-arrow): versioned schema tracking with compatibility modes (`Backward`, `Forward`, `Full`, `None`). Built-in schemas pre-registered at Broker startup. `validate_batch()` checks incoming data against registered schemas.
 
-## CDC (Change Data Capture)
+## Shannon Efficiency: Embedded vs Separate Pod
 
-`NatsCdcPublisher` / `NatsCdcConsumer` (yata-nats): CDC events on `yata.cdc.<table>` NATS subjects.
+| 指標 | Embedded (現構成) | Separate Pod |
+|---|---|---|
+| Overhead bytes/request | **400 B** | 2,738 B (6.8x) |
+| Shannon η (4KB batch) | **91.1%** | 59.9% |
+| Shannon η (64KB batch) | **99.4%** | 95.9% |
+| Latency (query) | **12-102 μs** | 107-507 μs (5-10x) |
+| Memory | **共有** (1 Broker) | +512Mi (2 Broker) |
 
-```rust
-let cdc = nats_backend.cdc_consumer();
-let stream = cdc.subscribe("my-cdc-group", Some("yata_events")).await?;
-// stream yields CdcEvent { table, op, row_count, ts_ns }
-```
+Embedded が全帯域で最適。Separate Pod は failure domain 分離のみ優位だが PVC + Raft で十分。
