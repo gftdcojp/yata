@@ -39,7 +39,7 @@ arrow-cast = "53"
 
 # LanceDB (high-level; brings lance 0.20 + arrow 53 transitively)
 lancedb = "0.14"
-object_store = { version = "=0.10.2", features = ["aws"] }
+object_store = { version = "=0.10.2", default-features = false, features = ["aws"] }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "io-util", "fs", "sync", "time"] }
