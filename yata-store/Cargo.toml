@@ -1,0 +1,9 @@
+[package]
+name = "yata-store"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+yata-grin = { path = "../yata-grin" }
+
+[dev-dependencies]
