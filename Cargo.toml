@@ -18,7 +18,6 @@ members = [
     "yata-signal",
     "yata-bench",
     "yata-cypher",
-    "yata-cypher-server",
     "yata-flight",
     "yata-graph",
     "yata-nats",
@@ -79,8 +78,9 @@ smallvec = "1"
 indexmap = { version = "2", features = ["serde"] }
 
 # Arrow Flight / gRPC
-arrow-flight = { version = "53" }
+arrow-flight = { version = "53", features = ["flight-sql-experimental"] }
 tonic = { version = "0.12", features = ["transport"] }
+prost = "0.13"
 
 # HTTP / WebSocket (for yata-at)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -119,7 +119,7 @@ yata-at = { path = "yata-at" }
 yata-signal = { path = "yata-signal" }
 yata-bench = { path = "yata-bench" }
 yata-cypher = { path = "yata-cypher" }
-yata-flight = { path = "yata-flight" }
+
 yata-graph = { path = "yata-graph" }
 yata-nats = { path = "yata-nats" }
 yata-raft = { path = "yata-raft" }

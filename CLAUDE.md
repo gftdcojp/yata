@@ -17,7 +17,7 @@ yata broker — Arrow-native distributed event store with Raft consensus。magat
 | `yata-arrow` | Arrow IPC encode/decode (`batch_to_ipc`, `ipc_to_batch`) + **SchemaRegistry** (versioned, backward/forward/full compatibility) |
 | `yata-cypher` | **Cypher パーサ + 実行エンジン** (pure Rust, Lance 非依存。variable-hop, regex, STARTS WITH/ENDS WITH/CONTAINS) |
 | `yata-graph` | **Lance-backed graph store** (`LanceGraphStore` + `QueryableGraph`) |
-| `yata-flight` | Arrow Flight gRPC サービス — `ScanTicket` (Lance scan) + `CypherTicket` (Cypher via graph) + `VectorSearchTicket` (ANN) |
+| `yata-flight` | Arrow Flight gRPC サービス — 分散時のみ必要 (single-Pod では embedded broker 利用)。削除済み k8s deploy |
 | `yata-at` | AT Protocol types, Firehose client, `AtFirehoseBridge` |
 | `yata-signal` | Signal Protocol crypto (X3DH, Double Ratchet, Sender Keys) |
 
@@ -38,7 +38,7 @@ magatama-host        — GraphStore trait を LanceGraphStore で実装。
 
 **CRITICAL**: `yata-cypher` は `yata-graph` を import しない。`yata-graph` は magatama を import しない。
 
-## yata-flight CypherTicket
+## CypherTicket (embedded broker)
 
 ```json
 {"kind":"cypher","cypher":"MATCH (n:Person) RETURN n.name","params":[]}
