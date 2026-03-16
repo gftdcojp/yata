@@ -8,4 +8,8 @@ yata-grin = { path = "../yata-grin" }
 yata-store = { path = "../yata-store" }
 yata-gie = { path = "../yata-gie" }
 
+[[bench]]
+name = "distributed_bench"
+harness = false
+
 [dev-dependencies]
