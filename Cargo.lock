@@ -7642,6 +7642,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "yata-cdc"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "yata-core",
+ "yata-grin",
+ "yata-store",
+]
+
+[[package]]
 name = "yata-cli"
 version = "0.1.0"
 dependencies = [

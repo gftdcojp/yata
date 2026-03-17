@@ -12,6 +12,7 @@ pub mod cache;
 pub mod hints;
 pub mod pipeline;
 pub mod coordinator;
+pub mod per_label;
 
 use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray, Float32Array, FixedSizeListArray};
@@ -173,8 +174,10 @@ pub mod graph_arrow {
 // ---- LanceGraphStore ----------------------------------------------------
 
 pub struct LanceGraphStore {
-    /// Lance DB connection. Public for filtered query access from graph_host.
+    /// Lance DB connection for writes (long-lived).
     pub conn: lancedb::Connection,
+    /// Base URI for creating fresh connections on reads (S3 consistency).
+    base_uri: String,
     pub schema: GraphSchema,
     /// In-memory cache: CSR graph + query result LRU.
     pub cache: tokio::sync::RwLock<cache::GraphCache>,
@@ -189,15 +192,27 @@ impl LanceGraphStore {
         base_uri: impl Into<String>,
         cache_config: cache::CacheConfig,
     ) -> GraphResult<Self> {
-        let conn = lancedb::connect(&base_uri.into())
+        let uri = base_uri.into();
+        let conn = lancedb::connect(&uri)
             .execute()
             .await
             .map_err(|e| GraphError::Storage(e.to_string()))?;
         Ok(Self {
             conn,
+            base_uri: uri,
             schema: GraphSchema::default(),
             cache: tokio::sync::RwLock::new(cache::GraphCache::new(cache_config)),
         })
+    }
+
+    /// Create a fresh connection for reads. On S3 backends, a stale Connection
+    /// may not see recently written Lance versions. A fresh connect() always
+    /// reads the latest manifest.
+    async fn fresh_conn(&self) -> GraphResult<lancedb::Connection> {
+        lancedb::connect(&self.base_uri)
+            .execute()
+            .await
+            .map_err(|e| GraphError::Storage(e.to_string()))
     }
 
     /// Write vertices to graph_vertices table (append).
@@ -335,20 +350,13 @@ impl LanceGraphStore {
     }
 
     /// Load all vertices from LanceDB.
+    /// Uses a fresh connection to guarantee S3 read-after-write consistency.
     pub async fn load_vertices(&self) -> GraphResult<Vec<yata_cypher::NodeRef>> {
-        let tables = self.conn.table_names().execute().await.unwrap_or_default();
-        let table = match self.conn.open_table("graph_vertices").execute().await {
-            Ok(t) => {
-                // Refresh to latest version so cross-request writes are visible.
-                // Requires caller runtime to have >= 2 worker threads.
-                if let Err(e) = t.checkout_latest().await {
-                    tracing::warn!(err = %e, "load_vertices: checkout_latest failed");
-                }
-                tracing::debug!(table_count = tables.len(), "load_vertices: opened graph_vertices");
-                t
-            }
+        let read_conn = self.fresh_conn().await?;
+        let table = match read_conn.open_table("graph_vertices").execute().await {
+            Ok(t) => t,
             Err(e) => {
-                tracing::debug!(err = %e, tables = ?tables, "load_vertices: graph_vertices not found");
+                tracing::debug!(err = %e, "load_vertices: graph_vertices not found");
                 return Ok(Vec::new());
             }
         };
@@ -397,15 +405,11 @@ impl LanceGraphStore {
     }
 
     /// Load all edges from LanceDB.
+    /// Uses a fresh connection to guarantee S3 read-after-write consistency.
     pub async fn load_edges(&self) -> GraphResult<Vec<yata_cypher::RelRef>> {
-        let _ = self.conn.table_names().execute().await;
-        let table = match self.conn.open_table("graph_edges").execute().await {
-            Ok(t) => {
-                if let Err(e) = t.checkout_latest().await {
-                    tracing::warn!(err = %e, "load_edges: checkout_latest failed");
-                }
-                t
-            }
+        let read_conn = self.fresh_conn().await?;
+        let table = match read_conn.open_table("graph_edges").execute().await {
+            Ok(t) => t,
             Err(_) => return Ok(Vec::new()),
         };
         let stream = table

@@ -1,0 +1,15 @@
+[package]
+name = "yata-cdc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+yata-core = { path = "../yata-core" }
+yata-store = { path = "../yata-store" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+yata-grin = { path = "../yata-grin" }

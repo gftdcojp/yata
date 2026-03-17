@@ -2477,6 +2477,17 @@ pub mod executor {
                     }
                     Clause::Set { items } => {
                         self.execute_set(items, &bindings, graph)?;
+                        // Refresh bindings from graph after SET so RETURN sees updated props
+                        for binding in &mut bindings {
+                            let keys: Vec<String> = binding.keys().cloned().collect();
+                            for key in keys {
+                                if let Some(Value::Node(n)) = binding.get(&key) {
+                                    if let Some(updated) = graph.node_by_id(&n.id) {
+                                        binding.insert(key, Value::Node(updated));
+                                    }
+                                }
+                            }
+                        }
                     }
                     Clause::Delete { exprs, detach } => {
                         self.execute_delete(exprs, *detach, &bindings, graph)?;

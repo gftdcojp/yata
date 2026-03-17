@@ -18,10 +18,12 @@ yata broker — Arrow-native distributed event store with Raft consensus。magat
 | `yata-cypher` | **Cypher パーサ + 実行エンジン** (pure Rust, Lance 非依存。variable-hop, regex, STARTS WITH/ENDS WITH/CONTAINS) |
 | `yata-graph` | **Lance-backed graph store** (`LanceGraphStore` + `QueryableGraph`) |
 | `yata-flight` | Arrow Flight SQL gRPC サービス — `FlightSqlService` trait 完全実装 (Catalogs/Schemas/Tables/SqlInfo/PrimaryKeys/ExportedKeys/ImportedKeys/CrossRef/XdbcTypeInfo/Statement/PreparedStatement + custom Cypher/VectorSearch/GraphWrite fallback) |
-| `yata-grin` | **GRIN trait** — storage-agnostic graph access (Topology/Property/Schema/Scannable/Mutable/Partitioned). Zero dependencies |
-| `yata-store` | **MutableCSR** — GraphScope Flex-inspired in-memory graph store. CSR adjacency O(degree), label bitmap index, property eq index, WAL, MVCC snapshots |
+| `yata-grin` | **GRIN trait** — storage-agnostic graph access (Topology/Property/Schema/Scannable/Mutable/Partitioned + **Tiered/Versioned/DistributedPartition**). Zero deps (serde only) |
+| `yata-store` | **MutableCSR** — GraphScope Flex-inspired in-memory graph store. CSR adjacency O(degree), label bitmap index, property eq index, WAL, MVCC snapshots. Implements Tiered (HOT) + Versioned |
 | `yata-gie` | **Graph Interactive Engine** — IR operators, predicate pushdown optimizer, push-based streaming executor. Depends on yata-grin + yata-store |
 | `yata-coordinator` | **ShardedGraphStore** — label-based partitioning, Rayon parallel shard execution, cross-shard aggregation merge |
+| `yata-engine` | **TieredGraphEngine** — HOT (CSR) → WARM (Lance) query routing, QueryCache (LRU+TTL), RLS filter, delta writer, Lance SQL pushdown. Absorbs all logic from magatama-host/graph_host.rs |
+| `yata-cdc` | **CDC emitter** — WalEntry → GraphCdcEvent broadcast (tokio broadcast channel). GART-inspired CDC for real-time graph change propagation |
 | `yata-at` | AT Protocol types, Firehose client, `AtFirehoseBridge` |
 | `yata-signal` | Signal Protocol crypto (X3DH, Double Ratchet, Sender Keys) |
 
@@ -204,6 +206,8 @@ Key metrics: `yata_log_appends_total`, `yata_kv_ops_total`, `yata_lance_flushes_
 
 ## Shannon Efficiency: Embedded vs Separate Pod
 
+### Theoretical analysis
+
 | 指標 | Embedded (現構成) | Separate Pod |
 |---|---|---|
 | Overhead bytes/request | **400 B** | 2,738 B (6.8x) |
@@ -212,4 +216,20 @@ Key metrics: `yata_log_appends_total`, `yata_kv_ops_total`, `yata_lance_flushes_
 | Latency (query) | **12-102 μs** | 107-507 μs (5-10x) |
 | Memory | **共有** (1 Broker) | +512Mi (2 Broker) |
 
-Embedded が全帯域で最適。Separate Pod は failure domain 分離のみ優位だが PVC + Raft で十分。
+### Measured load test (2026-03-17, 1000 nodes / 3000 edges)
+
+Benchmark: `cargo run -p yata-bench --bin embedded-vs-cluster-bench --release`
+
+| 指標 | A: Embedded | B: gRPC (Flight SQL) | C: shmem (zero-copy) |
+|---|---|---|---|
+| Single-client latency (avg) | **583 µs** | 1,678 µs (**2.9x**) | 580 µs (1.00x) |
+| Concurrent ×8 latency (avg) | **1,713 µs** | 4,321 µs (**2.5x**) | — |
+| Overhead/request | **400 B** | 2,214 B (**5.5x**) | 74 B |
+| Extra memory | **0 MB** | +512 MB | 0 MB |
+| Mixed workload (70R/30W) | **506 µs** | 1,777 µs (3.5x) | — |
+
+gRPC overhead decomposition: Arrow IPC schema ~1,900 B/batch + gRPC/HTTP2 framing ~64 B + TCP ~160 B = ~2,200 B/req。
+
+shmem zero-copy は Embedded と同等性能だが failure domain が同一のためメリットなし。
+
+**結論: Embedded が全帯域で最適。** Separate Pod (gRPC cluster) は 2.9x latency 劣化 + 512MB memory 追加 + 5.5x protocol redundancy。PVC + Raft で durability は十分。
