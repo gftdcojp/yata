@@ -26,6 +26,7 @@ yata broker — Arrow-native distributed event store with Raft consensus。magat
 | `yata-coordinator` | **ShardedGraphStore** — label-based partitioning, Rayon parallel shard execution, cross-shard aggregation merge |
 | `yata-engine` | **TieredGraphEngine** — HOT (CSR) → WARM (Lance) query routing, QueryCache (LRU+TTL), RLS filter, delta writer, Lance SQL pushdown. Absorbs all logic from magatama-host/graph_host.rs |
 | `yata-cdc` | **CDC emitter** — WalEntry → GraphCdcEvent broadcast (tokio broadcast channel). GART-inspired CDC for real-time graph change propagation |
+| `yata-mdag` | **Merkle DAG graph sync** — Graph → CBOR blocks in CAS (Blake3), commit chain, Merkle diff O(changed), time-travel checkout. COLD sync tier for AT Protocol federation |
 | `yata-at` | AT Protocol types, Firehose client, `AtFirehoseBridge` |
 | `yata-signal` | Signal Protocol crypto (X3DH, Double Ratchet, Sender Keys) |
 
@@ -93,6 +94,7 @@ Layer 4 (graph engine):
   yata-gie ────→ grin, store
   yata-engine ─→ grin, store, graph, cypher
   yata-cdc ────→ core, store
+  yata-mdag ───→ core, cas, cbor, grin, store
   yata-flight ─→ core, lance, cypher, graph
   yata-bolt ───→ graph
 

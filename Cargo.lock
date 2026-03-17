@@ -7911,6 +7911,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "yata-mdag"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "yata-cas",
+ "yata-cbor",
+ "yata-core",
+ "yata-grin",
+ "yata-store",
+]
+
+[[package]]
 name = "yata-nats"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,20 @@
+[package]
+name = "yata-mdag"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+yata-core = { path = "../yata-core" }
+yata-cas = { path = "../yata-cas" }
+yata-cbor = { path = "../yata-cbor" }
+yata-grin = { path = "../yata-grin" }
+yata-store = { path = "../yata-store" }
+serde = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

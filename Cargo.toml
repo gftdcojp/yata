@@ -30,6 +30,7 @@ members = [
     "yata-gateway",
     "yata-engine",
     "yata-cdc",
+    "yata-mdag",
 ]
 
 [workspace.package]
