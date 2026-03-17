@@ -149,4 +149,71 @@ mod tests {
         assert!(!diff.is_empty());
         assert!(diff.added_labels.contains(&"Y".to_string()));
     }
+
+    #[tokio::test]
+    async fn load_test_1k_graph() {
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Arc::new(LocalCasStore::new(dir.path().join("cas")).await.unwrap());
+        let mut log = CommitLog::new(cas.clone());
+
+        // Build 1K V / 3K E
+        let mut store = MutableCsrStore::new();
+        for i in 0u32..1000 {
+            let label = match i % 3 { 0 => "Person", 1 => "Company", _ => "Product" };
+            store.add_vertex(label, &[
+                ("name", PropValue::Str(format!("n{i}"))),
+                ("val", PropValue::Int(i as i64)),
+            ]);
+        }
+        for i in 0u32..3000 {
+            let src = i % 1000;
+            let dst = (i * 7 + 3) % 1000;
+            if src != dst {
+                store.add_edge(src, dst, "REL", &[("w", PropValue::Float(i as f64 * 0.001))]);
+            }
+        }
+        store.commit();
+
+        // Commit
+        let t0 = Instant::now();
+        let c1 = log.commit(&store, "initial").await.unwrap();
+        let commit_ms = t0.elapsed().as_millis();
+
+        // Load
+        let t0 = Instant::now();
+        let loaded = crate::load_graph(&c1, cas.as_ref()).await.unwrap();
+        let load_ms = t0.elapsed().as_millis();
+        assert_eq!(loaded.vertex_count(), store.vertex_count());
+
+        // Modify 10 → commit
+        for i in 0u32..10 {
+            store.set_vertex_prop(i, "val", PropValue::Int(9999));
+        }
+        store.commit();
+        let t0 = Instant::now();
+        let c2 = log.commit(&store, "delta").await.unwrap();
+        let commit2_ms = t0.elapsed().as_millis();
+
+        // Diff
+        let t0 = Instant::now();
+        let diff = log.diff(&c1, &c2).await.unwrap();
+        let diff_ms = t0.elapsed().as_millis();
+
+        // Checkout old
+        let t0 = Instant::now();
+        let _old = log.checkout(&c1).await.unwrap();
+        let checkout_ms = t0.elapsed().as_millis();
+
+        println!("\n=== MDAG Load Test (1K V / 3K E) ===");
+        println!("  Commit (full):  {commit_ms}ms");
+        println!("  Commit (delta): {commit2_ms}ms");
+        println!("  Load:           {load_ms}ms");
+        println!("  Diff:           {diff_ms}ms  (changes: {})", diff.total_changes());
+        println!("  Checkout:       {checkout_ms}ms");
+
+        assert!(diff.total_changes() > 0);
+        assert!(diff.total_changes() <= 20); // ~10 modified = 10 removed + 10 added
+    }
 }

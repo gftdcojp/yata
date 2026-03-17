@@ -2,6 +2,8 @@
 name = "yata-b2"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "Backblaze B2 / S3-compatible object storage client"
 
 [dependencies]
 yata-core.workspace = true

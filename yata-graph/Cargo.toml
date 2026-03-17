@@ -2,6 +2,8 @@
 name = "yata-graph"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "Lance-backed graph store with CSR cache and query LRU"
 
 [dependencies]
 yata-cypher = { path = "../yata-cypher" }

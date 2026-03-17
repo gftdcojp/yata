@@ -2,6 +2,8 @@
 name = "yata-server"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "Embedded broker with Raft consensus and Prometheus metrics"
 
 [[bin]]
 name = "yata-server"

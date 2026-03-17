@@ -2,6 +2,8 @@
 name = "yata-client"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "Async client API for yata KV, Log, and Lance stores"
 
 [lib]
 name = "yata_client"

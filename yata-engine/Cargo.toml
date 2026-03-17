@@ -1,7 +1,9 @@
 [package]
 name = "yata-engine"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tiered HTAP graph engine: HOT (CSR) to WARM (Lance) query routing"
 
 [dependencies]
 yata-grin = { path = "../yata-grin" }

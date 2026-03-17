@@ -2,6 +2,8 @@
 name = "yata-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "Core types, error handling, and storage traits for the yata broker"
 
 [dependencies]
 async-trait.workspace = true

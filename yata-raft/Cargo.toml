@@ -2,6 +2,7 @@
 name = "yata-raft"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Raft consensus for yata distributed streaming broker"
 
 [dependencies]

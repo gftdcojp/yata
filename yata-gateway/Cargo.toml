@@ -3,6 +3,7 @@ name = "yata-gateway"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Standalone query gateway: Bolt + Flight SQL + Neo4j Query API v2"
 
 [[bin]]
 name = "yata-gateway"

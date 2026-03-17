@@ -2,6 +2,8 @@
 name = "yata-lance"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "LanceDB table I/O helpers, Arrow RecordBatch conversion, and vector search"
 
 [dependencies]
 yata-core.workspace = true

@@ -2,6 +2,8 @@
 name = "yata-cas"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "Content-addressable storage with Blake3 hashing"
 
 [dependencies]
 yata-core.workspace = true

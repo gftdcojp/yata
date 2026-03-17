@@ -3,6 +3,7 @@ name = "yata-flight"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Arrow Flight SQL service for Cypher query and graph operations"
 
 [[bin]]
 name = "yata-flight"

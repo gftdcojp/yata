@@ -37,7 +37,6 @@ COPY yata-bench/Cargo.toml      yata-bench/Cargo.toml
 COPY yata-cypher/Cargo.toml     yata-cypher/Cargo.toml
 COPY yata-flight/Cargo.toml     yata-flight/Cargo.toml
 COPY yata-graph/Cargo.toml      yata-graph/Cargo.toml
-COPY yata-nats/Cargo.toml       yata-nats/Cargo.toml
 COPY yata-raft/Cargo.toml       yata-raft/Cargo.toml
 COPY yata-bolt/Cargo.toml       yata-bolt/Cargo.toml
 COPY yata-gateway/Cargo.toml    yata-gateway/Cargo.toml
@@ -45,13 +44,16 @@ COPY yata-grin/Cargo.toml       yata-grin/Cargo.toml
 COPY yata-store/Cargo.toml      yata-store/Cargo.toml
 COPY yata-gie/Cargo.toml        yata-gie/Cargo.toml
 COPY yata-coordinator/Cargo.toml yata-coordinator/Cargo.toml
+COPY yata-engine/Cargo.toml     yata-engine/Cargo.toml
+COPY yata-cdc/Cargo.toml        yata-cdc/Cargo.toml
+COPY yata-mdag/Cargo.toml       yata-mdag/Cargo.toml
 
 # Stub src/ for each crate so Cargo can resolve the dependency graph
 RUN for d in yata-core yata-arrow yata-log yata-kv yata-object yata-ocel \
              yata-lance yata-b2 yata-server yata-client yata-cli yata-cbor \
              yata-cas yata-at yata-signal yata-cypher yata-flight yata-graph \
-             yata-nats yata-raft yata-bolt yata-grin yata-store yata-gie \
-             yata-coordinator; do \
+             yata-raft yata-bolt yata-grin yata-store yata-gie \
+             yata-coordinator yata-engine yata-cdc yata-mdag; do \
       mkdir -p $d/src && echo '' > $d/src/lib.rs; \
     done && \
     mkdir -p yata-bench/src && \

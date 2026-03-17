@@ -10,7 +10,6 @@ yata broker — Arrow-native distributed event store with Raft consensus。magat
 | `yata-client` | `YataClient` trait — KV / Log / Lance への async API |
 | `yata-server` | `Broker` + `BrokerBackend` — embedded broker (magatama-server に埋め込み)。Raft consensus。Prometheus metrics (`/metrics` port 9090) |
 | `yata-raft` | **Raft consensus** — leader election, AppendEntries replication, `StateMachineApplier` trait。single-node は即 leader |
-| `yata-nats` | **(legacy, yata-server から除去済み)** — NATS JetStream backend。crate は残存するが Broker は使わない |
 | `yata-kv` | KV store (local: in-memory snapshot + append-only log + **TTL enforcement** — `ttl_expires_at_ns` lazy-check + reaper) |
 | `yata-log` | Append log (local: filesystem segment files + CBOR + CRC32 + **segment rotation** + **compaction**) |
 | `yata-lance` | Lance table I/O ヘルパー (Arrow RecordBatch 変換、`pub` conversion functions) + **vector search** (`vector_search()`, `create_vector_index()`) |
@@ -75,7 +74,6 @@ Layer 1 (→ core):
   yata-cas ────→ core
   yata-object ─→ core
   yata-ocel ───→ core
-  yata-nats ───→ core, arrow
 
 Layer 2 (→ core + infra):
   yata-cypher ─→ core, ocel
@@ -111,7 +109,7 @@ Layer 7 (binary):
   yata-bench ──→ 14 crates (integration tester)
 ```
 
-**CRITICAL**: 循環依存なし。最深パス 4 hop。`yata-grin` は serde のみ依存 (zero yata deps)。
+**CRITICAL**: 循環依存なし。30 crates、最深パス 4 hop。`yata-grin` は serde のみ依存 (zero yata deps)。
 
 ## yata-engine / magatama-host 責務分離 (CRITICAL)
 

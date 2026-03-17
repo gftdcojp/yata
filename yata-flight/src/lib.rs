@@ -1,3 +1,8 @@
+//! Arrow Flight SQL service for Cypher query and graph operations.
+//!
+//! Implements the full [`FlightSqlService`] trait with custom fallback
+//! tickets for Cypher, vector search, and graph writes.
+
 mod catalog;
 mod codec;
 mod error;

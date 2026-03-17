@@ -3,6 +3,7 @@ name = "yata-bolt"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Bolt v4 wire protocol server for Neo4j driver compatibility"
 
 [lib]
 name = "yata_bolt"

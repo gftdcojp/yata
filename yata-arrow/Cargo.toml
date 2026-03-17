@@ -2,6 +2,8 @@
 name = "yata-arrow"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "Arrow IPC encode/decode and versioned SchemaRegistry"
 
 [dependencies]
 yata-core.workspace = true

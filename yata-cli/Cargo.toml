@@ -2,6 +2,8 @@
 name = "yata-cli"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "CLI tool for yata broker administration"
 
 [[bin]]
 name = "yata"

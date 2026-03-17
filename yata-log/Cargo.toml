@@ -2,6 +2,8 @@
 name = "yata-log"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "Append-only segmented event log with CRC32 integrity and compaction"
 
 [dependencies]
 yata-core.workspace = true

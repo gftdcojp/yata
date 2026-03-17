@@ -1,3 +1,8 @@
+//! Pure-Rust Cypher parser and execution engine.
+//!
+//! Supports variable-length path expansion, regex filters,
+//! `STARTS WITH` / `ENDS WITH` / `CONTAINS` predicates, and `MemoryGraph: Clone`.
+
 #![allow(dead_code)]
 
 pub mod csr;

@@ -1,7 +1,9 @@
 [package]
 name = "yata-grin"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GRIN storage-agnostic graph access traits (Topology, Property, Schema, Mutable, Partitioned)"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

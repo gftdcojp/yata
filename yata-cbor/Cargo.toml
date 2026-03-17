@@ -2,6 +2,8 @@
 name = "yata-cbor"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "CBOR serialization helpers for AT Protocol dag-cbor"
 
 [dependencies]
 yata-core.workspace = true

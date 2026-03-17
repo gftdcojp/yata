@@ -1,7 +1,9 @@
 [package]
 name = "yata-gie"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Graph Interactive Engine with IR operators and push-based executor"
 
 [dependencies]
 yata-grin = { path = "../yata-grin" }

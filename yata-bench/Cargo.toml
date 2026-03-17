@@ -2,6 +2,8 @@
 name = "yata-bench"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "Integration benchmarks for the yata workspace"
 
 [[bin]]
 name = "yata-bench"

@@ -1,3 +1,8 @@
+//! Core types, error handling, and storage traits for the yata broker.
+//!
+//! Defines [`YataError`], [`PayloadRef`], and foundational async traits
+//! ([`AppendLog`], [`KvStore`], [`ObjectStorage`]) that all storage backends implement.
+
 #![allow(dead_code)]
 
 // ---- Forward declarations for inline modules ---------------------------
