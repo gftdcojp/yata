@@ -68,5 +68,6 @@ libc = "0.2"
 yata-flight.workspace = true
 arrow-flight.workspace = true
 tonic.workspace = true
+prost.workspace = true
 aws-config = { version = "1", default-features = false, features = ["rustls"] }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rustls"] }

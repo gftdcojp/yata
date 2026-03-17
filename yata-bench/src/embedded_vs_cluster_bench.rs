@@ -24,7 +24,9 @@
 use anyhow::Result;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt};
 use arrow_flight::Ticket;
+use prost::Message;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -375,12 +377,29 @@ async fn start_flight_server(ds: &Dataset, port: u16) -> tokio::task::JoinHandle
     })
 }
 
+/// Flight SQL 2-step: get_flight_info (CommandStatementQuery) → do_get (TicketStatementQuery)
 async fn flight_cypher_query(client: &mut FlightServiceClient<tonic::transport::Channel>, cypher: &str) -> Result<(usize, usize)> {
-    let ticket = CypherTicket::new(cypher, vec![]);
-    let ticket_bytes = ticket.to_bytes();
-    let total_request_bytes = ticket_bytes.len() + 64; // ~64 bytes gRPC framing
+    use arrow_flight::FlightDescriptor;
 
-    let response = client.do_get(Ticket { ticket: ticket_bytes }).await?;
+    // Step 1: get_flight_info with CommandStatementQuery
+    let cmd = CommandStatementQuery {
+        query: cypher.into(),
+        transaction_id: None,
+    };
+    let cmd_any = cmd.as_any();
+    let descriptor = FlightDescriptor::new_cmd(cmd_any.encode_to_vec());
+    let info_resp = client.get_flight_info(descriptor).await?;
+    let info = info_resp.into_inner();
+
+    let total_request_bytes = cypher.len() + 128; // query + gRPC/protobuf framing
+
+    // Step 2: do_get with the ticket from FlightInfo
+    let endpoint = info.endpoint.first()
+        .ok_or_else(|| anyhow::anyhow!("no endpoint in FlightInfo"))?;
+    let ticket = endpoint.ticket.clone()
+        .ok_or_else(|| anyhow::anyhow!("no ticket in endpoint"))?;
+
+    let response = client.do_get(ticket).await?;
     let inner = response.into_inner();
     let mapped = futures::TryStreamExt::map_err(inner, |e| arrow_flight::error::FlightError::Tonic(e));
     let stream = FlightRecordBatchStream::new_from_flight_data(mapped);
@@ -391,12 +410,10 @@ async fn flight_cypher_query(client: &mut FlightServiceClient<tonic::transport::
     for batch in &batches {
         let row_count = batch.num_rows();
         let col_count = batch.num_columns();
-        // Approximate result content size
-        result_bytes += row_count * col_count * 16; // ~16 bytes avg per cell
-        // Arrow IPC overhead: schema (~1.9KB first batch) + record batch framing
-        total_wire_bytes += 1900 + row_count * col_count * 16 + 128; // 128 bytes IPC framing per batch
+        result_bytes += row_count * col_count * 16;
+        total_wire_bytes += 1900 + row_count * col_count * 16 + 128;
     }
-    if result_bytes == 0 { result_bytes = 4; } // at least "{}"
+    if result_bytes == 0 { result_bytes = 4; }
 
     Ok((result_bytes, total_wire_bytes))
 }
