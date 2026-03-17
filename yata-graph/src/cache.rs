@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use yata_cypher::{Graph, MemoryGraph};
+use yata_cypher::MemoryGraph;
 
 /// Cache configuration.
 #[derive(Clone, Debug)]
@@ -136,6 +136,7 @@ impl GraphCache {
 
     /// Stats for observability.
     pub fn stats(&self) -> CacheStats {
+        use yata_cypher::Graph;
         CacheStats {
             csr_loaded: self.csr.is_some(),
             csr_nodes: self.csr.as_ref().map(|g| g.nodes().len()).unwrap_or(0),

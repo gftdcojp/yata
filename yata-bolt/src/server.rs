@@ -165,7 +165,7 @@ async fn handle_connection(
     }
 }
 
-/// Handle RUN: load graph → execute Cypher → stream RECORD rows.
+/// Handle RUN: execute Cypher via `cached_query()` → stream RECORD rows.
 async fn handle_run(
     stream: &mut TcpStream,
     graph: &LanceGraphStore,
@@ -177,7 +177,6 @@ async fn handle_run(
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // Extract parameters (field[1] is params map)
     let params: Vec<(String, String)> = bolt_struct
         .fields
         .get(1)
@@ -192,86 +191,45 @@ async fn handle_run(
 
     tracing::debug!(cypher, "bolt RUN");
 
-    // Load graph from Lance and execute Cypher
-    let query_result = graph.to_memory_graph().await;
-    match query_result {
-        Ok(mut qg) => {
-            use yata_cypher::Graph;
+    match graph.cached_query(cypher, &params).await {
+        Ok(result) => {
+            let columns: Vec<String> = result
+                .rows
+                .first()
+                .map(|row| row.iter().map(|(col, _)| col.clone()).collect())
+                .unwrap_or_default();
 
-            // Snapshot before state for delta detection on mutations
-            let before_nodes: indexmap::IndexMap<String, yata_cypher::NodeRef> = qg
-                .0
-                .nodes()
-                .into_iter()
-                .map(|n| (n.id.clone(), n))
-                .collect();
-            let before_edges: indexmap::IndexMap<String, yata_cypher::RelRef> = qg
-                .0
-                .rels()
-                .into_iter()
-                .map(|e| (e.id.clone(), e))
+            let fields_val: Vec<Value> = columns
+                .iter()
+                .map(|c| Value::String(c.clone()))
                 .collect();
 
-            match qg.query(cypher, &params) {
-            Ok(rows) => {
-                // Write-back delta for mutations
-                let upper = cypher.to_uppercase();
-                if upper.contains("CREATE")
-                    || upper.contains("MERGE")
-                    || upper.contains("DELETE")
-                    || upper.contains("SET ")
-                    || upper.contains("REMOVE ")
-                {
-                    match graph
-                        .write_delta(&before_nodes, &before_edges, &qg.0)
-                        .await
-                    {
-                        Ok(stats) => tracing::info!(?stats, "bolt: graph delta written"),
-                        Err(e) => tracing::warn!("bolt: write_delta failed: {e}"),
-                    }
-                }
+            let meta = vec![
+                ("fields".to_string(), Value::List(fields_val)),
+                ("t_first".to_string(), Value::Int(0)),
+            ];
+            let resp =
+                packstream::encode_struct_message(packstream::SIG_SUCCESS, &[Value::Map(meta)]);
+            stream.write_all(&resp).await?;
 
-                // Extract column names from first row (or empty)
-                let columns: Vec<String> = rows
-                    .first()
-                    .map(|row| row.iter().map(|(col, _)| col.clone()).collect())
-                    .unwrap_or_default();
-
-                let fields_val: Vec<Value> = columns
+            for row in &result.rows {
+                let record_values: Vec<Value> = row
                     .iter()
-                    .map(|c| Value::String(c.clone()))
+                    .map(|(_, val)| Value::String(val.clone()))
                     .collect();
-
-                // SUCCESS with fields metadata
-                let meta = vec![
-                    ("fields".to_string(), Value::List(fields_val)),
-                    ("t_first".to_string(), Value::Int(0)),
-                ];
-                let resp =
-                    packstream::encode_struct_message(packstream::SIG_SUCCESS, &[Value::Map(meta)]);
-                stream.write_all(&resp).await?;
-
-                // Stream RECORD rows
-                for row in &rows {
-                    let record_values: Vec<Value> = row
-                        .iter()
-                        .map(|(_, val)| Value::String(val.clone()))
-                        .collect();
-                    let record = packstream::encode_struct_message(
-                        packstream::SIG_RECORD,
-                        &[Value::List(record_values)],
-                    );
-                    stream.write_all(&record).await?;
-                }
+                let record = packstream::encode_struct_message(
+                    packstream::SIG_RECORD,
+                    &[Value::List(record_values)],
+                );
+                stream.write_all(&record).await?;
             }
-            Err(e) => {
-                send_failure(stream, "Neo.ClientError.Statement.SyntaxError", &e.to_string())
-                    .await?;
-            }
-        }},
+        }
         Err(e) => {
-            send_failure(stream, "Neo.DatabaseError.General.UnknownError", &e.to_string())
-                .await?;
+            let code = match &e {
+                yata_graph::GraphError::Query(_) => "Neo.ClientError.Statement.SyntaxError",
+                _ => "Neo.DatabaseError.General.UnknownError",
+            };
+            send_failure(stream, code, &e.to_string()).await?;
         }
     }
 

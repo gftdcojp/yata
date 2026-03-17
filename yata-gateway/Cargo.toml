@@ -13,8 +13,6 @@ yata-server.workspace = true
 yata-flight = { path = "../yata-flight" }
 yata-bolt = { path = "../yata-bolt" }
 yata-graph.workspace = true
-yata-cypher.workspace = true
-indexmap.workspace = true
 yata-b2 = { path = "../yata-b2" }
 tokio = { workspace = true }
 anyhow.workspace = true

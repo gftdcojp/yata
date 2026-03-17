@@ -461,6 +461,7 @@ impl LanceGraphStore {
     /// Return a clone of the cached CSR MemoryGraph, loading from Lance on cold start.
     /// Subsequent calls return the in-memory copy (ns latency) until a write invalidates it.
     pub async fn to_memory_graph_cached(&self) -> GraphResult<QueryableGraph> {
+        use yata_cypher::Graph;
         // Fast path: read lock
         {
             let cache = self.cache.read().await;
@@ -474,12 +475,10 @@ impl LanceGraphStore {
             let mut cache = self.cache.write().await;
             // Double-check (another task may have loaded while we waited)
             if cache.get_csr().is_none() {
+                let n = qg.0.nodes().len();
+                let e = qg.0.rels().len();
                 cache.set_csr(qg.0.clone());
-                tracing::info!(
-                    nodes = qg.0.nodes().len(),
-                    edges = qg.0.rels().len(),
-                    "graph cache: CSR loaded from Lance (cold start)"
-                );
+                tracing::info!(nodes = n, edges = e, "graph cache: CSR loaded from Lance (cold start)");
             }
         }
         Ok(qg)

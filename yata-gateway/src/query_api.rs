@@ -1,13 +1,6 @@
 //! Neo4j Query API v2 compatible HTTP endpoint.
 //!
-//! Spec: <https://neo4j.com/docs/query-api/current/>
-//!
-//! Endpoints:
-//!   POST /db/{db}/query/v2        — execute Cypher, return JSON
-//!   POST /db/{db}/query/v2/tx     — begin explicit transaction (stub)
-//!   POST /db/{db}/query/v2/tx/{id}  — execute in transaction (stub)
-//!   DELETE /db/{db}/query/v2/tx/{id} — rollback transaction (stub)
-//!   POST /db/{db}/query/v2/tx/{id}/commit — commit transaction (stub)
+//! Uses `LanceGraphStore::cached_query()` — CSR + query result LRU cache.
 
 use std::sync::Arc;
 
@@ -21,13 +14,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use yata_graph::LanceGraphStore;
 
-/// Shared state for the Query API router.
 #[derive(Clone)]
 pub struct QueryApiState {
     pub graph: Arc<LanceGraphStore>,
 }
-
-// ── Request / Response types (Neo4j Query API v2 compatible) ────────────────
 
 #[derive(Debug, Deserialize)]
 pub struct QueryRequest {
@@ -45,6 +35,8 @@ pub struct QueryResponse {
     pub counters: Option<QueryCounters>,
     #[serde(rename = "bookmarkId")]
     pub bookmark_id: String,
+    #[serde(rename = "cacheHit")]
+    pub cache_hit: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -91,11 +83,8 @@ pub struct TxResponse {
     pub expires_at: String,
 }
 
-// ── Router ──────────────────────────────────────────────────────────────────
-
 pub fn router(graph: Arc<LanceGraphStore>) -> Router {
     let state = QueryApiState { graph };
-
     Router::new()
         .route("/db/{db}/query/v2", post(handle_query))
         .route("/db/{db}/query/v2/tx", post(handle_tx_begin))
@@ -106,8 +95,6 @@ pub fn router(graph: Arc<LanceGraphStore>) -> Router {
         .with_state(state)
 }
 
-// ── Handlers ────────────────────────────────────────────────────────────────
-
 async fn handle_query(
     State(state): State<QueryApiState>,
     Path(_db): Path<String>,
@@ -116,13 +103,7 @@ async fn handle_query(
     execute_cypher(&state.graph, &req).await
 }
 
-/// Core Cypher execution with Lance write-back for mutations.
-async fn execute_cypher(
-    graph: &LanceGraphStore,
-    req: &QueryRequest,
-) -> axum::response::Response {
-    use yata_cypher::Graph;
-
+async fn execute_cypher(graph: &LanceGraphStore, req: &QueryRequest) -> axum::response::Response {
     tracing::debug!(statement = %req.statement, "query api v2");
 
     let params: Vec<(String, String)> = req
@@ -131,125 +112,73 @@ async fn execute_cypher(
         .map(|(k, v)| (k.clone(), v.to_string()))
         .collect();
 
-    // Load graph from Lance
-    let qg_result = graph.to_memory_graph().await;
-    match qg_result {
-        Ok(mut qg) => {
-            // Snapshot before state for delta detection
-            let before_nodes: indexmap::IndexMap<String, yata_cypher::NodeRef> = qg
-                .0
-                .nodes()
-                .into_iter()
-                .map(|n| (n.id.clone(), n))
-                .collect();
-            let before_edges: indexmap::IndexMap<String, yata_cypher::RelRef> = qg
-                .0
-                .rels()
-                .into_iter()
-                .map(|e| (e.id.clone(), e))
-                .collect();
+    match graph.cached_query(&req.statement, &params).await {
+        Ok(result) => {
+            let fields: Vec<String> = result
+                .rows
+                .first()
+                .map(|row| row.iter().map(|(col, _)| col.clone()).collect())
+                .unwrap_or_default();
 
-            match qg.query(&req.statement, &params) {
-                Ok(rows) => {
-                    // Detect if this was a mutation and write-back delta
-                    let delta = if is_mutation(&req.statement) {
-                        match graph
-                            .write_delta(&before_nodes, &before_edges, &qg.0)
-                            .await
-                        {
-                            Ok(stats) => {
-                                tracing::info!(?stats, "graph delta written");
-                                Some(stats)
-                            }
-                            Err(e) => {
-                                tracing::warn!("write_delta failed: {e}");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                    let fields: Vec<String> = rows
-                        .first()
-                        .map(|row| row.iter().map(|(col, _)| col.clone()).collect())
-                        .unwrap_or_default();
-
-                    let values: Vec<Vec<serde_json::Value>> = rows
-                        .iter()
-                        .map(|row| {
-                            row.iter()
-                                .map(|(_, val)| {
-                                    serde_json::from_str(val)
-                                        .unwrap_or(serde_json::Value::String(val.clone()))
-                                })
-                                .collect()
+            let values: Vec<Vec<serde_json::Value>> = result
+                .rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|(_, val)| {
+                            serde_json::from_str(val)
+                                .unwrap_or(serde_json::Value::String(val.clone()))
                         })
-                        .collect();
+                        .collect()
+                })
+                .collect();
 
-                    let counters = if req.include_counters || delta.is_some() {
-                        let d = delta.unwrap_or_default();
-                        Some(QueryCounters {
-                            contains_updates: d.nodes_created + d.edges_created + d.nodes_deleted + d.edges_deleted > 0,
-                            nodes_created: d.nodes_created,
-                            nodes_deleted: d.nodes_deleted,
-                            relationships_created: d.edges_created,
-                            relationships_deleted: d.edges_deleted,
-                            properties_set: d.nodes_modified + d.edges_modified,
-                            labels_added: 0,
-                            labels_removed: 0,
-                        })
-                    } else {
-                        None
-                    };
+            let counters = if req.include_counters || result.delta.is_some() {
+                let d = result.delta.unwrap_or_default();
+                Some(QueryCounters {
+                    contains_updates: d.nodes_created + d.edges_created + d.nodes_deleted + d.edges_deleted > 0,
+                    nodes_created: d.nodes_created,
+                    nodes_deleted: d.nodes_deleted,
+                    relationships_created: d.edges_created,
+                    relationships_deleted: d.edges_deleted,
+                    properties_set: d.nodes_modified + d.edges_modified,
+                    labels_added: 0,
+                    labels_removed: 0,
+                })
+            } else {
+                None
+            };
 
-                    let resp = QueryResponse {
-                        data: QueryData { fields, values },
-                        counters,
-                        bookmark_id: "yata:0".to_string(),
-                    };
-                    (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
-                }
-                Err(e) => error_response(
-                    StatusCode::BAD_REQUEST,
-                    "Neo.ClientError.Statement.SyntaxError",
-                    &e.to_string(),
-                ),
-            }
+            let resp = QueryResponse {
+                data: QueryData { fields, values },
+                counters,
+                bookmark_id: "yata:0".to_string(),
+                cache_hit: result.cache_hit,
+            };
+            (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
         }
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Neo.DatabaseError.General.UnknownError",
-            &e.to_string(),
-        ),
+        Err(e) => {
+            let code = match &e {
+                yata_graph::GraphError::Query(_) => "Neo.ClientError.Statement.SyntaxError",
+                _ => "Neo.DatabaseError.General.UnknownError",
+            };
+            let status = match &e {
+                yata_graph::GraphError::Query(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            let resp = ErrorResponse {
+                errors: vec![ApiError {
+                    code: code.to_string(),
+                    message: e.to_string(),
+                }],
+            };
+            (status, Json(serde_json::to_value(resp).unwrap())).into_response()
+        }
     }
 }
 
-fn is_mutation(cypher: &str) -> bool {
-    let upper = cypher.to_uppercase();
-    upper.contains("CREATE")
-        || upper.contains("MERGE")
-        || upper.contains("DELETE")
-        || upper.contains("SET ")
-        || upper.contains("REMOVE ")
-}
-
-fn error_response(status: StatusCode, code: &str, message: &str) -> axum::response::Response {
-    let resp = ErrorResponse {
-        errors: vec![ApiError {
-            code: code.to_string(),
-            message: message.to_string(),
-        }],
-    };
-    (status, Json(serde_json::to_value(resp).unwrap())).into_response()
-}
-
 async fn handle_tx_begin(Path(_db): Path<String>) -> impl IntoResponse {
-    let resp = TxResponse {
-        id: "yata-tx-1".to_string(),
-        expires_at: "2099-12-31T23:59:59Z".to_string(),
-    };
-    (StatusCode::CREATED, Json(serde_json::to_value(resp).unwrap()))
+    (StatusCode::CREATED, Json(serde_json::json!({"id": "yata-tx-1", "expiresAt": "2099-12-31T23:59:59Z"})))
 }
 
 async fn handle_tx_run(
@@ -260,26 +189,21 @@ async fn handle_tx_run(
     execute_cypher(&state.graph, &body).await
 }
 
-async fn handle_tx_rollback(
-    Path((_db, _tx_id)): Path<(String, String)>,
-) -> impl IntoResponse {
+async fn handle_tx_rollback(Path((_db, _tx_id)): Path<(String, String)>) -> impl IntoResponse {
     StatusCode::ACCEPTED
 }
 
-async fn handle_tx_commit(
-    Path((_db, _tx_id)): Path<(String, String)>,
-) -> impl IntoResponse {
+async fn handle_tx_commit(Path((_db, _tx_id)): Path<(String, String)>) -> impl IntoResponse {
     StatusCode::OK
 }
 
 async fn handle_discovery() -> impl IntoResponse {
-    let info = serde_json::json!({
+    Json(serde_json::json!({
         "neo4j_version": "5.0.0-yata",
         "neo4j_edition": "community",
         "bolt_routing": "neo4j://localhost:7687",
         "bolt_direct": "bolt://localhost:7687",
         "query": "/db/{databaseName}/query/v2",
         "transaction": "/db/{databaseName}/query/v2/tx",
-    });
-    (StatusCode::OK, Json(info))
+    }))
 }
