@@ -8,6 +8,7 @@
 //!
 //! Phase 2: Lance SQL pushdown for label/property/adjacency-driven filtered loading.
 
+pub mod cache;
 pub mod hints;
 pub mod pipeline;
 pub mod coordinator;
@@ -101,6 +102,8 @@ pub enum GraphError {
     Schema(String),
     #[error("serialization error: {0}")]
     Serialization(String),
+    #[error("query error: {0}")]
+    Query(String),
 }
 
 pub type GraphResult<T> = std::result::Result<T, GraphError>;
@@ -173,10 +176,19 @@ pub struct LanceGraphStore {
     /// Lance DB connection. Public for filtered query access from graph_host.
     pub conn: lancedb::Connection,
     pub schema: GraphSchema,
+    /// In-memory cache: CSR graph + query result LRU.
+    pub cache: tokio::sync::RwLock<cache::GraphCache>,
 }
 
 impl LanceGraphStore {
     pub async fn new(base_uri: impl Into<String>) -> GraphResult<Self> {
+        Self::with_cache_config(base_uri, cache::CacheConfig::default()).await
+    }
+
+    pub async fn with_cache_config(
+        base_uri: impl Into<String>,
+        cache_config: cache::CacheConfig,
+    ) -> GraphResult<Self> {
         let conn = lancedb::connect(&base_uri.into())
             .execute()
             .await
@@ -184,6 +196,7 @@ impl LanceGraphStore {
         Ok(Self {
             conn,
             schema: GraphSchema::default(),
+            cache: tokio::sync::RwLock::new(cache::GraphCache::new(cache_config)),
         })
     }
 
@@ -439,8 +452,114 @@ impl LanceGraphStore {
     }
 
     /// Load all vertices + edges into a QueryableGraph for Cypher queries.
+    /// **Uncached** — always loads from Lance. Prefer `cached_query()` or
+    /// `to_memory_graph_cached()` for repeated reads.
     pub async fn to_memory_graph(&self) -> GraphResult<QueryableGraph> {
         self.to_memory_graph_bounded(0, 0).await
+    }
+
+    /// Return a clone of the cached CSR MemoryGraph, loading from Lance on cold start.
+    /// Subsequent calls return the in-memory copy (ns latency) until a write invalidates it.
+    pub async fn to_memory_graph_cached(&self) -> GraphResult<QueryableGraph> {
+        // Fast path: read lock
+        {
+            let cache = self.cache.read().await;
+            if let Some(csr) = cache.get_csr() {
+                return Ok(QueryableGraph(csr.clone()));
+            }
+        }
+        // Cold path: load from Lance, store in cache
+        let qg = self.to_memory_graph().await?;
+        {
+            let mut cache = self.cache.write().await;
+            // Double-check (another task may have loaded while we waited)
+            if cache.get_csr().is_none() {
+                cache.set_csr(qg.0.clone());
+                tracing::info!(
+                    nodes = qg.0.nodes().len(),
+                    edges = qg.0.rels().len(),
+                    "graph cache: CSR loaded from Lance (cold start)"
+                );
+            }
+        }
+        Ok(qg)
+    }
+
+    /// Execute a Cypher query with full caching:
+    ///   1. Query result cache hit → μs
+    ///   2. CSR cache hit → ns (graph traversal) + query execution
+    ///   3. Cold → Lance load → CSR build → cache
+    ///
+    /// Mutations (CREATE/MERGE/DELETE/SET) bypass query cache and
+    /// write-back delta to Lance, invalidating the CSR.
+    pub async fn cached_query(
+        &self,
+        cypher: &str,
+        params: &[(String, String)],
+    ) -> GraphResult<CachedQueryResult> {
+        let is_mut = is_mutation(cypher);
+
+        // Read-only: check query result cache first
+        if !is_mut {
+            let key = cache::GraphCache::cache_key(cypher, params);
+            let cache = self.cache.read().await;
+            if let Some(rows) = cache.get_query(&key) {
+                return Ok(CachedQueryResult {
+                    rows: rows.clone(),
+                    delta: None,
+                    cache_hit: true,
+                });
+            }
+        }
+
+        // Load or use cached CSR
+        let mut qg = self.to_memory_graph_cached().await?;
+
+        // Snapshot before state for mutations
+        let (before_nodes, before_edges) = if is_mut {
+            use yata_cypher::Graph;
+            let bn: IndexMap<String, yata_cypher::NodeRef> =
+                qg.0.nodes().into_iter().map(|n| (n.id.clone(), n)).collect();
+            let be: IndexMap<String, yata_cypher::RelRef> =
+                qg.0.rels().into_iter().map(|e| (e.id.clone(), e)).collect();
+            (Some(bn), Some(be))
+        } else {
+            (None, None)
+        };
+
+        // Execute Cypher
+        let rows = qg.query(cypher, params).map_err(|e| GraphError::Query(e.to_string()))?;
+
+        // Mutation write-back
+        let delta = if is_mut {
+            let stats = self
+                .write_delta(
+                    before_nodes.as_ref().unwrap(),
+                    before_edges.as_ref().unwrap(),
+                    &qg.0,
+                )
+                .await?;
+            // Invalidate cache
+            self.cache.write().await.invalidate();
+            tracing::info!(?stats, "cached_query: delta written, cache invalidated");
+            Some(stats)
+        } else {
+            // Cache the result
+            let key = cache::GraphCache::cache_key(cypher, params);
+            self.cache.write().await.put_query(key, rows.clone());
+            None
+        };
+
+        Ok(CachedQueryResult {
+            rows,
+            delta,
+            cache_hit: false,
+        })
+    }
+
+    /// Cache stats for observability.
+    pub async fn cache_stats(&self) -> cache::CacheStats {
+        self.cache.read().await.stats()
     }
 
     /// Load vertices + edges with optional size guards.
@@ -953,6 +1072,25 @@ pub fn json_to_cypher(v: &serde_json::Value) -> yata_cypher::Value {
             yata_cypher::Value::Map(map)
         }
     }
+}
+
+// ---- CachedQueryResult --------------------------------------------------
+
+/// Result from `LanceGraphStore::cached_query()`.
+#[derive(Debug, Clone)]
+pub struct CachedQueryResult {
+    pub rows: Vec<Vec<(String, String)>>,
+    pub delta: Option<DeltaStats>,
+    pub cache_hit: bool,
+}
+
+fn is_mutation(cypher: &str) -> bool {
+    let upper = cypher.to_uppercase();
+    upper.contains("CREATE")
+        || upper.contains("MERGE")
+        || upper.contains("DELETE")
+        || upper.contains("SET ")
+        || upper.contains("REMOVE ")
 }
 
 // ---- QueryableGraph -----------------------------------------------------

@@ -1,7 +1,10 @@
 //! yata-gateway — standalone Bolt + Arrow Flight SQL + Neo4j Query API gateway.
 //!
+//! When lance_uri / graph_uri are `s3://` URIs, LanceDB writes directly to
+//! object storage (B2 S3-compatible). No local PVC or B2 sync needed for those.
+//!
 //! Starts:
-//!   1. yata Broker (PVC data + B2 tiered sync)
+//!   1. yata Broker (log/kv on PVC, lance/graph on S3 or PVC)
 //!   2. Arrow Flight SQL server (default :32010)
 //!   3. Bolt v4 server (default :7687)
 //!   4. Neo4j Query API v2 HTTP server (default :7474)

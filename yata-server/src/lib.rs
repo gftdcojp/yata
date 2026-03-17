@@ -120,7 +120,7 @@ pub struct Broker {
     /// Local log handle for compaction.
     local_log: Arc<LocalLog>,
     /// B2 sync handle (REQUIRED); used by background tasks for log/kv/lance dir sync.
-    b2_sync: Arc<B2Sync>,
+    pub b2_sync: Arc<B2Sync>,
     /// Raft consensus node. Single-node starts as leader immediately.
     pub raft: Arc<yata_raft::RaftNode>,
 }
