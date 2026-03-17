@@ -383,3 +383,128 @@ async fn test_vector_search_cosine_ranking() {
     assert!(results[0].1 < results[1].1, "close should have smaller distance: {} vs {}", results[0].1, results[1].1);
     assert_eq!(results[0].0.id, "close");
 }
+
+// ── cached_query tests ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_cached_query_create_and_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LanceGraphStore::new(dir.path().to_str().unwrap()).await.unwrap();
+
+    // CREATE via cached_query
+    let result = store.cached_query(
+        "CREATE (a:Person {name: \"Alice\", age: \"30\"}), (b:Person {name: \"Bob\", age: \"25\"}) RETURN a.name",
+        &[],
+    ).await.unwrap();
+    assert!(!result.cache_hit);
+    assert!(result.delta.is_some());
+    assert_eq!(result.delta.unwrap().nodes_created, 2);
+
+    // MATCH should find persisted data
+    let result = store.cached_query(
+        "MATCH (n:Person) RETURN n.name, n.age",
+        &[],
+    ).await.unwrap();
+    assert!(!result.cache_hit); // first read after write = cache invalidated
+    assert_eq!(result.rows.len(), 2);
+
+    // Same query again = cache hit
+    let result2 = store.cached_query(
+        "MATCH (n:Person) RETURN n.name, n.age",
+        &[],
+    ).await.unwrap();
+    assert!(result2.cache_hit);
+    assert_eq!(result2.rows.len(), 2);
+}
+
+#[tokio::test]
+async fn test_cached_query_create_with_edge_then_match_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LanceGraphStore::new(dir.path().to_str().unwrap()).await.unwrap();
+
+    // CREATE nodes + edge
+    store.cached_query(
+        "CREATE (a:Person {name: \"Alice\"}), (b:Person {name: \"Bob\"}), (a)-[:KNOWS {since: \"2024\"}]->(b) RETURN a.name",
+        &[],
+    ).await.unwrap();
+
+    // Debug: check what's in the graph after write-back
+    let qg = store.to_memory_graph().await.unwrap();
+    let nodes = qg.0.nodes();
+    let rels = qg.0.rels();
+    println!("After CREATE+write_delta:");
+    for n in &nodes { println!("  node: {} {:?} {:?}", n.id, n.labels, n.props); }
+    for r in &rels { println!("  edge: {} {} -[{}]-> {}", r.id, r.src, r.rel_type, r.dst); }
+
+    // MATCH path pattern — should resolve a.name and b.name
+    let result = store.cached_query(
+        "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name",
+        &[],
+    ).await.unwrap();
+
+    assert_eq!(result.rows.len(), 1, "expected 1 KNOWS relationship, got {}", result.rows.len());
+    // Check that a.name and b.name are resolved (not null)
+    let row = &result.rows[0];
+    let a_name = row.iter().find(|(c, _)| c == "a.name").map(|(_, v)| v.as_str());
+    let b_name = row.iter().find(|(c, _)| c == "b.name").map(|(_, v)| v.as_str());
+    assert!(a_name.is_some(), "a.name should not be null");
+    assert!(b_name.is_some(), "b.name should not be null");
+    assert_ne!(a_name.unwrap(), "null", "a.name should not be 'null'");
+    assert_ne!(b_name.unwrap(), "null", "b.name should not be 'null'");
+}
+
+#[tokio::test]
+async fn test_cached_query_merge_set_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LanceGraphStore::new(dir.path().to_str().unwrap()).await.unwrap();
+
+    // CREATE initial node
+    store.cached_query(
+        "CREATE (x:Engineer {name: \"Sato\", skill: \"Rust\"}) RETURN x.name",
+        &[],
+    ).await.unwrap();
+
+    // MERGE + SET new property
+    let result = store.cached_query(
+        "MERGE (x:Engineer {name: \"Sato\"}) SET x.level = \"senior\" RETURN x.name, x.level",
+        &[],
+    ).await.unwrap();
+    assert!(!result.cache_hit);
+
+    // Reload and verify the SET property persisted
+    let result = store.cached_query(
+        "MATCH (e:Engineer {name: \"Sato\"}) RETURN e.name, e.skill, e.level",
+        &[],
+    ).await.unwrap();
+    assert_eq!(result.rows.len(), 1);
+    let row = &result.rows[0];
+    let level = row.iter().find(|(c, _)| c == "e.level").map(|(_, v)| v.as_str());
+    // level should be "senior" (persisted via write_delta)
+    println!("MERGE SET test - row: {:?}", row);
+    println!("level = {:?}", level);
+}
+
+#[tokio::test]
+async fn test_cached_query_write_invalidates_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LanceGraphStore::new(dir.path().to_str().unwrap()).await.unwrap();
+
+    store.cached_query("CREATE (a:X {v: \"1\"}) RETURN a.v", &[]).await.unwrap();
+
+    // Read → cache miss (post-write invalidation)
+    let r1 = store.cached_query("MATCH (n:X) RETURN n.v", &[]).await.unwrap();
+    assert!(!r1.cache_hit);
+    assert_eq!(r1.rows.len(), 1);
+
+    // Same read → cache hit
+    let r2 = store.cached_query("MATCH (n:X) RETURN n.v", &[]).await.unwrap();
+    assert!(r2.cache_hit);
+
+    // Write → invalidates
+    store.cached_query("CREATE (b:X {v: \"2\"}) RETURN b.v", &[]).await.unwrap();
+
+    // Read again → cache miss, should see 2 nodes
+    let r3 = store.cached_query("MATCH (n:X) RETURN n.v", &[]).await.unwrap();
+    assert!(!r3.cache_hit);
+    assert_eq!(r3.rows.len(), 2);
+}
