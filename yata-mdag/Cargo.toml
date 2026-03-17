@@ -1,7 +1,9 @@
 [package]
 name = "yata-mdag"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Merkle DAG graph sync with CBOR blocks and time-travel checkout"
 
 [dependencies]
 yata-core = { path = "../yata-core" }

@@ -1,42 +1,50 @@
 [workspace]
 resolver = "2"
 members = [
+    # Layer 0: zero deps
     "yata-core",
-    "yata-arrow",
-    "yata-log",
-    "yata-kv",
-    "yata-object",
-    "yata-ocel",
-    "yata-lance",
-    "yata-b2",
-    "yata-server",
-    "yata-client",
-    "yata-cli",
-    "yata-cbor",
-    "yata-cas",
-    "yata-at",
-    "yata-signal",
-    "yata-bench",
-    "yata-cypher",
-    "yata-flight",
-    "yata-graph",
-    "yata-nats",
     "yata-raft",
     "yata-grin",
+    # Layer 1: core primitives
+    "yata-arrow",
+    "yata-cbor",
+    "yata-cas",
+    "yata-object",
+    "yata-ocel",
+    # Layer 2: storage
+    "yata-cypher",
+    "yata-log",
+    "yata-b2",
+    "yata-lance",
+    "yata-client",
+    # Layer 3: graph + kv
     "yata-store",
+    "yata-kv",
+    "yata-graph",
+    "yata-signal",
+    # Layer 4: graph engine
     "yata-gie",
-    "yata-coordinator",
-    "yata-bolt",
-    "yata-gateway",
     "yata-engine",
     "yata-cdc",
     "yata-mdag",
+    "yata-flight",
+    "yata-bolt",
+    # Layer 5: sharding
+    "yata-coordinator",
+    # Layer 6: composite
+    "yata-server",
+    "yata-at",
+    # Layer 7: binaries
+    "yata-gateway",
+    "yata-cli",
+    "yata-bench",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
+repository = "https://github.com/gftdcojp/yata"
 
 [workspace.dependencies]
 # Arrow
@@ -134,13 +142,9 @@ yata-gie = { path = "yata-gie" }
 yata-coordinator = { path = "yata-coordinator" }
 
 yata-graph = { path = "yata-graph" }
-yata-nats = { path = "yata-nats" }
 yata-raft = { path = "yata-raft" }
 yata-bolt = { path = "yata-bolt" }
 yata-flight = { path = "yata-flight" }
-
-# NATS
-async-nats = "0.38"
 
 # Parallelism
 rayon = "1.10"
