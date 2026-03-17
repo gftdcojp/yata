@@ -105,6 +105,73 @@ impl<T: Topology + Property + Schema + Scannable + Send + Sync> GraphStore for T
 pub trait MutableGraphStore: GraphStore + Mutable {}
 impl<T: GraphStore + Mutable> MutableGraphStore for T {}
 
+// ── Tiered storage (HOT OLTP → COLD OLAP) ──────────────────────────────
+
+/// Storage temperature tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Tier {
+    /// In-memory MutableCSR (ns latency, bounded by RAM).
+    Hot,
+    /// Lance local on PVC (ms latency, bounded by disk).
+    Warm,
+    /// Lance on S3/B2 (100ms+ latency, infinite scale).
+    Cold,
+}
+
+/// Tier-aware store — knows which tier it serves and what labels it holds.
+pub trait Tiered {
+    fn tier(&self) -> Tier;
+    fn can_serve(&self, labels: &[String]) -> bool;
+}
+
+// ── Versioning (Lance versioning / MVCC snapshots) ──────────────────────
+
+/// Version identifier (maps to Lance dataset version or MVCC commit).
+pub type VersionId = u64;
+
+/// Time-travel and snapshot support.
+pub trait Versioned {
+    fn current_version(&self) -> VersionId;
+    fn versions(&self, limit: usize) -> Vec<VersionId>;
+    fn has_version(&self, version: VersionId) -> bool;
+}
+
+// ── Distributed partition (GRIN edge-cut / vertex-cut) ──────────────────
+
+/// Cross-partition vertex reference.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct VertexRef {
+    pub partition_id: u32,
+    pub vid: u32,
+}
+
+/// Partition strategy for distributed graph storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PartitionStrategy {
+    /// Each vertex lives on exactly one partition; edges may cross.
+    EdgeCut,
+    /// Each edge lives on exactly one partition; vertices may be replicated.
+    VertexCut,
+}
+
+/// Extended distributed partition awareness (GRIN-style).
+pub trait DistributedPartition: Partitioned {
+    fn strategy(&self) -> PartitionStrategy;
+    fn is_mirror(&self, vid: u32) -> bool { !self.is_master(vid) }
+    fn master_of(&self, vid: u32) -> VertexRef;
+    fn mirrors_of(&self, vid: u32) -> Vec<u32>;
+}
+
+// ── Combined tiered traits ──────────────────────────────────────────────
+
+/// Tiered + versioned graph store.
+pub trait TieredGraphStore: GraphStore + Tiered + Versioned {}
+impl<T: GraphStore + Tiered + Versioned> TieredGraphStore for T {}
+
+/// Tiered + mutable graph store.
+pub trait TieredMutableGraphStore: TieredGraphStore + Mutable {}
+impl<T: TieredGraphStore + Mutable> TieredMutableGraphStore for T {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +211,42 @@ mod tests {
         assert_eq!(n.vid, n2.vid);
         assert_eq!(n.edge_id, n2.edge_id);
         assert_eq!(n.edge_label, n2.edge_label);
+    }
+
+    #[test]
+    fn test_tier_equality() {
+        assert_eq!(Tier::Hot, Tier::Hot);
+        assert_ne!(Tier::Hot, Tier::Warm);
+        assert_ne!(Tier::Warm, Tier::Cold);
+    }
+
+    #[test]
+    fn test_vertex_ref() {
+        let r = VertexRef { partition_id: 2, vid: 42 };
+        let r2 = r.clone();
+        assert_eq!(r, r2);
+        assert_eq!(r.partition_id, 2);
+        assert_eq!(r.vid, 42);
+    }
+
+    #[test]
+    fn test_partition_strategy() {
+        assert_eq!(PartitionStrategy::EdgeCut, PartitionStrategy::EdgeCut);
+        assert_ne!(PartitionStrategy::EdgeCut, PartitionStrategy::VertexCut);
+    }
+
+    #[test]
+    fn test_tier_serde() {
+        let json = serde_json::to_string(&Tier::Cold).unwrap();
+        let tier: Tier = serde_json::from_str(&json).unwrap();
+        assert_eq!(tier, Tier::Cold);
+    }
+
+    #[test]
+    fn test_vertex_ref_serde() {
+        let r = VertexRef { partition_id: 1, vid: 99 };
+        let json = serde_json::to_string(&r).unwrap();
+        let r2: VertexRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(r, r2);
     }
 }

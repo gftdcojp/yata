@@ -7565,6 +7565,7 @@ dependencies = [
  "anyhow",
  "arrow",
  "arrow-array",
+ "arrow-flight",
  "arrow-schema",
  "aws-config",
  "aws-sdk-s3",
@@ -7581,6 +7582,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
  "x25519-dalek",
@@ -7590,6 +7592,7 @@ dependencies = [
  "yata-client",
  "yata-core",
  "yata-cypher",
+ "yata-flight",
  "yata-kv",
  "yata-lance",
  "yata-log",
@@ -7719,6 +7722,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "yata-engine"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "futures",
+ "indexmap 2.13.0",
+ "lancedb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "yata-cypher",
+ "yata-graph",
+ "yata-grin",
+ "yata-store",
+]
+
+[[package]]
 name = "yata-flight"
 version = "0.1.0"
 dependencies = [
@@ -7807,6 +7829,7 @@ name = "yata-grin"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]

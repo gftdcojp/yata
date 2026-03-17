@@ -27,6 +27,10 @@ path = "src/at_bench.rs"
 name = "signal-bench"
 path = "src/signal_bench.rs"
 
+[[bin]]
+name = "embedded-vs-cluster-bench"
+path = "src/embedded_vs_cluster_bench.rs"
+
 [dependencies]
 yata-core.workspace = true
 yata-at.workspace = true
@@ -61,5 +65,8 @@ neo4rs = "0.8"
 rand = { workspace = true }
 memmap2 = "0.9"
 libc = "0.2"
+yata-flight.workspace = true
+arrow-flight.workspace = true
+tonic.workspace = true
 aws-config = { version = "1", default-features = false, features = ["rustls"] }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rustls"] }

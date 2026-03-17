@@ -1099,6 +1099,33 @@ impl Partitioned for MutableCsrStore {
     }
 }
 
+impl Tiered for MutableCsrStore {
+    fn tier(&self) -> Tier {
+        Tier::Hot
+    }
+
+    fn can_serve(&self, labels: &[String]) -> bool {
+        if labels.is_empty() {
+            return self.vertex_count() > 0;
+        }
+        labels.iter().any(|l| self.label_index.contains_key(l))
+    }
+}
+
+impl Versioned for MutableCsrStore {
+    fn current_version(&self) -> VersionId {
+        self.version.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn versions(&self, _limit: usize) -> Vec<VersionId> {
+        vec![self.current_version()]
+    }
+
+    fn has_version(&self, version: VersionId) -> bool {
+        version == self.current_version()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,21 @@
+[package]
+name = "yata-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+yata-grin = { path = "../yata-grin" }
+yata-store = { path = "../yata-store" }
+yata-graph = { path = "../yata-graph" }
+yata-cypher = { path = "../yata-cypher" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+indexmap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+arrow = { workspace = true }
+lancedb = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

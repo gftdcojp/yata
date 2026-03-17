@@ -2962,20 +2962,36 @@ pub mod executor {
             while i < elements.len() {
                 match &elements[i] {
                     PatternElement::Node(np) => {
-                        let id = uuid::Uuid::new_v4().to_string();
-                        let mut props = IndexMap::new();
-                        for (k, expr) in &np.props {
-                            props.insert(k.clone(), self.eval(expr, binding)?);
-                        }
-                        let node = NodeRef {
-                            id: id.clone(),
-                            labels: np.labels.clone(),
-                            props,
+                        // Check if variable already bound (from earlier pattern in same CREATE)
+                        let existing_id = np.var.as_ref().and_then(|v| {
+                            var_ids.get(v).cloned().or_else(|| {
+                                binding.get(v).and_then(|val| match val {
+                                    Value::Node(n) => Some(n.id.clone()),
+                                    _ => None,
+                                })
+                            })
+                        });
+
+                        let id = if let Some(eid) = existing_id {
+                            // Reuse existing node — don't create a duplicate
+                            eid
+                        } else {
+                            let id = uuid::Uuid::new_v4().to_string();
+                            let mut props = IndexMap::new();
+                            for (k, expr) in &np.props {
+                                props.insert(k.clone(), self.eval(expr, binding)?);
+                            }
+                            let node = NodeRef {
+                                id: id.clone(),
+                                labels: np.labels.clone(),
+                                props,
+                            };
+                            graph.add_node(node);
+                            if let Some(var) = &np.var {
+                                var_ids.insert(var.clone(), id.clone());
+                            }
+                            id
                         };
-                        graph.add_node(node);
-                        if let Some(var) = &np.var {
-                            var_ids.insert(var.clone(), id.clone());
-                        }
                         prev_node_id = Some(id);
                         i += 1;
                     }
@@ -2989,21 +3005,35 @@ pub mod executor {
                             }
                         };
 
-                        // Create dst node first
-                        let dst_id = uuid::Uuid::new_v4().to_string();
-                        let mut dst_props = IndexMap::new();
-                        for (k, expr) in &next_np.props {
-                            dst_props.insert(k.clone(), self.eval(expr, binding)?);
-                        }
-                        let dst_node = NodeRef {
-                            id: dst_id.clone(),
-                            labels: next_np.labels.clone(),
-                            props: dst_props,
+                        // Check if dst variable already bound
+                        let existing_dst = next_np.var.as_ref().and_then(|v| {
+                            var_ids.get(v).cloned().or_else(|| {
+                                binding.get(v).and_then(|val| match val {
+                                    Value::Node(n) => Some(n.id.clone()),
+                                    _ => None,
+                                })
+                            })
+                        });
+
+                        let dst_id = if let Some(eid) = existing_dst {
+                            eid
+                        } else {
+                            let dst_id = uuid::Uuid::new_v4().to_string();
+                            let mut dst_props = IndexMap::new();
+                            for (k, expr) in &next_np.props {
+                                dst_props.insert(k.clone(), self.eval(expr, binding)?);
+                            }
+                            let dst_node = NodeRef {
+                                id: dst_id.clone(),
+                                labels: next_np.labels.clone(),
+                                props: dst_props,
+                            };
+                            graph.add_node(dst_node);
+                            if let Some(var) = &next_np.var {
+                                var_ids.insert(var.clone(), dst_id.clone());
+                            }
+                            dst_id
                         };
-                        graph.add_node(dst_node);
-                        if let Some(var) = &next_np.var {
-                            var_ids.insert(var.clone(), dst_id.clone());
-                        }
 
                         let rel_id = uuid::Uuid::new_v4().to_string();
                         let mut rel_props = IndexMap::new();

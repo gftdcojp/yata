@@ -28,6 +28,7 @@ members = [
     "yata-coordinator",
     "yata-bolt",
     "yata-gateway",
+    "yata-engine",
 ]
 
 [workspace.package]
