@@ -1036,8 +1036,21 @@ impl TieredGraphEngine {
 
     /// Restore CSR from Vineyard fragment manifest (blobs already loaded).
     pub fn restore_from_vineyard(&self, manifest: &FragmentManifest) {
-        match crate::snapshot::restore_snapshot_from_vineyard(self.vineyard.as_ref(), manifest) {
-            Ok(store) => {
+        let all_labels: Vec<String> = manifest.vertex_labels.keys()
+            .chain(manifest.edge_labels.keys())
+            .cloned()
+            .collect();
+        let mut store = yata_store::MutableCsrStore::new_with_partition_id(
+            yata_core::PartitionId::from(manifest.partition_id),
+        );
+        match crate::loader::ensure_labels_from_vineyard(
+            self.vineyard.as_ref(),
+            manifest,
+            &all_labels,
+            &mut store,
+        ) {
+            Ok(_loaded) => {
+                store.commit();
                 let vc = store.vertex_count();
                 let ec = store.edge_count();
                 if let Ok(mut hot) = self.hot.lock() {
