@@ -296,3 +296,230 @@ fn multi_label_fragment() {
         Some("Company")
     );
 }
+
+// ── Arrow Row-Group Chunk Tests ──────────────────────────────────
+
+#[test]
+fn split_record_batch_basic() {
+    // 10 rows, chunk_size=3 → 4 chunks (3+3+3+1)
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+    ]));
+    let ids = Int64Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(ids)]).unwrap();
+
+    let chunks = split_record_batch(&batch, 3);
+    assert_eq!(chunks.len(), 4);
+    assert_eq!(chunks[0].num_rows(), 3);
+    assert_eq!(chunks[1].num_rows(), 3);
+    assert_eq!(chunks[2].num_rows(), 3);
+    assert_eq!(chunks[3].num_rows(), 1);
+
+    // Verify data integrity
+    let c0 = chunks[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(c0.value(0), 0);
+    assert_eq!(c0.value(2), 2);
+    let c3 = chunks[3].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(c3.value(0), 9);
+}
+
+#[test]
+fn split_record_batch_exact_multiple() {
+    // 6 rows, chunk_size=3 → 2 chunks (3+3)
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let vals = Int64Array::from(vec![10, 20, 30, 40, 50, 60]);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(vals)]).unwrap();
+
+    let chunks = split_record_batch(&batch, 3);
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].num_rows(), 3);
+    assert_eq!(chunks[1].num_rows(), 3);
+}
+
+#[test]
+fn split_record_batch_smaller_than_chunk() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let vals = Int64Array::from(vec![1, 2]);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(vals)]).unwrap();
+
+    // Batch smaller than chunk_size → single chunk
+    let chunks = split_record_batch(&batch, 100);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].num_rows(), 2);
+}
+
+/// Build a large test fragment with N vertices to exercise chunked serialization.
+fn build_large_fragment(n: usize) -> ArrowFragment {
+    let mut schema = PropertyGraphSchema::new();
+    let vlabel = schema.add_vertex_label("Node");
+    schema.vertex_entry_mut(vlabel).unwrap().add_prop("id", &DataType::Int64);
+    schema.vertex_entry_mut(vlabel).unwrap().add_prop("name", &DataType::Utf8);
+
+    let _elabel = schema.add_edge_label("LINK");
+
+    let mut frag = ArrowFragment::new(0, 1, true, schema);
+
+    let ids: Vec<i64> = (0..n as i64).collect();
+    let names: Vec<String> = (0..n).map(|i| format!("node_{}", i)).collect();
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+
+    let vertex_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        vertex_schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(name_refs)),
+        ],
+    ).unwrap();
+    frag.vertex_tables.push(batch);
+    frag.ivnums[0] = n as u64;
+
+    // Empty edge table
+    frag.edge_tables.push(RecordBatch::new_empty(Arc::new(Schema::empty())));
+
+    frag
+}
+
+#[test]
+fn chunked_serialize_deserialize_roundtrip() {
+    // 500 vertices, chunk_size=100 → 5 chunks
+    let frag = build_large_fragment(500);
+    let store = MemoryBlobStore::new();
+
+    let meta = frag.serialize_with_chunk_size(&store, 100);
+
+    // Verify chunked blobs exist in meta
+    let chunk_count = meta.get_field("vertex_table_0_chunks")
+        .and_then(|v| v.as_i64())
+        .unwrap();
+    assert_eq!(chunk_count, 5);
+
+    // Single vertex_table_0 blob should NOT exist
+    assert!(!meta.blobs.contains_key("vertex_table_0"));
+
+    // Chunk blobs should exist
+    for j in 0..5 {
+        assert!(meta.blobs.contains_key(&format!("vertex_table_0_chunk_{}", j)));
+    }
+
+    // Deserialize and verify full data integrity
+    let restored = ArrowFragment::deserialize(&meta, &store).unwrap();
+    assert_eq!(restored.inner_vertex_num(0), 500);
+
+    let batch = restored.vertex_table(0).unwrap();
+    assert_eq!(batch.num_rows(), 500);
+
+    let ids = batch.column_by_name("id").unwrap()
+        .as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(ids.value(0), 0);
+    assert_eq!(ids.value(99), 99);
+    assert_eq!(ids.value(100), 100); // crosses chunk boundary
+    assert_eq!(ids.value(499), 499);
+
+    let names = batch.column_by_name("name").unwrap()
+        .as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(names.value(0), "node_0");
+    assert_eq!(names.value(499), "node_499");
+}
+
+#[test]
+fn chunked_backward_compat_small_batch() {
+    // Small batch (< chunk_size) should NOT produce chunks
+    let frag = build_large_fragment(50);
+    let store = MemoryBlobStore::new();
+
+    let meta = frag.serialize_with_chunk_size(&store, 100);
+
+    // Should use single-blob format
+    assert!(meta.blobs.contains_key("vertex_table_0"));
+    assert!(meta.get_field("vertex_table_0_chunks").is_none());
+
+    let restored = ArrowFragment::deserialize(&meta, &store).unwrap();
+    assert_eq!(restored.inner_vertex_num(0), 50);
+    assert_eq!(restored.vertex_table(0).unwrap().num_rows(), 50);
+}
+
+#[test]
+fn byte_based_chunking_default() {
+    // 1000 vertices, default byte target (32 MB) — should NOT chunk (too small)
+    let frag = build_large_fragment(1000);
+    let store = MemoryBlobStore::new();
+
+    // Default serialize uses byte-based estimation
+    let meta = frag.serialize(&store);
+
+    // 1000 rows × ~20 bytes/row = ~20KB — far below 32 MB target → single blob
+    assert!(meta.blobs.contains_key("vertex_table_0"));
+    assert!(meta.get_field("vertex_table_0_chunks").is_none());
+
+    let restored = ArrowFragment::deserialize(&meta, &store).unwrap();
+    assert_eq!(restored.inner_vertex_num(0), 1000);
+}
+
+#[test]
+fn byte_based_chunking_small_target() {
+    // 10K vertices, target = 1 KB → resolve_chunk_rows clamps to min 1K rows → 10 chunks
+    let frag = build_large_fragment(10_000);
+    let store = MemoryBlobStore::new();
+
+    // Use byte target of 1KB — clamp produces min 1K rows/chunk → 10K/1K = 10 chunks
+    let meta = frag.serialize_with_byte_target(&store, 1024, None);
+
+    let chunk_count = meta.get_field("vertex_table_0_chunks")
+        .and_then(|v| v.as_i64());
+    assert!(chunk_count.is_some(), "expected chunked output for small byte target");
+    assert!(chunk_count.unwrap() >= 2, "expected multiple chunks");
+
+    // Roundtrip should be intact
+    let restored = ArrowFragment::deserialize(&meta, &store).unwrap();
+    assert_eq!(restored.inner_vertex_num(0), 10_000);
+    let batch = restored.vertex_table(0).unwrap();
+    assert_eq!(batch.num_rows(), 10_000);
+}
+
+#[test]
+fn chunked_with_csr_topology_roundtrip() {
+    // Use the standard test fragment (3 vertices, with CSR) to verify
+    // that chunking doesn't break CSR topology
+    let frag = build_test_fragment();
+    let store = MemoryBlobStore::new();
+
+    // Force chunk_size=2 so 3 vertices → 2 chunks (2+1)
+    let meta = frag.serialize_with_chunk_size(&store, 2);
+
+    let chunk_count = meta.get_field("vertex_table_0_chunks")
+        .and_then(|v| v.as_i64())
+        .unwrap();
+    assert_eq!(chunk_count, 2);
+
+    let restored = ArrowFragment::deserialize(&meta, &store).unwrap();
+    assert_eq!(restored.inner_vertex_num(0), 3);
+
+    // Verify vertex data
+    let batch = restored.vertex_table(0).unwrap();
+    let names = batch.column_by_name("name").unwrap()
+        .as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(names.value(0), "Alice");
+    assert_eq!(names.value(1), "Bob");
+    assert_eq!(names.value(2), "Carol");
+
+    // Verify CSR topology is intact (stored separately from vertex tables)
+    let nbrs = restored.out_neighbors(0, 0, 0).unwrap();
+    assert_eq!(nbrs.len(), 1);
+    assert_eq!(nbrs[0].vid, 1);
+
+    let nbrs = restored.out_neighbors(0, 0, 1).unwrap();
+    assert_eq!(nbrs.len(), 1);
+    assert_eq!(nbrs[0].vid, 2);
+
+    let nbrs = restored.in_neighbors(0, 0, 2).unwrap();
+    assert_eq!(nbrs.len(), 1);
+    assert_eq!(nbrs[0].vid, 1);
+}

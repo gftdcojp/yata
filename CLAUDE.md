@@ -1,6 +1,6 @@
 # packages/rust/yata
 
-yata — Rust Cypher graph engine. `[PRODUCTION]` Container (CSR + DiskVineyard/MmapVineyard) × 1 partition. Workers RPC coordinator. GraphScope partial parity 17/23 (Vineyard + GIE push-based + SecurityFilter RLS).
+yata — Rust Cypher graph engine. `[PRODUCTION]` Container (CSR + DiskVineyard/MmapVineyard) × 1 partition. Workers RPC coordinator. GraphScope parity 20/24 (14 PRODUCTION + 6 IMPLEMENTED)。Vineyard + GIE push-based + SecurityFilter RLS + Arrow row-group chunk page-in。
 
 ## Architecture (CRITICAL)
 
@@ -75,9 +75,9 @@ env.YATA.stats()                 // → all partition stats
 |---|---|
 | `yata-core` | GlobalVid, LocalVid, PartitionId |
 | `yata-grin` | GRIN trait (Topology, Property, Schema, Scannable, Mutable) |
-| `yata-vineyard` | **ArrowFragment format** (canonical snapshot/persistence format)。NbrUnit zero-copy CSR (25x faster neighbor traversal)。`csr_to_fragment()` (CSR→ArrowFragment) + `ArrowFragment::serialize/deserialize` (BlobStore↔R2)。PropertyGraphSchema (typed vertex/edge labels + Arrow property columns) |
+| `yata-vineyard` | **ArrowFragment format** (canonical snapshot/persistence format)。NbrUnit zero-copy CSR (25x faster neighbor traversal)。`csr_to_fragment()` (CSR→ArrowFragment) + `ArrowFragment::serialize/deserialize` (BlobStore↔R2)。**Arrow row-group chunk**: `split_record_batch` + byte-based chunking (32 MB default, `estimate_bytes_per_row`)。PropertyGraphSchema (typed vertex/edge labels + Arrow property columns) |
 | `yata-store` | MutableCsrStore (mutable in-memory CSR, GRIN traits), ArrowGraphStore, DiskVineyard/MmapVineyard/EdgeVineyard (blob cache), PartitionStoreSet, GraphStoreEnum |
-| `yata-engine` | TieredGraphEngine, ArrowFragment snapshot (trigger_snapshot → R2), page-in (R2 → ArrowFragment → CSR), Frontier BFS, ShardedCoordinator |
+| `yata-engine` | TieredGraphEngine, ArrowFragment snapshot (trigger_snapshot → R2), page-in (R2 → ArrowFragment → CSR), selective chunk page-in API (`page_in_vertex_chunk_from_r2`), Frontier BFS, ShardedCoordinator |
 | `yata-cypher` | Full Cypher parser + executor (incl. untyped edge traversal) |
 | `yata-gie` | GIE push-based executor, IR (Exchange/Receive/Gather), distributed planner |
 | `yata-s3` | R2 persistence (sync ureq+rustls S3 client, SigV4)。`trigger_snapshot()` → R2 PUT、page-in → R2 GET |
@@ -115,7 +115,7 @@ env.YATA.stats()                 // → all partition stats
 | Groot PK index | O(1) vertex lookup | merge_by_pk + prop_eq_index | `[IMPLEMENTED]` mergeRecord のみ、Cypher MERGE 未対応 |
 | Hash partition routing | vertex → partition | partition.rs PartitionAssignment::Hash | `[STUB]` 定義のみ、mutation flow 未結線 |
 | Chunk page-in | granular I/O | ArrowFragment per-label blob | `[PRODUCTION]` per-label 単位 (chunk 単位は `[STUB]`) |
-| Arrow row-group chunk | sub-label granular I/O | — | `[DESIGN]` RecordBatch 境界で row-group 分割 page-in |
+| Arrow row-group chunk | sub-label granular I/O | `split_record_batch` + byte-based chunked serialize/deserialize | `[IMPLEMENTED]` 32 MB/chunk default (byte-based), 9 tests pass。Selective chunk page-in API ready (`page_in_vertex_chunk_from_r2`) |
 | ~~LSMGraph tiered storage~~ | ~~multi-level auto~~ | — | `[DEPRECATED]` Arrow + snapshot compaction が LSM 本質を実現済み。置換: Arrow row-group chunk |
 | GART mutable CSR | HTGAP | MutableCsrStore + merge_by_pk | `[IMPLEMENTED]` mergeRecord のみ |
 | Distributed disk pool | cross-partition I/O | — | `[DESIGN]` コード 0 行 |
@@ -123,11 +123,11 @@ env.YATA.stats()                 // → all partition stats
 | GRAPE (analytics) | vertex-centric | — | not planned |
 | GLE (learning) | GNN | — | not planned |
 
-**GraphScope parity summary**: 14 `[PRODUCTION]` + 5 `[IMPLEMENTED]` + 3 `[STUB]` + 2 `[DESIGN]` + 1 `[DEPRECATED]` + 3 not planned.
+**GraphScope parity summary**: 14 `[PRODUCTION]` + 6 `[IMPLEMENTED]` + 2 `[STUB]` + 1 `[DESIGN]` + 1 `[DEPRECATED]` + 3 not planned.
 
 ## R2 Persistence `[PRODUCTION]`
 
-R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in-memory CSR に append のみ)。PK dedup は in-memory 内のみ。R2 既存データとの dedup は snapshot compaction 時。**Dirty tracking**: dirty flag が true の時のみ snapshot upload。**Snapshot compaction**: R2 既存 + in-memory pending → merge by PK → ArrowFragment → R2 PUT。**Partial page-in protection**: `last_snapshot_count` で上書き防止。**Name-based blob** (CAS 除去): `snap/fragment/{name}` で直接 PUT/GET。Blake3 hash 不要。**Read page-in**: `hot_initialized=false` (default) → first query triggers `page_in_from_r2()` → R2 GET → ArrowFragment → CSR。
+R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in-memory CSR に append のみ)。PK dedup は in-memory 内のみ。R2 既存データとの dedup は snapshot compaction 時。**Dirty tracking**: dirty flag が true の時のみ snapshot upload。**Snapshot compaction**: R2 既存 + in-memory pending → merge by PK → ArrowFragment → R2 PUT。**Partial page-in protection**: `last_snapshot_count` で上書き防止。**Name-based blob** (CAS 除去): `snap/fragment/{name}` で直接 PUT/GET。Blake3 hash 不要。**Read page-in**: `hot_initialized=false` (default) → first query triggers `page_in_from_r2()` → R2 GET → ArrowFragment → CSR。**Arrow row-group chunk `[IMPLEMENTED]`**: 大きい vertex/edge table は byte-based で自動分割 (default 32 MB/chunk)。`estimate_bytes_per_row()` が Arrow buffer size から行単価を推定 → `target_bytes / bytes_per_row` で chunk row 数算出 (clamp [1K, 10M])。R2 key: `vertex_table_{i}_chunk_{j}` / meta field: `vertex_table_{i}_chunks`。Old single-blob format は deserialize 時に自動検出 (backward compat)。1B vertices でも ~数十 chunks (S3/R2 10億ファイル問題回避)。
 
 ## Concurrency Model (CRITICAL)
 
@@ -162,7 +162,7 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
 `[PRODUCTION]` Phase 1: Per-label Arrow IPC (PARTITION_COUNT=1)
   evidence: wrangler.jsonc → YATA_PARTITION_COUNT: "1"
   evidence: yata-engine/src/engine.rs (page_in_from_r2, trigger_snapshot)
-  test: 844 unit tests + yata-server/tests/e2e_minio.rs (8 tests)
+  test: 852 unit tests + yata-server/tests/e2e_minio.rs (8 tests)
 
   `[PRODUCTION]` per-label R2 page-in
     evidence: yata-engine/src/engine.rs (ensure_labels → page_in_from_r2)
@@ -180,7 +180,7 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
 
   `[PRODUCTION]` GIE SecurityFilter (RLS)
     evidence: yata-gie/src/security.rs (transpile_secured, vertex_passes_security)
-    test: 844 tests pass (sensitivity_ord + owner_hash auto-injected)
+    test: 852 tests pass (sensitivity_ord + owner_hash auto-injected)
 
   `[IMPLEMENTED]` merge_by_pk with prop_eq_index (HashMap O(1) lookup)
     evidence: yata-store/src/mutable_csr.rs (merge_by_pk)
@@ -201,10 +201,18 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
 `[DESIGN]` Phase 3a: Read replica routing
   status: コード 0 行。wrangler.jsonc YATA_READ_REPLICA_COUNT=0。index.ts に routing logic なし
 
-`[DESIGN]` Phase 3b: Arrow row-group chunk page-in
-  status: コード 0 行。per-label ArrowFragment を RecordBatch 境界で row-group 分割し、
-  必要な chunk だけ page-in (10M vertex label → 100K chunk 単位)。
-  Arrow IPC native (LSM abstraction 不要)
+`[IMPLEMENTED]` Phase 3b: Arrow row-group chunk page-in
+  evidence: yata-vineyard/src/fragment.rs (split_record_batch, serialize_with_byte_target, resolve_chunk_rows, serialize_table_chunked)
+  evidence: yata-engine/src/loader.rs (page_in_vertex_chunk_from_r2, fetch_fragment_meta, vertex_label_chunk_count)
+  test: yata-vineyard/src/tests.rs (9 new tests: split_*, chunked_*, byte_based_*)
+  default: **byte-based** — 32 MB target per chunk (DEFAULT_CHUNK_TARGET_BYTES)。
+    estimate_bytes_per_row() が Arrow buffer size から行あたりバイト数を推定 →
+    target_bytes / bytes_per_row → chunk row 数を算出。clamp [1K, 10M] rows。
+    YATA_CHUNK_TARGET_BYTES (byte target) / YATA_CHUNK_ROWS (row override) で上書き可能。
+  R2 最適化: 32 MB/chunk → 1B vertices でも ~数十 chunks (10億ファイル問題回避)
+  backward-compat: old single-blob format auto-detected on deserialize
+  note: production は default byte target (32MB) で snapshot。selective chunk page-in API は ready だが
+  engine の ensure_labels は full page-in のまま (selective routing は Phase 3c)
 
 `[DEPRECATED]` LSMGraph 4-level tiered storage
   reason: 現 ArrowFragment + snapshot compaction が LSM の本質 (immutable sorted runs + compaction) を
@@ -236,7 +244,7 @@ Storage (2 level + R2): [PRODUCTION]
   Level 1: Vineyard ephemeral (DiskVineyard/MmapVineyard) — ~100µs
   R2: Source of truth (Arrow IPC per-label) — ~3-5ms page-in
   Level 2 (distributed disk pool): [DESIGN] コード 0 行
-  Level 3 (Arrow row-group chunk page-in): [DESIGN] RecordBatch 境界分割 (LSMGraph は DEPRECATED)
+  Level 3 (Arrow row-group chunk page-in): [IMPLEMENTED] 32 MB/chunk byte-based, selective API ready
 
 Partition fan-out: [PRODUCTION] = Level 0 + Level 1 のみ
   1 × standard-1     = ~20M nodes   (production 運用中)
@@ -247,7 +255,7 @@ Read latency:
   Level 0 hit: <1µs (CSR) — [PRODUCTION]
   Level 1 hit: ~100µs (mmap) — [PRODUCTION]
   Level 2 hit: ~1ms (Workers RPC) — [DESIGN]
-  Level 3 hit: ~2-5ms (R2 GET, Arrow row-group chunk) — [DESIGN]
+  Level 3 hit: ~2-5ms (R2 GET, Arrow row-group chunk) — [IMPLEMENTED]
 ```
 
 ## Env Vars
@@ -258,10 +266,12 @@ Read latency:
 | `YATA_MMAP_VINEYARD` | `false` | Enable MmapVineyard (zero-copy) |
 | `YATA_DIRECT_FAN_OUT_LIMIT` | `8` | Below this, direct fan-out; above, hierarchical √N |
 | `YATA_BATCH_COMMIT_THRESHOLD` | `10` | R2 snapshot upload triggers after this many WAL commits |
+| `YATA_CHUNK_TARGET_BYTES` | `33554432` (32 MB) | Arrow row-group chunk target byte size per blob。R2/S3 最適 8-64 MB |
+| `YATA_CHUNK_ROWS` | (unset) | 設定時は byte-based estimation を override し固定 row 数で chunk 分割 |
 
 ## Test Coverage
 
-844 Rust unit tests, 0 failures. E2E: 8 tests (docker-compose + MinIO, 2-partition). 6-node distributed: 6 tests (10K records, label routing, cold put/pull). ArrowFragment snapshot roundtrip verified.
+854 Rust unit tests, 0 failures. E2E: 8 tests (docker-compose + MinIO, 2-partition). 6-node distributed: 6 tests (10K records, label routing, cold put/pull). ArrowFragment snapshot roundtrip verified.
 
 ## Benchmark (measured, release build, 10K records)
 

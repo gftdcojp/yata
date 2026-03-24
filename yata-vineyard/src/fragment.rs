@@ -19,9 +19,16 @@ use crate::blob::{BlobStore, ObjectId, ObjectMeta};
 use crate::nbr::{NbrUnit64, NBR_UNIT_64_SIZE};
 use crate::schema::PropertyGraphSchema;
 
-/// Default chunk size for row-group splitting. Vertex/edge tables with more rows
-/// than this threshold are split into multiple Arrow IPC blobs.
-/// 100K rows ≈ 2-10 MB per chunk depending on column count.
+/// Target chunk size in bytes for row-group splitting.
+/// R2/S3 optimal object size = 8-64 MB. Default 32 MB balances:
+/// - page-in latency (~3-5ms per R2 GET)
+/// - snapshot PUT count (1B vertices ≈ tens of chunks, not millions)
+/// - meta.json size (blob count stays small)
+pub const DEFAULT_CHUNK_TARGET_BYTES: usize = 32 * 1024 * 1024; // 32 MB
+
+/// Fallback row-based chunk size, used only when byte estimation is unavailable.
+/// With 32 MB target and ~300 bytes/row average, this is ~100K rows.
+/// Override via YATA_CHUNK_ROWS env var.
 pub const DEFAULT_CHUNK_ROWS: usize = 100_000;
 
 /// Vineyard-compatible ArrowFragment.
@@ -193,6 +200,35 @@ impl ArrowFragment {
     /// fragment/{fid}/e/{elabel_id}/ie_nbrs/{vlabel_id}.bin
     /// ```
     pub fn serialize(&self, store: &dyn BlobStore) -> ObjectMeta {
+        // Byte-based chunk sizing: estimate rows per target byte budget.
+        // YATA_CHUNK_ROWS overrides byte-based estimation when set explicitly.
+        let chunk_target_bytes = std::env::var("YATA_CHUNK_TARGET_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_CHUNK_TARGET_BYTES);
+        let row_override = std::env::var("YATA_CHUNK_ROWS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+        self.serialize_with_byte_target(store, chunk_target_bytes, row_override)
+    }
+
+    /// Serialize with explicit row-count chunk size (for tests and backward compat).
+    pub fn serialize_with_chunk_size(&self, store: &dyn BlobStore, chunk_size: usize) -> ObjectMeta {
+        self.serialize_with_byte_target(store, 0, Some(chunk_size))
+    }
+
+    /// Serialize fragment to blob store.
+    ///
+    /// Chunk sizing strategy (in priority order):
+    /// 1. `row_override` — explicit row count (tests, YATA_CHUNK_ROWS)
+    /// 2. `target_bytes` — estimate rows from Arrow byte size per row (production default: 32 MB)
+    /// 3. `DEFAULT_CHUNK_ROWS` — fallback if estimation fails
+    pub fn serialize_with_byte_target(
+        &self,
+        store: &dyn BlobStore,
+        target_bytes: usize,
+        row_override: Option<usize>,
+    ) -> ObjectMeta {
         let mut meta = ObjectMeta::new(
             ObjectId::new(self.fid as u64),
             "vineyard::ArrowFragment<int64,uint64>",
@@ -212,30 +248,9 @@ impl ArrowFragment {
         meta.add_blob("schema");
 
         // Vertex tables (chunked: large tables split into row-group chunks)
-        let chunk_size = std::env::var("YATA_CHUNK_ROWS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_CHUNK_ROWS);
-
         for (i, batch) in self.vertex_tables.iter().enumerate() {
-            let num_rows = batch.num_rows();
-            if num_rows <= chunk_size || chunk_size == 0 {
-                // Single blob (backward-compatible path)
-                let name = format!("vertex_table_{}", i);
-                let ipc_bytes = yata_arrow::batch_to_ipc(batch).unwrap_or_default();
-                store.put(&name, ipc_bytes);
-                meta.add_blob(&name);
-            } else {
-                // Chunked: split into N row-group blobs
-                let chunks = split_record_batch(batch, chunk_size);
-                meta.set_field(&format!("vertex_table_{}_chunks", i), chunks.len() as i64);
-                for (j, chunk) in chunks.iter().enumerate() {
-                    let name = format!("vertex_table_{}_chunk_{}", i, j);
-                    let ipc_bytes = yata_arrow::batch_to_ipc(chunk).unwrap_or_default();
-                    store.put(&name, ipc_bytes);
-                    meta.add_blob(&name);
-                }
-            }
+            let chunk_rows = resolve_chunk_rows(batch, target_bytes, row_override);
+            serialize_table_chunked(store, &mut meta, &format!("vertex_table_{}", i), batch, chunk_rows);
         }
 
         // ivnums
@@ -247,24 +262,10 @@ impl ArrowFragment {
         store.put("ivnums", Bytes::from(ivnums_bytes));
         meta.add_blob("ivnums");
 
-        // Edge tables (chunked: same as vertex tables)
+        // Edge tables (chunked: same strategy as vertex tables)
         for (i, batch) in self.edge_tables.iter().enumerate() {
-            let num_rows = batch.num_rows();
-            if num_rows <= chunk_size || chunk_size == 0 {
-                let name = format!("edge_table_{}", i);
-                let ipc_bytes = yata_arrow::batch_to_ipc(batch).unwrap_or_default();
-                store.put(&name, ipc_bytes);
-                meta.add_blob(&name);
-            } else {
-                let chunks = split_record_batch(batch, chunk_size);
-                meta.set_field(&format!("edge_table_{}_chunks", i), chunks.len() as i64);
-                for (j, chunk) in chunks.iter().enumerate() {
-                    let name = format!("edge_table_{}_chunk_{}", i, j);
-                    let ipc_bytes = yata_arrow::batch_to_ipc(chunk).unwrap_or_default();
-                    store.put(&name, ipc_bytes);
-                    meta.add_blob(&name);
-                }
-            }
+            let chunk_rows = resolve_chunk_rows(batch, target_bytes, row_override);
+            serialize_table_chunked(store, &mut meta, &format!("edge_table_{}", i), batch, chunk_rows);
         }
 
         // CSR topology
@@ -519,6 +520,69 @@ fn concat_batches(batches: &[RecordBatch]) -> Result<Option<RecordBatch>, Fragme
     arrow::compute::concat_batches(&schema, batches)
         .map(Some)
         .map_err(|e| FragmentError::ArrowError(e.to_string()))
+}
+
+/// Estimate bytes per row for a RecordBatch from its Arrow buffer sizes.
+/// Uses actual in-memory byte footprint (Arrow columnar buffers) as proxy for IPC size.
+fn estimate_bytes_per_row(batch: &RecordBatch) -> usize {
+    let num_rows = batch.num_rows();
+    if num_rows == 0 {
+        return 0;
+    }
+    let total_bytes: usize = batch
+        .columns()
+        .iter()
+        .map(|col| col.get_array_memory_size())
+        .sum();
+    // Add ~10% overhead for Arrow IPC framing (schema, padding, footer)
+    (total_bytes * 11 / 10) / num_rows
+}
+
+/// Resolve chunk row count from byte target or explicit row override.
+fn resolve_chunk_rows(
+    batch: &RecordBatch,
+    target_bytes: usize,
+    row_override: Option<usize>,
+) -> usize {
+    if let Some(rows) = row_override {
+        return rows;
+    }
+    if target_bytes == 0 {
+        return DEFAULT_CHUNK_ROWS;
+    }
+    let bpr = estimate_bytes_per_row(batch);
+    if bpr == 0 {
+        return DEFAULT_CHUNK_ROWS;
+    }
+    // rows = target_bytes / bytes_per_row, clamped to [1K, 10M]
+    (target_bytes / bpr).clamp(1_000, 10_000_000)
+}
+
+/// Serialize a single table (vertex or edge) to the blob store, chunking if needed.
+fn serialize_table_chunked(
+    store: &dyn BlobStore,
+    meta: &mut ObjectMeta,
+    prefix: &str,
+    batch: &RecordBatch,
+    chunk_rows: usize,
+) {
+    let num_rows = batch.num_rows();
+    if num_rows <= chunk_rows || chunk_rows == 0 {
+        // Single blob (backward-compatible)
+        let ipc_bytes = yata_arrow::batch_to_ipc(batch).unwrap_or_default();
+        store.put(prefix, ipc_bytes);
+        meta.add_blob(prefix);
+    } else {
+        // Chunked: split into N row-group blobs
+        let chunks = split_record_batch(batch, chunk_rows);
+        meta.set_field(&format!("{}_chunks", prefix), chunks.len() as i64);
+        for (j, chunk) in chunks.iter().enumerate() {
+            let name = format!("{}_chunk_{}", prefix, j);
+            let ipc_bytes = yata_arrow::batch_to_ipc(chunk).unwrap_or_default();
+            store.put(&name, ipc_bytes);
+            meta.add_blob(&name);
+        }
+    }
 }
 
 #[derive(thiserror::Error, Debug)]

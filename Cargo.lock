@@ -3283,6 +3283,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "yata-arrow",
  "yata-core",
  "yata-cypher",
  "yata-gie",
