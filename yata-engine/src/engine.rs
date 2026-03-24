@@ -272,7 +272,11 @@ impl TieredGraphEngine {
             hot: Arc::new(Mutex::new(hot_store)),
             warm,
             cache: Arc::new(Mutex::new(cache)),
-            hot_initialized: Arc::new(AtomicBool::new(true)),
+            // false if S3 configured → triggers page_in_from_r2 on first query
+            // true if no S3 → engine starts empty (writes create new data)
+            hot_initialized: Arc::new(AtomicBool::new(
+                std::env::var("YATA_S3_ENDPOINT").unwrap_or_default().is_empty()
+            )),
             loaded_labels: Arc::new(Mutex::new(HashSet::new())),
             vineyard,
             fragment_manifest: Arc::new(Mutex::new(None)),

@@ -127,9 +127,7 @@ env.YATA.stats()                 // → all partition stats
 
 ## R2 Persistence (VERIFIED)
 
-R2 = source of truth. Write: mergeRecord fire-and-forget + cron (every 1 min) → `trigger_snapshot()` → `csr_to_fragment()` (CSR→ArrowFragment) → R2 PUT (`ureq+rustls` sync). Read: `page_in_from_r2()` → R2 GET ArrowFragment → NbrUnit zero-copy CSR. R2 layout: `snap/fragment/meta.json` (label manifest) + `snap/fragment/{blob_name}` (ArrowFragment blobs). `@cloudflare/containers` >=0.1.1 required. R2 repo persistence (commit chain + records + CAS blocks) for replay. FUSE/WAL/background upload/DO alarm 全除去済み。
-
-WAL truncation: after R2 snapshot commit, `mark_committed(lsn)` + `truncate()` removes persisted entries.
+R2 = source of truth. **Dirty tracking**: `trigger_snapshot()` は dirty flag が true の時のみ R2 upload (cron 毎分の無駄な full upload 排除)。**Partial page-in protection**: `last_snapshot_count` で page-in 済み record 数を追跡、page-in 失敗後の少数 write で大きい R2 snapshot を上書きしない。Write: mergeRecord → dirty=true → `trigger_snapshot()` → `csr_to_fragment()` → R2 PUT。Read: `page_in_from_r2()` → R2 GET ArrowFragment → NbrUnit zero-copy CSR。R2 layout: `snap/fragment/meta.json` + `snap/fragment/{blob_name}`。**Page-in timing**: S3 configured → `hot_initialized=false` → first query triggers `page_in_from_r2()` (lazy)。S3 未設定 → `hot_initialized=true` → 空 CSR start (writes create new data)。
 
 ## CRITICAL: 3 概念は直交 — partition ≠ label ≠ security
 
