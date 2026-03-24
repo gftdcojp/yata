@@ -121,13 +121,14 @@ impl ArrowGraphStore {
                 self.vid_index.insert(vid, (label.to_string(), batches.len(), row));
 
                 // Build PK index from all string columns
+                let schema = batch.schema();
                 for col_idx in 0..batch.num_columns() {
-                    let field = batch.schema().field(col_idx);
+                    let field_name = schema.field(col_idx).name().clone();
                     if let Some(arr) = batch.column(col_idx).as_any().downcast_ref::<StringArray>() {
                         if !arr.is_null(row) {
                             let val = arr.value(row).to_string();
                             self.pk_index
-                                .entry((label.to_string(), field.name().clone()))
+                                .entry((label.to_string(), field_name))
                                 .or_default()
                                 .insert(val, vid);
                         }
@@ -318,7 +319,7 @@ impl ArrowGraphStore {
     /// Get a vertex property, checking pending updates first.
     fn get_vertex_prop(&self, vid: u32, key: &str) -> Option<PropValue> {
         // Check pending updates first
-        if let Some(updates) = self.pending_props.get(vid) {
+        if let Some(updates) = self.pending_props.get(&vid) {
             if let Some(val) = updates.get(key) {
                 return Some(val.clone());
             }
@@ -516,7 +517,7 @@ impl Property for ArrowGraphStore {
                 }
             }
             // Apply pending updates
-            if let Some(updates) = self.pending_props.get(vid) {
+            if let Some(updates) = self.pending_props.get(&vid) {
                 for (k, v) in updates {
                     result.insert(k.clone(), v.clone());
                 }
