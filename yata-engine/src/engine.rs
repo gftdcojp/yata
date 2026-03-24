@@ -1101,18 +1101,27 @@ impl TieredGraphEngine {
         self.ensure_labels(&[label], &[]);
 
         if let Ok(mut hot) = self.hot.lock() {
+            // Arrow store path (Vineyard-native, no CSR conversion)
+            if let Some(arrow) = hot.as_arrow_mut() {
+                let vid = arrow.merge_by_pk(label, pk_key, pk_value, props);
+                arrow.commit();
+                if let Ok(mut ll) = self.loaded_labels.lock() {
+                    ll.insert(label.to_string());
+                }
+                return Ok(vid);
+            }
+            // Legacy CSR path
             if let Some(single) = hot.as_single_mut() {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
                 let vid = single.merge_by_pk(label, pk_key, &pk, props);
                 single.commit();
-                // Mark label as loaded
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     ll.insert(label.to_string());
                 }
                 return Ok(vid);
             }
         }
-        Err("failed to acquire CSR lock".into())
+        Err("failed to acquire hot store lock".into())
     }
 
     /// CSR-direct DELETE by primary key: O(1) lookup.
@@ -1125,6 +1134,10 @@ impl TieredGraphEngine {
         self.ensure_labels(&[label], &[]);
 
         if let Ok(mut hot) = self.hot.lock() {
+            if let Some(arrow) = hot.as_arrow_mut() {
+                let deleted = arrow.delete_by_pk(label, pk_key, pk_value);
+                return Ok(deleted);
+            }
             if let Some(single) = hot.as_single_mut() {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
                 let deleted = single.delete_by_pk(label, pk_key, &pk);
@@ -1132,7 +1145,7 @@ impl TieredGraphEngine {
                 return Ok(deleted);
             }
         }
-        Err("failed to acquire CSR lock".into())
+        Err("failed to acquire hot store lock".into())
     }
 
     /// Trigger R2 snapshot: serialize current CSR → Vineyard blobs → R2 PUT.
