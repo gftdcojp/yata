@@ -7,16 +7,11 @@ description = "Object storage abstraction with tiered write-through"
 
 [dependencies]
 yata-core.workspace = true
+yata-cas.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
-blake3.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 ciborium.workspace = true
-thiserror.workspace = true
 tokio = { workspace = true }
-futures.workspace = true
-tracing.workspace = true
 chrono.workspace = true
 
 [dev-dependencies]

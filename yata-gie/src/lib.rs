@@ -7,12 +7,18 @@
 //!
 //! Depends only on yata-grin (traits) and yata-store (storage).
 
-pub mod ir;
-pub mod planner;
-pub mod optimizer;
+pub mod distributed_executor;
+pub mod distributed_planner;
 pub mod executor;
+pub mod ir;
+pub mod optimizer;
+pub mod planner;
+pub mod transpile;
 
-pub use ir::{AggOp, Expr, LogicalOp, QueryPlan};
-pub use planner::{plan_scan, plan_traversal, PlanBuilder};
+pub use distributed_executor::{ExchangeTransport, MemoryExchangeTransport, execute_fragment};
+pub use distributed_planner::{plan_distributed, requires_distribution};
+pub use executor::{Record, execute, execute_op, eval_expr};
+pub use ir::{AggOp, DistributedPlan, ExchangeKind, Expr, LogicalOp, PartitionPlanFragment, QueryPlan, SecurityScope};
 pub use optimizer::optimize;
-pub use executor::{execute, Record};
+pub use planner::{PlanBuilder, plan_scan, plan_traversal};
+pub use transpile::{transpile, transpile_secured};

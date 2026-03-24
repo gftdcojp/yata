@@ -117,11 +117,7 @@ impl PlanBuilder {
         self
     }
 
-    pub fn aggregate(
-        mut self,
-        group_by: Vec<Expr>,
-        aggs: Vec<(String, AggOp, Expr)>,
-    ) -> Self {
+    pub fn aggregate(mut self, group_by: Vec<Expr>, aggs: Vec<(String, AggOp, Expr)>) -> Self {
         self.plan.push(LogicalOp::Aggregate { group_by, aggs });
         self
     }
@@ -167,7 +163,11 @@ mod tests {
         let plan = plan_scan("Person", "n", None);
         assert_eq!(plan.len(), 1);
         match &plan.ops[0] {
-            LogicalOp::Scan { label, alias, predicate } => {
+            LogicalOp::Scan {
+                label,
+                alias,
+                predicate,
+            } => {
                 assert_eq!(label, "Person");
                 assert_eq!(alias, "n");
                 assert!(predicate.is_none());
@@ -182,7 +182,10 @@ mod tests {
         let plan = plan_scan("Person", "n", Some(pred));
         assert_eq!(plan.len(), 1);
         match &plan.ops[0] {
-            LogicalOp::Scan { predicate: Some(Predicate::Eq(k, _)), .. } => {
+            LogicalOp::Scan {
+                predicate: Some(Predicate::Eq(k, _)),
+                ..
+            } => {
                 assert_eq!(k, "name");
             }
             _ => panic!("expected Scan with predicate"),
@@ -198,7 +201,11 @@ mod tests {
             _ => panic!("expected Scan"),
         }
         match &plan.ops[1] {
-            LogicalOp::Expand { edge_label, direction, .. } => {
+            LogicalOp::Expand {
+                edge_label,
+                direction,
+                ..
+            } => {
                 assert_eq!(edge_label, "KNOWS");
                 assert_eq!(*direction, Direction::Out);
             }
@@ -269,7 +276,9 @@ mod tests {
 
         assert_eq!(plan.len(), 2);
         match &plan.ops[1] {
-            LogicalOp::PathExpand { min_hops, max_hops, .. } => {
+            LogicalOp::PathExpand {
+                min_hops, max_hops, ..
+            } => {
                 assert_eq!(*min_hops, 1);
                 assert_eq!(*max_hops, 3);
             }

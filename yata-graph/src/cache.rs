@@ -1,12 +1,10 @@
 //! Graph-level cache: CSR store + query result LRU.
 //!
-//! Lives inside `LanceGraphStore` so all consumers (gateway, flight, bolt,
+//! Lives inside `GraphStore` so all consumers (gateway, bolt,
 //! magatama-server) get caching for free.
 //!
-//! Design: B2 as cold store.
-//! - First read: Lance (S3/local) → build CSR → cache in memory
-//! - Subsequent reads: CSR hit (ns) or query cache hit (μs)
-//! - Writes: Lance append → invalidate CSR + bump generation → lazy reload on next read
+//! - CSR hit (ns) or query cache hit (us)
+//! - Writes: update in-memory graph + bump generation
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -41,7 +39,7 @@ struct QueryEntry {
 /// Graph cache: CSR store + query result LRU.
 pub struct GraphCache {
     config: CacheConfig,
-    /// Cached CSR-indexed MemoryGraph. `None` = cold (needs load from Lance).
+    /// Cached CSR-indexed MemoryGraph. `None` = cold (needs external restore).
     csr: Option<MemoryGraph>,
     /// Generation counter. Bumped on every write. Query cache entries with
     /// older generation are stale.

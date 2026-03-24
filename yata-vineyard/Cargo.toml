@@ -1,0 +1,20 @@
+[package]
+name = "yata-vineyard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Vineyard-native ArrowFragment format for yata graph engine"
+
+[dependencies]
+yata-arrow = { workspace = true }
+
+arrow = { workspace = true }
+
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+
+[dev-dependencies]

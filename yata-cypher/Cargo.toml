@@ -6,12 +6,8 @@ license.workspace = true
 description = "Pure-Rust Cypher parser and execution engine"
 
 [dependencies]
-yata-core = { path = "../yata-core" }
-yata-ocel = { path = "../yata-ocel" }
-serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 indexmap = { workspace = true }
 uuid = { workspace = true }
-chrono = { workspace = true }
 regex = "1"

@@ -7,11 +7,11 @@
 
 pub mod csr;
 
-pub use error::*;
-pub use types::*;
 pub use ast::*;
-pub use graph::*;
+pub use error::*;
 pub use executor::*;
+pub use graph::*;
+pub use types::*;
 
 // Re-export parse as a convenience function
 pub use parser::parse;
@@ -361,6 +361,22 @@ pub mod ast {
     }
 
     #[derive(Clone, Debug)]
+    pub enum ConstraintKind {
+        Unique {
+            label: String,
+            properties: Vec<String>,
+        },
+        NodeKey {
+            label: String,
+            properties: Vec<String>,
+        },
+        Exists {
+            label: String,
+            property: String,
+        },
+    }
+
+    #[derive(Clone, Debug)]
     pub enum Clause {
         Match {
             patterns: Vec<Pattern>,
@@ -420,6 +436,36 @@ pub mod ast {
             name: String,
             args: Vec<Expr>,
             yields: Vec<String>,
+        },
+        /// CREATE INDEX name FOR (n:Label) ON (n.prop1, n.prop2)
+        CreateIndex {
+            name: String,
+            label: String,
+            properties: Vec<String>,
+            index_type: String,
+        },
+        /// DROP INDEX name
+        DropIndex {
+            name: String,
+        },
+        /// SHOW INDEXES
+        ShowIndexes,
+        /// CREATE CONSTRAINT name FOR (n:Label) REQUIRE n.prop IS UNIQUE
+        CreateConstraint {
+            name: String,
+            kind: ConstraintKind,
+        },
+        /// DROP CONSTRAINT name
+        DropConstraint {
+            name: String,
+        },
+        /// SHOW CONSTRAINTS
+        ShowConstraints,
+        /// LOAD CSV WITH HEADERS FROM $url AS row
+        LoadCsv {
+            url_expr: Expr,
+            as_var: String,
+            with_headers: bool,
         },
     }
 
@@ -505,8 +551,8 @@ pub mod lexer {
         Star,
         Slash,
         Percent,
-        PlusEq,      // +=
-        RegexMatch,  // =~
+        PlusEq,     // +=
+        RegexMatch, // =~
         // Literals
         Ident(String),
         IntLit(i64),
@@ -570,7 +616,7 @@ pub mod lexer {
                     None => {
                         return Err(CypherError::ParseError(
                             "unterminated string literal".into(),
-                        ))
+                        ));
                     }
                     Some(c) if c == quote => break,
                     Some('\\') => match self.advance() {
@@ -587,7 +633,7 @@ pub mod lexer {
                         None => {
                             return Err(CypherError::ParseError(
                                 "unterminated escape sequence".into(),
-                            ))
+                            ));
                         }
                     },
                     Some(c) => s.push(c),
@@ -603,7 +649,7 @@ pub mod lexer {
                     None => {
                         return Err(CypherError::ParseError(
                             "unterminated backtick identifier".into(),
-                        ))
+                        ));
                     }
                     Some('`') => break,
                     Some(c) => s.push(c),
@@ -622,7 +668,10 @@ pub mod lexer {
                         s.push(c);
                         self.advance();
                     }
-                    Some('.') if !is_float && matches!(self.peek_char(), Some(c) if c.is_ascii_digit()) => {
+                    Some('.')
+                        if !is_float
+                            && matches!(self.peek_char(), Some(c) if c.is_ascii_digit()) =>
+                    {
                         is_float = true;
                         s.push('.');
                         self.advance();
@@ -819,6 +868,15 @@ pub mod parser {
     use crate::error::{CypherError, Result};
     use crate::lexer::{Lexer, Token};
 
+    /// Extract a dotted name from an expression chain (e.g., Prop(Prop(Var("gds"), "util"), "algo") → "gds.util.algo").
+    fn expr_to_dotted_name(e: &Expr) -> String {
+        match e {
+            Expr::Var(v) => v.clone(),
+            Expr::Prop(base, key) => format!("{}.{}", expr_to_dotted_name(base), key),
+            _ => format!("{e:?}"),
+        }
+    }
+
     pub fn parse(input: &str) -> Result<Query> {
         let mut p = Parser::new(input);
         p.parse_query()
@@ -920,23 +978,27 @@ pub mod parser {
         }
 
         fn is_clause_start(tok: &Token) -> bool {
-            matches!(
-                tok,
+            match tok {
                 Token::Match
-                    | Token::Optional
-                    | Token::Create
-                    | Token::Merge
-                    | Token::Return
-                    | Token::With
-                    | Token::Set
-                    | Token::Delete
-                    | Token::Detach
-                    | Token::Unwind
-                    | Token::Union
-                    | Token::Foreach
-                    | Token::Remove
-                    | Token::Call
-            )
+                | Token::Optional
+                | Token::Create
+                | Token::Merge
+                | Token::Return
+                | Token::With
+                | Token::Set
+                | Token::Delete
+                | Token::Detach
+                | Token::Unwind
+                | Token::Union
+                | Token::Foreach
+                | Token::Remove
+                | Token::Call => true,
+                Token::Ident(s) => {
+                    let u = s.to_ascii_uppercase();
+                    matches!(u.as_str(), "DROP" | "SHOW" | "LOAD")
+                }
+                _ => false,
+            }
         }
 
         pub fn parse_query(&mut self) -> Result<Query> {
@@ -958,7 +1020,23 @@ pub mod parser {
             match self.peek()? {
                 Token::Match => self.parse_match(),
                 Token::Optional => self.parse_optional_match(),
-                Token::Create => self.parse_create(),
+                Token::Create => {
+                    // Peek ahead: CREATE INDEX or CREATE CONSTRAINT?
+                    self.next()?; // consume CREATE
+                    match self.peek()? {
+                        Token::Ident(s) if s.to_ascii_uppercase() == "INDEX" => {
+                            self.parse_create_index()
+                        }
+                        Token::Ident(s) if s.to_ascii_uppercase() == "CONSTRAINT" => {
+                            self.parse_create_constraint()
+                        }
+                        _ => {
+                            // Fall through to normal CREATE pattern parsing
+                            let patterns = self.parse_pattern_list()?;
+                            Ok(Clause::Create { patterns })
+                        }
+                    }
+                }
                 Token::Merge => self.parse_merge(),
                 Token::Return => self.parse_return(),
                 Token::With => self.parse_with(),
@@ -970,6 +1048,9 @@ pub mod parser {
                 Token::Foreach => self.parse_foreach(),
                 Token::Remove => self.parse_remove(),
                 Token::Call => self.parse_call(),
+                Token::Ident(s) if s.to_ascii_uppercase() == "DROP" => self.parse_drop(),
+                Token::Ident(s) if s.to_ascii_uppercase() == "SHOW" => self.parse_show(),
+                Token::Ident(s) if s.to_ascii_uppercase() == "LOAD" => self.parse_load_csv(),
                 tok => Err(CypherError::ParseError(format!(
                     "unexpected token at clause start: {:?}",
                     tok
@@ -993,7 +1074,7 @@ pub mod parser {
                     return Err(CypherError::ParseError(format!(
                         "expected MATCH after OPTIONAL, got {:?}",
                         tok
-                    )))
+                    )));
                 }
             }
             let patterns = self.parse_pattern_list()?;
@@ -1001,10 +1082,203 @@ pub mod parser {
             Ok(Clause::OptionalMatch { patterns, where_ })
         }
 
-        fn parse_create(&mut self) -> Result<Clause> {
-            self.next()?; // consume CREATE
-            let patterns = self.parse_pattern_list()?;
-            Ok(Clause::Create { patterns })
+        // CREATE INDEX name FOR (n:Label) ON (n.prop1, ...)
+        fn parse_create_index(&mut self) -> Result<Clause> {
+            self.next()?; // consume INDEX
+            let name = self.expect_name()?;
+            // FOR (n:Label)
+            self.expect_ident_upper("FOR")?;
+            self.expect(&Token::LParen)?;
+            let _var = self.expect_name()?; // variable (ignored)
+            self.expect(&Token::Colon)?;
+            let label = self.expect_name()?;
+            self.expect(&Token::RParen)?;
+            // ON (n.prop1, n.prop2, ...)
+            self.expect_ident_upper("ON")?;
+            self.expect(&Token::LParen)?;
+            let mut properties = Vec::new();
+            loop {
+                let _var2 = self.expect_name()?;
+                self.expect(&Token::Dot)?;
+                let prop = self.expect_name()?;
+                properties.push(prop);
+                if !matches!(self.peek()?, Token::Comma) {
+                    break;
+                }
+                self.next()?; // consume comma
+            }
+            self.expect(&Token::RParen)?;
+            Ok(Clause::CreateIndex {
+                name,
+                label,
+                properties,
+                index_type: "btree".into(),
+            })
+        }
+
+        // CREATE CONSTRAINT name FOR (n:Label) REQUIRE n.prop IS UNIQUE / IS NODE KEY / IS NOT NULL
+        fn parse_create_constraint(&mut self) -> Result<Clause> {
+            self.next()?; // consume CONSTRAINT
+            let name = self.expect_name()?;
+            self.expect_ident_upper("FOR")?;
+            self.expect(&Token::LParen)?;
+            let _var = self.expect_name()?;
+            self.expect(&Token::Colon)?;
+            let label = self.expect_name()?;
+            self.expect(&Token::RParen)?;
+            // REQUIRE
+            self.expect_ident_upper("REQUIRE")?;
+            // Parse property references: var.prop or (var.prop1, var.prop2)
+            let mut properties = Vec::new();
+            let has_parens = matches!(self.peek()?, Token::LParen);
+            if has_parens {
+                self.next()?; // consume (
+                loop {
+                    let _v = self.expect_name()?;
+                    self.expect(&Token::Dot)?;
+                    properties.push(self.expect_name()?);
+                    if !matches!(self.peek()?, Token::Comma) {
+                        break;
+                    }
+                    self.next()?;
+                }
+                self.expect(&Token::RParen)?;
+            } else {
+                let _v = self.expect_name()?;
+                self.expect(&Token::Dot)?;
+                properties.push(self.expect_name()?);
+            }
+            // IS UNIQUE | IS NODE KEY | IS NOT NULL
+            self.expect(&Token::Is)?;
+            let kind = match self.peek()? {
+                Token::Not => {
+                    self.next()?; // consume NOT
+                    self.expect(&Token::Null)?;
+                    if properties.len() != 1 {
+                        return Err(CypherError::ParseError(
+                            "EXISTS constraint requires exactly one property".into(),
+                        ));
+                    }
+                    ConstraintKind::Exists {
+                        label,
+                        property: properties.into_iter().next().unwrap(),
+                    }
+                }
+                Token::Ident(s) if s.to_ascii_uppercase() == "UNIQUE" => {
+                    self.next()?;
+                    ConstraintKind::Unique { label, properties }
+                }
+                Token::Ident(s) if s.to_ascii_uppercase() == "NODE" => {
+                    self.next()?; // consume NODE
+                    self.expect_ident_upper("KEY")?;
+                    ConstraintKind::NodeKey { label, properties }
+                }
+                tok => {
+                    return Err(CypherError::ParseError(format!(
+                        "expected UNIQUE, NODE KEY, or NOT NULL, got {:?}",
+                        tok
+                    )));
+                }
+            };
+            Ok(Clause::CreateConstraint { name, kind })
+        }
+
+        // DROP INDEX name / DROP CONSTRAINT name
+        fn parse_drop(&mut self) -> Result<Clause> {
+            self.next()?; // consume DROP
+            match self.peek()? {
+                Token::Ident(s) if s.to_ascii_uppercase() == "INDEX" => {
+                    self.next()?;
+                    let name = self.expect_name()?;
+                    // Optional IF EXISTS
+                    if let Token::Ident(s) = self.peek()? {
+                        if s.to_ascii_uppercase() == "IF" {
+                            self.next()?; // IF
+                            self.expect(&Token::Exists)?;
+                        }
+                    }
+                    Ok(Clause::DropIndex { name })
+                }
+                Token::Ident(s) if s.to_ascii_uppercase() == "CONSTRAINT" => {
+                    self.next()?;
+                    let name = self.expect_name()?;
+                    if let Token::Ident(s) = self.peek()? {
+                        if s.to_ascii_uppercase() == "IF" {
+                            self.next()?;
+                            self.expect(&Token::Exists)?;
+                        }
+                    }
+                    Ok(Clause::DropConstraint { name })
+                }
+                tok => Err(CypherError::ParseError(format!(
+                    "expected INDEX or CONSTRAINT after DROP, got {:?}",
+                    tok
+                ))),
+            }
+        }
+
+        // SHOW INDEXES / SHOW CONSTRAINTS
+        fn parse_show(&mut self) -> Result<Clause> {
+            self.next()?; // consume SHOW
+            match self.peek()? {
+                Token::Ident(s)
+                    if {
+                        let u = s.to_ascii_uppercase();
+                        u == "INDEXES" || u == "INDEX"
+                    } =>
+                {
+                    self.next()?;
+                    Ok(Clause::ShowIndexes)
+                }
+                Token::Ident(s)
+                    if {
+                        let u = s.to_ascii_uppercase();
+                        u == "CONSTRAINTS" || u == "CONSTRAINT"
+                    } =>
+                {
+                    self.next()?;
+                    Ok(Clause::ShowConstraints)
+                }
+                tok => Err(CypherError::ParseError(format!(
+                    "expected INDEXES or CONSTRAINTS after SHOW, got {:?}",
+                    tok
+                ))),
+            }
+        }
+
+        // LOAD CSV [WITH HEADERS] FROM expr AS var
+        fn parse_load_csv(&mut self) -> Result<Clause> {
+            self.next()?; // consume LOAD
+            self.expect_ident_upper("CSV")?;
+            let with_headers = if matches!(self.peek()?, Token::With) {
+                self.next()?; // consume WITH
+                self.expect_ident_upper("HEADERS")?;
+                true
+            } else {
+                false
+            };
+            self.expect_ident_upper("FROM")?;
+            let url_expr = self.parse_expr()?;
+            self.expect(&Token::As)?;
+            let as_var = self.expect_name()?;
+            Ok(Clause::LoadCsv {
+                url_expr,
+                as_var,
+                with_headers,
+            })
+        }
+
+        /// Helper: expect an Ident token whose uppercase value matches the given keyword.
+        fn expect_ident_upper(&mut self, kw: &str) -> Result<()> {
+            match self.next()? {
+                Token::Ident(s) if s.to_ascii_uppercase() == kw => Ok(()),
+                // Also accept keyword tokens that happen to match
+                Token::On if kw == "ON" => Ok(()),
+                tok => Err(CypherError::ParseError(format!(
+                    "expected {}, got {:?}",
+                    kw, tok
+                ))),
+            }
         }
 
         fn parse_merge(&mut self) -> Result<Clause> {
@@ -1031,12 +1305,17 @@ pub mod parser {
                     _ => {
                         let tok = self.next()?;
                         return Err(CypherError::ParseError(format!(
-                            "expected CREATE or MATCH after ON, got {:?}", tok
+                            "expected CREATE or MATCH after ON, got {:?}",
+                            tok
                         )));
                     }
                 }
             }
-            Ok(Clause::Merge { pattern, on_create, on_match })
+            Ok(Clause::Merge {
+                pattern,
+                on_create,
+                on_match,
+            })
         }
 
         fn parse_return(&mut self) -> Result<Clause> {
@@ -1098,7 +1377,7 @@ pub mod parser {
                     return Err(CypherError::ParseError(format!(
                         "expected AS in UNWIND, got {:?}",
                         tok
-                    )))
+                    )));
                 }
             }
             let alias = self.expect_ident()?;
@@ -1128,7 +1407,11 @@ pub mod parser {
                 body.push(self.parse_clause()?);
             }
             self.expect(&Token::RParen)?;
-            Ok(Clause::Foreach { var, list_expr, body })
+            Ok(Clause::Foreach {
+                var,
+                list_expr,
+                body,
+            })
         }
 
         fn parse_remove(&mut self) -> Result<Clause> {
@@ -1202,7 +1485,7 @@ pub mod parser {
                     return Err(CypherError::ParseError(format!(
                         "expected BY after ORDER, got {:?}",
                         tok
-                    )))
+                    )));
                 }
             }
             let mut items = vec![self.parse_order_item()?];
@@ -1350,74 +1633,74 @@ pub mod parser {
                 self.next()?;
             }
 
-            let (var, types, props, min_hops, max_hops) =
-                if matches!(self.peek()?, Token::LBracket) {
-                    self.next()?; // consume [
-                    let var = match self.peek()? {
-                        Token::Ident(_) => {
-                            if let Token::Ident(s) = self.next()? {
-                                Some(s)
-                            } else {
-                                unreachable!()
-                            }
-                        }
-                        _ => None,
-                    };
-                    let mut types = Vec::new();
-                    while matches!(self.peek()?, Token::Colon) {
-                        self.next()?;
-                        types.push(self.expect_name()?);
-                        // Support |TYPE2
-                        while matches!(self.peek()?, Token::Pipe) {
-                            self.next()?;
-                            types.push(self.expect_name()?);
+            let (var, types, props, min_hops, max_hops) = if matches!(self.peek()?, Token::LBracket)
+            {
+                self.next()?; // consume [
+                let var = match self.peek()? {
+                    Token::Ident(_) => {
+                        if let Token::Ident(s) = self.next()? {
+                            Some(s)
+                        } else {
+                            unreachable!()
                         }
                     }
-                    // Variable hops: *2..5 or * or *2
-                    let (min_hops, max_hops) = if matches!(self.peek()?, Token::Star) {
+                    _ => None,
+                };
+                let mut types = Vec::new();
+                while matches!(self.peek()?, Token::Colon) {
+                    self.next()?;
+                    types.push(self.expect_name()?);
+                    // Support |TYPE2
+                    while matches!(self.peek()?, Token::Pipe) {
                         self.next()?;
-                        let min = if matches!(self.peek()?, Token::IntLit(_)) {
-                            if let Token::IntLit(n) = self.next()? {
-                                Some(n as u32)
-                            } else {
-                                unreachable!()
-                            }
+                        types.push(self.expect_name()?);
+                    }
+                }
+                // Variable hops: *2..5 or * or *2
+                let (min_hops, max_hops) = if matches!(self.peek()?, Token::Star) {
+                    self.next()?;
+                    let min = if matches!(self.peek()?, Token::IntLit(_)) {
+                        if let Token::IntLit(n) = self.next()? {
+                            Some(n as u32)
                         } else {
-                            None
-                        };
-                        let max = if matches!(self.peek()?, Token::Dot) {
-                            self.next()?; // first dot
-                            if matches!(self.peek()?, Token::Dot) {
-                                self.next()?; // second dot
-                                if matches!(self.peek()?, Token::IntLit(_)) {
-                                    if let Token::IntLit(n) = self.next()? {
-                                        Some(n as u32)
-                                    } else {
-                                        unreachable!()
-                                    }
+                            unreachable!()
+                        }
+                    } else {
+                        None
+                    };
+                    let max = if matches!(self.peek()?, Token::Dot) {
+                        self.next()?; // first dot
+                        if matches!(self.peek()?, Token::Dot) {
+                            self.next()?; // second dot
+                            if matches!(self.peek()?, Token::IntLit(_)) {
+                                if let Token::IntLit(n) = self.next()? {
+                                    Some(n as u32)
                                 } else {
-                                    None
+                                    unreachable!()
                                 }
                             } else {
                                 None
                             }
                         } else {
-                            min
-                        };
-                        (min, max)
+                            None
+                        }
                     } else {
-                        (None, None)
+                        min
                     };
-                    let props = if matches!(self.peek()?, Token::LBrace) {
-                        self.parse_props_map()?
-                    } else {
-                        Vec::new()
-                    };
-                    self.expect(&Token::RBracket)?;
-                    (var, types, props, min_hops, max_hops)
+                    (min, max)
                 } else {
-                    (None, Vec::new(), Vec::new(), None, None)
+                    (None, None)
                 };
+                let props = if matches!(self.peek()?, Token::LBrace) {
+                    self.parse_props_map()?
+                } else {
+                    Vec::new()
+                };
+                self.expect(&Token::RBracket)?;
+                (var, types, props, min_hops, max_hops)
+            } else {
+                (None, Vec::new(), Vec::new(), None, None)
+            };
 
             // Trailing dashes and arrow
             let dir_right = if matches!(self.peek()?, Token::Dash | Token::DoubleDash) {
@@ -1429,6 +1712,10 @@ pub mod parser {
                     false
                 }
             } else if matches!(self.peek()?, Token::Arrow) {
+                self.next()?;
+                true
+            } else if matches!(self.peek()?, Token::Gt) {
+                // Handle `-->` where `--` was consumed as leading DoubleDash, leaving `>`
                 self.next()?;
                 true
             } else {
@@ -1748,7 +2035,23 @@ pub mod parser {
                     Token::Dot => {
                         self.next()?;
                         let prop = self.expect_ident()?;
-                        expr = Expr::Prop(Box::new(expr), prop);
+                        // Check for dotted function call: expr.prop(...) or expr.ns.func(...)
+                        if matches!(self.peek()?, Token::LParen) {
+                            self.next()?; // consume (
+                            let fn_name = format!("{}.{}", expr_to_dotted_name(&expr), prop);
+                            let mut args = Vec::new();
+                            if !matches!(self.peek()?, Token::RParen) {
+                                args.push(self.parse_expr()?);
+                                while matches!(self.peek()?, Token::Comma) {
+                                    self.next()?;
+                                    args.push(self.parse_expr()?);
+                                }
+                            }
+                            self.expect(&Token::RParen)?;
+                            expr = Expr::FnCall(fn_name.to_ascii_lowercase(), args);
+                        } else {
+                            expr = Expr::Prop(Box::new(expr), prop);
+                        }
                     }
                     Token::LBracket => {
                         self.next()?; // consume [
@@ -1762,7 +2065,9 @@ pub mod parser {
                         let saved_pos = self.lexer.pos;
                         let saved_peeked = self.lexer.peeked.clone();
                         self.next()?; // consume {
-                        if matches!(self.peek()?, Token::Dot | Token::RBrace) || self.is_map_proj_start()? {
+                        if matches!(self.peek()?, Token::Dot | Token::RBrace)
+                            || self.is_map_proj_start()?
+                        {
                             let entries = self.parse_map_proj_entries()?;
                             self.expect(&Token::RBrace)?;
                             expr = Expr::MapProjection {
@@ -1959,7 +2264,9 @@ pub mod parser {
                         self.expect(&Token::RParen)?;
                         Ok(Expr::FnCall("exists".into(), args))
                     } else {
-                        Err(CypherError::ParseError("expected { or ( after EXISTS".into()))
+                        Err(CypherError::ParseError(
+                            "expected { or ( after EXISTS".into(),
+                        ))
                     }
                 }
                 Token::Ident(_) => {
@@ -2008,7 +2315,9 @@ pub mod parser {
                                 if matches!(self.peek()?, Token::Star) {
                                     self.next()?;
                                     args.push(Expr::Var("*".into()));
-                                } else if name_lower == "count" && matches!(self.peek()?, Token::Distinct) {
+                                } else if name_lower == "count"
+                                    && matches!(self.peek()?, Token::Distinct)
+                                {
                                     // count(DISTINCT expr)
                                     self.next()?; // consume DISTINCT
                                     args.push(self.parse_expr()?);
@@ -2059,7 +2368,7 @@ pub mod parser {
                         return Err(CypherError::ParseError(format!(
                             "expected THEN in CASE, got {:?}",
                             tok
-                        )))
+                        )));
                     }
                 }
                 let result = self.parse_expr()?;
@@ -2077,7 +2386,7 @@ pub mod parser {
                     return Err(CypherError::ParseError(format!(
                         "expected END in CASE, got {:?}",
                         tok
-                    )))
+                    )));
                 }
             }
             Ok(Expr::Case {
@@ -2113,13 +2422,30 @@ pub mod graph {
         /// Build adjacency index for O(degree) neighbor lookup. Default no-op.
         fn ensure_adjacency_index(&mut self) {}
         /// Vector search: return nodes matching labels sorted by similarity (descending).
-        fn vector_search(&self, _query: &[f32], _limit: usize, _labels: &[String]) -> Vec<(NodeRef, f64)> {
+        fn vector_search(
+            &self,
+            _query: &[f32],
+            _limit: usize,
+            _labels: &[String],
+        ) -> Vec<(NodeRef, f64)> {
             vec![]
         }
         /// Store embedding vector for a node.
         fn set_node_embedding(&mut self, _id: &str, _embedding: &[f32]) {
             // default no-op
         }
+        /// Set a metadata key-value (for indexes, constraints, etc.)
+        fn set_metadata(&mut self, _key: &str, _value: &str) {}
+        /// Remove a metadata key
+        fn remove_metadata(&mut self, _key: &str) {}
+        /// List metadata entries with a given prefix
+        fn list_metadata_prefix(&self, _prefix: &str) -> Vec<(String, String)> {
+            vec![]
+        }
+        /// Remove a node property
+        fn remove_node_prop(&mut self, _id: &str, _key: &str) {}
+        /// Set a relationship property
+        fn set_rel_prop(&mut self, _id: &str, _key: &str, _val: Value) {}
     }
 
     #[derive(Clone)]
@@ -2128,11 +2454,18 @@ pub mod graph {
         rels: IndexMap<String, RelRef>,
         /// CSR adjacency index — built lazily, invalidated on mutation.
         csr: Option<crate::csr::CsrIndex>,
+        /// Metadata storage for indexes, constraints, etc.
+        metadata: IndexMap<String, String>,
     }
 
     impl Default for MemoryGraph {
         fn default() -> Self {
-            Self { nodes: IndexMap::new(), rels: IndexMap::new(), csr: None }
+            Self {
+                nodes: IndexMap::new(),
+                rels: IndexMap::new(),
+                csr: None,
+                metadata: IndexMap::new(),
+            }
         }
     }
 
@@ -2143,7 +2476,9 @@ pub mod graph {
 
         /// Build (or rebuild) the CSR adjacency index from current edges.
         pub fn build_csr(&mut self) {
-            let edges: Vec<(String, String, String)> = self.rels.values()
+            let edges: Vec<(String, String, String)> = self
+                .rels
+                .values()
                 .map(|r| (r.src.clone(), r.dst.clone(), r.id.clone()))
                 .collect();
             self.csr = Some(crate::csr::CsrIndex::build(&edges));
@@ -2161,6 +2496,11 @@ pub mod graph {
             self.csr = None;
         }
 
+        /// Mutable access to all nodes (for metadata injection).
+        pub fn nodes_mut(&mut self) -> impl Iterator<Item = &mut NodeRef> {
+            self.nodes.values_mut()
+        }
+
         /// Retain only nodes for which the predicate returns true.
         pub fn retain_nodes(&mut self, f: impl Fn(&NodeRef) -> bool) {
             self.nodes.retain(|_, n| f(n));
@@ -2172,42 +2512,9 @@ pub mod graph {
             self.rels.retain(|_, r| f(r));
             self.invalidate_csr();
         }
-
-        pub fn from_ocel(
-            objects: &[yata_ocel::OcelObject],
-            edges: &[yata_ocel::OcelObjectObjectEdge],
-        ) -> Self {
-            let mut g = Self::new();
-            for obj in objects {
-                let mut props = IndexMap::new();
-                for (k, v) in &obj.attrs {
-                    props.insert(k.clone(), json_to_value(v));
-                }
-                g.add_node(NodeRef {
-                    id: obj.object_id.clone(),
-                    labels: vec![obj.object_type.clone()],
-                    props,
-                });
-            }
-            for edge in edges {
-                let id = uuid::Uuid::new_v4().to_string();
-                let mut props = IndexMap::new();
-                if let Some(q) = &edge.qualifier {
-                    props.insert("qualifier".into(), Value::Str(q.clone()));
-                }
-                g.add_rel(RelRef {
-                    id,
-                    rel_type: edge.rel_type.clone(),
-                    src: edge.src_object_id.clone(),
-                    dst: edge.dst_object_id.clone(),
-                    props,
-                });
-            }
-            g
-        }
     }
 
-    fn json_to_value(v: &serde_json::Value) -> Value {
+    pub fn json_to_value(v: &serde_json::Value) -> Value {
         match v {
             serde_json::Value::Null => Value::Null,
             serde_json::Value::Bool(b) => Value::Bool(*b),
@@ -2219,9 +2526,7 @@ pub mod graph {
                 }
             }
             serde_json::Value::String(s) => Value::Str(s.clone()),
-            serde_json::Value::Array(arr) => {
-                Value::List(arr.iter().map(json_to_value).collect())
-            }
+            serde_json::Value::Array(arr) => Value::List(arr.iter().map(json_to_value).collect()),
             serde_json::Value::Object(obj) => {
                 let mut m = IndexMap::new();
                 for (k, v) in obj {
@@ -2320,8 +2625,15 @@ pub mod graph {
             self.ensure_csr();
         }
 
-        fn vector_search(&self, query: &[f32], limit: usize, labels: &[String]) -> Vec<(NodeRef, f64)> {
-            let mut scored: Vec<(NodeRef, f64)> = self.nodes.values()
+        fn vector_search(
+            &self,
+            query: &[f32],
+            limit: usize,
+            labels: &[String],
+        ) -> Vec<(NodeRef, f64)> {
+            let mut scored: Vec<(NodeRef, f64)> = self
+                .nodes
+                .values()
                 .filter(|n| labels.is_empty() || labels.iter().any(|l| n.labels.contains(l)))
                 .filter_map(|n| {
                     let embedding = extract_f32_vec(n.props.get("embedding")?)?;
@@ -2342,32 +2654,77 @@ pub mod graph {
                 );
             }
         }
+
+        fn set_metadata(&mut self, key: &str, value: &str) {
+            self.metadata.insert(key.to_owned(), value.to_owned());
+        }
+
+        fn remove_metadata(&mut self, key: &str) {
+            self.metadata.shift_remove(key);
+        }
+
+        fn list_metadata_prefix(&self, prefix: &str) -> Vec<(String, String)> {
+            self.metadata
+                .iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        }
+
+        fn remove_node_prop(&mut self, id: &str, key: &str) {
+            if let Some(node) = self.nodes.get_mut(id) {
+                node.props.shift_remove(key);
+            }
+        }
+
+        fn set_rel_prop(&mut self, id: &str, key: &str, val: Value) {
+            if let Some(rel) = self.rels.get_mut(id) {
+                rel.props.insert(key.to_owned(), val);
+            }
+        }
     }
 
     pub fn extract_f32_vec(val: &Value) -> Option<Vec<f32>> {
         if let Value::List(items) = val {
-            items.iter().map(|v| match v {
-                Value::Float(f) => Some(*f as f32),
-                Value::Int(i) => Some(*i as f32),
-                _ => None,
-            }).collect()
+            items
+                .iter()
+                .map(|v| match v {
+                    Value::Float(f) => Some(*f as f32),
+                    Value::Int(i) => Some(*i as f32),
+                    _ => None,
+                })
+                .collect()
         } else {
             None
         }
     }
 
     pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
-        if a.len() != b.len() || a.is_empty() { return 0.0; }
-        let dot: f64 = a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
+        if a.len() != b.len() || a.is_empty() {
+            return 0.0;
+        }
+        let dot: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| (*x as f64) * (*y as f64))
+            .sum();
         let norm_a: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
         let norm_b: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-        if norm_a == 0.0 || norm_b == 0.0 { return 0.0; }
+        if norm_a == 0.0 || norm_b == 0.0 {
+            return 0.0;
+        }
         dot / (norm_a * norm_b)
     }
 
     pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f64 {
-        if a.len() != b.len() { return f64::MAX; }
-        a.iter().zip(b).map(|(x, y)| ((*x as f64) - (*y as f64)).powi(2)).sum::<f64>().sqrt()
+        if a.len() != b.len() {
+            return f64::MAX;
+        }
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| ((*x as f64) - (*y as f64)).powi(2))
+            .sum::<f64>()
+            .sqrt()
     }
 }
 
@@ -2381,6 +2738,53 @@ pub mod executor {
     use indexmap::IndexMap;
 
     type Binding = IndexMap<String, Value>;
+
+    fn value_to_json_string(val: &Value) -> String {
+        match val {
+            Value::Null => "null".to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Int(i) => i.to_string(),
+            Value::Float(f) => f.to_string(),
+            Value::Str(s) => serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s)),
+            Value::List(items) => {
+                let inner: Vec<String> = items.iter().map(value_to_json_string).collect();
+                format!("[{}]", inner.join(","))
+            }
+            Value::Map(m) => {
+                let inner: Vec<String> = m
+                    .iter()
+                    .map(|(k, v)| {
+                        format!(
+                            "{}:{}",
+                            serde_json::to_string(k).unwrap_or_default(),
+                            value_to_json_string(v)
+                        )
+                    })
+                    .collect();
+                format!("{{{}}}", inner.join(","))
+            }
+            Value::Node(n) => {
+                let props_json = value_to_json_string(&Value::Map(n.props.clone()));
+                format!(
+                    "{{\"id\":{},\"labels\":{},\"properties\":{}}}",
+                    serde_json::to_string(&n.id).unwrap_or_default(),
+                    serde_json::to_string(&n.labels).unwrap_or_default(),
+                    props_json
+                )
+            }
+            Value::Rel(r) => {
+                let props_json = value_to_json_string(&Value::Map(r.props.clone()));
+                format!(
+                    "{{\"id\":{},\"type\":{},\"start\":{},\"end\":{},\"properties\":{}}}",
+                    serde_json::to_string(&r.id).unwrap_or_default(),
+                    serde_json::to_string(&r.rel_type).unwrap_or_default(),
+                    serde_json::to_string(&r.src).unwrap_or_default(),
+                    serde_json::to_string(&r.dst).unwrap_or_default(),
+                    props_json
+                )
+            }
+        }
+    }
 
     pub struct Executor {
         params: IndexMap<String, Value>,
@@ -2457,13 +2861,16 @@ pub mod executor {
                         bindings = self.execute_match(patterns, where_, &bindings, graph, false)?;
                     }
                     Clause::OptionalMatch { patterns, where_ } => {
-                        bindings =
-                            self.execute_match(patterns, where_, &bindings, graph, true)?;
+                        bindings = self.execute_match(patterns, where_, &bindings, graph, true)?;
                     }
                     Clause::Create { patterns } => {
                         self.execute_create(patterns, &mut bindings, graph)?;
                     }
-                    Clause::Merge { pattern, on_create, on_match } => {
+                    Clause::Merge {
+                        pattern,
+                        on_create,
+                        on_match,
+                    } => {
                         self.execute_merge(pattern, on_create, on_match, &mut bindings, graph)?;
                     }
                     Clause::Return {
@@ -2473,9 +2880,8 @@ pub mod executor {
                         limit,
                         skip,
                     } => {
-                        result = self.execute_return(
-                            items, *distinct, order_by, limit, skip, &bindings,
-                        )?;
+                        result = self
+                            .execute_return(items, *distinct, order_by, limit, skip, &bindings)?;
                     }
                     Clause::With { items, where_ } => {
                         bindings = self.execute_with(items, where_, &bindings)?;
@@ -2503,7 +2909,11 @@ pub mod executor {
                     Clause::Union { .. } => {
                         // Handled at top level
                     }
-                    Clause::Foreach { var, list_expr, body } => {
+                    Clause::Foreach {
+                        var,
+                        list_expr,
+                        body,
+                    } => {
                         self.execute_foreach(var, list_expr, body, &bindings, graph)?;
                     }
                     Clause::Remove { items } => {
@@ -2513,7 +2923,101 @@ pub mod executor {
                         bindings = self.execute_call(subquery, &bindings, graph)?;
                     }
                     Clause::CallProcedure { name, args, yields } => {
-                        bindings = self.execute_call_procedure(name, args, yields, &bindings, graph)?;
+                        bindings =
+                            self.execute_call_procedure(name, args, yields, &bindings, graph)?;
+                    }
+                    Clause::CreateIndex {
+                        name,
+                        label,
+                        properties,
+                        index_type,
+                    } => {
+                        // MemoryGraph has no persistent indexes — record as metadata
+                        graph.set_metadata(
+                            &format!("index:{}", name),
+                            &format!(
+                                "{{\"label\":\"{}\",\"properties\":{:?},\"type\":\"{}\"}}",
+                                label, properties, index_type
+                            ),
+                        );
+                    }
+                    Clause::DropIndex { name } => {
+                        graph.remove_metadata(&format!("index:{}", name));
+                    }
+                    Clause::ShowIndexes => {
+                        let indexes = graph.list_metadata_prefix("index:");
+                        let mut rows = Vec::new();
+                        for (key, val) in &indexes {
+                            let idx_name = key.strip_prefix("index:").unwrap_or(key);
+                            let mut cols = IndexMap::new();
+                            cols.insert("name".to_owned(), Value::Str(idx_name.to_owned()));
+                            cols.insert("type".to_owned(), Value::Str(val.clone()));
+                            rows.push(cols);
+                        }
+                        if rows.is_empty() {
+                            result = ResultSet {
+                                columns: vec!["name".into(), "type".into()],
+                                rows: vec![],
+                            };
+                        } else {
+                            result = ResultSet {
+                                columns: vec!["name".into(), "type".into()],
+                                rows: rows
+                                    .iter()
+                                    .map(|r| {
+                                        Row(r.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                                    })
+                                    .collect(),
+                            };
+                        }
+                    }
+                    Clause::CreateConstraint { name, kind } => {
+                        let meta = match kind {
+                            ConstraintKind::Unique { label, properties } => format!(
+                                "{{\"kind\":\"unique\",\"label\":\"{}\",\"properties\":{:?}}}",
+                                label, properties
+                            ),
+                            ConstraintKind::NodeKey { label, properties } => format!(
+                                "{{\"kind\":\"node_key\",\"label\":\"{}\",\"properties\":{:?}}}",
+                                label, properties
+                            ),
+                            ConstraintKind::Exists { label, property } => format!(
+                                "{{\"kind\":\"exists\",\"label\":\"{}\",\"property\":\"{}\"}}",
+                                label, property
+                            ),
+                        };
+                        graph.set_metadata(&format!("constraint:{}", name), &meta);
+                    }
+                    Clause::DropConstraint { name } => {
+                        graph.remove_metadata(&format!("constraint:{}", name));
+                    }
+                    Clause::ShowConstraints => {
+                        let constraints = graph.list_metadata_prefix("constraint:");
+                        let mut rows = Vec::new();
+                        for (key, val) in &constraints {
+                            let c_name = key.strip_prefix("constraint:").unwrap_or(key);
+                            let mut cols = IndexMap::new();
+                            cols.insert("name".to_owned(), Value::Str(c_name.to_owned()));
+                            cols.insert("type".to_owned(), Value::Str(val.clone()));
+                            rows.push(cols);
+                        }
+                        result = ResultSet {
+                            columns: vec!["name".into(), "type".into()],
+                            rows: rows
+                                .iter()
+                                .map(|r| {
+                                    Row(r.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                                })
+                                .collect(),
+                        };
+                    }
+                    Clause::LoadCsv {
+                        url_expr,
+                        as_var,
+                        with_headers,
+                    } => {
+                        bindings =
+                            self.execute_load_csv(url_expr, as_var, *with_headers, &bindings)?;
                     }
                 }
             }
@@ -2525,8 +3029,11 @@ pub mod executor {
             let mut seen: Vec<Vec<(String, String)>> = Vec::new();
             let mut result = Vec::new();
             for row in rows {
-                let key: Vec<(String, String)> =
-                    row.0.iter().map(|(k, v)| (k.clone(), v.to_string())).collect();
+                let key: Vec<(String, String)> = row
+                    .0
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.to_string()))
+                    .collect();
                 if !seen.contains(&key) {
                     seen.push(key);
                     result.push(row.clone());
@@ -2630,7 +3137,7 @@ pub mod executor {
                                 _ => {
                                     return Err(CypherError::ParseError(
                                         "expected node after relationship in pattern".into(),
-                                    ))
+                                    ));
                                 }
                             }
                         } else {
@@ -2643,8 +3150,7 @@ pub mod executor {
                         for b in &current_bindings {
                             // Get the last bound node (the src side)
                             let src_node = self.get_last_node_in_binding(b, elements, i)?;
-                            let expanded =
-                                self.match_rel_step(rp, next_np, &src_node, b, graph)?;
+                            let expanded = self.match_rel_step(rp, next_np, &src_node, b, graph)?;
                             next.extend(expanded);
                         }
                         current_bindings = next;
@@ -2887,9 +3393,7 @@ pub mod executor {
                         if let Some(rv) = &rp.var {
                             nb.insert(
                                 rv.clone(),
-                                Value::List(
-                                    rels.iter().map(|r| Value::Rel(r.clone())).collect(),
-                                ),
+                                Value::List(rels.iter().map(|r| Value::Rel(r.clone())).collect()),
                             );
                         }
                         if let Some(nv) = &next_np.var {
@@ -3017,7 +3521,7 @@ pub mod executor {
                             _ => {
                                 return Err(CypherError::ParseError(
                                     "dangling rel in CREATE pattern".into(),
-                                ))
+                                ));
                             }
                         };
 
@@ -3058,14 +3562,12 @@ pub mod executor {
                         }
 
                         let (src, dst) = match rp.dir {
-                            RelDir::Right | RelDir::Both => (
-                                prev_node_id.clone().unwrap_or_default(),
-                                dst_id.clone(),
-                            ),
-                            RelDir::Left => (
-                                dst_id.clone(),
-                                prev_node_id.clone().unwrap_or_default(),
-                            ),
+                            RelDir::Right | RelDir::Both => {
+                                (prev_node_id.clone().unwrap_or_default(), dst_id.clone())
+                            }
+                            RelDir::Left => {
+                                (dst_id.clone(), prev_node_id.clone().unwrap_or_default())
+                            }
                         };
 
                         let rel_type = rp.types.first().cloned().unwrap_or_default();
@@ -3239,8 +3741,18 @@ pub mod executor {
                                 Clause::Delete { exprs, detach } => {
                                     self.execute_delete(exprs, *detach, &inner_bindings, graph)?;
                                 }
-                                Clause::Merge { pattern, on_create, on_match } => {
-                                    self.execute_merge(pattern, on_create, on_match, &mut inner_bindings, graph)?;
+                                Clause::Merge {
+                                    pattern,
+                                    on_create,
+                                    on_match,
+                                } => {
+                                    self.execute_merge(
+                                        pattern,
+                                        on_create,
+                                        on_match,
+                                        &mut inner_bindings,
+                                        graph,
+                                    )?;
                                 }
                                 Clause::Remove { items } => {
                                     self.execute_remove(items, &inner_bindings, graph)?;
@@ -3306,10 +3818,17 @@ pub mod executor {
                 for clause in &clause_refs {
                     match clause {
                         Clause::Match { patterns, where_ } => {
-                            inner_bindings = self.execute_match(patterns, where_, &inner_bindings, graph, false)?;
+                            inner_bindings = self.execute_match(
+                                patterns,
+                                where_,
+                                &inner_bindings,
+                                graph,
+                                false,
+                            )?;
                         }
                         Clause::OptionalMatch { patterns, where_ } => {
-                            inner_bindings = self.execute_match(patterns, where_, &inner_bindings, graph, true)?;
+                            inner_bindings =
+                                self.execute_match(patterns, where_, &inner_bindings, graph, true)?;
                         }
                         Clause::With { items, where_ } => {
                             inner_bindings = self.execute_with(items, where_, &inner_bindings)?;
@@ -3317,16 +3836,33 @@ pub mod executor {
                         Clause::Unwind { expr, alias } => {
                             inner_bindings = self.execute_unwind(expr, alias, &inner_bindings)?;
                         }
-                        Clause::Return { items, distinct, order_by, limit, skip } => {
-                            inner_result = self.execute_return(items, *distinct, order_by, limit, skip, &inner_bindings)?;
+                        Clause::Return {
+                            items,
+                            distinct,
+                            order_by,
+                            limit,
+                            skip,
+                        } => {
+                            inner_result = self.execute_return(
+                                items,
+                                *distinct,
+                                order_by,
+                                limit,
+                                skip,
+                                &inner_bindings,
+                            )?;
                             // Convert returned rows back to bindings
-                            inner_bindings = inner_result.rows.iter().map(|r| {
-                                let mut nb = binding.clone();
-                                for (k, v) in &r.0 {
-                                    nb.insert(k.clone(), v.clone());
-                                }
-                                nb
-                            }).collect();
+                            inner_bindings = inner_result
+                                .rows
+                                .iter()
+                                .map(|r| {
+                                    let mut nb = binding.clone();
+                                    for (k, v) in &r.0 {
+                                        nb.insert(k.clone(), v.clone());
+                                    }
+                                    nb
+                                })
+                                .collect();
                         }
                         _ => {}
                     }
@@ -3364,7 +3900,11 @@ pub mod executor {
                     for binding in bindings {
                         let label = match self.eval(&args[0], binding)? {
                             Value::Str(s) => s,
-                            _ => return Err(CypherError::TypeError("queryNodes: label must be string".into())),
+                            _ => {
+                                return Err(CypherError::TypeError(
+                                    "queryNodes: label must be string".into(),
+                                ));
+                            }
                         };
                         // args[1] is embedding property name (unused in MemoryGraph — always "embedding")
                         let query_vec = match self.eval(&args[2], binding)? {
@@ -3374,16 +3914,29 @@ pub mod executor {
                                     match item {
                                         Value::Float(f) => v.push(*f as f32),
                                         Value::Int(i) => v.push(*i as f32),
-                                        _ => return Err(CypherError::TypeError("queryNodes: vector elements must be numeric".into())),
+                                        _ => {
+                                            return Err(CypherError::TypeError(
+                                                "queryNodes: vector elements must be numeric"
+                                                    .into(),
+                                            ));
+                                        }
                                     }
                                 }
                                 v
                             }
-                            _ => return Err(CypherError::TypeError("queryNodes: queryVector must be a list".into())),
+                            _ => {
+                                return Err(CypherError::TypeError(
+                                    "queryNodes: queryVector must be a list".into(),
+                                ));
+                            }
                         };
                         let k = match self.eval(&args[3], binding)? {
                             Value::Int(n) => n as usize,
-                            _ => return Err(CypherError::TypeError("queryNodes: k must be integer".into())),
+                            _ => {
+                                return Err(CypherError::TypeError(
+                                    "queryNodes: k must be integer".into(),
+                                ));
+                            }
                         };
                         let labels = vec![label];
                         let hits = graph.vector_search(&query_vec, k, &labels);
@@ -3399,8 +3952,418 @@ pub mod executor {
                     }
                     Ok(result)
                 }
-                other => Err(CypherError::GraphError(format!("unknown procedure: {}", other))),
+                "db.labels" => {
+                    let mut labels = std::collections::BTreeSet::new();
+                    for node in graph.nodes() {
+                        for label in &node.labels {
+                            labels.insert(label.clone());
+                        }
+                    }
+                    let mut result = Vec::new();
+                    let yield_var = yields.first().map(|s| s.as_str()).unwrap_or("label");
+                    for label in labels {
+                        for binding in bindings {
+                            let mut nb = binding.clone();
+                            nb.insert(yield_var.to_owned(), Value::Str(label.clone()));
+                            result.push(nb);
+                        }
+                    }
+                    Ok(result)
+                }
+
+                "db.relationshiptypes" => {
+                    let mut types = std::collections::BTreeSet::new();
+                    for rel in graph.rels() {
+                        types.insert(rel.rel_type.clone());
+                    }
+                    let mut result = Vec::new();
+                    let yield_var = yields
+                        .first()
+                        .map(|s| s.as_str())
+                        .unwrap_or("relationshipType");
+                    for t in types {
+                        for binding in bindings {
+                            let mut nb = binding.clone();
+                            nb.insert(yield_var.to_owned(), Value::Str(t.clone()));
+                            result.push(nb);
+                        }
+                    }
+                    Ok(result)
+                }
+
+                "db.propertykeys" => {
+                    let mut keys = std::collections::BTreeSet::new();
+                    for node in graph.nodes() {
+                        for k in node.props.keys() {
+                            keys.insert(k.clone());
+                        }
+                    }
+                    for rel in graph.rels() {
+                        for k in rel.props.keys() {
+                            keys.insert(k.clone());
+                        }
+                    }
+                    let mut result = Vec::new();
+                    let yield_var = yields.first().map(|s| s.as_str()).unwrap_or("propertyKey");
+                    for key in keys {
+                        for binding in bindings {
+                            let mut nb = binding.clone();
+                            nb.insert(yield_var.to_owned(), Value::Str(key.clone()));
+                            result.push(nb);
+                        }
+                    }
+                    Ok(result)
+                }
+
+                "db.schema.nodetypeproperties" => {
+                    let mut label_props: std::collections::BTreeMap<
+                        String,
+                        std::collections::BTreeSet<String>,
+                    > = std::collections::BTreeMap::new();
+                    for node in graph.nodes() {
+                        for label in &node.labels {
+                            let entry = label_props.entry(label.clone()).or_default();
+                            for k in node.props.keys() {
+                                entry.insert(k.clone());
+                            }
+                        }
+                    }
+                    let mut result = Vec::new();
+                    let nt_var = yields.first().map(|s| s.as_str()).unwrap_or("nodeType");
+                    let pn_var = yields.get(1).map(|s| s.as_str()).unwrap_or("propertyName");
+                    let pt_var = yields.get(2).map(|s| s.as_str()).unwrap_or("propertyTypes");
+                    for (label, props) in &label_props {
+                        for prop in props {
+                            for binding in bindings {
+                                let mut nb = binding.clone();
+                                nb.insert(nt_var.to_owned(), Value::Str(format!(":{}", label)));
+                                nb.insert(pn_var.to_owned(), Value::Str(prop.clone()));
+                                nb.insert(
+                                    pt_var.to_owned(),
+                                    Value::List(vec![Value::Str("String".into())]),
+                                );
+                                result.push(nb);
+                            }
+                        }
+                    }
+                    Ok(result)
+                }
+
+                "db.schema.reltypeproperties" => {
+                    let mut type_props: std::collections::BTreeMap<
+                        String,
+                        std::collections::BTreeSet<String>,
+                    > = std::collections::BTreeMap::new();
+                    for rel in graph.rels() {
+                        let entry = type_props.entry(rel.rel_type.clone()).or_default();
+                        for k in rel.props.keys() {
+                            entry.insert(k.clone());
+                        }
+                    }
+                    let mut result = Vec::new();
+                    let rt_var = yields.first().map(|s| s.as_str()).unwrap_or("relType");
+                    let pn_var = yields.get(1).map(|s| s.as_str()).unwrap_or("propertyName");
+                    let pt_var = yields.get(2).map(|s| s.as_str()).unwrap_or("propertyTypes");
+                    for (rel_type, props) in &type_props {
+                        for prop in props {
+                            for binding in bindings {
+                                let mut nb = binding.clone();
+                                nb.insert(rt_var.to_owned(), Value::Str(format!(":{}", rel_type)));
+                                nb.insert(pn_var.to_owned(), Value::Str(prop.clone()));
+                                nb.insert(
+                                    pt_var.to_owned(),
+                                    Value::List(vec![Value::Str("String".into())]),
+                                );
+                                result.push(nb);
+                            }
+                        }
+                    }
+                    Ok(result)
+                }
+
+                "db.indexes" | "db.schema.indexes" => Ok(bindings.to_vec()),
+
+                "db.constraints" | "db.schema.constraints" => Ok(bindings.to_vec()),
+
+                // ---- APOC procedures ------------------------------------------------
+                "apoc.create.uuid" | "apoc.create.uuid()" => {
+                    let mut result = Vec::new();
+                    let yield_var = yields.first().map(|s| s.as_str()).unwrap_or("uuid");
+                    for binding in bindings {
+                        let mut nb = binding.clone();
+                        nb.insert(
+                            yield_var.to_owned(),
+                            Value::Str(uuid::Uuid::new_v4().to_string()),
+                        );
+                        result.push(nb);
+                    }
+                    Ok(result)
+                }
+
+                "apoc.text.join" => {
+                    if args.len() < 2 {
+                        return Err(CypherError::TypeError(
+                            "apoc.text.join requires 2 arguments: list, delimiter".into(),
+                        ));
+                    }
+                    let mut result = Vec::new();
+                    let yield_var = yields.first().map(|s| s.as_str()).unwrap_or("value");
+                    for binding in bindings {
+                        let list = self.eval(&args[0], binding)?;
+                        let delim = match self.eval(&args[1], binding)? {
+                            Value::Str(s) => s,
+                            _ => {
+                                return Err(CypherError::TypeError(
+                                    "delimiter must be string".into(),
+                                ));
+                            }
+                        };
+                        let joined = match list {
+                            Value::List(items) => items
+                                .iter()
+                                .map(|v| format!("{}", v))
+                                .collect::<Vec<_>>()
+                                .join(&delim),
+                            _ => {
+                                return Err(CypherError::TypeError(
+                                    "first arg must be list".into(),
+                                ));
+                            }
+                        };
+                        let mut nb = binding.clone();
+                        nb.insert(yield_var.to_owned(), Value::Str(joined));
+                        result.push(nb);
+                    }
+                    Ok(result)
+                }
+
+                "apoc.convert.tojson" => {
+                    if args.is_empty() {
+                        return Err(CypherError::TypeError(
+                            "apoc.convert.toJson requires 1 argument".into(),
+                        ));
+                    }
+                    let mut result = Vec::new();
+                    let yield_var = yields.first().map(|s| s.as_str()).unwrap_or("value");
+                    for binding in bindings {
+                        let val = self.eval(&args[0], binding)?;
+                        let json_str = value_to_json_string(&val);
+                        let mut nb = binding.clone();
+                        nb.insert(yield_var.to_owned(), Value::Str(json_str));
+                        result.push(nb);
+                    }
+                    Ok(result)
+                }
+
+                "apoc.convert.fromjsonmap" => {
+                    if args.is_empty() {
+                        return Err(CypherError::TypeError(
+                            "apoc.convert.fromJsonMap requires 1 argument".into(),
+                        ));
+                    }
+                    let mut result = Vec::new();
+                    let yield_var = yields.first().map(|s| s.as_str()).unwrap_or("value");
+                    for binding in bindings {
+                        let json_str = match self.eval(&args[0], binding)? {
+                            Value::Str(s) => s,
+                            _ => {
+                                return Err(CypherError::TypeError(
+                                    "argument must be string".into(),
+                                ));
+                            }
+                        };
+                        let parsed: serde_json::Value = serde_json::from_str(&json_str)
+                            .map_err(|e| CypherError::TypeError(format!("invalid JSON: {}", e)))?;
+                        let val = crate::graph::json_to_value(&parsed);
+                        let mut nb = binding.clone();
+                        nb.insert(yield_var.to_owned(), val);
+                        result.push(nb);
+                    }
+                    Ok(result)
+                }
+
+                "apoc.convert.fromjsonlist" => {
+                    if args.is_empty() {
+                        return Err(CypherError::TypeError(
+                            "apoc.convert.fromJsonList requires 1 argument".into(),
+                        ));
+                    }
+                    let mut result = Vec::new();
+                    let yield_var = yields.first().map(|s| s.as_str()).unwrap_or("value");
+                    for binding in bindings {
+                        let json_str = match self.eval(&args[0], binding)? {
+                            Value::Str(s) => s,
+                            _ => {
+                                return Err(CypherError::TypeError(
+                                    "argument must be string".into(),
+                                ));
+                            }
+                        };
+                        let parsed: serde_json::Value = serde_json::from_str(&json_str)
+                            .map_err(|e| CypherError::TypeError(format!("invalid JSON: {}", e)))?;
+                        let val = crate::graph::json_to_value(&parsed);
+                        let mut nb = binding.clone();
+                        nb.insert(yield_var.to_owned(), val);
+                        result.push(nb);
+                    }
+                    Ok(result)
+                }
+
+                "apoc.map.frompairs" => {
+                    if args.is_empty() {
+                        return Err(CypherError::TypeError(
+                            "apoc.map.fromPairs requires 1 argument".into(),
+                        ));
+                    }
+                    let mut result = Vec::new();
+                    let yield_var = yields.first().map(|s| s.as_str()).unwrap_or("value");
+                    for binding in bindings {
+                        let pairs = match self.eval(&args[0], binding)? {
+                            Value::List(items) => items,
+                            _ => {
+                                return Err(CypherError::TypeError(
+                                    "argument must be list of pairs".into(),
+                                ));
+                            }
+                        };
+                        let mut map = IndexMap::new();
+                        for pair in pairs {
+                            if let Value::List(kv) = pair {
+                                if kv.len() >= 2 {
+                                    let key = format!("{}", kv[0]);
+                                    map.insert(key, kv[1].clone());
+                                }
+                            }
+                        }
+                        let mut nb = binding.clone();
+                        nb.insert(yield_var.to_owned(), Value::Map(map));
+                        result.push(nb);
+                    }
+                    Ok(result)
+                }
+
+                "apoc.map.merge" => {
+                    if args.len() < 2 {
+                        return Err(CypherError::TypeError(
+                            "apoc.map.merge requires 2 arguments".into(),
+                        ));
+                    }
+                    let mut result = Vec::new();
+                    let yield_var = yields.first().map(|s| s.as_str()).unwrap_or("value");
+                    for binding in bindings {
+                        let map1 = match self.eval(&args[0], binding)? {
+                            Value::Map(m) => m,
+                            _ => {
+                                return Err(CypherError::TypeError("first arg must be map".into()));
+                            }
+                        };
+                        let map2 = match self.eval(&args[1], binding)? {
+                            Value::Map(m) => m,
+                            _ => {
+                                return Err(CypherError::TypeError(
+                                    "second arg must be map".into(),
+                                ));
+                            }
+                        };
+                        let mut merged = map1;
+                        for (k, v) in map2 {
+                            merged.insert(k, v);
+                        }
+                        let mut nb = binding.clone();
+                        nb.insert(yield_var.to_owned(), Value::Map(merged));
+                        result.push(nb);
+                    }
+                    Ok(result)
+                }
+
+                "apoc.coll.flatten" => {
+                    if args.is_empty() {
+                        return Err(CypherError::TypeError(
+                            "apoc.coll.flatten requires 1 argument".into(),
+                        ));
+                    }
+                    let mut result = Vec::new();
+                    let yield_var = yields.first().map(|s| s.as_str()).unwrap_or("value");
+                    for binding in bindings {
+                        let list = match self.eval(&args[0], binding)? {
+                            Value::List(items) => items,
+                            _ => {
+                                return Err(CypherError::TypeError("argument must be list".into()));
+                            }
+                        };
+                        fn flatten_list(items: Vec<Value>) -> Vec<Value> {
+                            let mut out = Vec::new();
+                            for item in items {
+                                match item {
+                                    Value::List(inner) => out.extend(flatten_list(inner)),
+                                    other => out.push(other),
+                                }
+                            }
+                            out
+                        }
+                        let mut nb = binding.clone();
+                        nb.insert(yield_var.to_owned(), Value::List(flatten_list(list)));
+                        result.push(nb);
+                    }
+                    Ok(result)
+                }
+
+                other => Err(CypherError::GraphError(format!(
+                    "unknown procedure: {}",
+                    other
+                ))),
             }
+        }
+
+        // ---- LOAD CSV -------------------------------------------------------
+
+        fn execute_load_csv(
+            &self,
+            url_expr: &Expr,
+            as_var: &str,
+            with_headers: bool,
+            bindings: &[Binding],
+        ) -> Result<Vec<Binding>> {
+            let mut result = Vec::new();
+            for binding in bindings {
+                let csv_data = match self.eval(url_expr, binding)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(CypherError::TypeError(
+                            "LOAD CSV source must evaluate to a string".into(),
+                        ));
+                    }
+                };
+                let lines: Vec<&str> = csv_data.lines().collect();
+                if lines.is_empty() {
+                    continue;
+                }
+                if with_headers {
+                    let headers: Vec<&str> = lines[0].split(',').map(|s| s.trim()).collect();
+                    for line in &lines[1..] {
+                        let values: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+                        let mut map = IndexMap::new();
+                        for (i, header) in headers.iter().enumerate() {
+                            let val = values.get(i).copied().unwrap_or("");
+                            map.insert(header.to_string(), Value::Str(val.to_string()));
+                        }
+                        let mut nb = binding.clone();
+                        nb.insert(as_var.to_owned(), Value::Map(map));
+                        result.push(nb);
+                    }
+                } else {
+                    for line in &lines {
+                        let values: Vec<Value> = line
+                            .split(',')
+                            .map(|s| Value::Str(s.trim().to_string()))
+                            .collect();
+                        let mut nb = binding.clone();
+                        nb.insert(as_var.to_owned(), Value::List(values));
+                        result.push(nb);
+                    }
+                }
+            }
+            Ok(result)
         }
 
         // ---- UNWIND ---------------------------------------------------------
@@ -3624,11 +4587,7 @@ pub mod executor {
             }
         }
 
-        fn aggregate(
-            &self,
-            items: &[ReturnItem],
-            bindings: &[Binding],
-        ) -> Result<Vec<Binding>> {
+        fn aggregate(&self, items: &[ReturnItem], bindings: &[Binding]) -> Result<Vec<Binding>> {
             // Separate grouping keys from aggregation expressions
             let (group_items, agg_items): (Vec<_>, Vec<_>) = items
                 .iter()
@@ -3710,9 +4669,9 @@ pub mod executor {
                         Ok(Value::Int(count as i64))
                     }
                     "count_distinct" => {
-                        let arg = args
-                            .first()
-                            .ok_or_else(|| CypherError::TypeError("count(DISTINCT) requires arg".into()))?;
+                        let arg = args.first().ok_or_else(|| {
+                            CypherError::TypeError("count(DISTINCT) requires arg".into())
+                        })?;
                         let mut seen: Vec<String> = Vec::new();
                         for b in group {
                             let v = self.eval(arg, b)?;
@@ -3806,9 +4765,7 @@ pub mod executor {
                             min_val = Some(match min_val {
                                 None => v,
                                 Some(curr) => {
-                                    if v.partial_cmp_val(&curr)
-                                        == Some(std::cmp::Ordering::Less)
-                                    {
+                                    if v.partial_cmp_val(&curr) == Some(std::cmp::Ordering::Less) {
                                         v
                                     } else {
                                         curr
@@ -3831,8 +4788,7 @@ pub mod executor {
                             max_val = Some(match max_val {
                                 None => v,
                                 Some(curr) => {
-                                    if v.partial_cmp_val(&curr)
-                                        == Some(std::cmp::Ordering::Greater)
+                                    if v.partial_cmp_val(&curr) == Some(std::cmp::Ordering::Greater)
                                     {
                                         v
                                     } else {
@@ -4053,7 +5009,12 @@ pub mod executor {
                     }
                 }
 
-                Expr::ListComp { var, list_expr, filter, map_expr } => {
+                Expr::ListComp {
+                    var,
+                    list_expr,
+                    filter,
+                    map_expr,
+                } => {
                     let list_val = self.eval(list_expr, binding)?;
                     match list_val {
                         Value::List(items) => {
@@ -4078,7 +5039,9 @@ pub mod executor {
                             Ok(Value::List(result))
                         }
                         Value::Null => Ok(Value::Null),
-                        _ => Err(CypherError::TypeError("list comprehension requires list".into())),
+                        _ => Err(CypherError::TypeError(
+                            "list comprehension requires list".into(),
+                        )),
                     }
                 }
 
@@ -4088,9 +5051,11 @@ pub mod executor {
                         Value::Node(n) => &n.props,
                         Value::Map(m) => m,
                         Value::Rel(r) => &r.props,
-                        _ => return Err(CypherError::TypeError(
-                            "map projection requires node, rel, or map".into(),
-                        )),
+                        _ => {
+                            return Err(CypherError::TypeError(
+                                "map projection requires node, rel, or map".into(),
+                            ));
+                        }
                     };
                     let mut result = IndexMap::new();
                     for entry in entries {
@@ -4120,7 +5085,12 @@ pub mod executor {
                     ))
                 }
 
-                Expr::ListPredicate { kind, var, list_expr, pred } => {
+                Expr::ListPredicate {
+                    kind,
+                    var,
+                    list_expr,
+                    pred,
+                } => {
                     let list_val = self.eval(list_expr, binding)?;
                     match list_val {
                         Value::List(items) => {
@@ -4142,24 +5112,33 @@ pub mod executor {
                             Ok(Value::Bool(result))
                         }
                         Value::Null => Ok(Value::Null),
-                        _ => Err(CypherError::TypeError("list predicate requires list".into())),
+                        _ => Err(CypherError::TypeError(
+                            "list predicate requires list".into(),
+                        )),
                     }
                 }
             }
         }
 
         /// Evaluate expression with graph access (needed for EXISTS subquery)
-        pub fn eval_with_graph(&self, expr: &Expr, binding: &Binding, graph: &dyn Graph) -> Result<Value> {
+        pub fn eval_with_graph(
+            &self,
+            expr: &Expr,
+            binding: &Binding,
+            graph: &dyn Graph,
+        ) -> Result<Value> {
             match expr {
                 Expr::ExistsSubquery(clauses) => {
                     let mut current: Vec<Binding> = vec![binding.clone()];
                     for clause in clauses {
                         match clause {
                             Clause::Match { patterns, where_ } => {
-                                current = self.execute_match(patterns, where_, &current, graph, false)?;
+                                current =
+                                    self.execute_match(patterns, where_, &current, graph, false)?;
                             }
                             Clause::OptionalMatch { patterns, where_ } => {
-                                current = self.execute_match(patterns, where_, &current, graph, true)?;
+                                current =
+                                    self.execute_match(patterns, where_, &current, graph, true)?;
                             }
                             Clause::With { items, where_ } => {
                                 current = self.execute_with(items, where_, &current)?;
@@ -4361,9 +5340,9 @@ pub mod executor {
                 "labels" => {
                     let v = self.eval_arg(args, 0, binding)?;
                     match v {
-                        Value::Node(n) => Ok(Value::List(
-                            n.labels.into_iter().map(Value::Str).collect(),
-                        )),
+                        Value::Node(n) => {
+                            Ok(Value::List(n.labels.into_iter().map(Value::Str).collect()))
+                        }
                         _ => Err(CypherError::TypeError("labels() requires node".into())),
                     }
                 }
@@ -4371,7 +5350,9 @@ pub mod executor {
                     let v = self.eval_arg(args, 0, binding)?;
                     match v {
                         Value::Rel(r) => Ok(Value::Str(r.rel_type)),
-                        _ => Err(CypherError::TypeError("type() requires relationship".into())),
+                        _ => Err(CypherError::TypeError(
+                            "type() requires relationship".into(),
+                        )),
                     }
                 }
                 "keys" => {
@@ -4426,12 +5407,13 @@ pub mod executor {
                     match v {
                         Value::Int(n) => Ok(Value::Int(n)),
                         Value::Float(f) => Ok(Value::Int(f as i64)),
-                        Value::Str(s) => s
-                            .parse::<i64>()
-                            .map(Value::Int)
-                            .map_err(|_| CypherError::TypeError(format!("cannot parse '{}' as integer", s))),
+                        Value::Str(s) => s.parse::<i64>().map(Value::Int).map_err(|_| {
+                            CypherError::TypeError(format!("cannot parse '{}' as integer", s))
+                        }),
                         Value::Null => Ok(Value::Null),
-                        _ => Err(CypherError::TypeError("toInteger() requires numeric or string".into())),
+                        _ => Err(CypherError::TypeError(
+                            "toInteger() requires numeric or string".into(),
+                        )),
                     }
                 }
                 "tostring" | "tostr" => {
@@ -4497,11 +5479,15 @@ pub mod executor {
                 "range" => {
                     let start = match self.eval_arg(args, 0, binding)? {
                         Value::Int(n) => n,
-                        _ => return Err(CypherError::TypeError("range() requires integers".into())),
+                        _ => {
+                            return Err(CypherError::TypeError("range() requires integers".into()));
+                        }
                     };
                     let end = match self.eval_arg(args, 1, binding)? {
                         Value::Int(n) => n,
-                        _ => return Err(CypherError::TypeError("range() requires integers".into())),
+                        _ => {
+                            return Err(CypherError::TypeError("range() requires integers".into()));
+                        }
                     };
                     let step = if args.len() > 2 {
                         match self.eval_arg(args, 2, binding)? {
@@ -4522,7 +5508,11 @@ pub mod executor {
                 "substring" => {
                     let s = match self.eval_arg(args, 0, binding)? {
                         Value::Str(s) => s,
-                        _ => return Err(CypherError::TypeError("substring() requires string".into())),
+                        _ => {
+                            return Err(CypherError::TypeError(
+                                "substring() requires string".into(),
+                            ));
+                        }
                     };
                     let start = match self.eval_arg(args, 1, binding)? {
                         Value::Int(n) => n as usize,
@@ -4534,7 +5524,8 @@ pub mod executor {
                             Value::Int(n) => n as usize,
                             _ => chars.len(),
                         };
-                        chars[start.min(chars.len())..][..len.min(chars.len().saturating_sub(start))]
+                        chars[start.min(chars.len())..]
+                            [..len.min(chars.len().saturating_sub(start))]
                             .iter()
                             .collect()
                     } else {
@@ -4565,12 +5556,13 @@ pub mod executor {
                     match v {
                         Value::Float(f) => Ok(Value::Float(f)),
                         Value::Int(n) => Ok(Value::Float(n as f64)),
-                        Value::Str(s) => s
-                            .parse::<f64>()
-                            .map(Value::Float)
-                            .map_err(|_| CypherError::TypeError(format!("cannot parse '{}' as float", s))),
+                        Value::Str(s) => s.parse::<f64>().map(Value::Float).map_err(|_| {
+                            CypherError::TypeError(format!("cannot parse '{}' as float", s))
+                        }),
                         Value::Null => Ok(Value::Null),
-                        _ => Err(CypherError::TypeError("toFloat() requires numeric or string".into())),
+                        _ => Err(CypherError::TypeError(
+                            "toFloat() requires numeric or string".into(),
+                        )),
                     }
                 }
                 "ceil" => {
@@ -4604,7 +5596,13 @@ pub mod executor {
                     let v = self.eval_arg(args, 0, binding)?;
                     match v {
                         Value::Int(n) => Ok(Value::Int(n.signum())),
-                        Value::Float(f) => Ok(Value::Float(if f > 0.0 { 1.0 } else if f < 0.0 { -1.0 } else { 0.0 })),
+                        Value::Float(f) => Ok(Value::Float(if f > 0.0 {
+                            1.0
+                        } else if f < 0.0 {
+                            -1.0
+                        } else {
+                            0.0
+                        })),
                         Value::Null => Ok(Value::Null),
                         _ => Err(CypherError::TypeError("sign() requires numeric".into())),
                     }
@@ -4622,15 +5620,25 @@ pub mod executor {
                     let s = match self.eval_arg(args, 0, binding)? {
                         Value::Str(s) => s,
                         Value::Null => return Ok(Value::Null),
-                        _ => return Err(CypherError::TypeError("replace() requires string".into())),
+                        _ => {
+                            return Err(CypherError::TypeError("replace() requires string".into()));
+                        }
                     };
                     let search = match self.eval_arg(args, 1, binding)? {
                         Value::Str(s) => s,
-                        _ => return Err(CypherError::TypeError("replace() search must be string".into())),
+                        _ => {
+                            return Err(CypherError::TypeError(
+                                "replace() search must be string".into(),
+                            ));
+                        }
                     };
                     let replacement = match self.eval_arg(args, 2, binding)? {
                         Value::Str(s) => s,
-                        _ => return Err(CypherError::TypeError("replace() replacement must be string".into())),
+                        _ => {
+                            return Err(CypherError::TypeError(
+                                "replace() replacement must be string".into(),
+                            ));
+                        }
                     };
                     Ok(Value::Str(s.replace(&*search, &replacement)))
                 }
@@ -4642,7 +5650,11 @@ pub mod executor {
                     };
                     let n = match self.eval_arg(args, 1, binding)? {
                         Value::Int(n) => n as usize,
-                        _ => return Err(CypherError::TypeError("left() length must be integer".into())),
+                        _ => {
+                            return Err(CypherError::TypeError(
+                                "left() length must be integer".into(),
+                            ));
+                        }
                     };
                     Ok(Value::Str(s.chars().take(n).collect()))
                 }
@@ -4654,7 +5666,11 @@ pub mod executor {
                     };
                     let n = match self.eval_arg(args, 1, binding)? {
                         Value::Int(n) => n as usize,
-                        _ => return Err(CypherError::TypeError("right() length must be integer".into())),
+                        _ => {
+                            return Err(CypherError::TypeError(
+                                "right() length must be integer".into(),
+                            ));
+                        }
                     };
                     let chars: Vec<char> = s.chars().collect();
                     let start = chars.len().saturating_sub(n);
@@ -4668,7 +5684,11 @@ pub mod executor {
                     };
                     let delim = match self.eval_arg(args, 1, binding)? {
                         Value::Str(s) => s,
-                        _ => return Err(CypherError::TypeError("split() delimiter must be string".into())),
+                        _ => {
+                            return Err(CypherError::TypeError(
+                                "split() delimiter must be string".into(),
+                            ));
+                        }
                     };
                     Ok(Value::List(
                         s.split(&*delim).map(|p| Value::Str(p.to_owned())).collect(),
@@ -4683,7 +5703,9 @@ pub mod executor {
                             Ok(Value::List(l))
                         }
                         Value::Null => Ok(Value::Null),
-                        _ => Err(CypherError::TypeError("reverse() requires string or list".into())),
+                        _ => Err(CypherError::TypeError(
+                            "reverse() requires string or list".into(),
+                        )),
                     }
                 }
                 "length" => {
@@ -4692,7 +5714,9 @@ pub mod executor {
                         Value::List(l) => Ok(Value::Int(l.len() as i64)),
                         Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
                         Value::Null => Ok(Value::Null),
-                        _ => Err(CypherError::TypeError("length() requires list or string".into())),
+                        _ => Err(CypherError::TypeError(
+                            "length() requires list or string".into(),
+                        )),
                     }
                 }
                 // Trigonometric functions
@@ -4726,8 +5750,24 @@ pub mod executor {
                     match (y, x) {
                         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                         (y, x) => {
-                            let yf = match y { Value::Int(n) => n as f64, Value::Float(f) => f, _ => return Err(CypherError::TypeError("atan2() requires numeric".into())) };
-                            let xf = match x { Value::Int(n) => n as f64, Value::Float(f) => f, _ => return Err(CypherError::TypeError("atan2() requires numeric".into())) };
+                            let yf = match y {
+                                Value::Int(n) => n as f64,
+                                Value::Float(f) => f,
+                                _ => {
+                                    return Err(CypherError::TypeError(
+                                        "atan2() requires numeric".into(),
+                                    ));
+                                }
+                            };
+                            let xf = match x {
+                                Value::Int(n) => n as f64,
+                                Value::Float(f) => f,
+                                _ => {
+                                    return Err(CypherError::TypeError(
+                                        "atan2() requires numeric".into(),
+                                    ));
+                                }
+                            };
                             Ok(Value::Float(yf.atan2(xf)))
                         }
                     }
@@ -4840,7 +5880,11 @@ pub mod executor {
                     };
                     let width = match self.eval_arg(args, 1, binding)? {
                         Value::Int(n) => n as usize,
-                        _ => return Err(CypherError::TypeError("lpad() width must be integer".into())),
+                        _ => {
+                            return Err(CypherError::TypeError(
+                                "lpad() width must be integer".into(),
+                            ));
+                        }
                     };
                     let pad_char = if args.len() > 2 {
                         match self.eval_arg(args, 2, binding)? {
@@ -4853,7 +5897,8 @@ pub mod executor {
                     if s.len() >= width {
                         Ok(Value::Str(s))
                     } else {
-                        let padding: String = std::iter::repeat(pad_char).take(width - s.len()).collect();
+                        let padding: String =
+                            std::iter::repeat(pad_char).take(width - s.len()).collect();
                         Ok(Value::Str(format!("{}{}", padding, s)))
                     }
                 }
@@ -4865,7 +5910,11 @@ pub mod executor {
                     };
                     let width = match self.eval_arg(args, 1, binding)? {
                         Value::Int(n) => n as usize,
-                        _ => return Err(CypherError::TypeError("rpad() width must be integer".into())),
+                        _ => {
+                            return Err(CypherError::TypeError(
+                                "rpad() width must be integer".into(),
+                            ));
+                        }
                     };
                     let pad_char = if args.len() > 2 {
                         match self.eval_arg(args, 2, binding)? {
@@ -4878,7 +5927,8 @@ pub mod executor {
                     if s.len() >= width {
                         Ok(Value::Str(s))
                     } else {
-                        let padding: String = std::iter::repeat(pad_char).take(width - s.len()).collect();
+                        let padding: String =
+                            std::iter::repeat(pad_char).take(width - s.len()).collect();
                         Ok(Value::Str(format!("{}{}", s, padding)))
                     }
                 }
@@ -4911,7 +5961,9 @@ pub mod executor {
                                 crate::graph::extract_f32_vec(&a),
                                 crate::graph::extract_f32_vec(&b),
                             ) {
-                                Ok(Value::Float(1.0 - crate::graph::cosine_similarity(&va, &vb)))
+                                Ok(Value::Float(
+                                    1.0 - crate::graph::cosine_similarity(&va, &vb),
+                                ))
                             } else {
                                 Ok(Value::Null)
                             }
@@ -5103,20 +6155,15 @@ pub mod executor {
                 }
                 // GDS link prediction (require graph context — return null in scalar eval)
                 "gds.alpha.linkprediction.adamicadar" | "adamic_adar" => Ok(Value::Null),
-                "gds.alpha.linkprediction.commonneighbors" | "common_neighbors" => {
+                "gds.alpha.linkprediction.commonneighbors" | "common_neighbors" => Ok(Value::Null),
+                "gds.alpha.linkprediction.preferentialattachment" | "preferential_attachment" => {
                     Ok(Value::Null)
                 }
-                "gds.alpha.linkprediction.preferentialattachment"
-                | "preferential_attachment" => Ok(Value::Null),
                 "gds.alpha.linkprediction.resourceallocation" | "resource_allocation" => {
                     Ok(Value::Null)
                 }
-                "gds.alpha.linkprediction.totalneighbors" | "total_neighbors" => {
-                    Ok(Value::Null)
-                }
-                "gds.alpha.linkprediction.samecommunity" | "same_community" => {
-                    Ok(Value::Null)
-                }
+                "gds.alpha.linkprediction.totalneighbors" | "total_neighbors" => Ok(Value::Null),
+                "gds.alpha.linkprediction.samecommunity" | "same_community" => Ok(Value::Null),
                 // count_distinct is handled in aggregation; if used in non-agg context, count unique
                 "count_distinct" => {
                     let v = self.eval_arg(args, 0, binding)?;
@@ -5135,7 +6182,9 @@ pub mod executor {
                 Value::Int(n) => Ok(Value::Float(f(n as f64))),
                 Value::Float(fl) => Ok(Value::Float(f(fl))),
                 Value::Null => Ok(Value::Null),
-                _ => Err(CypherError::TypeError("function requires numeric argument".into())),
+                _ => Err(CypherError::TypeError(
+                    "function requires numeric argument".into(),
+                )),
             }
         }
 

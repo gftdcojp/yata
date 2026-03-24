@@ -1,25 +1,16 @@
 #![allow(dead_code)]
-//! JanusGraph-equivalent graph store on Arrow + LanceDB.
+//! Graph store with Cypher query engine and vector search.
 //!
-//! Phase 1 (verification): single-table schemaless storage.
-//!   graph_vertices — all vertex data (vid, labels as JSON, props as JSON)
-//!   graph_edges    — all edge data (eid, src, dst, rel_type, props as JSON)
-//!   graph_adj      — adjacency index (vid, direction OUT/IN, edge_label, neighbor_vid, eid)
-//!
-//! Phase 2: Lance SQL pushdown for label/property/adjacency-driven filtered loading.
+//! In-memory MemoryGraph + yata-vex vector index. MDAG CAS is sole persistence.
 
 pub mod cache;
-pub mod hints;
-pub mod pipeline;
 pub mod coordinator;
+pub mod hints;
 pub mod per_label;
+pub mod pipeline;
 
-use std::sync::Arc;
-use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray, Float32Array, FixedSizeListArray};
-use arrow_schema::{Schema, DataType, Field};
-use futures::TryStreamExt;
+use arrow_array::{RecordBatch, StringArray};
 use indexmap::IndexMap;
-use lancedb::query::{ExecutableQuery, QueryBase};
 
 // ---- Schema registry types -----------------------------------------------
 
@@ -141,10 +132,14 @@ pub mod graph_arrow {
             Field::new("labels_json", DataType::Utf8, false),
             Field::new("props_json", DataType::Utf8, false),
             Field::new("created_ns", DataType::Int64, false),
-            Field::new("embedding", DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, false)),
-                dim as i32,
-            ), true),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    dim as i32,
+                ),
+                true,
+            ),
         ]))
     }
 
@@ -171,330 +166,145 @@ pub mod graph_arrow {
     }
 }
 
-// ---- LanceGraphStore ----------------------------------------------------
+// ---- GraphStore ---------------------------------------------------------
 
-pub struct LanceGraphStore {
-    /// Lance DB connection for writes (long-lived).
-    pub conn: lancedb::Connection,
-    /// Base URI for creating fresh connections on reads (S3 consistency).
-    base_uri: String,
+/// In-memory graph store with Cypher query engine and vector search.
+///
+/// In-memory graph store. MDAG CAS is the sole persistence path.
+/// Vector search uses `yata_vex`.
+pub struct GraphStore {
     pub schema: GraphSchema,
     /// In-memory cache: CSR graph + query result LRU.
     pub cache: tokio::sync::RwLock<cache::GraphCache>,
+    /// Lazy vector index: auto-tiered brute-force → IVF_PQ.
+    vector_index: yata_vex::lazy::LazyVectorIndex,
+    /// Mapping from fxhash vid (u64) to original string vid.
+    vid_map: tokio::sync::RwLock<IndexMap<u64, String>>,
 }
 
-impl LanceGraphStore {
-    pub async fn new(base_uri: impl Into<String>) -> GraphResult<Self> {
-        Self::with_cache_config(base_uri, cache::CacheConfig::default()).await
+impl GraphStore {
+    pub async fn new(_base_uri: impl Into<String>) -> GraphResult<Self> {
+        Self::with_cache_config(_base_uri, cache::CacheConfig::default()).await
     }
 
     pub async fn with_cache_config(
-        base_uri: impl Into<String>,
+        _base_uri: impl Into<String>,
         cache_config: cache::CacheConfig,
     ) -> GraphResult<Self> {
-        let uri = base_uri.into();
-        let conn = lancedb::connect(&uri)
-            .execute()
-            .await
-            .map_err(|e| GraphError::Storage(e.to_string()))?;
+        let base = _base_uri.into();
+        // Use base_uri as data_dir for vector index disk persistence
+        // Only use disk-backed vector index for real filesystem paths
+        let vex_dir = if base.is_empty() || base.contains(':') || base == "." {
+            None
+        } else {
+            let p = std::path::PathBuf::from(&base).join("vex");
+            let _ = std::fs::create_dir_all(&p);
+            Some(p)
+        };
+        let vector_index = match vex_dir {
+            Some(dir) => {
+                yata_vex::lazy::LazyVectorIndex::with_data_dir(0, yata_vex::DistanceMetric::L2, dir)
+            }
+            None => yata_vex::lazy::LazyVectorIndex::new(0, yata_vex::DistanceMetric::L2),
+        };
         Ok(Self {
-            conn,
-            base_uri: uri,
             schema: GraphSchema::default(),
             cache: tokio::sync::RwLock::new(cache::GraphCache::new(cache_config)),
+            vector_index,
+            vid_map: tokio::sync::RwLock::new(IndexMap::new()),
         })
     }
 
-    /// Create a fresh connection for reads. On S3 backends, a stale Connection
-    /// may not see recently written Lance versions. A fresh connect() always
-    /// reads the latest manifest.
-    async fn fresh_conn(&self) -> GraphResult<lancedb::Connection> {
-        lancedb::connect(&self.base_uri)
-            .execute()
-            .await
-            .map_err(|e| GraphError::Storage(e.to_string()))
-    }
-
-    /// Write vertices to graph_vertices table (append).
+    /// Write vertices to the in-memory graph cache.
     pub async fn write_vertices(&self, nodes: &[yata_cypher::NodeRef]) -> GraphResult<()> {
         if nodes.is_empty() {
             return Ok(());
         }
-        let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-
-        let vids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
-        let labels_jsons: Vec<String> = nodes
-            .iter()
-            .map(|n| serde_json::to_string(&n.labels).unwrap_or_else(|_| "[]".into()))
-            .collect();
-        let props_jsons: Vec<String> = nodes
-            .iter()
-            .map(|n| {
-                let m: serde_json::Map<String, serde_json::Value> = n
-                    .props
-                    .iter()
-                    .map(|(k, v)| (k.clone(), cypher_to_json(v)))
-                    .collect();
-                serde_json::to_string(&m).unwrap_or_else(|_| "{}".into())
-            })
-            .collect();
-        let created_nses = vec![now_ns; nodes.len()];
-
-        let schema = graph_arrow::vertices_schema();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vids)) as Arc<dyn arrow_array::Array>,
-                Arc::new(StringArray::from(
-                    labels_jsons.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                )) as Arc<dyn arrow_array::Array>,
-                Arc::new(StringArray::from(
-                    props_jsons.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                )) as Arc<dyn arrow_array::Array>,
-                Arc::new(Int64Array::from(created_nses)) as Arc<dyn arrow_array::Array>,
-            ],
-        )
-        .map_err(|e| GraphError::Storage(e.to_string()))?;
-
-        self.append_batch("graph_vertices", schema, batch).await
+        use yata_cypher::Graph;
+        let mut cache = self.cache.write().await;
+        let mut mg = cache
+            .get_csr()
+            .cloned()
+            .unwrap_or_else(yata_cypher::MemoryGraph::new);
+        for node in nodes {
+            mg.add_node(node.clone());
+        }
+        mg.build_csr();
+        cache.set_csr(mg);
+        Ok(())
     }
 
-    /// Write edges to graph_edges + adjacency rows to graph_adj (append).
+    /// Write edges to the in-memory graph cache.
     pub async fn write_edges(&self, rels: &[yata_cypher::RelRef]) -> GraphResult<()> {
         if rels.is_empty() {
             return Ok(());
         }
-        let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-
-        // --- graph_edges ---
-        let eids: Vec<&str> = rels.iter().map(|r| r.id.as_str()).collect();
-        let srcs: Vec<&str> = rels.iter().map(|r| r.src.as_str()).collect();
-        let dsts: Vec<&str> = rels.iter().map(|r| r.dst.as_str()).collect();
-        let rel_types: Vec<&str> = rels.iter().map(|r| r.rel_type.as_str()).collect();
-        let props_jsons: Vec<String> = rels
-            .iter()
-            .map(|r| {
-                let m: serde_json::Map<String, serde_json::Value> = r
-                    .props
-                    .iter()
-                    .map(|(k, v)| (k.clone(), cypher_to_json(v)))
-                    .collect();
-                serde_json::to_string(&m).unwrap_or_else(|_| "{}".into())
-            })
-            .collect();
-        let created_nses = vec![now_ns; rels.len()];
-
-        let edge_schema = graph_arrow::edges_schema();
-        let edge_batch = RecordBatch::try_new(
-            edge_schema.clone(),
-            vec![
-                Arc::new(StringArray::from(eids)) as Arc<dyn arrow_array::Array>,
-                Arc::new(StringArray::from(srcs)) as Arc<dyn arrow_array::Array>,
-                Arc::new(StringArray::from(dsts)) as Arc<dyn arrow_array::Array>,
-                Arc::new(StringArray::from(rel_types)) as Arc<dyn arrow_array::Array>,
-                Arc::new(StringArray::from(
-                    props_jsons.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                )) as Arc<dyn arrow_array::Array>,
-                Arc::new(Int64Array::from(created_nses)) as Arc<dyn arrow_array::Array>,
-            ],
-        )
-        .map_err(|e| GraphError::Storage(e.to_string()))?;
-        self.append_batch("graph_edges", edge_schema, edge_batch).await?;
-
-        // --- graph_adj (2 rows per edge: OUT and IN) ---
-        let mut adj_vids: Vec<String> = Vec::new();
-        let mut adj_dirs: Vec<&str> = Vec::new();
-        let mut adj_labels: Vec<String> = Vec::new();
-        let mut adj_neighbors: Vec<String> = Vec::new();
-        let mut adj_eids: Vec<String> = Vec::new();
-        let mut adj_nses: Vec<i64> = Vec::new();
-
+        use yata_cypher::Graph;
+        let mut cache = self.cache.write().await;
+        let mut mg = cache
+            .get_csr()
+            .cloned()
+            .unwrap_or_else(yata_cypher::MemoryGraph::new);
         for rel in rels {
-            adj_vids.push(rel.src.clone());
-            adj_dirs.push("OUT");
-            adj_labels.push(rel.rel_type.clone());
-            adj_neighbors.push(rel.dst.clone());
-            adj_eids.push(rel.id.clone());
-            adj_nses.push(now_ns);
-
-            adj_vids.push(rel.dst.clone());
-            adj_dirs.push("IN");
-            adj_labels.push(rel.rel_type.clone());
-            adj_neighbors.push(rel.src.clone());
-            adj_eids.push(rel.id.clone());
-            adj_nses.push(now_ns);
+            mg.add_rel(rel.clone());
         }
-
-        let adj_schema = graph_arrow::adj_schema();
-        let adj_batch = RecordBatch::try_new(
-            adj_schema.clone(),
-            vec![
-                Arc::new(StringArray::from(
-                    adj_vids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                )) as Arc<dyn arrow_array::Array>,
-                Arc::new(StringArray::from(adj_dirs)) as Arc<dyn arrow_array::Array>,
-                Arc::new(StringArray::from(
-                    adj_labels.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                )) as Arc<dyn arrow_array::Array>,
-                Arc::new(StringArray::from(
-                    adj_neighbors.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                )) as Arc<dyn arrow_array::Array>,
-                Arc::new(StringArray::from(
-                    adj_eids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                )) as Arc<dyn arrow_array::Array>,
-                Arc::new(Int64Array::from(adj_nses)) as Arc<dyn arrow_array::Array>,
-            ],
-        )
-        .map_err(|e| GraphError::Storage(e.to_string()))?;
-        self.append_batch("graph_adj", adj_schema, adj_batch).await
+        mg.build_csr();
+        cache.set_csr(mg);
+        Ok(())
     }
 
-    /// Load all vertices from LanceDB.
-    /// Uses a fresh connection to guarantee S3 read-after-write consistency.
+    /// Load all vertices from cache.
     pub async fn load_vertices(&self) -> GraphResult<Vec<yata_cypher::NodeRef>> {
-        let read_conn = self.fresh_conn().await?;
-        let table = match read_conn.open_table("graph_vertices").execute().await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::debug!(err = %e, "load_vertices: graph_vertices not found");
-                return Ok(Vec::new());
-            }
-        };
-        let stream = table
-            .query()
-            .execute()
-            .await
-            .map_err(|e| GraphError::Storage(e.to_string()))?;
-        let batches: Vec<RecordBatch> = stream
-            .try_collect()
-            .await
-            .map_err(|e| GraphError::Storage(e.to_string()))?;
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        tracing::debug!(batches = batches.len(), total_rows, "load_vertices: read from Lance");
-
-        // last-write-wins dedup: append-only table may have multiple rows per vid.
-        // Rows are in insertion order (created_ns ascending), so later entries override.
-        let mut seen: IndexMap<String, yata_cypher::NodeRef> = IndexMap::new();
-        for batch in &batches {
-            let vids = col_str(batch, "vid");
-            let labels_jsons = col_str(batch, "labels_json");
-            let props_jsons = col_str(batch, "props_json");
-            let (Some(vids), Some(labels_jsons), Some(props_jsons)) =
-                (vids, labels_jsons, props_jsons)
-            else {
-                continue;
-            };
-            for i in 0..batch.num_rows() {
-                let vid = vids.value(i).to_owned();
-                let raw_props = props_jsons.value(i);
-                if i == 0 || raw_props.len() < 5 {
-                    tracing::debug!(vid = %vid, props_len = raw_props.len(), props_preview = &raw_props[..raw_props.len().min(100)], "load_vertices: raw props_json");
-                }
-                let labels: Vec<String> =
-                    serde_json::from_str(labels_jsons.value(i)).unwrap_or_default();
-                let json_props: serde_json::Map<String, serde_json::Value> =
-                    serde_json::from_str(raw_props).unwrap_or_default();
-                let props: IndexMap<String, yata_cypher::Value> = json_props
-                    .into_iter()
-                    .map(|(k, v)| (k, json_to_cypher(&v)))
-                    .collect();
-                seen.insert(vid.clone(), yata_cypher::NodeRef { id: vid, labels, props });
-            }
+        let cache = self.cache.read().await;
+        if let Some(mg) = cache.get_csr() {
+            use yata_cypher::Graph;
+            Ok(mg.nodes())
+        } else {
+            Ok(Vec::new())
         }
-        Ok(seen.into_values().collect())
     }
 
-    /// Load all edges from LanceDB.
-    /// Uses a fresh connection to guarantee S3 read-after-write consistency.
+    /// Load all edges from cache.
     pub async fn load_edges(&self) -> GraphResult<Vec<yata_cypher::RelRef>> {
-        let read_conn = self.fresh_conn().await?;
-        let table = match read_conn.open_table("graph_edges").execute().await {
-            Ok(t) => t,
-            Err(_) => return Ok(Vec::new()),
-        };
-        let stream = table
-            .query()
-            .execute()
-            .await
-            .map_err(|e| GraphError::Storage(e.to_string()))?;
-        let batches: Vec<RecordBatch> = stream
-            .try_collect()
-            .await
-            .map_err(|e| GraphError::Storage(e.to_string()))?;
-
-        // last-write-wins dedup on eid.
-        let mut seen: IndexMap<String, yata_cypher::RelRef> = IndexMap::new();
-        for batch in &batches {
-            let eids = col_str(batch, "eid");
-            let srcs = col_str(batch, "src");
-            let dsts = col_str(batch, "dst");
-            let rel_types = col_str(batch, "rel_type");
-            let props_jsons = col_str(batch, "props_json");
-            let (Some(eids), Some(srcs), Some(dsts), Some(rel_types), Some(props_jsons)) =
-                (eids, srcs, dsts, rel_types, props_jsons)
-            else {
-                continue;
-            };
-            for i in 0..batch.num_rows() {
-                let eid = eids.value(i).to_owned();
-                let json_props: serde_json::Map<String, serde_json::Value> =
-                    serde_json::from_str(props_jsons.value(i)).unwrap_or_default();
-                let props: IndexMap<String, yata_cypher::Value> = json_props
-                    .into_iter()
-                    .map(|(k, v)| (k, json_to_cypher(&v)))
-                    .collect();
-                seen.insert(eid.clone(), yata_cypher::RelRef {
-                    id: eid,
-                    src: srcs.value(i).to_owned(),
-                    dst: dsts.value(i).to_owned(),
-                    rel_type: rel_types.value(i).to_owned(),
-                    props,
-                });
-            }
+        let cache = self.cache.read().await;
+        if let Some(mg) = cache.get_csr() {
+            use yata_cypher::Graph;
+            Ok(mg.rels())
+        } else {
+            Ok(Vec::new())
         }
-        Ok(seen.into_values().collect())
     }
 
     /// Load all vertices + edges into a QueryableGraph for Cypher queries.
-    /// **Uncached** — always loads from Lance. Prefer `cached_query()` or
-    /// `to_memory_graph_cached()` for repeated reads.
     pub async fn to_memory_graph(&self) -> GraphResult<QueryableGraph> {
         self.to_memory_graph_bounded(0, 0).await
     }
 
-    /// Return a clone of the cached CSR MemoryGraph, loading from Lance on cold start.
-    /// Subsequent calls return the in-memory copy (ns latency) until a write invalidates it.
+    /// Return a clone of the cached CSR MemoryGraph.
+    /// On cold start, returns an empty graph (MDAG CAS restore happens externally).
     pub async fn to_memory_graph_cached(&self) -> GraphResult<QueryableGraph> {
-        use yata_cypher::Graph;
-        // Fast path: read lock
-        {
-            let cache = self.cache.read().await;
-            if let Some(csr) = cache.get_csr() {
-                return Ok(QueryableGraph(csr.clone()));
-            }
+        let cache = self.cache.read().await;
+        if let Some(csr) = cache.get_csr() {
+            return Ok(QueryableGraph(csr.clone()));
         }
-        // Cold path: load from Lance, store in cache
-        let qg = self.to_memory_graph().await?;
-        {
-            let mut cache = self.cache.write().await;
-            // Double-check (another task may have loaded while we waited)
-            if cache.get_csr().is_none() {
-                let n = qg.0.nodes().len();
-                let e = qg.0.rels().len();
-                cache.set_csr(qg.0.clone());
-                tracing::info!(nodes = n, edges = e, "graph cache: CSR loaded from Lance (cold start)");
-            }
+        // Cold: return empty graph and store it
+        drop(cache);
+        let mg = yata_cypher::MemoryGraph::new();
+        let qg = QueryableGraph(mg.clone());
+        let mut cache = self.cache.write().await;
+        if cache.get_csr().is_none() {
+            cache.set_csr(mg);
         }
         Ok(qg)
     }
 
     /// Execute a Cypher query with full caching:
-    ///   1. Query result cache hit → μs
-    ///   2. CSR cache hit → ns (graph traversal) + query execution
-    ///   3. Cold → Lance load → CSR build → cache
+    ///   1. Query result cache hit -> us
+    ///   2. CSR cache hit -> ns (graph traversal) + query execution
+    ///   3. Cold -> empty graph
     ///
     /// Mutations (CREATE/MERGE/DELETE/SET) bypass query cache and
-    /// write-back delta to Lance, invalidating the CSR.
+    /// write-back delta to the in-memory graph, invalidating the CSR.
     pub async fn cached_query(
         &self,
         cypher: &str,
@@ -522,7 +332,10 @@ impl LanceGraphStore {
         let (before_nodes, before_edges) = if is_mut {
             use yata_cypher::Graph;
             let bn: IndexMap<String, yata_cypher::NodeRef> =
-                qg.0.nodes().into_iter().map(|n| (n.id.clone(), n)).collect();
+                qg.0.nodes()
+                    .into_iter()
+                    .map(|n| (n.id.clone(), n))
+                    .collect();
             let be: IndexMap<String, yata_cypher::RelRef> =
                 qg.0.rels().into_iter().map(|e| (e.id.clone(), e)).collect();
             (Some(bn), Some(be))
@@ -531,7 +344,9 @@ impl LanceGraphStore {
         };
 
         // Execute Cypher
-        let rows = qg.query(cypher, params).map_err(|e| GraphError::Query(e.to_string()))?;
+        let rows = qg
+            .query(cypher, params)
+            .map_err(|e| GraphError::Query(e.to_string()))?;
 
         // Mutation write-back
         let delta = if is_mut {
@@ -542,8 +357,10 @@ impl LanceGraphStore {
                     &qg.0,
                 )
                 .await?;
-            // Invalidate cache
-            self.cache.write().await.invalidate();
+            // Invalidate query cache and update CSR with new state
+            let mut cache = self.cache.write().await;
+            cache.invalidate();
+            cache.set_csr(qg.0.clone());
             tracing::info!(?stats, "cached_query: delta written, cache invalidated");
             Some(stats)
         } else {
@@ -567,131 +384,50 @@ impl LanceGraphStore {
 
     /// Load vertices + edges with optional size guards.
     /// `max_nodes=0` / `max_edges=0` means unlimited.
-    /// Returns error if the graph exceeds the bounds (prevents OOM).
     pub async fn to_memory_graph_bounded(
         &self,
         max_nodes: usize,
         max_edges: usize,
     ) -> GraphResult<QueryableGraph> {
         use yata_cypher::Graph;
-        let nodes = self.load_vertices().await?;
-        if max_nodes > 0 && nodes.len() > max_nodes {
-            return Err(GraphError::Storage(format!(
-                "graph too large: {} vertices exceeds limit {} — use KV for bulk data, graph for relationships only",
-                nodes.len(), max_nodes,
-            )));
+        let cache = self.cache.read().await;
+        if let Some(csr) = cache.get_csr() {
+            let nodes = csr.nodes();
+            let rels = csr.rels();
+            if max_nodes > 0 && nodes.len() > max_nodes {
+                return Err(GraphError::Storage(format!(
+                    "graph too large: {} vertices exceeds limit {}",
+                    nodes.len(),
+                    max_nodes,
+                )));
+            }
+            if max_edges > 0 && rels.len() > max_edges {
+                return Err(GraphError::Storage(format!(
+                    "graph too large: {} edges exceeds limit {}",
+                    rels.len(),
+                    max_edges,
+                )));
+            }
+            return Ok(QueryableGraph(csr.clone()));
         }
-        let rels = self.load_edges().await?;
-        if max_edges > 0 && rels.len() > max_edges {
-            return Err(GraphError::Storage(format!(
-                "graph too large: {} edges exceeds limit {} — use KV for bulk data, graph for relationships only",
-                rels.len(), max_edges,
-            )));
-        }
-        tracing::debug!(nodes = nodes.len(), edges = rels.len(), "graph: loaded into memory");
-        let mut g = yata_cypher::MemoryGraph::new();
-        for node in nodes {
-            g.add_node(node);
-        }
-        for rel in rels {
-            g.add_rel(rel);
-        }
-        // Pre-build CSR adjacency index for O(degree) neighbor lookup.
-        g.build_csr();
-        Ok(QueryableGraph(g))
+        // Cold: return empty graph
+        Ok(QueryableGraph(yata_cypher::MemoryGraph::new()))
     }
 
-    /// Write pre-built Arrow RecordBatch directly to `graph_vertices`.
-    ///
-    /// Schema must match `graph_arrow::vertices_schema()` (vid, labels_json, props_json, created_ns).
-    /// Skips NodeRef→Arrow conversion — zero-copy path for Arrow Flight `do_put`.
+    /// Write pre-built Arrow RecordBatch directly to graph_vertices.
+    /// Parses Arrow columns and adds to in-memory graph.
     pub async fn write_vertices_batch(&self, batch: RecordBatch) -> GraphResult<()> {
-        let schema = graph_arrow::vertices_schema();
-        self.append_batch("graph_vertices", schema, batch).await
+        let nodes = deserialize_vertices_from_batch(&batch);
+        self.write_vertices(&nodes).await
     }
 
-    /// Write pre-built Arrow RecordBatch directly to `graph_edges` + auto-generate `graph_adj`.
-    ///
-    /// Schema must match `graph_arrow::edges_schema()` (eid, src, dst, rel_type, props_json, created_ns).
-    /// Adjacency index rows are derived from the edge batch columns.
+    /// Write pre-built Arrow RecordBatch directly to graph_edges.
     pub async fn write_edges_batch(&self, batch: RecordBatch) -> GraphResult<()> {
-        let adj_batch = self.derive_adj_from_edge_batch(&batch)?;
-
-        let edge_schema = graph_arrow::edges_schema();
-        self.append_batch("graph_edges", edge_schema, batch).await?;
-
-        let adj_schema = graph_arrow::adj_schema();
-        self.append_batch("graph_adj", adj_schema, adj_batch).await
+        let rels = deserialize_edges_from_batch(&batch);
+        self.write_edges(&rels).await
     }
 
-    /// Derive `graph_adj` rows from an edge RecordBatch.
-    /// For each edge: 2 adjacency rows (OUT from src, IN to dst).
-    fn derive_adj_from_edge_batch(&self, batch: &RecordBatch) -> GraphResult<RecordBatch> {
-        let eids = col_str(batch, "eid")
-            .ok_or_else(|| GraphError::Schema("missing eid column".into()))?;
-        let srcs = col_str(batch, "src")
-            .ok_or_else(|| GraphError::Schema("missing src column".into()))?;
-        let dsts = col_str(batch, "dst")
-            .ok_or_else(|| GraphError::Schema("missing dst column".into()))?;
-        let rel_types = col_str(batch, "rel_type")
-            .ok_or_else(|| GraphError::Schema("missing rel_type column".into()))?;
-        let created_ns_col = batch
-            .column_by_name("created_ns")
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-            .ok_or_else(|| GraphError::Schema("missing created_ns column".into()))?;
-
-        let n = batch.num_rows();
-        let mut adj_vids = Vec::with_capacity(n * 2);
-        let mut adj_dirs = Vec::with_capacity(n * 2);
-        let mut adj_labels = Vec::with_capacity(n * 2);
-        let mut adj_neighbors = Vec::with_capacity(n * 2);
-        let mut adj_eids = Vec::with_capacity(n * 2);
-        let mut adj_nses = Vec::with_capacity(n * 2);
-
-        for i in 0..n {
-            let eid = eids.value(i);
-            let src = srcs.value(i);
-            let dst = dsts.value(i);
-            let rt = rel_types.value(i);
-            let ns = created_ns_col.value(i);
-
-            // OUT direction
-            adj_vids.push(src);
-            adj_dirs.push("OUT");
-            adj_labels.push(rt);
-            adj_neighbors.push(dst);
-            adj_eids.push(eid);
-            adj_nses.push(ns);
-
-            // IN direction
-            adj_vids.push(dst);
-            adj_dirs.push("IN");
-            adj_labels.push(rt);
-            adj_neighbors.push(src);
-            adj_eids.push(eid);
-            adj_nses.push(ns);
-        }
-
-        let adj_schema = graph_arrow::adj_schema();
-        RecordBatch::try_new(
-            adj_schema,
-            vec![
-                Arc::new(StringArray::from(adj_vids)) as Arc<dyn arrow_array::Array>,
-                Arc::new(StringArray::from(adj_dirs)) as Arc<dyn arrow_array::Array>,
-                Arc::new(StringArray::from(adj_labels)) as Arc<dyn arrow_array::Array>,
-                Arc::new(StringArray::from(adj_neighbors)) as Arc<dyn arrow_array::Array>,
-                Arc::new(StringArray::from(adj_eids)) as Arc<dyn arrow_array::Array>,
-                Arc::new(Int64Array::from(adj_nses)) as Arc<dyn arrow_array::Array>,
-            ],
-        )
-        .map_err(|e| GraphError::Storage(e.to_string()))
-    }
-
-    /// Compute graph delta between before/after state and write to Lance.
-    ///
-    /// Efficient batch write: collects all new/modified nodes and edges into
-    /// single RecordBatches, then appends once per table.
-    /// Deleted entities are written as tombstones (props_json = `{"_deleted":true}`).
+    /// Compute graph delta between before/after state and write to graph.
     pub async fn write_delta(
         &self,
         before_nodes: &indexmap::IndexMap<String, yata_cypher::NodeRef>,
@@ -703,7 +439,6 @@ impl LanceGraphStore {
         let after_nodes = after_graph.nodes();
         let after_edges = after_graph.rels();
 
-        // Classify nodes: new, modified, deleted
         let mut upsert_nodes: Vec<yata_cypher::NodeRef> = Vec::new();
         let mut deleted_node_count: usize = 0;
 
@@ -715,24 +450,12 @@ impl LanceGraphStore {
             }
         }
 
-        // Deleted nodes: in before but not in after
-        let mut tombstone_nodes: Vec<yata_cypher::NodeRef> = Vec::new();
         for (id, _) in before_nodes {
             if after_graph.node_by_id(id).is_none() {
                 deleted_node_count += 1;
-                tombstone_nodes.push(yata_cypher::NodeRef {
-                    id: id.clone(),
-                    labels: vec![],
-                    props: {
-                        let mut m = indexmap::IndexMap::new();
-                        m.insert("_deleted".into(), yata_cypher::Value::Bool(true));
-                        m
-                    },
-                });
             }
         }
 
-        // Classify edges
         let mut upsert_edges: Vec<yata_cypher::RelRef> = Vec::new();
         let mut deleted_edge_count: usize = 0;
 
@@ -744,21 +467,9 @@ impl LanceGraphStore {
             }
         }
 
-        let mut tombstone_edges: Vec<yata_cypher::RelRef> = Vec::new();
-        for (id, old) in before_edges {
+        for (id, _) in before_edges {
             if after_graph.rel_by_id(id).is_none() {
                 deleted_edge_count += 1;
-                tombstone_edges.push(yata_cypher::RelRef {
-                    id: id.clone(),
-                    src: old.src.clone(),
-                    dst: old.dst.clone(),
-                    rel_type: old.rel_type.clone(),
-                    props: {
-                        let mut m = indexmap::IndexMap::new();
-                        m.insert("_deleted".into(), yata_cypher::Value::Bool(true));
-                        m
-                    },
-                });
             }
         }
 
@@ -773,10 +484,7 @@ impl LanceGraphStore {
             .count();
         let edges_modified = upsert_edges.len() - edges_created;
 
-        // Merge upserts + tombstones and batch write
-        upsert_nodes.extend(tombstone_nodes);
-        upsert_edges.extend(tombstone_edges);
-
+        // Write upserts to in-memory graph
         if !upsert_nodes.is_empty() {
             self.write_vertices(&upsert_nodes).await?;
         }
@@ -794,10 +502,10 @@ impl LanceGraphStore {
         })
     }
 
-    /// Write vertices with embedding vectors to graph_vertices table.
+    /// Write vertices with embedding vectors.
     ///
-    /// Extracts the embedding property from each node's props, builds a FixedSizeList column,
-    /// and writes with the extended schema including the `embedding` column.
+    /// Stores nodes in the in-memory graph and builds a yata-vex vector index
+    /// for the embedding property.
     pub async fn write_vertices_with_embeddings(
         &self,
         nodes: &[yata_cypher::NodeRef],
@@ -807,196 +515,134 @@ impl LanceGraphStore {
         if nodes.is_empty() {
             return Ok(());
         }
-        let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
-        let vids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
-        let labels_jsons: Vec<String> = nodes
-            .iter()
-            .map(|n| serde_json::to_string(&n.labels).unwrap_or_else(|_| "[]".into()))
-            .collect();
-        // Build props_json without the embedding key (stored in dedicated column)
-        let props_jsons: Vec<String> = nodes
-            .iter()
-            .map(|n| {
-                let m: serde_json::Map<String, serde_json::Value> = n
-                    .props
-                    .iter()
-                    .filter(|(k, _)| k.as_str() != embedding_key)
-                    .map(|(k, v)| (k.clone(), cypher_to_json(v)))
-                    .collect();
-                serde_json::to_string(&m).unwrap_or_else(|_| "{}".into())
-            })
-            .collect();
-        let created_nses = vec![now_ns; nodes.len()];
+        let mut vid_map = self.vid_map.write().await;
 
-        // Build embedding FixedSizeList column
-        let mut all_values: Vec<f32> = Vec::with_capacity(nodes.len() * dim);
-        let mut valid = vec![true; nodes.len()];
-        for (i, node) in nodes.iter().enumerate() {
+        for node in nodes {
             if let Some(val) = node.props.get(embedding_key) {
-                if let Some(vec) = yata_cypher::graph::extract_f32_vec(val) {
+                if let Some(vec) = extract_f32_vec(val) {
                     if vec.len() == dim {
-                        all_values.extend_from_slice(&vec);
-                        continue;
+                        let vid_hash = fxhash_vid(&node.id);
+                        // Lazy append: no index rebuild, just store
+                        self.vector_index
+                            .append(vid_hash, &vec)
+                            .map_err(|e| GraphError::Storage(e.to_string()))?;
+                        vid_map.insert(vid_hash, node.id.clone());
                     }
                 }
             }
-            // Null embedding — fill zeros and mark null
-            all_values.extend(std::iter::repeat(0.0f32).take(dim));
-            valid[i] = false;
         }
+        drop(vid_map);
 
-        let values_array = Float32Array::from(all_values);
-        let embedding_array = FixedSizeListArray::try_new(
-            Arc::new(Field::new("item", DataType::Float32, false)),
-            dim as i32,
-            Arc::new(values_array),
-            Some(valid.into()),
-        ).map_err(|e| GraphError::Storage(e.to_string()))?;
+        // Write nodes to graph cache (strip embedding from props)
+        let stripped: Vec<yata_cypher::NodeRef> = nodes
+            .iter()
+            .map(|n| {
+                let mut node = n.clone();
+                node.props.shift_remove(embedding_key);
+                node
+            })
+            .collect();
+        self.write_vertices(&stripped).await?;
 
-        let schema = graph_arrow::vertices_with_embedding_schema(dim);
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vids)) as Arc<dyn arrow_array::Array>,
-                Arc::new(StringArray::from(
-                    labels_jsons.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                )) as Arc<dyn arrow_array::Array>,
-                Arc::new(StringArray::from(
-                    props_jsons.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                )) as Arc<dyn arrow_array::Array>,
-                Arc::new(Int64Array::from(created_nses)) as Arc<dyn arrow_array::Array>,
-                Arc::new(embedding_array) as Arc<dyn arrow_array::Array>,
-            ],
-        )
-        .map_err(|e| GraphError::Storage(e.to_string()))?;
-
-        self.append_batch("graph_vertices", schema, batch).await
+        // Persist vector store to disk (lazy, skips if clean)
+        if let Err(e) = self.vector_index.persist_to_disk() {
+            tracing::warn!("vector index disk persist failed: {e}");
+        }
+        Ok(())
     }
 
-    /// Vector search over graph_vertices using the `embedding` column.
-    ///
-    /// Returns nodes sorted by distance (ascending), along with distance scores.
+    /// Vector search over vertices using the lazy yata-vex index.
+    /// Index is built on first search (lazy), not on write.
+    /// < 1000 vectors: brute-force scan. >= 1000: IVF_PQ.
     pub async fn vector_search_vertices(
         &self,
         query_vector: Vec<f32>,
         limit: usize,
-        label_filter: Option<&str>,
-        prop_filter: Option<&str>,
+        _label_filter: Option<&str>,
+        _prop_filter: Option<&str>,
     ) -> GraphResult<Vec<(yata_cypher::NodeRef, f32)>> {
-        let table = match self.conn.open_table("graph_vertices").execute().await {
-            Ok(t) => t,
-            Err(_) => return Ok(Vec::new()),
-        };
+        use yata_vex::VectorIndex;
 
-        let mut search = table.vector_search(query_vector)
-            .map_err(|e| GraphError::Storage(format!("vector_search setup: {e}")))?;
-        search = search.column("embedding").limit(limit);
+        let nprobes = 16.min(limit * 2).max(1);
+        let results = self
+            .vector_index
+            .search(&query_vector, limit, nprobes)
+            .map_err(|e| GraphError::Storage(e.to_string()))?;
 
-        if let Some(filter) = prop_filter {
-            search = search.only_if(filter);
-        }
+        // Map vid back to NodeRef via vid_map + graph cache
+        let vid_map = self.vid_map.read().await;
+        let cache = self.cache.read().await;
+        let mg = cache.get_csr();
 
-        let stream = search
-            .execute()
-            .await
-            .map_err(|e| GraphError::Storage(format!("vector_search exec: {e}")))?;
-        let batches: Vec<RecordBatch> = stream
-            .try_collect()
-            .await
-            .map_err(|e| GraphError::Storage(format!("vector_search collect: {e}")))?;
-
-        let mut results = Vec::new();
-        for batch in &batches {
-            let vids = col_str(batch, "vid");
-            let labels_jsons = col_str(batch, "labels_json");
-            let props_jsons = col_str(batch, "props_json");
-            let distances = batch
-                .column_by_name("_distance")
-                .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
-            let (Some(vids), Some(labels_jsons), Some(props_jsons)) =
-                (vids, labels_jsons, props_jsons)
-            else {
-                continue;
-            };
-            for i in 0..batch.num_rows() {
-                let vid = vids.value(i).to_owned();
-                let labels: Vec<String> =
-                    serde_json::from_str(labels_jsons.value(i)).unwrap_or_default();
-
-                // Apply label filter
-                if let Some(lf) = label_filter {
-                    if !labels.contains(&lf.to_owned()) {
-                        continue;
-                    }
-                }
-
-                let json_props: serde_json::Map<String, serde_json::Value> =
-                    serde_json::from_str(props_jsons.value(i)).unwrap_or_default();
-                let props: IndexMap<String, yata_cypher::Value> = json_props
-                    .into_iter()
-                    .map(|(k, v)| (k, json_to_cypher(&v)))
-                    .collect();
-                let distance = distances.map(|d| d.value(i)).unwrap_or(0.0);
-                results.push((
-                    yata_cypher::NodeRef { id: vid, labels, props },
-                    distance,
+        let mut out = Vec::new();
+        for r in results {
+            if let Some(str_vid) = vid_map.get(&r.vid) {
+                let node = mg
+                    .and_then(|g| {
+                        use yata_cypher::Graph;
+                        g.node_by_id(str_vid)
+                    })
+                    .unwrap_or_else(|| yata_cypher::NodeRef {
+                        id: str_vid.clone(),
+                        labels: vec![],
+                        props: IndexMap::new(),
+                    });
+                out.push((node, r.distance));
+            } else {
+                out.push((
+                    yata_cypher::NodeRef {
+                        id: format!("v{}", r.vid),
+                        labels: vec![],
+                        props: IndexMap::new(),
+                    },
+                    r.distance,
                 ));
             }
         }
-        Ok(results)
+        Ok(out)
     }
 
-    /// Create an IVF-PQ vector index on the `embedding` column of graph_vertices.
+    /// Create vector index (triggers lazy build if dirty).
     pub async fn create_embedding_index(&self) -> GraphResult<()> {
-        let table = self.conn.open_table("graph_vertices")
-            .execute()
-            .await
+        self.vector_index
+            .ensure_index()
+            .map_err(|e| GraphError::Storage(e.to_string()))
+    }
+
+    /// Restore vector index from disk (cold start).
+    /// Returns number of vectors loaded.
+    pub fn restore_vector_index(&self) -> GraphResult<usize> {
+        let n = self
+            .vector_index
+            .restore_from_disk()
             .map_err(|e| GraphError::Storage(e.to_string()))?;
-        table.create_index(&["embedding"], lancedb::index::Index::Auto)
-            .execute()
-            .await
-            .map_err(|e| GraphError::Storage(format!("create_embedding_index: {e}")))?;
-        Ok(())
-    }
-
-    /// Append-only write (used for `graph_adj`).
-    async fn append_batch(
-        &self,
-        table_name: &str,
-        schema: Arc<Schema>,
-        batch: RecordBatch,
-    ) -> GraphResult<()> {
-        let num_rows = batch.num_rows();
-        let reader = RecordBatchIterator::new(
-            std::iter::once(Ok::<_, arrow::error::ArrowError>(batch)),
-            schema,
-        );
-        match self.conn.open_table(table_name).execute().await {
-            Ok(table) => {
-                table
-                    .add(reader)
-                    .execute()
-                    .await
-                    .map_err(|e| GraphError::Storage(e.to_string()))?;
-                let count = table.count_rows(None).await.unwrap_or(0);
-                tracing::debug!(table = table_name, appended = num_rows, total = count, "lance: appended to existing table");
-            }
-            Err(_) => {
-                self.conn
-                    .create_table(table_name, reader)
-                    .execute()
-                    .await
-                    .map_err(|e| GraphError::Storage(e.to_string()))?;
-                tracing::debug!(table = table_name, rows = num_rows, "lance: created new table");
-            }
+        if n > 0 {
+            tracing::info!(vectors = n, "GraphStore: restored vector index from disk");
         }
-        // Verify table list after write
-        let tables = self.conn.table_names().execute().await.unwrap_or_default();
-        tracing::debug!(tables = ?tables, "lance: table list after write");
-        Ok(())
+        Ok(n)
     }
 
+    /// Access the lazy vector index (for CAS persist/restore from engine layer).
+    pub fn lazy_vector_index(&self) -> &yata_vex::lazy::LazyVectorIndex {
+        &self.vector_index
+    }
+
+    /// Optimize (no-op, in-memory store has nothing to compact).
+    pub async fn optimize(&self) -> GraphResult<()> {
+        Ok(())
+    }
+}
+
+// ---- Helper: vid hashing ------------------------------------------------
+
+fn fxhash_vid(vid: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in vid.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 // ---- Helper: column accessor -------------------------------------------
@@ -1005,6 +651,66 @@ fn col_str<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringArray> {
     batch
         .column_by_name(name)
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+}
+
+// ---- Helper: deserialize from Arrow batches ----------------------------
+
+fn deserialize_vertices_from_batch(batch: &RecordBatch) -> Vec<yata_cypher::NodeRef> {
+    let mut nodes = Vec::new();
+    let vids = col_str(batch, "vid");
+    let labels_jsons = col_str(batch, "labels_json");
+    let props_jsons = col_str(batch, "props_json");
+    let (Some(vids), Some(labels_jsons), Some(props_jsons)) = (vids, labels_jsons, props_jsons)
+    else {
+        return nodes;
+    };
+    for i in 0..batch.num_rows() {
+        let vid = vids.value(i).to_owned();
+        let labels: Vec<String> = serde_json::from_str(labels_jsons.value(i)).unwrap_or_default();
+        let json_props: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(props_jsons.value(i)).unwrap_or_default();
+        let props: IndexMap<String, yata_cypher::Value> = json_props
+            .into_iter()
+            .map(|(k, v)| (k, json_to_cypher(&v)))
+            .collect();
+        nodes.push(yata_cypher::NodeRef {
+            id: vid,
+            labels,
+            props,
+        });
+    }
+    nodes
+}
+
+fn deserialize_edges_from_batch(batch: &RecordBatch) -> Vec<yata_cypher::RelRef> {
+    let mut rels = Vec::new();
+    let eids = col_str(batch, "eid");
+    let srcs = col_str(batch, "src");
+    let dsts = col_str(batch, "dst");
+    let rel_types = col_str(batch, "rel_type");
+    let props_jsons = col_str(batch, "props_json");
+    let (Some(eids), Some(srcs), Some(dsts), Some(rel_types), Some(props_jsons)) =
+        (eids, srcs, dsts, rel_types, props_jsons)
+    else {
+        return rels;
+    };
+    for i in 0..batch.num_rows() {
+        let eid = eids.value(i).to_owned();
+        let json_props: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(props_jsons.value(i)).unwrap_or_default();
+        let props: IndexMap<String, yata_cypher::Value> = json_props
+            .into_iter()
+            .map(|(k, v)| (k, json_to_cypher(&v)))
+            .collect();
+        rels.push(yata_cypher::RelRef {
+            id: eid,
+            src: srcs.value(i).to_owned(),
+            dst: dsts.value(i).to_owned(),
+            rel_type: rel_types.value(i).to_owned(),
+            props,
+        });
+    }
+    rels
 }
 
 // ---- Value conversion --------------------------------------------------
@@ -1022,7 +728,9 @@ pub fn cypher_to_json(v: &yata_cypher::Value) -> serde_json::Value {
             serde_json::Value::Array(l.iter().map(cypher_to_json).collect())
         }
         yata_cypher::Value::Map(m) => serde_json::Value::Object(
-            m.iter().map(|(k, v)| (k.clone(), cypher_to_json(v))).collect(),
+            m.iter()
+                .map(|(k, v)| (k.clone(), cypher_to_json(v)))
+                .collect(),
         ),
         yata_cypher::Value::Node(n) => {
             let mut obj: serde_json::Map<String, serde_json::Value> = n
@@ -1034,7 +742,10 @@ pub fn cypher_to_json(v: &yata_cypher::Value) -> serde_json::Value {
             obj.insert(
                 "__labels".into(),
                 serde_json::Value::Array(
-                    n.labels.iter().map(|l| serde_json::Value::String(l.clone())).collect(),
+                    n.labels
+                        .iter()
+                        .map(|l| serde_json::Value::String(l.clone()))
+                        .collect(),
                 ),
             );
             serde_json::Value::Object(obj)
@@ -1046,7 +757,10 @@ pub fn cypher_to_json(v: &yata_cypher::Value) -> serde_json::Value {
                 .map(|(k, v)| (k.clone(), cypher_to_json(v)))
                 .collect();
             obj.insert("__eid".into(), serde_json::Value::String(r.id.clone()));
-            obj.insert("__type".into(), serde_json::Value::String(r.rel_type.clone()));
+            obj.insert(
+                "__type".into(),
+                serde_json::Value::String(r.rel_type.clone()),
+            );
             serde_json::Value::Object(obj)
         }
     }
@@ -1077,9 +791,25 @@ pub fn json_to_cypher(v: &serde_json::Value) -> yata_cypher::Value {
     }
 }
 
+/// Extract f32 vector from a Cypher Value.
+pub fn extract_f32_vec(val: &yata_cypher::Value) -> Option<Vec<f32>> {
+    if let yata_cypher::Value::List(items) = val {
+        items
+            .iter()
+            .map(|v| match v {
+                yata_cypher::Value::Float(f) => Some(*f as f32),
+                yata_cypher::Value::Int(i) => Some(*i as f32),
+                _ => None,
+            })
+            .collect()
+    } else {
+        None
+    }
+}
+
 // ---- CachedQueryResult --------------------------------------------------
 
-/// Result from `LanceGraphStore::cached_query()`.
+/// Result from `GraphStore::cached_query()`.
 #[derive(Debug, Clone)]
 pub struct CachedQueryResult {
     pub rows: Vec<Vec<(String, String)>>,
@@ -1124,8 +854,7 @@ impl QueryableGraph {
                 row.0
                     .into_iter()
                     .map(|(col, val)| {
-                        let json = serde_json::to_string(&cypher_to_json(&val))
-                            .unwrap_or_default();
+                        let json = serde_json::to_string(&cypher_to_json(&val)).unwrap_or_default();
                         (col, json)
                     })
                     .collect()

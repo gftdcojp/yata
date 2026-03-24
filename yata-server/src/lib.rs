@@ -1,185 +1,156 @@
 #![allow(dead_code)]
 
-//! YATA broker/runtime — wires together log, kv, object, ocel, lance + Raft consensus.
+//! YATA broker/runtime — graph (Cypher) + objects (CAS).
 //!
-//! Tiered storage is always active when `BrokerConfig.b2` is set:
-//! - ObjectStore: local CAS + async B2 sync, read-through fallback
-//! - KV: flushed to Lance `yata_kv_history` + log segments synced to B2
-//! - Flight/Lance: datasets synced to B2 periodically
-//! - Cypher: implicitly tiered via OCEL → Lance → B2
+//! Single write path: CypherExec -> CSR -> DurableWal (fsync) -> async MDAG CAS -> R2.
+//! Per-app single-writer. MDAG commit chain is the replication mechanism.
+//! No consensus protocol — R2 is the source of truth for durability.
 
 pub mod metrics;
+pub mod rest;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use yata_arrow::ArrowBatchHandle;
-use yata_b2::{B2Config, B2Sync, TieredObjectStore};
-use yata_core::{
-    Ack, AppendLog, Blake3Hash, Envelope, KvStore, ObjectStorage, PayloadRef, PublishRequest,
-    Result, SchemaId, StreamId, Subject,
-};
-use yata_kv::KvBucketStore;
-use yata_lance::{LocalLanceSink, LanceSink, SyncStats};
-use yata_log::{LocalLog, PayloadStore};
+use yata_cas::{CasStore, LocalCasStore};
+use yata_core::OcelEventDraft;
+use yata_core::{ObjectStorage, Result};
 use yata_object::LocalObjectStore;
-use yata_ocel::{MemoryOcelProjector, OcelEventDraft, OcelProjector};
-
-/// Raft cluster peer configuration.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct RaftPeer {
-    pub node_id: u64,
-    pub addr: String,
-}
-
-/// Raft configuration.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct RaftConfig {
-    /// This node's ID. 0 = standalone (no Raft).
-    pub node_id: u64,
-    /// Peer nodes for Raft cluster. Empty = single-node.
-    #[serde(default)]
-    pub peers: Vec<RaftPeer>,
-    /// TCP bind address for Raft RPC listener (e.g., "0.0.0.0:4222").
-    /// Only used when peers is non-empty.
-    #[serde(default = "default_raft_bind")]
-    pub bind_addr: String,
-}
-
-fn default_raft_bind() -> String { "0.0.0.0:4222".to_string() }
-
-impl Default for RaftConfig {
-    fn default() -> Self {
-        Self {
-            node_id: 1,
-            peers: Vec::new(),
-            bind_addr: default_raft_bind(),
-        }
-    }
-}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BrokerConfig {
-    /// Base directory for log segments and CAS.
     pub data_dir: PathBuf,
-    /// Lance dataset URI (local path or s3-compatible URL).
-    pub lance_uri: String,
-    /// Lance flush interval (milliseconds).
-    pub lance_flush_interval_ms: u64,
-    /// B2 credentials (REQUIRED). Tiered storage for all subsystems.
-    pub b2: B2Config,
-    /// How often to sync log/kv_payloads/lance dirs to B2 (milliseconds).
-    pub b2_sync_interval_ms: u64,
-    /// Graph store base URI. When set, initializes a LanceGraphStore at this path.
     pub graph_uri: Option<String>,
-    /// Raft consensus config.
+    /// FUSE mount mode: all paths point to a FUSE-backed filesystem.
+    /// When true, S3 API write-through is disabled (FUSE handles persistence).
+    #[serde(default = "default_true")]
+    pub fuse: bool,
+    /// Optional mount root for FUSE adapter (e.g., tigrisfs mountpoint).
     #[serde(default)]
-    pub raft: RaftConfig,
-    /// Log segment rotation and compaction config.
+    pub fuse_mount_dir: Option<PathBuf>,
+    /// S3-compatible cold storage config for write-through when FUSE is unavailable.
+    /// When set (non-empty endpoint), CAS uses AsyncS3CasStore (local + R2 async write-through).
     #[serde(default)]
-    pub log: yata_log::config::LogConfig,
-    /// Log compaction interval (milliseconds). 0 = disabled.
-    pub log_compact_interval_ms: u64,
+    pub s3: Option<yata_s3::S3Config>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for BrokerConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("./yata-data"),
-            lance_uri: "./yata-lance".to_string(),
-            lance_flush_interval_ms: 5000,
-            b2: B2Config {
-                endpoint: "https://s3.us-west-004.backblazeb2.com".to_string(),
-                bucket: "ai-gftd-lancedb".to_string(),
-                key_id: String::new(),
-                application_key: String::new(),
-                region: "us-west-004".to_string(),
-                prefix: "yata/".to_string(),
-            },
-            b2_sync_interval_ms: 30_000,
             graph_uri: None,
-            raft: RaftConfig::default(),
-            log: yata_log::config::LogConfig::default(),
-            log_compact_interval_ms: 60_000,
+            fuse: true,
+            fuse_mount_dir: None,
+            s3: None,
         }
     }
 }
 
-/// The central broker: owns all subsystems + Raft node.
+/// The central broker: graph (Cypher) + objects (CAS).
+/// Per-app single-writer. MDAG commit chain + R2 = durability.
 pub struct Broker {
     pub config: BrokerConfig,
-    pub log: Arc<dyn AppendLog>,
-    pub kv: Arc<dyn KvStore>,
-    pub schema_registry: Arc<tokio::sync::RwLock<yata_arrow::SchemaRegistry>>,
+    /// Object storage (CAS + manifest). S3 write-through when configured.
     pub objects: Arc<dyn ObjectStorage>,
-    pub ocel: Arc<MemoryOcelProjector>,
-    pub lance: Arc<LocalLanceSink>,
-    /// Graph store — initialized when `BrokerConfig.graph_uri` is set.
-    pub graph: Option<Arc<yata_graph::LanceGraphStore>>,
-    /// Local KV handle for drain_pending and snapshot loading.
-    pub local_kv: Arc<KvBucketStore>,
-    /// Local log handle for compaction.
-    local_log: Arc<LocalLog>,
-    /// B2 sync handle (REQUIRED); used by background tasks for log/kv/lance dir sync.
-    pub b2_sync: Arc<B2Sync>,
-    /// Raft consensus node. Single-node starts as leader immediately.
-    pub raft: Arc<yata_raft::RaftNode>,
+    /// Graph store — all data persists here via Cypher.
+    pub graph: Option<Arc<yata_graph::GraphStore>>,
+    /// Shared CAS store. AsyncS3CasStore when S3 configured.
+    pub cas: Arc<dyn CasStore>,
+    /// S3 sync handle for MDAG HEAD push/restore. None when using FUSE.
+    pub s3_sync: Option<Arc<yata_s3::S3Sync>>,
 }
 
 impl Broker {
-    /// Initialize all subsystems from config.
     pub async fn new(config: BrokerConfig) -> anyhow::Result<Self> {
         let data_dir = &config.data_dir;
         tokio::fs::create_dir_all(data_dir).await?;
 
-        // Local backends (always — NATS removed)
-        let local_log = Arc::new(
-            LocalLog::with_config(data_dir.join("log"), config.log.clone()).await?,
-        );
-        local_log.recover().await?;
+        let storage_root = config
+            .fuse_mount_dir
+            .clone()
+            .unwrap_or_else(|| data_dir.clone());
+        tokio::fs::create_dir_all(&storage_root).await?;
 
-        let kv_payload_store = Arc::new(
-            PayloadStore::new(data_dir.join("kv_payloads"))
-                .await
-                .map_err(anyhow::Error::from)?,
+        let local_cas = Arc::new(LocalCasStore::new(storage_root.join("cas")).await?);
+        let local_objects = Arc::new(
+            LocalObjectStore::with_cas(
+                storage_root.join("objects"),
+                local_cas.clone() as Arc<dyn CasStore>,
+            )
+            .await?,
         );
-        let local_kv =
-            Arc::new(KvBucketStore::new(local_log.clone(), kv_payload_store).await?);
 
-        let local_objects =
-            Arc::new(LocalObjectStore::new(data_dir.join("objects")).await?);
+        // S3 write-through: when S3 config has a non-empty endpoint and FUSE is not active,
+        // wrap local CAS/objects with S3 write-through for persistence across container restarts.
+        let s3_active = config
+            .s3
+            .as_ref()
+            .map(|s| !s.endpoint.is_empty())
+            .unwrap_or(false)
+            && !config.fuse;
 
-        // B2 tiered storage (REQUIRED)
-        let b2 = Arc::new(
-            B2Sync::new(config.b2.clone(), local_objects.clone())
-                .map_err(anyhow::Error::from)?,
-        );
-        let objects: Arc<dyn ObjectStorage> =
-            Arc::new(TieredObjectStore::new(local_objects, b2.clone()));
-        let b2_sync = b2;
+        let mut s3_sync_handle: Option<Arc<yata_s3::S3Sync>> = None;
+        let (cas, objects): (Arc<dyn CasStore>, Arc<dyn ObjectStorage>) = if s3_active {
+            let s3_config = config.s3.as_ref().unwrap().clone();
+            let eager = s3_config.eager;
+            let s3_sync = Arc::new(yata_s3::S3Sync::with_cas(
+                s3_config.clone(),
+                local_objects.clone(),
+                local_cas.clone(),
+            )?);
+            let async_s3_channel_size: usize = std::env::var("YATA_ASYNC_S3_CHANNEL_SIZE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1024);
 
-        let ocel = Arc::new(MemoryOcelProjector::new());
-        let lance = Arc::new(LocalLanceSink::new(&config.lance_uri).await?);
+            let s3_cas: Arc<dyn CasStore> = Arc::new(yata_s3::async_cas::AsyncS3CasStore::new(
+                local_cas.clone(),
+                s3_sync.remote_store().clone(),
+                s3_config.prefix.clone(),
+                async_s3_channel_size,
+            ));
+            let tiered_objects: Arc<dyn ObjectStorage> =
+                Arc::new(yata_s3::TieredObjectStore::new_eager(
+                    local_objects.clone(),
+                    s3_sync.clone(),
+                    eager,
+                ));
 
-        // Initialize schema registry with built-in table schemas.
-        let mut registry = yata_arrow::SchemaRegistry::new();
-        let _ = registry.register("yata_messages", yata_lance::messages_schema());
-        let _ = registry.register("yata_events", yata_lance::ocel_events_schema());
-        let _ = registry.register("yata_objects", yata_lance::ocel_objects_schema());
-        let _ = registry.register(
-            "yata_event_object_edges",
-            yata_lance::event_object_edges_schema(),
-        );
-        let _ = registry.register(
-            "yata_object_object_edges",
-            yata_lance::object_object_edges_schema(),
-        );
-        let _ = registry.register("yata_kv_history", yata_lance::kv_history_schema());
-        let _ = registry.register("yata_blobs", yata_lance::blobs_schema());
-        let schema_registry = Arc::new(tokio::sync::RwLock::new(registry));
+            // Restore MDAG HEAD from R2 if local disk lost it (container restart).
+            let head_file = data_dir.join("MDAG_HEAD");
+            if !head_file.exists() {
+                if let Some(head) = s3_sync.restore_head().await {
+                    tracing::info!(head = %head.hex(), "restored MDAG HEAD from R2");
+                    tokio::fs::write(&head_file, head.hex()).await?;
+                }
+            }
+
+            tracing::info!(
+                bucket = %s3_config.bucket,
+                prefix = %s3_config.prefix,
+                async_s3_channel_size,
+                "S3 write-through active (AsyncS3CasStore)"
+            );
+            s3_sync_handle = Some(s3_sync);
+            (s3_cas, tiered_objects)
+        } else {
+            tracing::info!(
+                storage_root = %storage_root.display(),
+                fuse = config.fuse,
+                "local/FUSE storage mode active"
+            );
+            (
+                local_cas as Arc<dyn CasStore>,
+                local_objects as Arc<dyn ObjectStorage>,
+            )
+        };
 
         let graph = if let Some(ref graph_uri) = config.graph_uri {
             Some(Arc::new(
-                yata_graph::LanceGraphStore::new(graph_uri)
+                yata_graph::GraphStore::new(graph_uri)
                     .await
                     .map_err(|e| anyhow::anyhow!("graph store init: {e}"))?,
             ))
@@ -187,320 +158,110 @@ impl Broker {
             None
         };
 
-        // Initialize Raft node
-        let peers: Vec<yata_raft::PeerAddr> = config
-            .raft
-            .peers
-            .iter()
-            .map(|p| yata_raft::PeerAddr {
-                node_id: p.node_id,
-                addr: p.addr.clone(),
-            })
-            .collect();
-
-        // Raft consensus: TCP transport when peers configured, NoopTransport for single-node.
-        let applier = Arc::new(NoopApplier);
-        let raft = if peers.is_empty() {
-            Arc::new(yata_raft::RaftNode::new(
-                config.raft.node_id,
-                peers,
-                applier,
-            ))
-        } else {
-            Arc::new(yata_raft::RaftNode::with_transport(
-                config.raft.node_id,
-                peers,
-                applier,
-                Arc::new(yata_raft::TcpRaftTransport::new()),
-            ))
-        };
-
         Ok(Self {
             config,
-            log: local_log.clone() as Arc<dyn AppendLog>,
-            kv: local_kv.clone() as Arc<dyn KvStore>,
-            schema_registry,
             objects,
-            ocel,
-            lance,
             graph,
-            local_kv,
-            local_log,
-            b2_sync,
-            raft,
+            cas,
+            s3_sync: s3_sync_handle,
         })
     }
 
-    /// Start background tasks: Raft, Lance flush, log compaction, TTL reaper, B2 sync.
+    /// Start background tasks.
     pub async fn start_background_tasks(self: Arc<Self>) -> anyhow::Result<()> {
-        // Start Raft node (single-node becomes leader immediately)
-        self.raft
-            .start()
-            .await
-            .map_err(|e| anyhow::anyhow!("raft start: {e}"))?;
-        tracing::info!(
-            node_id = self.config.raft.node_id,
-            is_leader = self.raft.is_leader(),
-            "raft node started"
-        );
-
-        // Start TCP listener for Raft RPC (multi-node only)
-        if !self.config.raft.peers.is_empty() {
-            let raft_node = self.raft.clone();
-            let bind_addr = self.config.raft.bind_addr.clone();
-            tokio::spawn(async move {
-                if let Err(e) = yata_raft::TcpRaftListener::run(&bind_addr, raft_node).await {
-                    tracing::error!("raft TCP listener stopped: {e}");
-                }
-            });
-        }
-
-        // Lance flush loop
-        {
-            let broker = self.clone();
-            let flush_ms = self.config.lance_flush_interval_ms;
-            tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(tokio::time::Duration::from_millis(flush_ms));
-                loop {
-                    interval.tick().await;
-                    if let Err(e) = broker.flush_lance().await {
-                        tracing::warn!("lance flush error: {}", e);
-                    }
-                }
-            });
-        }
-
-        // Log compaction
-        {
-            let compact_ms = self.config.log_compact_interval_ms;
-            if compact_ms > 0 {
-                let log = self.local_log.clone();
-                tokio::spawn(async move {
-                    let mut interval =
-                        tokio::time::interval(tokio::time::Duration::from_millis(compact_ms));
-                    loop {
-                        interval.tick().await;
-                        if let Err(e) = log.compact().await {
-                            tracing::warn!("log compaction error: {}", e);
-                        }
-                    }
-                });
-            }
-        }
-
-        // TTL reaper
-        {
-            let kv = self.local_kv.clone();
-            tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(tokio::time::Duration::from_secs(5));
-                loop {
-                    interval.tick().await;
-                    kv.reap_expired().await;
-                }
-            });
-        }
-
-        // B2 data sync loop (REQUIRED — tiered storage)
-        {
-            let b2 = self.b2_sync.clone();
-            let data_dir = self.config.data_dir.clone();
-            let lance_uri = self.config.lance_uri.clone();
-            let sync_ms = self.config.b2_sync_interval_ms;
-            tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(tokio::time::Duration::from_millis(sync_ms));
-                loop {
-                    interval.tick().await;
-                    tracing::info!("b2 sync cycle start");
-                    if let Err(e) = b2.sync_dir(&data_dir.join("log"), "log/").await {
-                        tracing::warn!("b2 log sync error: {}", e);
-                    }
-                    if let Err(e) =
-                        b2.sync_dir(&data_dir.join("kv_payloads"), "kv_payloads/").await
-                    {
-                        tracing::warn!("b2 kv_payloads sync error: {}", e);
-                    }
-                    if !lance_uri.starts_with("s3://") && !lance_uri.starts_with("gs://") {
-                        let lance_path = std::path::Path::new(&lance_uri);
-                        match b2.sync_dir(lance_path, "lance/").await {
-                            Ok(n) => if n > 0 { tracing::info!(uploaded = n, "b2 lance sync"); },
-                            Err(e) => tracing::warn!("b2 lance sync error: {}", e),
-                        }
-                    }
-                }
-            });
-        }
-
+        tracing::info!("broker started (single-writer, MDAG-native replication)");
         Ok(())
     }
 
-    /// Publish an Arrow batch to a stream (local write).
-    pub async fn publish_arrow(
-        &self,
-        stream: &str,
-        subject: &str,
-        batch: ArrowBatchHandle,
-    ) -> Result<Ack> {
-        let stream_id = StreamId::from(stream);
-        let subject_id = Subject::from(subject);
-        let payload = batch.as_payload_ref();
-        let content_hash = batch.content_hash.clone();
-        let schema_id = SchemaId("yata.arrow.batch".to_string());
-        let envelope = Envelope::new(subject_id.clone(), schema_id, content_hash);
-
-        let req = PublishRequest {
-            stream: stream_id,
-            subject: subject_id,
-            envelope,
-            payload,
-            expected_last_seq: None,
-        };
-        self.log.append(req).await
+    /// Per-app single-writer: always the authority for its own graph partition.
+    pub fn is_leader(&self) -> bool {
+        true
     }
 
-    /// Publish an OCEL event (with optional Arrow payload).
+    /// Publish an OCEL event — persists as `:OcelEvent` graph node via Cypher.
     pub async fn publish_ocel_event(
         &self,
         stream: &str,
         event: OcelEventDraft,
-        payload: Option<ArrowBatchHandle>,
-    ) -> Result<Ack> {
+        _payload: Option<yata_arrow::ArrowBatchHandle>,
+    ) -> Result<yata_core::Ack> {
         let ts_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let event_id = uuid::Uuid::new_v4().to_string();
 
-        let ocel_event = yata_ocel::OcelEvent {
-            event_id: event_id.clone(),
-            event_type: event.event_type.clone(),
-            timestamp: chrono::Utc::now(),
-            attrs: event.attrs.clone(),
-            message_id: None,
-            stream_id: Some(stream.to_owned()),
-            seq: None,
-        };
-        self.ocel.project_event(ocel_event).await?;
+        if let Some(ref graph) = self.graph {
+            let attrs_json = serde_json::to_string(&event.attrs).unwrap_or_default();
+            let cypher = format!(
+                "CREATE (e:OcelEvent {{event_id: '{}', event_type: '{}', stream: '{}', attrs_json: '{}', ts_ns: {}}})",
+                event_id.replace('\'', "\\'"),
+                event.event_type.replace('\'', "\\'"),
+                stream.replace('\'', "\\'"),
+                attrs_json.replace('\'', "\\'"),
+                ts_ns,
+            );
+            if let Err(e) = graph.cached_query(&cypher, &[]).await {
+                tracing::warn!("ocel graph create failed: {e}");
+            }
 
-        for obj_ref in &event.object_refs {
-            let edge = yata_ocel::OcelEventObjectEdge {
-                event_id: event_id.clone(),
-                object_id: obj_ref.object_id.clone(),
-                qualifier: obj_ref.qualifier.clone().unwrap_or_default(),
-                role: obj_ref.role.clone(),
-            };
-            self.ocel.add_e2o(edge).await?;
+            for obj_ref in &event.object_refs {
+                let obj_cypher = format!(
+                    "MERGE (o:OcelObject {{object_id: '{}', object_type: '{}'}}) \
+                     WITH o MATCH (e:OcelEvent {{event_id: '{}'}}) \
+                     CREATE (e)-[:INVOLVES {{qualifier: '{}', role: '{}'}}]->(o)",
+                    obj_ref.object_id.replace('\'', "\\'"),
+                    obj_ref.object_type.replace('\'', "\\'"),
+                    event_id.replace('\'', "\\'"),
+                    obj_ref
+                        .qualifier
+                        .as_deref()
+                        .unwrap_or("")
+                        .replace('\'', "\\'"),
+                    obj_ref.role.as_deref().unwrap_or("").replace('\'', "\\'"),
+                );
+                if let Err(e) = graph.cached_query(&obj_cypher, &[]).await {
+                    tracing::warn!("ocel graph edge failed: {e}");
+                }
+            }
         }
 
-        let stream_id = StreamId::from(stream);
-        let subject_id = Subject(format!("ocel.event.{}", event.event_type));
+        Ok(yata_core::Ack {
+            message_id: yata_core::MessageId::new(),
+            stream_id: yata_core::StreamId::from(stream),
+            seq: yata_core::Sequence(ts_ns as u64),
+            ts_ns,
+        })
+    }
 
-        let (payload_ref, content_hash) = if let Some(batch) = payload {
-            let h = batch.content_hash.clone();
-            (batch.as_payload_ref(), h)
+    /// Export OCEL events as JSON — queries graph `:OcelEvent` nodes.
+    pub async fn export_ocel_json(&self) -> Result<String> {
+        if let Some(ref graph) = self.graph {
+            let result = graph
+                .cached_query(
+                    "MATCH (e:OcelEvent) RETURN e.event_id, e.event_type, e.attrs_json, e.ts_ns ORDER BY e.ts_ns",
+                    &[],
+                )
+                .await
+                .map_err(|e| yata_core::YataError::Storage(e.to_string()))?;
+            let json = serde_json::to_string(&result.rows)
+                .map_err(|e| yata_core::YataError::Serialization(e.to_string()))?;
+            Ok(json)
         } else {
-            let data = event_id.as_bytes().to_vec();
-            let h = Blake3Hash::of(&data);
-            (PayloadRef::InlineBytes(bytes::Bytes::from(data)), h)
-        };
-
-        let mut envelope = Envelope::new(
-            subject_id.clone(),
-            SchemaId("yata.ocel.event".to_string()),
-            content_hash,
-        );
-        envelope.ocel_event_type = Some(event.event_type.clone());
-        for obj_ref in &event.object_refs {
-            envelope.ocel_object_refs.push(obj_ref.clone());
+            Ok("[]".to_string())
         }
-
-        let req = PublishRequest {
-            stream: stream_id,
-            subject: subject_id,
-            envelope,
-            payload: payload_ref,
-            expected_last_seq: None,
-        };
-        self.log.append(req).await
-    }
-
-    /// Record an object manifest event in the append-only log.
-    /// This makes object puts Raft-replicable (CAS chunks are B2 write-through,
-    /// manifest log enables replay on followers).
-    pub async fn log_object_manifest(
-        &self,
-        manifest: &yata_core::ObjectManifest,
-    ) -> Result<Ack> {
-        let mut cbor_buf = Vec::new();
-        ciborium::into_writer(manifest, &mut cbor_buf)
-            .map_err(|e| yata_core::YataError::Serialization(e.to_string()))?;
-        let payload = PayloadRef::InlineBytes(bytes::Bytes::from(cbor_buf));
-        let content_hash = payload.content_hash();
-        let stream_id = StreamId::from("_objects.manifests");
-        let subject_id = Subject(format!("object.{}", manifest.object_id));
-        let envelope = Envelope::new(
-            subject_id.clone(),
-            SchemaId("yata.object.manifest".to_string()),
-            content_hash,
-        );
-        let req = PublishRequest {
-            stream: stream_id,
-            subject: subject_id,
-            envelope,
-            payload,
-            expected_last_seq: None,
-        };
-        self.log.append(req).await
-    }
-
-    /// Flush pending OCEL projection + KV history to Lance (direct path).
-    pub async fn flush_lance(&self) -> Result<SyncStats> {
-        let start = std::time::Instant::now();
-        ::metrics::counter!(crate::metrics::names::LANCE_FLUSHES).increment(1);
-        let snapshot = self.ocel.snapshot().await?;
-
-        if !snapshot.events.is_empty() {
-            self.lance.write_ocel_events(&snapshot.events).await?;
-        }
-        if !snapshot.objects.is_empty() {
-            self.lance.write_ocel_objects(&snapshot.objects).await?;
-        }
-        if !snapshot.event_object_edges.is_empty() {
-            self.lance
-                .write_e2o_edges(&snapshot.event_object_edges)
-                .await?;
-        }
-        if !snapshot.object_object_edges.is_empty() {
-            self.lance
-                .write_o2o_edges(&snapshot.object_object_edges)
-                .await?;
-        }
-
-        let kv_entries = self.local_kv.drain_pending();
-        if !kv_entries.is_empty() {
-            self.lance.write_kv_history(&kv_entries).await?;
-        }
-
-        let stats = self.lance.sync_stats().await?;
-        let elapsed = start.elapsed().as_secs_f64();
-        ::metrics::histogram!(crate::metrics::names::LANCE_FLUSH_DURATION).record(elapsed);
-        tracing::debug!(?stats, elapsed_ms = elapsed * 1000.0, "lance flush complete");
-        Ok(stats)
     }
 }
 
-/// No-op applier — Broker handles storage directly; Raft gates write access.
-struct NoopApplier;
-
 #[async_trait::async_trait]
-impl yata_raft::StateMachineApplier for NoopApplier {
-    async fn apply_publish(
-        &self, _: &str, _: u32, _: &str, _: Option<&str>, _: &str, _: Option<&str>, ts_ns: i64, _: &[u8],
-    ) -> std::result::Result<(u64, i64), String> {
-        Ok((0, ts_ns))
+impl yata_core::WrpcBroker for Broker {
+    async fn cas_put(&self, data: bytes::Bytes) -> Result<yata_core::Blake3Hash> {
+        self.cas
+            .put(data)
+            .await
+            .map_err(|e| yata_core::YataError::Storage(e.to_string()))
     }
-    async fn apply_create_topic(&self, _: &str, _: u32, _: u32, _: Option<u64>) -> std::result::Result<(), String> { Ok(()) }
-    async fn apply_delete_topic(&self, _: &str) -> std::result::Result<(), String> { Ok(()) }
-    async fn apply_commit_offset(&self, _: &str, _: &str, _: u32, _: u64) -> std::result::Result<(), String> { Ok(()) }
+
+    fn is_leader(&self) -> bool {
+        true
+    }
 }
 
 /// In-process ClientBackend backed by a Broker.
@@ -522,57 +283,26 @@ impl BrokerBackend {
 impl yata_client::ClientBackend for BrokerBackend {
     async fn publish_arrow(
         &self,
-        stream: &str,
-        subject: &str,
-        batch: yata_arrow::ArrowBatchHandle,
+        _stream: &str,
+        _subject: &str,
+        _batch: yata_arrow::ArrowBatchHandle,
         _opts: yata_client::PublishOpts,
     ) -> yata_core::Result<yata_core::Ack> {
-        self.broker.publish_arrow(stream, subject, batch).await
+        Ok(yata_core::Ack {
+            message_id: yata_core::MessageId::new(),
+            stream_id: yata_core::StreamId::from(_stream),
+            seq: yata_core::Sequence(0),
+            ts_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        })
     }
 
     async fn publish_ocel_event(
         &self,
         stream: &str,
-        event: yata_ocel::OcelEventDraft,
+        event: yata_core::OcelEventDraft,
         payload: Option<yata_arrow::ArrowBatchHandle>,
     ) -> yata_core::Result<yata_core::Ack> {
         self.broker.publish_ocel_event(stream, event, payload).await
-    }
-
-    async fn kv_put(
-        &self,
-        bucket: &str,
-        key: &str,
-        value: bytes::Bytes,
-        expected_rev: Option<yata_core::Revision>,
-    ) -> yata_core::Result<yata_core::KvAck> {
-        use yata_core::{BucketId, KvPutRequest, KvStore};
-        self.broker.kv.put(KvPutRequest {
-            bucket: BucketId::from(bucket),
-            key: key.to_owned(),
-            value,
-            expected_revision: expected_rev,
-            ttl_secs: None,
-        }).await
-    }
-
-    async fn kv_get(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> yata_core::Result<Option<yata_core::KvEntry>> {
-        use yata_core::{BucketId, KvStore};
-        self.broker.kv.get(&BucketId::from(bucket), key).await
-    }
-
-    async fn kv_delete(
-        &self,
-        bucket: &str,
-        key: &str,
-        expected_rev: Option<yata_core::Revision>,
-    ) -> yata_core::Result<yata_core::KvAck> {
-        use yata_core::{BucketId, KvStore};
-        self.broker.kv.delete(&BucketId::from(bucket), key, expected_rev).await
     }
 
     async fn put_object(
@@ -580,23 +310,14 @@ impl yata_client::ClientBackend for BrokerBackend {
         data: bytes::Bytes,
         meta: yata_core::ObjectMeta,
     ) -> yata_core::Result<yata_core::ObjectManifest> {
-        let manifest = self.broker.objects.put_object(data, meta).await?;
-        // Log manifest to event bus for Raft replication
-        let _ = self.broker.log_object_manifest(&manifest).await;
-        Ok(manifest)
+        self.broker.objects.put_object(data, meta).await
     }
 
-    async fn get_object(
-        &self,
-        id: &yata_core::ObjectId,
-    ) -> yata_core::Result<bytes::Bytes> {
+    async fn get_object(&self, id: &yata_core::ObjectId) -> yata_core::Result<bytes::Bytes> {
         self.broker.objects.get_object(id).await
     }
 
     async fn export_ocel_json(&self, _dataset: &str) -> yata_core::Result<String> {
-        use yata_ocel::OcelProjector;
-        let snapshot = self.broker.ocel.snapshot().await?;
-        yata_ocel::export_json(&snapshot)
-            .map_err(|e| yata_core::YataError::Serialization(e.to_string()))
+        self.broker.export_ocel_json().await
     }
 }

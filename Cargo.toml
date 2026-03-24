@@ -3,41 +3,32 @@ resolver = "2"
 members = [
     # Layer 0: zero deps
     "yata-core",
-    "yata-raft",
     "yata-grin",
     # Layer 1: core primitives
     "yata-arrow",
     "yata-cbor",
     "yata-cas",
     "yata-object",
-    "yata-ocel",
-    # Layer 2: storage
+    # Layer 1.5: Vineyard-native format
+    "yata-vineyard",
+    # Layer 2: graph
     "yata-cypher",
-    "yata-log",
-    "yata-b2",
-    "yata-lance",
-    "yata-client",
-    # Layer 3: graph + kv
     "yata-store",
-    "yata-kv",
     "yata-graph",
-    "yata-signal",
-    # Layer 4: graph engine
+    # Layer 2.5: Flight SQL
+    "yata-flight",
+    # Layer 3: graph engine
     "yata-gie",
     "yata-engine",
-    "yata-cdc",
+    "yata-vex",
+    "yata-s3",
     "yata-mdag",
-    "yata-flight",
-    "yata-bolt",
-    # Layer 5: sharding
-    "yata-coordinator",
-    # Layer 6: composite
+    # Layer 4: protocol
     "yata-server",
-    "yata-at",
-    # Layer 7: binaries
-    "yata-gateway",
-    "yata-cli",
+    "yata-client",
+    # Layer 5: dev
     "yata-bench",
+    "yata-git",
 ]
 
 [workspace.package]
@@ -46,17 +37,54 @@ edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/gftdcojp/yata"
 
+[profile.dev]
+debug = 1
+incremental = false
+codegen-units = 1
+
+[profile.dev.package."*"]
+debug = 0
+
 [workspace.dependencies]
+hex = "0.4"
+sha2 = "0.10"
+hmac = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Internal crate refs (workspace path deps)
+yata-core = { path = "yata-core" }
+yata-grin = { path = "yata-grin" }
+yata-cas = { path = "yata-cas" }
+yata-cbor = { path = "yata-cbor" }
+yata-object = { path = "yata-object" }
+yata-store = { path = "yata-store" }
+yata-cypher = { path = "yata-cypher" }
+yata-graph = { path = "yata-graph" }
+yata-mdag = { path = "yata-mdag" }
+yata-s3 = { path = "yata-s3" }
+yata-engine = { path = "yata-engine" }
+yata-gie = { path = "yata-gie" }
+yata-vex = { path = "yata-vex" }
+yata-server = { path = "yata-server" }
+yata-client = { path = "yata-client" }
+yata-arrow = { path = "yata-arrow" }
+yata-vineyard = { path = "yata-vineyard" }
+yata-flight = { path = "yata-flight" }
+# Signal/AT/Server deps
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+zeroize = "1"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+serde_bytes = "0.11"
+cid = "0.11"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
 # Arrow
 arrow = { version = "53", features = ["ipc"] }
 arrow-array = "53"
 arrow-schema = "53"
 arrow-ipc = "53"
 arrow-cast = "53"
-
-# LanceDB (high-level; brings lance 0.20 + arrow 53 transitively)
-lancedb = "0.14"
-object_store = { version = "=0.10.2", default-features = false, features = ["aws"] }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "io-util", "fs", "sync", "time"] }
@@ -78,9 +106,6 @@ bytes = "1"
 memmap2 = "0.9"
 once_cell = "1"
 
-# IPLD / CID (AT Protocol dag-cbor)
-cid = "0.11"
-
 # Error handling
 thiserror = "2"
 anyhow = "1"
@@ -89,69 +114,27 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# HTTP / REST
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
 # Utils
 chrono = { version = "0.4", features = ["serde"] }
 smallvec = "1"
 indexmap = { version = "2", features = ["serde"] }
 
-# Arrow Flight / gRPC
-arrow-flight = { version = "53", features = ["flight-sql-experimental"] }
-tonic = { version = "0.12", features = ["transport"] }
-prost = "0.13"
-
-# HTTP / WebSocket (for yata-at)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
-
-# Signal Protocol crypto (for yata-signal)
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+# Crypto (bench signing)
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-chacha20poly1305 = "0.10"
-hkdf = "0.12"
-sha2 = "0.10"
-hmac = "0.12"
 rand = "0.8"
-zeroize = { version = "1", features = ["derive"] }
-
-# Encoding utilities
-hex = "0.4"
-serde_bytes = "0.11"
 
 # Internal crates
-yata-core = { path = "yata-core" }
-yata-arrow = { path = "yata-arrow" }
-yata-log = { path = "yata-log" }
-yata-kv = { path = "yata-kv" }
-yata-object = { path = "yata-object" }
-yata-ocel = { path = "yata-ocel" }
-yata-lance = { path = "yata-lance" }
-yata-b2 = { path = "yata-b2" }
-yata-server = { path = "yata-server" }
-yata-client = { path = "yata-client" }
-
-# Internal crates (new)
-yata-cbor = { path = "yata-cbor" }
-yata-cas = { path = "yata-cas" }
-yata-at = { path = "yata-at" }
-yata-signal = { path = "yata-signal" }
-yata-bench = { path = "yata-bench" }
-yata-cypher = { path = "yata-cypher" }
-yata-grin = { path = "yata-grin" }
-yata-store = { path = "yata-store" }
-yata-gie = { path = "yata-gie" }
-yata-coordinator = { path = "yata-coordinator" }
-
-yata-graph = { path = "yata-graph" }
-yata-raft = { path = "yata-raft" }
-yata-bolt = { path = "yata-bolt" }
-yata-flight = { path = "yata-flight" }
 
 # Parallelism
 rayon = "1.10"
 
-# Metrics
-metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+# WAL (rkyv zero-copy serialization + CRC)
+rkyv = { version = "0.8", features = ["bytecheck"] }
+crc32fast = "1"
 
-# Config
-toml = "0.8"
+# Git (for yata-git)
+git2 = "0.19"

@@ -6,6 +6,7 @@
 [subrepo]
 	remote = git@github.com:gftdcojp/yata.git
 	branch = main
-	commit = 
+	commit = 6c2c3e5e39e1f818f2ab17bbf44595d9b48a071a
 	method = merge
 	cmdver = 0.4.9
+	parent = 45348d99db21e808086c8421309f18baf22f4b84

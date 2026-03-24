@@ -5,7 +5,7 @@
 //! Directory layout:
 //! ```text
 //! cas/
-//!   <hash[0..2]>/<hash[2..4]>/<full_hex_hash>   # chunk blobs
+//!   <hash[0..2]>/<hash[2..4]>/<full_hex_hash>   # chunk blobs (delegated to CasStore)
 //! manifests/
 //!   <object_id>.cbor                              # ObjectManifest as CBOR
 //! pins/
@@ -13,71 +13,105 @@
 //! ```
 //!
 //! Small objects (< INLINE_THRESHOLD=256KB) are stored as single chunk.
-//! Larger objects use content-defined chunking (fixed 4MB for Phase 1).
+//! Larger objects use fixed 128MB chunks (Shannon-optimal for R2 FUSE:
+//! η=92.8%, ≤200MB single-PUT, fits CF Container 256MB RAM).
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use yata_cas::CasStore;
 use yata_core::{
-    Blake3Hash, ChunkRef, ObjectId, ObjectManifest, ObjectMeta, ObjectStorage, Result,
-    YataError,
+    Blake3Hash, ChunkRef, ObjectId, ObjectManifest, ObjectMeta, ObjectStorage, Result, YataError,
 };
 
-pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+pub const DEFAULT_CHUNK_SIZE: usize = 128 * 1024 * 1024;
 pub const INLINE_THRESHOLD: usize = 256 * 1024;
 
 pub struct LocalObjectStore {
     base_dir: PathBuf,
     chunk_size: usize,
+    cas: Arc<dyn CasStore>,
 }
 
 impl LocalObjectStore {
+    /// Create with an externally provided CasStore (shared dedup).
+    pub async fn with_cas(
+        base_dir: impl Into<PathBuf>,
+        cas: Arc<dyn CasStore>,
+    ) -> std::io::Result<Self> {
+        Self::with_cas_and_chunk_size(base_dir, cas, DEFAULT_CHUNK_SIZE).await
+    }
+
+    /// Create with external CasStore and custom chunk size.
+    pub async fn with_cas_and_chunk_size(
+        base_dir: impl Into<PathBuf>,
+        cas: Arc<dyn CasStore>,
+        chunk_size: usize,
+    ) -> std::io::Result<Self> {
+        let base_dir = base_dir.into();
+        tokio::fs::create_dir_all(base_dir.join("manifests")).await?;
+        tokio::fs::create_dir_all(base_dir.join("pins")).await?;
+        Ok(Self {
+            base_dir,
+            chunk_size,
+            cas,
+        })
+    }
+
+    /// Create with a standalone LocalCasStore at `<base_dir>/cas`.
     pub async fn new(base_dir: impl Into<PathBuf>) -> std::io::Result<Self> {
         Self::new_with_chunk_size(base_dir, DEFAULT_CHUNK_SIZE).await
     }
 
+    /// Create standalone with custom chunk size.
     pub async fn new_with_chunk_size(
         base_dir: impl Into<PathBuf>,
         chunk_size: usize,
     ) -> std::io::Result<Self> {
         let base_dir = base_dir.into();
-        tokio::fs::create_dir_all(base_dir.join("cas")).await?;
+        let cas_dir = base_dir.join("cas");
+        let cas: Arc<dyn CasStore> = Arc::new(yata_cas::LocalCasStore::new(&cas_dir).await?);
         tokio::fs::create_dir_all(base_dir.join("manifests")).await?;
         tokio::fs::create_dir_all(base_dir.join("pins")).await?;
-        Ok(Self { base_dir, chunk_size })
+        Ok(Self {
+            base_dir,
+            chunk_size,
+            cas,
+        })
+    }
+
+    /// Access the underlying CasStore.
+    pub fn cas(&self) -> &Arc<dyn CasStore> {
+        &self.cas
     }
 
     async fn write_chunk(&self, data: &[u8]) -> std::io::Result<ChunkRef> {
-        let hash = Blake3Hash::of(data);
-        let path = self.chunk_path(&hash);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        if !path.exists() {
-            tokio::fs::write(&path, data).await?;
-        }
+        let hash = self
+            .cas
+            .put(Bytes::copy_from_slice(data))
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         Ok(ChunkRef {
-            seq: 0, // will be set by caller
+            seq: 0,
             hash,
             size_bytes: data.len() as u64,
-            offset: 0, // will be set by caller
+            offset: 0,
         })
     }
 
     async fn read_chunk(&self, chunk: &ChunkRef) -> std::io::Result<Bytes> {
-        let path = self.chunk_path(&chunk.hash);
-        let data = tokio::fs::read(&path).await?;
-        Ok(Bytes::from(data))
-    }
-
-    pub fn chunk_path(&self, hash: &Blake3Hash) -> PathBuf {
-        let hex = hash.hex();
-        self.base_dir
-            .join("cas")
-            .join(&hex[..2])
-            .join(&hex[2..4])
-            .join(&hex)
+        self.cas
+            .get(&chunk.hash)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("chunk not found: {}", chunk.hash.hex()),
+                )
+            })
     }
 
     pub fn manifest_path(&self, id: &ObjectId) -> PathBuf {
@@ -92,8 +126,9 @@ impl LocalObjectStore {
         let path = self.manifest_path(id);
         match tokio::fs::read(&path).await {
             Ok(data) => {
-                let manifest: ObjectManifest = ciborium::from_reader(std::io::Cursor::new(&data))
-                    .map_err(|e| YataError::Serialization(e.to_string()))?;
+                let manifest: ObjectManifest =
+                    ciborium::from_reader(std::io::Cursor::new(&data))
+                        .map_err(|e| YataError::Serialization(e.to_string()))?;
                 Ok(Some(manifest))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -177,13 +212,12 @@ impl ObjectStorage for LocalObjectStore {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        // Touch pin file
         tokio::fs::write(&path, b"").await?;
         Ok(())
     }
 
     async fn gc(&self) -> Result<u64> {
-        // Collect all pinned object IDs
+        // Collect chunk hashes referenced by pinned manifests
         let pins_dir = self.base_dir.join("pins");
         let mut pinned_ids: HashSet<String> = HashSet::new();
         if let Ok(mut rd) = tokio::fs::read_dir(&pins_dir).await {
@@ -195,7 +229,6 @@ impl ObjectStorage for LocalObjectStore {
             }
         }
 
-        // Collect all chunk hashes referenced by pinned manifests
         let manifests_dir = self.base_dir.join("manifests");
         let mut referenced_chunks: HashSet<String> = HashSet::new();
         if let Ok(mut rd) = tokio::fs::read_dir(&manifests_dir).await {
@@ -210,9 +243,9 @@ impl ObjectStorage for LocalObjectStore {
                     continue;
                 }
                 if let Ok(data) = tokio::fs::read(&path).await {
-                    if let Ok(manifest) = ciborium::from_reader::<ObjectManifest, _>(
-                        std::io::Cursor::new(&data),
-                    ) {
+                    if let Ok(manifest) =
+                        ciborium::from_reader::<ObjectManifest, _>(std::io::Cursor::new(&data))
+                    {
                         for chunk in &manifest.chunks {
                             referenced_chunks.insert(chunk.hash.hex());
                         }
@@ -221,7 +254,9 @@ impl ObjectStorage for LocalObjectStore {
             }
         }
 
-        // Delete unreferenced chunks
+        // GC scans the CAS directory on the filesystem directly.
+        // This only works when the underlying CAS is a LocalCasStore.
+        // For tiered CAS, GC only removes local unreferenced chunks.
         let cas_dir = self.base_dir.join("cas");
         let mut deleted = 0u64;
         deleted += gc_dir_recursive(&cas_dir, &referenced_chunks).await;

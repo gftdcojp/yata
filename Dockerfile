@@ -23,11 +23,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY yata-core/Cargo.toml       yata-core/Cargo.toml
 COPY yata-arrow/Cargo.toml      yata-arrow/Cargo.toml
 COPY yata-log/Cargo.toml        yata-log/Cargo.toml
-COPY yata-kv/Cargo.toml         yata-kv/Cargo.toml
 COPY yata-object/Cargo.toml     yata-object/Cargo.toml
 COPY yata-ocel/Cargo.toml       yata-ocel/Cargo.toml
-COPY yata-lance/Cargo.toml      yata-lance/Cargo.toml
-COPY yata-b2/Cargo.toml         yata-b2/Cargo.toml
+COPY yata-s3/Cargo.toml         yata-s3/Cargo.toml
 COPY yata-server/Cargo.toml     yata-server/Cargo.toml
 COPY yata-client/Cargo.toml     yata-client/Cargo.toml
 COPY yata-cli/Cargo.toml        yata-cli/Cargo.toml
@@ -38,8 +36,8 @@ COPY yata-signal/Cargo.toml     yata-signal/Cargo.toml
 COPY yata-bench/Cargo.toml      yata-bench/Cargo.toml
 
 # Stub src/ for each crate so Cargo can resolve the dependency graph
-RUN for d in yata-core yata-arrow yata-log yata-kv yata-object yata-ocel \
-             yata-lance yata-b2 yata-server yata-client yata-cli yata-cbor \
+RUN for d in yata-core yata-arrow yata-log yata-object yata-ocel \
+             yata-s3 yata-server yata-client yata-cli yata-cbor \
              yata-cas yata-at yata-signal yata-cypher; do \
       mkdir -p $d/src && echo '' > $d/src/lib.rs; \
     done && \
@@ -70,6 +68,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/target/release/yata-bench /usr/local/bin/yata-bench
 
-# Default: run all scenarios; override with e.g. "log", "kv", "object", "e2e"
+# Default: run all scenarios; override with e.g. "log", "object", "e2e"
 ENTRYPOINT ["/usr/local/bin/yata-bench"]
 CMD ["all"]

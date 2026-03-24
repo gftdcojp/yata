@@ -30,28 +30,27 @@ fn push_down_filters(plan: QueryPlan) -> QueryPlan {
         while i + 1 < ops.len() {
             // If ops[i] is Expand and ops[i+1] is Filter referencing only
             // the scan alias (before the expand), swap them.
-            let should_swap = if let (
-                LogicalOp::Expand { src_alias: _, .. },
-                LogicalOp::Filter { predicate },
-            ) = (&ops[i], &ops[i + 1])
-            {
-                // Check if the filter predicate only references properties
-                // (not variables from the expand destination).
-                // Simple heuristic: if we can find a Scan before this Expand
-                // whose alias matches, and the predicate doesn't reference
-                // the dst_alias, we can push down.
-                let expand_dst = if let LogicalOp::Expand { dst_alias, .. } = &ops[i] {
-                    dst_alias.clone()
+            let should_swap =
+                if let (LogicalOp::Expand { src_alias: _, .. }, LogicalOp::Filter { predicate }) =
+                    (&ops[i], &ops[i + 1])
+                {
+                    // Check if the filter predicate only references properties
+                    // (not variables from the expand destination).
+                    // Simple heuristic: if we can find a Scan before this Expand
+                    // whose alias matches, and the predicate doesn't reference
+                    // the dst_alias, we can push down.
+                    let expand_dst = if let LogicalOp::Expand { dst_alias, .. } = &ops[i] {
+                        dst_alias.clone()
+                    } else {
+                        String::new()
+                    };
+                    // Predicates in GRIN format don't reference aliases directly,
+                    // they reference property keys. We push down all pure property
+                    // predicates that appear after an Expand.
+                    !predicate_references_alias(&expand_dst, predicate) && !expand_dst.is_empty()
                 } else {
-                    String::new()
+                    false
                 };
-                // Predicates in GRIN format don't reference aliases directly,
-                // they reference property keys. We push down all pure property
-                // predicates that appear after an Expand.
-                !predicate_references_alias(&expand_dst, predicate) && !expand_dst.is_empty()
-            } else {
-                false
-            };
 
             if should_swap {
                 ops.swap(i, i + 1);
@@ -84,16 +83,21 @@ fn merge_adjacent_scans(plan: QueryPlan) -> QueryPlan {
                 let filter = ops[i + 1].clone();
 
                 if let (
-                    LogicalOp::Scan { label, alias, predicate: existing },
-                    LogicalOp::Filter { predicate: new_pred },
+                    LogicalOp::Scan {
+                        label,
+                        alias,
+                        predicate: existing,
+                    },
+                    LogicalOp::Filter {
+                        predicate: new_pred,
+                    },
                 ) = (scan, filter)
                 {
                     let merged_pred = match existing {
                         None => new_pred,
-                        Some(existing_pred) => Predicate::And(
-                            Box::new(existing_pred),
-                            Box::new(new_pred),
-                        ),
+                        Some(existing_pred) => {
+                            Predicate::And(Box::new(existing_pred), Box::new(new_pred))
+                        }
                     };
                     result.push(LogicalOp::Scan {
                         label,
@@ -181,7 +185,10 @@ mod tests {
         assert_eq!(optimized.ops.len(), 1);
 
         match &optimized.ops[0] {
-            LogicalOp::Scan { predicate: Some(Predicate::Eq(k, _)), .. } => {
+            LogicalOp::Scan {
+                predicate: Some(Predicate::Eq(k, _)),
+                ..
+            } => {
                 assert_eq!(k, "name");
             }
             _ => panic!("expected Scan with merged predicate"),
@@ -208,7 +215,10 @@ mod tests {
         assert_eq!(optimized.ops.len(), 1);
 
         match &optimized.ops[0] {
-            LogicalOp::Scan { predicate: Some(Predicate::And(_, _)), .. } => {}
+            LogicalOp::Scan {
+                predicate: Some(Predicate::And(_, _)),
+                ..
+            } => {}
             _ => panic!("expected Scan with And predicate"),
         }
     }
@@ -243,7 +253,13 @@ mod tests {
         // After pushdown: Scan -> Filter -> Expand -> Project
         // After merge: Scan(pred) -> Expand -> Project
         assert_eq!(optimized.ops.len(), 3);
-        assert!(matches!(&optimized.ops[0], LogicalOp::Scan { predicate: Some(_), .. }));
+        assert!(matches!(
+            &optimized.ops[0],
+            LogicalOp::Scan {
+                predicate: Some(_),
+                ..
+            }
+        ));
         assert!(matches!(&optimized.ops[1], LogicalOp::Expand { .. }));
         assert!(matches!(&optimized.ops[2], LogicalOp::Project { .. }));
     }

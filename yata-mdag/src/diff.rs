@@ -1,4 +1,8 @@
 //! Merkle diff: compute minimal set of changed blocks between two graph roots.
+//!
+//! With inline vertices/edges, diff works at two levels:
+//! 1. Label group CID comparison — O(1) skip for unchanged labels
+//! 2. For changed groups: inline vertex/edge set diff by vid/edge_id
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use yata_cas::CasStore;
@@ -10,10 +14,10 @@ use crate::error::{MdagError, Result};
 /// Diff result between two MDAG graph roots.
 #[derive(Debug, Clone, Default)]
 pub struct MdagDiff {
-    pub added_vertex_cids: Vec<Blake3Hash>,
-    pub removed_vertex_cids: Vec<Blake3Hash>,
-    pub added_edge_cids: Vec<Blake3Hash>,
-    pub removed_edge_cids: Vec<Blake3Hash>,
+    pub added_vertices: Vec<VertexBlock>,
+    pub removed_vertices: Vec<VertexBlock>,
+    pub added_edges: Vec<EdgeBlock>,
+    pub removed_edges: Vec<EdgeBlock>,
     pub added_labels: Vec<String>,
     pub removed_labels: Vec<String>,
     pub schema_changed: bool,
@@ -21,20 +25,20 @@ pub struct MdagDiff {
 
 impl MdagDiff {
     pub fn is_empty(&self) -> bool {
-        self.added_vertex_cids.is_empty()
-            && self.removed_vertex_cids.is_empty()
-            && self.added_edge_cids.is_empty()
-            && self.removed_edge_cids.is_empty()
+        self.added_vertices.is_empty()
+            && self.removed_vertices.is_empty()
+            && self.added_edges.is_empty()
+            && self.removed_edges.is_empty()
             && self.added_labels.is_empty()
             && self.removed_labels.is_empty()
             && !self.schema_changed
     }
 
     pub fn total_changes(&self) -> usize {
-        self.added_vertex_cids.len()
-            + self.removed_vertex_cids.len()
-            + self.added_edge_cids.len()
-            + self.removed_edge_cids.len()
+        self.added_vertices.len()
+            + self.removed_vertices.len()
+            + self.added_edges.len()
+            + self.removed_edges.len()
     }
 }
 
@@ -57,28 +61,56 @@ pub async fn merkle_diff(
     diff.schema_changed = old_root.schema_cid != new_root.schema_cid;
 
     // ── Diff vertex groups ────────────────────────────────────────────────
-    let old_vg = load_label_map::<LabelVertexGroup>(cas, &old_root.vertex_groups).await?;
-    let new_vg = load_label_map::<LabelVertexGroup>(cas, &new_root.vertex_groups).await?;
+    let old_vg = load_vertex_cid_map(cas, &old_root.vertex_groups).await?;
+    let new_vg = load_vertex_cid_map(cas, &new_root.vertex_groups).await?;
 
-    let all_labels: BTreeSet<&str> = old_vg.keys().chain(new_vg.keys()).map(|s| s.as_str()).collect();
+    let all_labels: BTreeSet<&str> = old_vg
+        .keys()
+        .chain(new_vg.keys())
+        .map(|s| s.as_str())
+        .collect();
     for label in all_labels {
         match (old_vg.get(label), new_vg.get(label)) {
-            (None, Some(new_g)) => {
+            (None, Some((_, new_g))) => {
                 diff.added_labels.push(label.to_string());
-                diff.added_vertex_cids.extend(new_g.vertex_cids.clone());
+                diff.added_vertices.extend(new_g.vertices.clone());
             }
-            (Some(old_g), None) => {
+            (Some((_, old_g)), None) => {
                 diff.removed_labels.push(label.to_string());
-                diff.removed_vertex_cids.extend(old_g.vertex_cids.clone());
+                diff.removed_vertices.extend(old_g.vertices.clone());
             }
-            (Some(old_g), Some(new_g)) => {
-                let old_set: HashSet<_> = old_g.vertex_cids.iter().collect();
-                let new_set: HashSet<_> = new_g.vertex_cids.iter().collect();
-                for cid in new_set.difference(&old_set) {
-                    diff.added_vertex_cids.push((*cid).clone());
+            (Some((old_cid, old_g)), Some((new_cid, new_g))) => {
+                if old_cid == new_cid {
+                    continue; // O(1) skip — label group unchanged
                 }
-                for cid in old_set.difference(&new_set) {
-                    diff.removed_vertex_cids.push((*cid).clone());
+                // Diff inline vertices by vid
+                let old_set: HashSet<u32> = old_g.vertices.iter().map(|v| v.vid).collect();
+                let new_set: HashSet<u32> = new_g.vertices.iter().map(|v| v.vid).collect();
+                let old_map: BTreeMap<u32, &VertexBlock> =
+                    old_g.vertices.iter().map(|v| (v.vid, v)).collect();
+                let new_map: BTreeMap<u32, &VertexBlock> =
+                    new_g.vertices.iter().map(|v| (v.vid, v)).collect();
+
+                // Added vertices (in new but not in old)
+                for vid in new_set.difference(&old_set) {
+                    if let Some(v) = new_map.get(vid) {
+                        diff.added_vertices.push((*v).clone());
+                    }
+                }
+                // Removed vertices (in old but not in new)
+                for vid in old_set.difference(&new_set) {
+                    if let Some(v) = old_map.get(vid) {
+                        diff.removed_vertices.push((*v).clone());
+                    }
+                }
+                // Modified vertices (same vid, different content)
+                for vid in old_set.intersection(&new_set) {
+                    let old_v = old_map[vid];
+                    let new_v = new_map[vid];
+                    if old_v != new_v {
+                        diff.removed_vertices.push(old_v.clone());
+                        diff.added_vertices.push(new_v.clone());
+                    }
                 }
             }
             (None, None) => unreachable!(),
@@ -86,26 +118,50 @@ pub async fn merkle_diff(
     }
 
     // ── Diff edge groups ──────────────────────────────────────────────────
-    let old_eg = load_label_map::<LabelEdgeGroup>(cas, &old_root.edge_groups).await?;
-    let new_eg = load_label_map::<LabelEdgeGroup>(cas, &new_root.edge_groups).await?;
+    let old_eg = load_edge_cid_map(cas, &old_root.edge_groups).await?;
+    let new_eg = load_edge_cid_map(cas, &new_root.edge_groups).await?;
 
-    let all_edge_labels: BTreeSet<&str> = old_eg.keys().chain(new_eg.keys()).map(|s| s.as_str()).collect();
+    let all_edge_labels: BTreeSet<&str> = old_eg
+        .keys()
+        .chain(new_eg.keys())
+        .map(|s| s.as_str())
+        .collect();
     for label in all_edge_labels {
         match (old_eg.get(label), new_eg.get(label)) {
-            (None, Some(new_g)) => {
-                diff.added_edge_cids.extend(new_g.edge_cids.clone());
+            (None, Some((_, new_g))) => {
+                diff.added_edges.extend(new_g.edges.clone());
             }
-            (Some(old_g), None) => {
-                diff.removed_edge_cids.extend(old_g.edge_cids.clone());
+            (Some((_, old_g)), None) => {
+                diff.removed_edges.extend(old_g.edges.clone());
             }
-            (Some(old_g), Some(new_g)) => {
-                let old_set: HashSet<_> = old_g.edge_cids.iter().collect();
-                let new_set: HashSet<_> = new_g.edge_cids.iter().collect();
-                for cid in new_set.difference(&old_set) {
-                    diff.added_edge_cids.push((*cid).clone());
+            (Some((old_cid, old_g)), Some((new_cid, new_g))) => {
+                if old_cid == new_cid {
+                    continue;
                 }
-                for cid in old_set.difference(&new_set) {
-                    diff.removed_edge_cids.push((*cid).clone());
+                let old_set: HashSet<u32> = old_g.edges.iter().map(|e| e.edge_id).collect();
+                let new_set: HashSet<u32> = new_g.edges.iter().map(|e| e.edge_id).collect();
+                let old_map: BTreeMap<u32, &EdgeBlock> =
+                    old_g.edges.iter().map(|e| (e.edge_id, e)).collect();
+                let new_map: BTreeMap<u32, &EdgeBlock> =
+                    new_g.edges.iter().map(|e| (e.edge_id, e)).collect();
+
+                for eid in new_set.difference(&old_set) {
+                    if let Some(e) = new_map.get(eid) {
+                        diff.added_edges.push((*e).clone());
+                    }
+                }
+                for eid in old_set.difference(&new_set) {
+                    if let Some(e) = old_map.get(eid) {
+                        diff.removed_edges.push((*e).clone());
+                    }
+                }
+                for eid in old_set.intersection(&new_set) {
+                    let old_e = old_map[eid];
+                    let new_e = new_map[eid];
+                    if old_e != new_e {
+                        diff.removed_edges.push(old_e.clone());
+                        diff.added_edges.push(new_e.clone());
+                    }
                 }
             }
             (None, None) => unreachable!(),
@@ -120,26 +176,61 @@ trait LabelGroup {
     fn label(&self) -> &str;
 }
 impl LabelGroup for LabelVertexGroup {
-    fn label(&self) -> &str { &self.label }
+    fn label(&self) -> &str {
+        &self.label
+    }
 }
 impl LabelGroup for LabelEdgeGroup {
-    fn label(&self) -> &str { &self.label }
+    fn label(&self) -> &str {
+        &self.label
+    }
 }
 
-async fn load_label_map<T: serde::de::DeserializeOwned + LabelGroup>(
+async fn load_vertex_cid_map(
     cas: &dyn CasStore,
     cids: &[Blake3Hash],
-) -> Result<BTreeMap<String, T>> {
+) -> Result<BTreeMap<String, (Blake3Hash, LabelVertexGroup)>> {
     let mut map = BTreeMap::new();
     for cid in cids {
-        let group: T = fetch(cas, cid).await?;
-        map.insert(group.label().to_string(), group);
+        let data = cas
+            .get(cid)
+            .await?
+            .ok_or_else(|| MdagError::NotFound(cid.hex()))?;
+        let group = if crate::arrow_codec::is_arrow_block(&data) {
+            crate::arrow_codec::decode_vertex_group(&data)?
+        } else {
+            yata_cbor::decode(&data).map_err(|e| MdagError::Deserialize(e.to_string()))?
+        };
+        map.insert(group.label.clone(), (cid.clone(), group));
+    }
+    Ok(map)
+}
+
+async fn load_edge_cid_map(
+    cas: &dyn CasStore,
+    cids: &[Blake3Hash],
+) -> Result<BTreeMap<String, (Blake3Hash, LabelEdgeGroup)>> {
+    let mut map = BTreeMap::new();
+    for cid in cids {
+        let data = cas
+            .get(cid)
+            .await?
+            .ok_or_else(|| MdagError::NotFound(cid.hex()))?;
+        let group = if crate::arrow_codec::is_arrow_block(&data) {
+            crate::arrow_codec::decode_edge_group(&data)?
+        } else {
+            yata_cbor::decode(&data).map_err(|e| MdagError::Deserialize(e.to_string()))?
+        };
+        map.insert(group.label.clone(), (cid.clone(), group));
     }
     Ok(map)
 }
 
 async fn fetch<T: serde::de::DeserializeOwned>(cas: &dyn CasStore, cid: &Blake3Hash) -> Result<T> {
-    let data = cas.get(cid).await?.ok_or_else(|| MdagError::NotFound(cid.hex()))?;
+    let data = cas
+        .get(cid)
+        .await?
+        .ok_or_else(|| MdagError::NotFound(cid.hex()))?;
     yata_cbor::decode(&data).map_err(|e| MdagError::Deserialize(e.to_string()))
 }
 
@@ -147,9 +238,15 @@ async fn fetch<T: serde::de::DeserializeOwned>(cas: &dyn CasStore, cid: &Blake3H
 mod tests {
     use super::*;
     use crate::serialize::commit_graph;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
     use yata_cas::LocalCasStore;
     use yata_grin::{Mutable, PropValue};
     use yata_store::MutableCsrStore;
+
+    fn test_key() -> (SigningKey, &'static str) {
+        (SigningKey::generate(&mut OsRng), "did:key:z6MkTest")
+    }
 
     #[tokio::test]
     async fn test_diff_same_root() {
@@ -159,7 +256,10 @@ mod tests {
         store.add_vertex("A", &[("x", PropValue::Int(1))]);
         store.commit();
 
-        let root = commit_graph(&store, &cas, None, "v1").await.unwrap();
+        let (sk, did) = test_key();
+        let root = commit_graph(&store, &cas, None, "v1", &sk, did)
+            .await
+            .unwrap();
         let diff = merkle_diff(&root, &root, &cas).await.unwrap();
         assert!(diff.is_empty());
     }
@@ -169,19 +269,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cas = LocalCasStore::new(dir.path().join("cas")).await.unwrap();
 
+        let (sk, did) = test_key();
         let mut store = MutableCsrStore::new();
         store.add_vertex("Person", &[("name", PropValue::Str("Alice".into()))]);
         store.commit();
-        let root1 = commit_graph(&store, &cas, None, "v1").await.unwrap();
+        let root1 = commit_graph(&store, &cas, None, "v1", &sk, did)
+            .await
+            .unwrap();
 
         store.add_vertex("Person", &[("name", PropValue::Str("Bob".into()))]);
         store.commit();
-        let root2 = commit_graph(&store, &cas, Some(root1.clone()), "v2").await.unwrap();
+        let root2 = commit_graph(&store, &cas, Some(root1.clone()), "v2", &sk, did)
+            .await
+            .unwrap();
 
         let diff = merkle_diff(&root1, &root2, &cas).await.unwrap();
         assert!(!diff.is_empty());
-        assert_eq!(diff.added_vertex_cids.len(), 1); // Bob added
-        assert_eq!(diff.removed_vertex_cids.len(), 0);
+        assert_eq!(diff.added_vertices.len(), 1);
+        assert_eq!(diff.removed_vertices.len(), 0);
+        assert_eq!(
+            diff.added_vertices[0].props[0].1,
+            PropValue::Str("Bob".into())
+        );
     }
 
     #[tokio::test]
@@ -189,14 +298,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cas = LocalCasStore::new(dir.path().join("cas")).await.unwrap();
 
+        let (sk, did) = test_key();
         let mut store = MutableCsrStore::new();
         store.add_vertex("Person", &[("name", PropValue::Str("Alice".into()))]);
         store.commit();
-        let root1 = commit_graph(&store, &cas, None, "v1").await.unwrap();
+        let root1 = commit_graph(&store, &cas, None, "v1", &sk, did)
+            .await
+            .unwrap();
 
         store.add_vertex("Company", &[("name", PropValue::Str("GFTD".into()))]);
         store.commit();
-        let root2 = commit_graph(&store, &cas, Some(root1.clone()), "v2").await.unwrap();
+        let root2 = commit_graph(&store, &cas, Some(root1.clone()), "v2", &sk, did)
+            .await
+            .unwrap();
 
         let diff = merkle_diff(&root1, &root2, &cas).await.unwrap();
         assert!(diff.added_labels.contains(&"Company".to_string()));
@@ -207,19 +321,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cas = LocalCasStore::new(dir.path().join("cas")).await.unwrap();
 
+        let (sk, did) = test_key();
         let mut store = MutableCsrStore::new();
-        store.add_vertex("Person", &[("name", PropValue::Str("Alice".into())), ("age", PropValue::Int(30))]);
+        store.add_vertex(
+            "Person",
+            &[
+                ("name", PropValue::Str("Alice".into())),
+                ("age", PropValue::Int(30)),
+            ],
+        );
         store.commit();
-        let root1 = commit_graph(&store, &cas, None, "v1").await.unwrap();
+        let root1 = commit_graph(&store, &cas, None, "v1", &sk, did)
+            .await
+            .unwrap();
 
-        // Change property → different CID for vertex block
         store.set_vertex_prop(0, "age", PropValue::Int(31));
         store.commit();
-        let root2 = commit_graph(&store, &cas, Some(root1.clone()), "v2").await.unwrap();
+        let root2 = commit_graph(&store, &cas, Some(root1.clone()), "v2", &sk, did)
+            .await
+            .unwrap();
 
         let diff = merkle_diff(&root1, &root2, &cas).await.unwrap();
-        // Old vertex CID removed, new one added
-        assert_eq!(diff.removed_vertex_cids.len(), 1);
-        assert_eq!(diff.added_vertex_cids.len(), 1);
+        assert_eq!(diff.removed_vertices.len(), 1);
+        assert_eq!(diff.added_vertices.len(), 1);
+        assert_eq!(
+            diff.removed_vertices[0]
+                .props
+                .iter()
+                .find(|(k, _)| k == "age")
+                .unwrap()
+                .1,
+            PropValue::Int(30)
+        );
+        assert_eq!(
+            diff.added_vertices[0]
+                .props
+                .iter()
+                .find(|(k, _)| k == "age")
+                .unwrap()
+                .1,
+            PropValue::Int(31)
+        );
     }
 }

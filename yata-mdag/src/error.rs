@@ -8,13 +8,19 @@ pub enum MdagError {
     NotFound(String),
     #[error("deserialization error: {0}")]
     Deserialize(String),
+    #[error("signature verification failed: {0}")]
+    Verify(String),
 }
 
 pub type Result<T> = std::result::Result<T, MdagError>;
 
 impl From<yata_cas::CasError> for MdagError {
-    fn from(e: yata_cas::CasError) -> Self { Self::Cas(e.to_string()) }
+    fn from(e: yata_cas::CasError) -> Self {
+        Self::Cas(e.to_string())
+    }
 }
 impl From<yata_cbor::CborError> for MdagError {
-    fn from(e: yata_cbor::CborError) -> Self { Self::Cbor(e.to_string()) }
+    fn from(e: yata_cbor::CborError) -> Self {
+        Self::Cbor(e.to_string())
+    }
 }

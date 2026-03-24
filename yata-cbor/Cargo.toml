@@ -10,4 +10,3 @@ yata-core.workspace = true
 ciborium.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-bytes.workspace = true

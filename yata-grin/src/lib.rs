@@ -63,6 +63,11 @@ pub trait Property {
     fn edge_prop(&self, edge_id: u32, key: &str) -> Option<PropValue>;
     fn vertex_prop_keys(&self, label: &str) -> Vec<String>;
     fn edge_prop_keys(&self, label: &str) -> Vec<String>;
+    /// Get all properties of a vertex as a map.
+    fn vertex_all_props(&self, vid: u32) -> std::collections::HashMap<String, PropValue> {
+        let _ = vid;
+        std::collections::HashMap::new()
+    }
 }
 
 /// Schema information.
@@ -112,9 +117,9 @@ impl<T: GraphStore + Mutable> MutableGraphStore for T {}
 pub enum Tier {
     /// In-memory MutableCSR (ns latency, bounded by RAM).
     Hot,
-    /// Lance local on PVC (ms latency, bounded by disk).
+    /// Disk-backed (ms latency, bounded by disk).
     Warm,
-    /// Lance on S3/B2 (100ms+ latency, infinite scale).
+    /// S3/R2 (100ms+ latency, infinite scale).
     Cold,
 }
 
@@ -124,9 +129,9 @@ pub trait Tiered {
     fn can_serve(&self, labels: &[String]) -> bool;
 }
 
-// ── Versioning (Lance versioning / MVCC snapshots) ──────────────────────
+// ── Versioning (MVCC snapshots) ──────────────────────────────────────────
 
-/// Version identifier (maps to Lance dataset version or MVCC commit).
+/// Version identifier (MVCC commit).
 pub type VersionId = u64;
 
 /// Time-travel and snapshot support.
@@ -134,6 +139,47 @@ pub trait Versioned {
     fn current_version(&self) -> VersionId;
     fn versions(&self, limit: usize) -> Vec<VersionId>;
     fn has_version(&self, version: VersionId) -> bool;
+}
+
+// ── Typed ID neighbor (M1: global/local ID separation) ──────────────────
+//
+// Design decision (M1): GRIN traits keep bare u32 parameters — these are
+// implicitly **local** vertex/edge IDs within a single partition store.
+// Cross-partition references use VertexRef { partition_id, vid }.
+// Future M2 will introduce TypedTopology<V,E> generic traits; for now
+// the u32 surface is stable and the global→local translation lives in
+// yata-store::GlobalToLocalMap.
+
+/// Typed neighbor entry using explicit LocalVid/LocalEid semantics.
+/// Parallel to `Neighbor` but with newtype IDs for stronger guarantees.
+#[derive(Debug, Clone)]
+pub struct TypedNeighbor {
+    /// Local vertex ID of the neighbor (within the same partition).
+    pub local_vid: u32,
+    /// Local edge ID connecting to this neighbor.
+    pub local_eid: u32,
+    /// Edge label (relationship type).
+    pub edge_label: String,
+}
+
+impl From<Neighbor> for TypedNeighbor {
+    fn from(n: Neighbor) -> Self {
+        Self {
+            local_vid: n.vid,
+            local_eid: n.edge_id,
+            edge_label: n.edge_label,
+        }
+    }
+}
+
+impl From<TypedNeighbor> for Neighbor {
+    fn from(n: TypedNeighbor) -> Self {
+        Self {
+            vid: n.local_vid,
+            edge_id: n.local_eid,
+            edge_label: n.edge_label,
+        }
+    }
 }
 
 // ── Distributed partition (GRIN edge-cut / vertex-cut) ──────────────────
@@ -157,7 +203,9 @@ pub enum PartitionStrategy {
 /// Extended distributed partition awareness (GRIN-style).
 pub trait DistributedPartition: Partitioned {
     fn strategy(&self) -> PartitionStrategy;
-    fn is_mirror(&self, vid: u32) -> bool { !self.is_master(vid) }
+    fn is_mirror(&self, vid: u32) -> bool {
+        !self.is_master(vid)
+    }
     fn master_of(&self, vid: u32) -> VertexRef;
     fn mirrors_of(&self, vid: u32) -> Vec<u32>;
 }
@@ -192,7 +240,10 @@ mod tests {
     fn test_prop_value_equality() {
         assert_eq!(PropValue::Int(42), PropValue::Int(42));
         assert_ne!(PropValue::Int(42), PropValue::Int(43));
-        assert_eq!(PropValue::Str("hello".into()), PropValue::Str("hello".into()));
+        assert_eq!(
+            PropValue::Str("hello".into()),
+            PropValue::Str("hello".into())
+        );
         assert_eq!(PropValue::Null, PropValue::Null);
         assert_ne!(PropValue::Bool(true), PropValue::Bool(false));
     }
@@ -206,7 +257,11 @@ mod tests {
 
     #[test]
     fn test_neighbor_clone() {
-        let n = Neighbor { vid: 1, edge_id: 0, edge_label: "KNOWS".into() };
+        let n = Neighbor {
+            vid: 1,
+            edge_id: 0,
+            edge_label: "KNOWS".into(),
+        };
         let n2 = n.clone();
         assert_eq!(n.vid, n2.vid);
         assert_eq!(n.edge_id, n2.edge_id);
@@ -222,7 +277,10 @@ mod tests {
 
     #[test]
     fn test_vertex_ref() {
-        let r = VertexRef { partition_id: 2, vid: 42 };
+        let r = VertexRef {
+            partition_id: 2,
+            vid: 42,
+        };
         let r2 = r.clone();
         assert_eq!(r, r2);
         assert_eq!(r.partition_id, 2);
@@ -244,7 +302,10 @@ mod tests {
 
     #[test]
     fn test_vertex_ref_serde() {
-        let r = VertexRef { partition_id: 1, vid: 99 };
+        let r = VertexRef {
+            partition_id: 1,
+            vid: 99,
+        };
         let json = serde_json::to_string(&r).unwrap();
         let r2: VertexRef = serde_json::from_str(&json).unwrap();
         assert_eq!(r, r2);

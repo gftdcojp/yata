@@ -8,5 +8,8 @@ description = "Graph Interactive Engine with IR operators and push-based executo
 [dependencies]
 yata-grin = { path = "../yata-grin" }
 yata-store = { path = "../yata-store" }
+yata-cypher = { path = "../yata-cypher" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]

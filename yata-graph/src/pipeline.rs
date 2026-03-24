@@ -1,5 +1,5 @@
 //! GIE-inspired lazy evaluation pipeline for Cypher queries.
-//! Converts Cypher AST → operator DAG → lazy execution against Lance.
+//! Converts Cypher AST -> operator DAG -> lazy execution.
 //! Only loads data that the query actually needs.
 
 use crate::hints::QueryHints;
@@ -7,7 +7,7 @@ use crate::hints::QueryHints;
 /// A pipeline operator that lazily produces rows.
 #[derive(Debug, Clone)]
 pub enum PipelineOp {
-    /// Scan vertices with label filter (Lance pushdown).
+    /// Scan vertices with label filter.
     ScanVertices {
         labels: Vec<String>,
         props_filter: Vec<(String, String)>,
@@ -53,16 +53,16 @@ impl Pipeline {
     /// True if the pipeline contains any scan or expand operators
     /// (i.e., it actually does something).
     pub fn has_data_ops(&self) -> bool {
-        self.ops.iter().any(|op| matches!(
-            op,
-            PipelineOp::ScanVertices { .. } | PipelineOp::ExpandEdges { .. }
-        ))
+        self.ops.iter().any(|op| {
+            matches!(
+                op,
+                PipelineOp::ScanVertices { .. } | PipelineOp::ExpandEdges { .. }
+            )
+        })
     }
 }
 
 /// Build a pipeline from QueryHints extracted from the Cypher AST.
-/// This is used by `load_subgraph_for_hints` to decide what data to load
-/// from Lance before executing the Cypher query.
 pub fn plan_from_hints(hints: &QueryHints) -> Pipeline {
     let mut pipeline = Pipeline::new();
 
@@ -131,7 +131,10 @@ mod tests {
         let pipeline = plan_from_hints(&hints);
         assert_eq!(pipeline.ops.len(), 2);
         match &pipeline.ops[1] {
-            PipelineOp::ExpandEdges { rel_types, direction } => {
+            PipelineOp::ExpandEdges {
+                rel_types,
+                direction,
+            } => {
                 assert_eq!(rel_types, &["KNOWS"]);
                 assert_eq!(*direction, Direction::Out);
             }

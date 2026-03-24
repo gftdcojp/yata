@@ -1,0 +1,20 @@
+[package]
+name = "yata-git"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+ciborium.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+git2.workspace = true
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }
+
+[package.metadata.cargo-machete]
+ignored = ["tokio", "tempfile"]

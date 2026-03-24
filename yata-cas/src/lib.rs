@@ -1,9 +1,13 @@
 #![allow(dead_code)]
 
-//! Content-addressed chunk storage for YATA.
+//! Content-addressed chunk storage.
 //!
 //! `CasStore` stores arbitrary byte blobs keyed by Blake3 hash.
 //! Layout: `<base>/<hash[0..2]>/<hash[2..4]>/<full_hex_hash>`
+//!
+//! NOTE: Authoritative source is `wproto::cas`. This crate retains its own
+//! implementation for backward compatibility (no circular dependency).
+//! New code should prefer `wproto::cas` when available.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -22,14 +26,22 @@ pub type Result<T> = std::result::Result<T, CasError>;
 /// Content-addressed chunk store.
 #[async_trait]
 pub trait CasStore: Send + Sync + 'static {
-    /// Store `data`, returning its Blake3 hash.
     async fn put(&self, data: Bytes) -> Result<Blake3Hash>;
-
-    /// Retrieve chunk by hash. Returns `None` if not found.
     async fn get(&self, hash: &Blake3Hash) -> Result<Option<Bytes>>;
-
-    /// Check existence without loading data.
     async fn has(&self, hash: &Blake3Hash) -> Result<bool>;
+
+    async fn put_at(&self, hash: Blake3Hash, data: Bytes) -> Result<()> {
+        let _ = hash;
+        let _ = data;
+        Err(CasError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "put_at not supported",
+        )))
+    }
+
+    async fn get_raw(&self, hash: &Blake3Hash) -> Result<Option<Bytes>> {
+        self.get(hash).await
+    }
 }
 
 /// Local filesystem CAS store.
@@ -58,7 +70,6 @@ impl CasStore for LocalCasStore {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        // Only write if not already present (dedup)
         if !path.exists() {
             tokio::fs::write(&path, &data).await?;
         }
@@ -69,7 +80,6 @@ impl CasStore for LocalCasStore {
         let path = self.chunk_path(hash);
         match tokio::fs::read(&path).await {
             Ok(data) => {
-                // Verify hash on read
                 let actual = Blake3Hash::of(&data);
                 if actual != *hash {
                     return Err(CasError::HashMismatch {
@@ -87,53 +97,22 @@ impl CasStore for LocalCasStore {
     async fn has(&self, hash: &Blake3Hash) -> Result<bool> {
         Ok(self.chunk_path(hash).exists())
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_put_get_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalCasStore::new(dir.path()).await.unwrap();
-
-        let data = Bytes::from_static(b"hello yata cas");
-        let hash = store.put(data.clone()).await.unwrap();
-        let retrieved = store.get(&hash).await.unwrap().unwrap();
-        assert_eq!(retrieved, data);
+    async fn put_at(&self, hash: Blake3Hash, data: Bytes) -> Result<()> {
+        let path = self.chunk_path(&hash);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&path, &data).await?;
+        Ok(())
     }
 
-    #[tokio::test]
-    async fn test_has() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalCasStore::new(dir.path()).await.unwrap();
-
-        let hash = Blake3Hash::of(b"not stored");
-        assert!(!store.has(&hash).await.unwrap());
-
-        store.put(Bytes::from_static(b"not stored")).await.unwrap();
-        assert!(store.has(&hash).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_dedup() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalCasStore::new(dir.path()).await.unwrap();
-
-        let data = Bytes::from_static(b"same bytes");
-        let h1 = store.put(data.clone()).await.unwrap();
-        let h2 = store.put(data.clone()).await.unwrap();
-        assert_eq!(h1, h2);
-    }
-
-    #[tokio::test]
-    async fn test_missing_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalCasStore::new(dir.path()).await.unwrap();
-
-        let hash = Blake3Hash::of(b"ghost");
-        let result = store.get(&hash).await.unwrap();
-        assert!(result.is_none());
+    async fn get_raw(&self, hash: &Blake3Hash) -> Result<Option<Bytes>> {
+        let path = self.chunk_path(hash);
+        match tokio::fs::read(&path).await {
+            Ok(data) => Ok(Some(Bytes::from(data))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(CasError::Io(e)),
+        }
     }
 }

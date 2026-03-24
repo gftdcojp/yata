@@ -13,13 +13,13 @@
 //! - `LazyArrowBatchHandle` defers IPC serialization until first call to `ipc_bytes()`.
 
 use arrow::datatypes::Schema;
+use arrow::ipc::reader::{FileReader, StreamReader};
+use arrow::ipc::writer::{FileWriter, IpcWriteOptions, StreamWriter};
 use arrow::record_batch::RecordBatch;
-use arrow::ipc::writer::{IpcWriteOptions, StreamWriter, FileWriter};
-use arrow::ipc::reader::{StreamReader, FileReader};
 use bytes::Bytes;
-use std::sync::Arc;
 use once_cell::sync::OnceCell;
 use std::io::Cursor;
+use std::sync::Arc;
 use yata_core::{Blake3Hash, PayloadRef, YataError};
 
 pub type Result<T> = std::result::Result<T, ArrowError>;
@@ -91,7 +91,8 @@ impl ArrowBatchHandle {
 pub fn batch_to_ipc(batch: &RecordBatch) -> Result<Bytes> {
     let mut buf = Vec::new();
     let options = IpcWriteOptions::default();
-    let mut writer = StreamWriter::try_new_with_options(&mut buf, batch.schema().as_ref(), options)?;
+    let mut writer =
+        StreamWriter::try_new_with_options(&mut buf, batch.schema().as_ref(), options)?;
     writer.write(batch)?;
     writer.finish()?;
     drop(writer);
@@ -155,7 +156,7 @@ pub fn read_ipc_file_mmap(path: &std::path::Path) -> Result<Vec<RecordBatch>> {
 /// A RecordBatch handle that defers IPC serialization until first access.
 ///
 /// Preferred over `ArrowBatchHandle` when the batch may be consumed by the
-/// Arrow Flight `do_get` path directly (Lance scan → IPC stream), avoiding
+/// Arrow Flight `do_get` path directly (scan → IPC stream), avoiding
 /// an unnecessary eager serialize-then-deserialize round-trip.
 pub struct LazyArrowBatchHandle {
     pub batch: RecordBatch,
@@ -168,7 +169,12 @@ impl LazyArrowBatchHandle {
     pub fn new(batch: RecordBatch) -> Self {
         let schema = batch.schema();
         let row_count = batch.num_rows();
-        Self { batch, schema, row_count, ipc_bytes: OnceCell::new() }
+        Self {
+            batch,
+            schema,
+            row_count,
+            ipc_bytes: OnceCell::new(),
+        }
     }
 
     /// Returns IPC stream bytes, serializing on first call (subsequent calls are free).
@@ -254,13 +260,8 @@ impl SchemaRegistry {
             );
             Ok(new_version)
         } else {
-            self.inner.insert(
-                id.to_owned(),
-                SchemaEntry {
-                    schema,
-                    version: 1,
-                },
-            );
+            self.inner
+                .insert(id.to_owned(), SchemaEntry { schema, version: 1 });
             Ok(1)
         }
     }
@@ -278,27 +279,24 @@ impl SchemaRegistry {
     }
 
     /// Check if a RecordBatch is compatible with a registered schema.
-    pub fn validate_batch(&self, schema_id: &str, batch: &RecordBatch) -> std::result::Result<(), String> {
+    pub fn validate_batch(
+        &self,
+        schema_id: &str,
+        batch: &RecordBatch,
+    ) -> std::result::Result<(), String> {
         let registered = self
             .get(schema_id)
             .ok_or_else(|| format!("schema not registered: {schema_id}"))?;
 
         for field in registered.fields() {
             if batch.schema().field_with_name(field.name()).is_err() && !field.is_nullable() {
-                return Err(format!(
-                    "batch missing required field: {}",
-                    field.name()
-                ));
+                return Err(format!("batch missing required field: {}", field.name()));
             }
         }
         Ok(())
     }
 
-    fn check_compatibility(
-        &self,
-        old: &Schema,
-        new: &Schema,
-    ) -> std::result::Result<(), String> {
+    fn check_compatibility(&self, old: &Schema, new: &Schema) -> std::result::Result<(), String> {
         match self.compatibility {
             SchemaCompatibility::None => Ok(()),
             SchemaCompatibility::Backward => {
@@ -394,5 +392,248 @@ impl SchemaRegistry {
 impl Default for SchemaRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field};
+
+    fn sample_batch() -> RecordBatch {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["Alice", "Bob"])),
+                Arc::new(Int64Array::from(vec![30, 25])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_ipc_stream_roundtrip() {
+        let batch = sample_batch();
+        let ipc = batch_to_ipc(&batch).unwrap();
+        let decoded = ipc_to_batch(&ipc).unwrap();
+        assert_eq!(decoded.num_rows(), 2);
+        assert_eq!(decoded.num_columns(), 2);
+    }
+
+    #[test]
+    fn test_ipc_file_roundtrip() {
+        let batch = sample_batch();
+        let ipc = batch_to_ipc_file(&batch).unwrap();
+        let batches = ipc_file_to_batches(&ipc).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
+    }
+
+    #[test]
+    fn test_ipc_hash_deterministic() {
+        let batch = sample_batch();
+        let ipc1 = batch_to_ipc(&batch).unwrap();
+        let ipc2 = batch_to_ipc(&batch).unwrap();
+        assert_eq!(ipc_hash(&ipc1), ipc_hash(&ipc2));
+    }
+
+    #[test]
+    fn test_arrow_batch_handle() {
+        let batch = sample_batch();
+        let handle = ArrowBatchHandle::from_batch(batch).unwrap();
+        assert_eq!(handle.row_count, 2);
+        assert_eq!(handle.content_hash.hex().len(), 64);
+    }
+
+    #[test]
+    fn test_arrow_batch_handle_from_ipc() {
+        let batch = sample_batch();
+        let ipc = batch_to_ipc(&batch).unwrap();
+        let handle = ArrowBatchHandle::from_ipc(ipc.clone()).unwrap();
+        assert_eq!(handle.row_count, 2);
+        assert_eq!(handle.ipc_bytes, ipc);
+    }
+
+    #[test]
+    fn test_lazy_handle() {
+        let batch = sample_batch();
+        let lazy = LazyArrowBatchHandle::new(batch.clone());
+        assert_eq!(lazy.row_count, 2);
+        let ipc = lazy.ipc_bytes().unwrap();
+        let decoded = ipc_to_batch(ipc).unwrap();
+        assert_eq!(decoded.num_rows(), 2);
+    }
+
+    #[test]
+    fn test_ipc_to_batch_empty() {
+        let result = ipc_to_batch(&[]);
+        assert!(result.is_err());
+    }
+
+    // ── UTF-8 tests ──────────────────────────────────────────────────────
+
+    fn japanese_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("city", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["田中太郎", "佐藤花子", "鈴木一郎"])),
+                Arc::new(StringArray::from(vec!["東京都", "大阪府", "北海道"])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_ipc_roundtrip_japanese_strings() {
+        let batch = japanese_batch();
+        let ipc = batch_to_ipc(&batch).unwrap();
+        let decoded = ipc_to_batch(&ipc).unwrap();
+        assert_eq!(decoded.num_rows(), 3);
+        let names = decoded
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "田中太郎");
+        assert_eq!(names.value(1), "佐藤花子");
+        assert_eq!(names.value(2), "鈴木一郎");
+        let cities = decoded
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(cities.value(0), "東京都");
+        assert_eq!(cities.value(1), "大阪府");
+        assert_eq!(cities.value(2), "北海道");
+    }
+
+    #[test]
+    fn test_ipc_roundtrip_emoji_mixed_cjk() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "content",
+            DataType::Utf8,
+            false,
+        )]));
+        let strings = vec![
+            "Hello 世界 🌍",
+            "こんにちは 🎌 Rust",
+            "漢字かなカナ ASCII 混在 🚀✨",
+            "🇯🇵 日本語テスト 🏯",
+            "café résumé naïve",
+            "中文简体 繁體中文 한국어",
+        ];
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(strings.clone()))])
+                .unwrap();
+        let ipc = batch_to_ipc(&batch).unwrap();
+        let decoded = ipc_to_batch(&ipc).unwrap();
+        assert_eq!(decoded.num_rows(), strings.len());
+        let col = decoded
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for (i, expected) in strings.iter().enumerate() {
+            assert_eq!(col.value(i), *expected, "mismatch at row {i}");
+        }
+    }
+
+    #[test]
+    fn test_ipc_hash_determinism_non_ascii() {
+        let batch = japanese_batch();
+        let ipc1 = batch_to_ipc(&batch).unwrap();
+        let ipc2 = batch_to_ipc(&batch).unwrap();
+        let h1 = ipc_hash(&ipc1);
+        let h2 = ipc_hash(&ipc2);
+        assert_eq!(h1, h2, "hash must be deterministic for non-ASCII data");
+        assert_eq!(h1.hex().len(), 64);
+
+        // Emoji batch hash determinism
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "emoji",
+            DataType::Utf8,
+            false,
+        )]));
+        let emoji_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["🔥🚀✨", "日本語🎌"]))],
+        )
+        .unwrap();
+        let e1 = batch_to_ipc(&emoji_batch).unwrap();
+        let e2 = batch_to_ipc(&emoji_batch).unwrap();
+        assert_eq!(ipc_hash(&e1), ipc_hash(&e2));
+
+        // Different content must produce different hashes
+        assert_ne!(h1, ipc_hash(&e1));
+    }
+
+    #[test]
+    fn test_ipc_roundtrip_large_utf8_strings() {
+        // Build strings >1KB each with mixed UTF-8
+        let base_jp = "吾輩は猫である。名前はまだ無い。"; // 45 bytes UTF-8
+        let base_emoji = "🌸🗾🏯🎌🍣🍱🎎🎏🎐🎑"; // 40 bytes UTF-8
+        let large_jp: String = base_jp.repeat(40); // ~1800 bytes
+        let large_emoji: String = base_emoji.repeat(30); // ~1200 bytes
+        let large_mixed = format!(
+            "{}---ASCII padding here---{}",
+            "漢字".repeat(100),
+            "α β γ δ ε ζ η θ ι κ ".repeat(20),
+        ); // well over 1KB
+
+        assert!(large_jp.len() > 1024, "large_jp must be >1KB");
+        assert!(large_emoji.len() > 1024, "large_emoji must be >1KB");
+        assert!(large_mixed.len() > 1024, "large_mixed must be >1KB");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![
+                large_jp.as_str(),
+                large_emoji.as_str(),
+                large_mixed.as_str(),
+            ]))],
+        )
+        .unwrap();
+
+        // Stream format roundtrip
+        let ipc = batch_to_ipc(&batch).unwrap();
+        let decoded = ipc_to_batch(&ipc).unwrap();
+        assert_eq!(decoded.num_rows(), 3);
+        let col = decoded
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(col.value(0), large_jp);
+        assert_eq!(col.value(1), large_emoji);
+        assert_eq!(col.value(2), large_mixed);
+
+        // File format roundtrip
+        let ipc_file = batch_to_ipc_file(&batch).unwrap();
+        let file_batches = ipc_file_to_batches(&ipc_file).unwrap();
+        assert_eq!(file_batches.len(), 1);
+        let fcol = file_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(fcol.value(0), large_jp);
+        assert_eq!(fcol.value(1), large_emoji);
+        assert_eq!(fcol.value(2), large_mixed);
+
+        // ArrowBatchHandle roundtrip with large UTF-8
+        let handle = ArrowBatchHandle::from_batch(batch).unwrap();
+        assert_eq!(handle.row_count, 3);
+        let rt = ArrowBatchHandle::from_ipc(handle.ipc_bytes.clone()).unwrap();
+        assert_eq!(rt.content_hash, handle.content_hash);
     }
 }

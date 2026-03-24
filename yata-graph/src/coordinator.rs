@@ -10,8 +10,8 @@ pub struct Partition {
     pub id: u32,
     /// Labels owned by this partition (empty = all labels).
     pub labels: Vec<String>,
-    /// URI of the Lance store for this partition.
-    pub lance_uri: String,
+    /// URI for this partition.
+    pub store_uri: String,
 }
 
 /// Query coordinator that routes Cypher queries to appropriate partitions.
@@ -22,11 +22,11 @@ pub struct Coordinator {
 
 impl Coordinator {
     /// Create a single-partition coordinator (current default).
-    pub fn single(lance_uri: &str) -> Self {
+    pub fn single(store_uri: &str) -> Self {
         let p = Partition {
             id: 0,
             labels: vec![],
-            lance_uri: lance_uri.to_string(),
+            store_uri: store_uri.to_string(),
         };
         Self {
             partitions: vec![p],
@@ -35,7 +35,6 @@ impl Coordinator {
     }
 
     /// Create a label-partitioned coordinator.
-    /// Each label gets its own partition (future: per-label Lance tables).
     pub fn label_partitioned(base_uri: &str, labels: &[String]) -> Self {
         let mut partitions = Vec::new();
         let mut label_to_partition = HashMap::new();
@@ -45,7 +44,7 @@ impl Coordinator {
             partitions.push(Partition {
                 id: i as u32,
                 labels: vec![label.clone()],
-                lance_uri: uri,
+                store_uri: uri,
             });
             label_to_partition.insert(label.clone(), i as u32);
         }
@@ -54,10 +53,13 @@ impl Coordinator {
         partitions.push(Partition {
             id: labels.len() as u32,
             labels: vec![],
-            lance_uri: base_uri.to_string(),
+            store_uri: base_uri.to_string(),
         });
 
-        Self { partitions, label_to_partition }
+        Self {
+            partitions,
+            label_to_partition,
+        }
     }
 
     /// Route a query: given required labels, return partition IDs to query.
@@ -66,7 +68,8 @@ impl Coordinator {
             return self.partitions.iter().map(|p| p.id).collect();
         }
 
-        let mut pids: Vec<u32> = required_labels.iter()
+        let mut pids: Vec<u32> = required_labels
+            .iter()
             .filter_map(|l| self.label_to_partition.get(l))
             .copied()
             .collect();
@@ -102,7 +105,7 @@ mod tests {
         let coord = Coordinator::single("/data/graph");
         assert_eq!(coord.route(&[]).len(), 1);
         assert_eq!(coord.route(&["Person".into()]).len(), 1);
-        assert_eq!(coord.partition(0).unwrap().lance_uri, "/data/graph");
+        assert_eq!(coord.partition(0).unwrap().store_uri, "/data/graph");
     }
 
     #[test]
@@ -152,16 +155,13 @@ mod tests {
         let coord = Coordinator::label_partitioned("/data/graph", &labels);
 
         assert_eq!(
-            coord.partition(0).unwrap().lance_uri,
+            coord.partition(0).unwrap().store_uri,
             "/data/graph/partition_person"
         );
         assert_eq!(
-            coord.partition(1).unwrap().lance_uri,
+            coord.partition(1).unwrap().store_uri,
             "/data/graph/partition_company"
         );
-        assert_eq!(
-            coord.partition(2).unwrap().lance_uri,
-            "/data/graph"
-        );
+        assert_eq!(coord.partition(2).unwrap().store_uri, "/data/graph");
     }
 }

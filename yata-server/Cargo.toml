@@ -3,7 +3,7 @@ name = "yata-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Embedded broker with Raft consensus and Prometheus metrics"
+description = "Embedded broker: graph (Cypher) + objects (CAS), MDAG-native replication"
 
 [[bin]]
 name = "yata-server"
@@ -15,34 +15,38 @@ path = "src/lib.rs"
 
 [dependencies]
 yata-core.workspace = true
+yata-cas.workspace = true
 yata-arrow.workspace = true
-yata-log.workspace = true
-yata-kv.workspace = true
 yata-object.workspace = true
-yata-b2.workspace = true
-yata-ocel.workspace = true
-yata-lance.workspace = true
 yata-client.workspace = true
 yata-graph.workspace = true
-yata-raft.workspace = true
+yata-s3.workspace = true
+yata-store.workspace = true
+yata-engine.workspace = true
+yata-flight.workspace = true
+yata-grin.workspace = true
+arrow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
-ciborium.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 anyhow.workspace = true
 tokio = { workspace = true }
 uuid.workspace = true
-futures.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+axum.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
 arrow = { version = "53", features = ["ipc"] }
 arrow-array = "53"
 arrow-schema = "53"
+tower = "0.5"
+http-body-util = "0.1"
+
+[package.metadata.cargo-machete]
+ignored = ["arrow-array", "arrow-schema"]

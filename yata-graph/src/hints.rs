@@ -1,12 +1,12 @@
 //! Query hint extraction from parsed Cypher AST.
 //!
 //! Walks MATCH clause patterns to collect node labels, relationship types,
-//! and inline property equality filters. Used by `LanceGraphStore` to build
-//! Lance SQL pushdown filters for subgraph loading.
+//! and inline property equality filters. Used by `GraphStore` for
+//! query optimization.
 
 use yata_cypher::ast::*;
 
-/// Hints extracted from a parsed Cypher query for Lance SQL pushdown.
+/// Hints extracted from a parsed Cypher query for query pushdown.
 pub struct QueryHints {
     pub node_labels: Vec<String>,
     pub rel_types: Vec<String>,
@@ -38,7 +38,12 @@ impl QueryHints {
         node_labels.dedup();
         rel_types.dedup();
 
-        Self { node_labels, rel_types, prop_eq_filters, is_read_only }
+        Self {
+            node_labels,
+            rel_types,
+            prop_eq_filters,
+            is_read_only,
+        }
     }
 
     /// Returns true if there are any label or property filters to push down.
@@ -59,11 +64,17 @@ impl QueryHints {
                     Self::visit_pattern(pattern, node_labels, rel_types, prop_eq_filters);
                 }
             }
-            Clause::Create { .. }
-            | Clause::Merge { .. }
-            | Clause::Delete { .. }
-            | Clause::Set { .. }
-            | Clause::Remove { .. } => {
+            Clause::Create { patterns, .. } => {
+                *is_read_only = false;
+                for pattern in patterns {
+                    Self::visit_pattern(pattern, node_labels, rel_types, prop_eq_filters);
+                }
+            }
+            Clause::Merge { pattern, .. } => {
+                *is_read_only = false;
+                Self::visit_pattern(pattern, node_labels, rel_types, prop_eq_filters);
+            }
+            Clause::Delete { .. } | Clause::Set { .. } | Clause::Remove { .. } => {
                 *is_read_only = false;
             }
             Clause::Foreach { body, .. } => {
@@ -110,10 +121,7 @@ impl QueryHints {
 
     /// Extract equality filters from inline property maps like `{name: 'Alice'}`.
     /// Only literal values (string, int, float, bool) are captured.
-    fn extract_prop_eq(
-        props: &[(String, Expr)],
-        out: &mut Vec<(String, String)>,
-    ) {
+    fn extract_prop_eq(props: &[(String, Expr)], out: &mut Vec<(String, String)>) {
         for (key, expr) in props {
             if let Expr::Lit(lit) = expr {
                 let json_val = match lit {
