@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use yata_cypher::Graph;
 use yata_graph::{GraphStore, QueryableGraph};
 use yata_grin::{Mutable, PropValue, Topology};
+use yata_vineyard::BlobStore;
 use yata_store::vineyard::{
     DiskVineyard, EdgeVineyard, FragmentManifest, MmapVineyard, VineyardStore,
 };
@@ -607,93 +608,31 @@ impl TieredGraphEngine {
         );
     }
 
-    /// Snapshot a single label from CSR to Vineyard blob cache (page-out warm tier).
-    fn snapshot_label_to_vineyard(&self, store: &yata_store::MutableCsrStore, label: &str) {
-        use yata_grin::{Property, Scannable};
-        use yata_store::arrow_codec;
-        use yata_store::blocks::{EdgeBlock, LabelEdgeGroup, LabelVertexGroup, VertexBlock};
+    /// Snapshot CSR to Vineyard blob cache using ArrowFragment format (NbrUnit zero-copy CSR).
+    ///
+    /// Converts full MutableCsrStore → ArrowFragment → BlobStore → VineyardStore blobs.
+    /// ArrowFragment uses packed NbrUnit (16B per edge, zero-copy cast) for ~2x faster
+    /// neighbor traversal vs the old per-label Arrow IPC + JSON topology approach.
+    fn snapshot_label_to_vineyard(&self, store: &yata_store::MutableCsrStore, _label: &str) {
+        let partition_id = store.partition_id_raw().get();
+        let frag = yata_vineyard::convert::csr_to_fragment(store, partition_id);
+        let blob_store = yata_vineyard::MemoryBlobStore::new();
+        let meta = frag.serialize(&blob_store);
 
-        // Vertex group
-        let vids: Vec<u32> = Scannable::scan_vertices_by_label(store, label);
-        if !vids.is_empty() {
-            let mut vertices = Vec::new();
-            for &vid in &vids {
-                let labels = Property::vertex_labels(store, vid);
-                let prop_keys = store.vertex_prop_keys(label);
-                let props: Vec<(String, PropValue)> = prop_keys
-                    .iter()
-                    .filter_map(|k| store.vertex_prop(vid, k).map(|v| (k.clone(), v)))
-                    .collect();
-                vertices.push(VertexBlock { vid, labels, props });
-            }
-            let group = LabelVertexGroup {
-                count: vertices.len() as u32,
-                label: label.to_string(),
-                vertices,
-            };
-            if let Ok(arrow_bytes) = arrow_codec::encode_vertex_group(&group) {
-                let meta = yata_store::ObjectMeta {
+        // Transfer ArrowFragment blobs into VineyardStore
+        for (name, blob_id) in &meta.blobs {
+            if let Some(data) = blob_store.get(blob_id) {
+                let obj_meta = yata_store::ObjectMeta {
                     id: yata_store::ObjectId(0),
                     blob_type: yata_store::BlobType::ArrowVertexGroup,
-                    label: label.to_string(),
-                    partition_id: store.partition_id_raw().get(),
+                    label: name.clone(),
+                    partition_id,
                     size_bytes: 0,
-                    r2_key: format!("snap/v/{label}.arrow"),
+                    r2_key: format!("snap/fragment/{partition_id}/{name}"),
                     fields: std::collections::HashMap::new(),
                     created_at: 0,
                 };
-                self.vineyard.put(meta, bytes::Bytes::from(arrow_bytes));
-            }
-        }
-
-        // Edge group
-        let edge_count = store.edge_count_raw();
-        let mut edges = Vec::new();
-        for eid in 0..edge_count as usize {
-            if !store.edge_alive_raw().get(eid).copied().unwrap_or(false) {
-                continue;
-            }
-            let elabel = store
-                .edge_labels_raw()
-                .get(eid)
-                .cloned()
-                .unwrap_or_default();
-            if elabel != label {
-                continue;
-            }
-            let src = store.edge_src_raw().get(eid).copied().unwrap_or(0);
-            let dst = store.edge_dst_raw().get(eid).copied().unwrap_or(0);
-            let props: Vec<(String, PropValue)> = store
-                .edge_props_raw()
-                .get(eid)
-                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                .unwrap_or_default();
-            edges.push(EdgeBlock {
-                edge_id: eid as u32,
-                src,
-                dst,
-                label: elabel,
-                props,
-            });
-        }
-        if !edges.is_empty() {
-            let group = LabelEdgeGroup {
-                count: edges.len() as u32,
-                label: label.to_string(),
-                edges,
-            };
-            if let Ok(arrow_bytes) = arrow_codec::encode_edge_group(&group) {
-                let meta = yata_store::ObjectMeta {
-                    id: yata_store::ObjectId(0),
-                    blob_type: yata_store::BlobType::ArrowEdgeGroup,
-                    label: label.to_string(),
-                    partition_id: store.partition_id_raw().get(),
-                    size_bytes: 0,
-                    r2_key: format!("snap/e/{label}.arrow"),
-                    fields: std::collections::HashMap::new(),
-                    created_at: 0,
-                };
-                self.vineyard.put(meta, bytes::Bytes::from(arrow_bytes));
+                self.vineyard.put(obj_meta, data);
             }
         }
     }

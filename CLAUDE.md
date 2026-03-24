@@ -273,8 +273,22 @@ Key: Neighbor O(1) any scale. CSR Build <1s at 100K. Memory ~782MB/100K → stan
 
 `mergeResults()` correctly handles GROUP BY + aggregate functions (COUNT, SUM, AVG, MIN, MAX). AVG is computed from per-partition sum/count.
 
+## CRITICAL: Build (cargo zigbuild)
+
+```bash
+# macOS → linux/amd64 cross-compile (標準パス)
+RUSTC_WRAPPER="" cargo zigbuild --manifest-path packages/server/yata/Cargo.toml \
+  --release --target x86_64-unknown-linux-gnu -p yata-server  # ~1m24s
+```
+
+- **TLS**: `ureq` + `rustls` (ring backend)。`aws-lc-sys` / `reqwest` は除去済み (cross-compile 障害)
+- **sccache 禁止**: `RUSTC_WRAPPER=""` 必須 (cc-rs が sccache 経由で C compiler を探して失敗)
+- **rest.rs 変更後は必ず rebuild** → バイナリが古いと `/xrpc/ai.gftd.yata.cypher` が 404
+
 ## 禁止事項
 
 - **R2 以外を source of truth にする禁止** — R2 が正本
 - **JSON RPC で graph data 転送禁止** — Workers RPC (structured clone) + ArrayBuffer
 - **lite instance 禁止** — standard-1 以上 (lite は CSR rebuild 遅すぎ)
+- **`reqwest` crate 再追加禁止** — `aws-lc-sys` (OpenSSL/BoringSSL C cross-compile) を引き込む。`ureq` + `rustls` を使用
+- **`RUSTC_WRAPPER=sccache` での cross-compile 禁止** — `cargo zigbuild` を使用
