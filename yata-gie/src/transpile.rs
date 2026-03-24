@@ -300,7 +300,7 @@ fn transpile_predicate(expr: &Expr) -> Result<Predicate, TranspileError> {
             BinOp::Gt => prop_cmp_predicate(lhs, rhs, |k, v| Predicate::Gt(k, v)),
             _ => Err(TranspileError::UnsupportedExpr(format!("binop {op:?}"))),
         },
-        Expr::IsNotNull(inner) => {
+        Expr::IsNotNull(_inner) => {
             // IS NOT NULL → True (always passes, approximate)
             Ok(Predicate::True)
         }
@@ -316,7 +316,7 @@ fn prop_cmp_predicate(
     make: impl Fn(String, PropValue) -> Predicate,
 ) -> Result<Predicate, TranspileError> {
     // n.key = value
-    if let Expr::Prop(base, key) = lhs {
+    if let Expr::Prop(_base, key) = lhs {
         if let Expr::Lit(lit) = rhs {
             return Ok(make(key.clone(), literal_to_prop(lit)));
         }
@@ -328,7 +328,7 @@ fn prop_cmp_predicate(
         }
     }
     // value = n.key (reversed)
-    if let Expr::Prop(base, key) = rhs {
+    if let Expr::Prop(_base, key) = rhs {
         if let Expr::Lit(lit) = lhs {
             return Ok(make(key.clone(), literal_to_prop(lit)));
         }

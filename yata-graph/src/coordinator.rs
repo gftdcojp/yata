@@ -1,6 +1,6 @@
 //! Graph query coordinator — routes queries to partitions and merges results.
 //! Single-node mode: all partitions are local (passthrough).
-//! Future: multi-node routing via gRPC.
+//! Future: multi-node routing via Workers RPC.
 
 use std::collections::HashMap;
 

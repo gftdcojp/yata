@@ -48,6 +48,7 @@ pub fn routes(state: FlightSqlHttpState) -> Router {
 struct SqlRequest {
     sql: String,
     #[serde(default = "default_params")]
+    #[allow(dead_code)]
     params: String,
 }
 
@@ -186,7 +187,7 @@ async fn flight_query(
 async fn flight_exec(
     State(state): State<FlightSqlHttpState>,
     headers: HeaderMap,
-    Json(req): Json<SqlRequest>,
+    Json(_req): Json<SqlRequest>,
 ) -> impl IntoResponse {
     if let Err(status) = authorize(&headers, &state) {
         return (status, Json(ErrorResponse { error: "unauthorized".into() })).into_response();

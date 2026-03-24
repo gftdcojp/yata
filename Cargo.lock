@@ -3329,12 +3329,9 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "chrono",
- "ciborium",
- "ed25519-dalek",
  "indexmap",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "tokio",
  "tracing",

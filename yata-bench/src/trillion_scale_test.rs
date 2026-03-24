@@ -9,7 +9,7 @@
 //!   SCALE=large    (10M, load test)
 //!   SCALE_JSON=1   (JSON output)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -220,7 +220,7 @@ fn run_coverage(s: Scale) -> CoverageReport {
     }
     let total: usize = counts.iter().sum();
     t.assert_eq("total_vertices", total as u64 >= s.nodes, true);
-    let expected_per = s.nodes as f64 / s.partitions as f64;
+    let _expected_per = s.nodes as f64 / s.partitions as f64;
     for (pid, &count) in counts.iter().enumerate() {
         // Each partition should have at least 25% of expected (accounting for ghosts)
         t.assert_true(&format!("partition_{}_has_vertices", pid), count > 0);
@@ -381,7 +381,7 @@ fn run_load(s: Scale) -> LoadReport {
 
 // ── Security tests ──
 
-fn run_security(s: Scale) -> SecurityReport {
+fn run_security(_s: Scale) -> SecurityReport {
     eprintln!("  security: RLS partition isolation...");
     let mut t = TestRunner::new();
 

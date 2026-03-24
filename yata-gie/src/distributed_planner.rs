@@ -7,7 +7,6 @@
 //! Exchange/Receive are no-op passthrough in the current single-partition executor.
 
 use crate::ir::*;
-use yata_grin::Direction;
 
 /// Split a QueryPlan into a DistributedPlan for N partitions.
 ///
@@ -161,6 +160,7 @@ pub fn requires_distribution(plan: &QueryPlan) -> bool {
 mod tests {
     use super::*;
     use crate::planner::PlanBuilder;
+    use yata_grin::Direction;
 
     #[test]
     fn test_single_partition_no_exchange() {

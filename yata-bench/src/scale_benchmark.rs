@@ -208,6 +208,7 @@ fn bench_cypher(graph: &mut MemoryGraph, cypher: &str) -> u64 {
 
 // ── GIE benchmarks ──────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 fn bench_gie_count(store: &MutableCsrStore) -> u64 {
     let plan = QueryPlan {
         ops: vec![

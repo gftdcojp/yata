@@ -87,7 +87,7 @@ impl CommitLog {
     }
 
     /// Try to restore HEAD from CAS store (works with S3CasStore which has restore_head()).
-    fn try_restore_head_from_cas(cas: &dyn CasStore) -> Option<Blake3Hash> {
+    fn try_restore_head_from_cas(_cas: &dyn CasStore) -> Option<Blake3Hash> {
         // S3CasStore stores HEAD at well-known key. We try to read it by downcasting
         // or by checking if the CAS has a `restore_head` method via the trait object.
         // Since CasStore trait doesn't have restore_head, we use a convention:

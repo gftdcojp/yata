@@ -927,7 +927,7 @@ impl TieredGraphEngine {
                         // If _rls_clearance param is present → new governance model → use GIE SecurityFilter.
                         // Otherwise → old org_id model → fall through to MemoryGraph path.
                         let has_clearance = params.iter().any(|(k, _)| k == "_rls_clearance");
-                        let use_gie_security = rls_org_id.is_none() || has_clearance;
+                        let _use_gie_security = rls_org_id.is_none() || has_clearance;
 
                         let plan_result = if rls_org_id.is_some() && has_clearance {
                             let rls = build_rls_scope_from_params(rls_org_id.unwrap(), params);

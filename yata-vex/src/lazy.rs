@@ -55,7 +55,7 @@ impl LazyVectorIndex {
     /// Create with a data directory for disk persistence.
     pub fn with_data_dir(dim: usize, metric: DistanceMetric, data_dir: impl Into<PathBuf>) -> Self {
         let dir = data_dir.into();
-        let mut idx = Self::new(dim, metric);
+        let idx = Self::new(dim, metric);
         *idx.data_dir.write().unwrap() = Some(dir);
         idx
     }

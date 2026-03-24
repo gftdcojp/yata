@@ -57,10 +57,13 @@ PDS Container (Rust) は不要 — 全て TS Worker + Pipeline + YATA_RPC。
 
 ```ts
 // Bind: { service: "magatama-yata", entrypoint: "YataRPC" }
+// Transport: Workers RPC only (gRPC 除去済み)
+// Container XRPC: /xrpc/ai.gftd.yata.cypher (unified read+write)
 
-env.YATA.cypher(cypher, appId)   // unified Cypher path
+env.YATA.cypher(cypher, appId)   // unified Cypher path → /xrpc/ai.gftd.yata.cypher
 env.YATA.query(cypher, appId)    // read-only alias
 env.YATA.mutate(cypher, appId)   // CREATE → random partition, DELETE → broadcast
+env.YATA.sql(query, appId)       // Flight SQL → /xrpc/ai.gftd.yata.flightSqlQuery
 env.YATA.health()                // → partition-0 Container
 env.YATA.ping()                  // "pong" (no wake)
 env.YATA.stats()                 // → all partition stats
@@ -81,7 +84,7 @@ env.YATA.stats()                 // → all partition stats
 | `yata-bench` | Benchmarks + trillion-scale test + 10K-10M scale benchmarks (scale_benchmark.rs) |
 | ~~`yata-at`~~ | **除去済み** — AT Protocol integration は `wproto-compat` に移行 |
 | ~~`yata-signal`~~ | **除去済み** — Signal Protocol は `wproto-signal` に移行 |
-| `yata-server` | REST API server。`rest.rs` moved from yata workspace root。`GraphQueryExecutor` trait (standalone, inline query method + snapshot ops) |
+| `yata-server` | XRPC API server (`/xrpc/ai.gftd.yata.*`)。Workers RPC only transport。`GraphQueryExecutor` trait (standalone, inline query method + snapshot ops) |
 
 ## GraphScope Parity
 
