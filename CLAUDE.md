@@ -245,7 +245,7 @@ CSR neighbor lookup: O(1) any scale
 
 ## Test Coverage
 
-1031+ Rust unit tests, 0 failures. Production: 32/32 E2E pass, p50=28ms. 2-partition: verified. 4-partition: cold start timeout (known limitation — sleeping Container wake exceeds Worker timeout).
+988+ Rust unit tests, 0 warnings, 0 failures. Production: 32/32 E2E pass, p50=28ms. 2-partition: verified. 4-partition: cold start timeout (known limitation — sleeping Container wake exceeds Worker timeout).
 
 ## Benchmark (measured, release build)
 
