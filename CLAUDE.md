@@ -58,7 +58,7 @@ PDS Container (Rust) は不要 — 全て TS Worker + Pipeline + YATA_RPC。
 
 ```ts
 // Bind: { service: "ai-gftd-yata", entrypoint: "YataRPC" }
-// Transport: Workers RPC only (gRPC 除去済み)
+// Transport: Workers RPC only
 // Container XRPC: /xrpc/ai.gftd.yata.cypher (unified read+write)
 
 env.YATA.cypher(cypher, appId)   // unified Cypher path → /xrpc/ai.gftd.yata.cypher
