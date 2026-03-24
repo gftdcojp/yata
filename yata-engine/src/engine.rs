@@ -272,11 +272,10 @@ impl TieredGraphEngine {
             hot: Arc::new(Mutex::new(hot_store)),
             warm,
             cache: Arc::new(Mutex::new(cache)),
-            // false if S3 configured → triggers page_in_from_r2 on first query
-            // true if no S3 → engine starts empty (writes create new data)
-            hot_initialized: Arc::new(AtomicBool::new(
-                std::env::var("YATA_S3_ENDPOINT").unwrap_or_default().is_empty()
-            )),
+            // Default false: first read triggers page_in_from_r2.
+            // Writes are append-only (no page-in needed).
+            // Snapshot compaction merges R2 existing + in-memory pending.
+            hot_initialized: Arc::new(AtomicBool::new(false)),
             loaded_labels: Arc::new(Mutex::new(HashSet::new())),
             vineyard,
             fragment_manifest: Arc::new(Mutex::new(None)),
@@ -861,8 +860,9 @@ impl TieredGraphEngine {
         pk_value: &str,
         props: &[(&str, yata_grin::PropValue)],
     ) -> Result<u32, String> {
-        // Ensure label is loaded from R2 (page-in)
-        self.ensure_labels(&[label], &[]);
+        // Append-only write: NO page-in required.
+        // PK dedup is done within the in-memory store only.
+        // Full dedup against R2 data happens during snapshot compaction.
         self.dirty.store(true, Ordering::Relaxed);
 
         if let Ok(mut hot) = self.hot.lock() {
@@ -875,7 +875,7 @@ impl TieredGraphEngine {
                 }
                 return Ok(vid);
             }
-            // Legacy CSR path
+            // CSR path
             if let Some(single) = hot.as_single_mut() {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
                 let vid = single.merge_by_pk(label, pk_key, &pk, props);
@@ -914,12 +914,12 @@ impl TieredGraphEngine {
         Err("failed to acquire hot store lock".into())
     }
 
-    /// Trigger R2 snapshot: CSR → ArrowFragment → BlobStore → R2 PUT.
+    /// Trigger R2 snapshot with compaction: page-in existing R2 → merge with in-memory → upload.
     ///
-    /// Uses yata-vineyard ArrowFragment format with NbrUnit zero-copy CSR.
-    /// ~2000x faster serialize, ~50% smaller blobs vs legacy SnapshotBundle.
+    /// Append-only writes don't page-in, so in-memory CSR may only have new records.
+    /// Snapshot compacts: R2 existing + in-memory new → full ArrowFragment → R2 PUT.
     pub fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
-        // Skip if no mutations since last snapshot (avoid redundant R2 uploads)
+        // Skip if no mutations since last snapshot
         if !self.dirty.load(Ordering::Relaxed) {
             return Ok((0, 0));
         }
@@ -928,7 +928,47 @@ impl TieredGraphEngine {
             .ok_or_else(|| "S3 client not configured".to_string())?;
         let prefix = &self.s3_prefix;
 
-        // Serialize CSR → ArrowFragment → MemoryBlobStore
+        // Compaction: merge R2 existing data into in-memory CSR before snapshot.
+        // This ensures append-only writes get merged with prior R2 data.
+        if !self.hot_initialized.load(Ordering::Relaxed) {
+            // Page-in existing R2 data first, then merge with pending writes
+            if let Ok(existing) = crate::loader::page_in_from_r2(
+                &s3, prefix, self.config.hot_partition_id,
+            ) {
+                let existing_vc = existing.vertex_count();
+                if existing_vc > 0 {
+                    if let Ok(mut hot) = self.hot.lock() {
+                        if let Some(single) = hot.as_single_mut() {
+                            // Merge existing R2 data into current CSR
+                            // (existing vertices that aren't in pending get added)
+                            use yata_grin::{Scannable, Property, Schema as GrinSchema};
+                            for label in GrinSchema::vertex_labels(&existing) {
+                                for vid in Scannable::scan_vertices_by_label(&existing, &label) {
+                                    let props: Vec<(String, yata_grin::PropValue)> = existing
+                                        .vertex_prop_keys(&label)
+                                        .iter()
+                                        .filter_map(|k| existing.vertex_prop(vid, k).map(|v| (k.clone(), v)))
+                                        .collect();
+                                    let props_ref: Vec<(&str, yata_grin::PropValue)> =
+                                        props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                                    // merge_by_pk handles dedup: if PK exists in pending, skip
+                                    if let Some(pk_val) = props.iter().find(|(k, _)| k == "rkey").map(|(_, v)| v.clone()) {
+                                        single.merge_by_pk(&label, "rkey", &pk_val, &props_ref);
+                                    } else {
+                                        single.add_vertex(&label, &props_ref);
+                                    }
+                                }
+                            }
+                            single.commit();
+                            tracing::info!(existing_vertices = existing_vc, "compacted R2 data into CSR");
+                        }
+                    }
+                }
+            }
+            self.hot_initialized.store(true, Ordering::Relaxed);
+        }
+
+        // Serialize compacted CSR → ArrowFragment → MemoryBlobStore
         let (v_count, e_count, blob_store, meta) = if let Ok(csr) = self.hot.lock() {
             let store = csr.as_single()
                 .ok_or_else(|| "no CSR store available".to_string())?;
