@@ -32,6 +32,7 @@ path = "src/scale_benchmark.rs"
 [dependencies]
 yata-core.workspace = true
 yata-arrow.workspace = true
+yata-object.workspace = true
 yata-cypher.workspace = true
 yata-engine.workspace = true
 yata-store.workspace = true

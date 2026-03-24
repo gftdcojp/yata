@@ -11,7 +11,7 @@ pub mod rest;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use yata_cas::{CasStore, LocalCasStore};
+use yata_object::cas::{CasStore, LocalCasStore};
 use yata_core::OcelEventDraft;
 use yata_core::{ObjectStorage, Result};
 use yata_object::LocalObjectStore;

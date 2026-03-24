@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::mpsc;
-use yata_cas::{CasStore, LocalCasStore};
+use yata_object::cas::{CasStore, LocalCasStore};
 use yata_core::Blake3Hash;
 
 use crate::s3::S3Client;
@@ -102,7 +102,7 @@ impl AsyncS3CasStore {
     }
 
     /// Fetch from S3 and cache locally.
-    async fn fetch_remote(&self, hash: &Blake3Hash) -> yata_cas::Result<Option<Bytes>> {
+    async fn fetch_remote(&self, hash: &Blake3Hash) -> yata_object::cas::Result<Option<Bytes>> {
         let key = self.remote_key(hash);
         match self.remote.get(&key).await {
             Ok(Some(data)) => {
@@ -110,7 +110,7 @@ impl AsyncS3CasStore {
                 Ok(Some(data))
             }
             Ok(None) => Ok(None),
-            Err(e) => Err(yata_cas::CasError::Io(std::io::Error::new(
+            Err(e) => Err(yata_object::cas::CasError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 e.to_string(),
             ))),
@@ -162,7 +162,7 @@ impl AsyncS3CasStore {
 
 #[async_trait]
 impl CasStore for AsyncS3CasStore {
-    async fn put(&self, data: Bytes) -> yata_cas::Result<Blake3Hash> {
+    async fn put(&self, data: Bytes) -> yata_object::cas::Result<Blake3Hash> {
         let hash = self.local.put(data.clone()).await?;
         let key = self.remote_key(&hash);
         // Non-blocking enqueue
@@ -170,34 +170,34 @@ impl CasStore for AsyncS3CasStore {
         Ok(hash)
     }
 
-    async fn get(&self, hash: &Blake3Hash) -> yata_cas::Result<Option<Bytes>> {
+    async fn get(&self, hash: &Blake3Hash) -> yata_object::cas::Result<Option<Bytes>> {
         if let Some(data) = self.local.get(hash).await? {
             return Ok(Some(data));
         }
         self.fetch_remote(hash).await
     }
 
-    async fn has(&self, hash: &Blake3Hash) -> yata_cas::Result<bool> {
+    async fn has(&self, hash: &Blake3Hash) -> yata_object::cas::Result<bool> {
         if self.local.has(hash).await? {
             return Ok(true);
         }
         let key = self.remote_key(hash);
         self.remote.head(&key).await.map_err(|e| {
-            yata_cas::CasError::Io(std::io::Error::new(
+            yata_object::cas::CasError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 e.to_string(),
             ))
         })
     }
 
-    async fn put_at(&self, hash: Blake3Hash, data: Bytes) -> yata_cas::Result<()> {
+    async fn put_at(&self, hash: Blake3Hash, data: Bytes) -> yata_object::cas::Result<()> {
         self.local.put_at(hash.clone(), data.clone()).await?;
         let key = self.remote_key(&hash);
         let _ = self.tx.try_send(S3PutRequest { key, data, lsn: 0 });
         Ok(())
     }
 
-    async fn get_raw(&self, hash: &Blake3Hash) -> yata_cas::Result<Option<Bytes>> {
+    async fn get_raw(&self, hash: &Blake3Hash) -> yata_object::cas::Result<Option<Bytes>> {
         if let Some(data) = self.local.get_raw(hash).await? {
             return Ok(Some(data));
         }

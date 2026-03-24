@@ -16,12 +16,14 @@
 //! Larger objects use fixed 128MB chunks (Shannon-optimal for R2 FUSE:
 //! η=92.8%, ≤200MB single-PUT, fits CF Container 256MB RAM).
 
+pub mod cas;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use yata_cas::CasStore;
+use cas::CasStore;
 use yata_core::{
     Blake3Hash, ChunkRef, ObjectId, ObjectManifest, ObjectMeta, ObjectStorage, Result, YataError,
 };
@@ -72,7 +74,7 @@ impl LocalObjectStore {
     ) -> std::io::Result<Self> {
         let base_dir = base_dir.into();
         let cas_dir = base_dir.join("cas");
-        let cas: Arc<dyn CasStore> = Arc::new(yata_cas::LocalCasStore::new(&cas_dir).await?);
+        let cas: Arc<dyn CasStore> = Arc::new(cas::LocalCasStore::new(&cas_dir).await?);
         tokio::fs::create_dir_all(base_dir.join("manifests")).await?;
         tokio::fs::create_dir_all(base_dir.join("pins")).await?;
         Ok(Self {

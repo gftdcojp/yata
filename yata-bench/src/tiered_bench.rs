@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use rand::{Rng, SeedableRng, rngs::StdRng};
-use yata_cas::LocalCasStore;
+use yata_object::cas::LocalCasStore;
 use yata_engine::TieredGraphEngine;
 use yata_engine::config::{PersistenceMode, TieredEngineConfig};
 
@@ -76,7 +76,7 @@ fn make_engine(dir: &std::path::Path) -> TieredGraphEngine {
 
 fn make_engine_with_cas(
     dir: &std::path::Path,
-    cas: Arc<dyn yata_cas::CasStore>,
+    cas: Arc<dyn yata_object::cas::CasStore>,
 ) -> TieredGraphEngine {
     let config = engine_config();
     TieredGraphEngine::with_cas(config, dir.to_str().unwrap(), cas)

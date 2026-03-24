@@ -8,7 +8,6 @@ description = "S3-compatible object storage client for Cloudflare R2 (ureq sync 
 [dependencies]
 yata-core.workspace = true
 yata-object.workspace = true
-yata-cas.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 serde.workspace = true

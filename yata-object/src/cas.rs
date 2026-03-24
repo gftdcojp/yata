@@ -1,13 +1,7 @@
-#![allow(dead_code)]
-
 //! Content-addressed chunk storage.
 //!
 //! `CasStore` stores arbitrary byte blobs keyed by Blake3 hash.
 //! Layout: `<base>/<hash[0..2]>/<hash[2..4]>/<full_hex_hash>`
-//!
-//! NOTE: Authoritative source is `wproto::cas`. This crate retains its own
-//! implementation for backward compatibility (no circular dependency).
-//! New code should prefer `wproto::cas` when available.
 
 use async_trait::async_trait;
 use bytes::Bytes;
