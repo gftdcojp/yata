@@ -24,21 +24,9 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
         rls_org_id: Option<&str>,
     ) -> Result<Vec<Vec<(String, String)>>, String>;
 
-    fn import_blob(
-        &self,
-        label: &str,
-        blob_type: yata_store::BlobType,
-        partition_id: u32,
-        r2_key: &str,
-        data: bytes::Bytes,
-    ) -> yata_store::ObjectId;
-
     fn rebuild_from_r2(&self);
 
     fn force_snapshot_flush(&self);
-
-    
-    fn export_blob(&self, obj_id: yata_store::ObjectId) -> Option<bytes::Bytes>;
 
     fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
         Err("trigger_snapshot not implemented".to_string())
@@ -68,13 +56,7 @@ pub fn router<G: GraphQueryExecutor>(state: YataRestState<G>) -> Router {
         .route("/xrpc/ai.gftd.yata.cypher", post(xrpc_cypher::<G>))
         .route("/xrpc/ai.gftd.yata.flightSqlQuery", post(flight_sql_query::<G>))
         .route("/xrpc/ai.gftd.yata.triggerSnapshot", post(trigger_snapshot_handler::<G>))
-        // DO R2 proxy snapshot endpoints
-        .route("/internal/snapshot/import-manifest", post(import_snapshot_manifest::<G>))
-        .route("/internal/snapshot/import-blob", post(import_snapshot_blob::<G>))
         .route("/internal/snapshot/rebuild", post(rebuild_from_snapshot::<G>))
-        .route("/internal/snapshot/export-manifest", get(export_snapshot_manifest::<G>))
-        .route("/internal/snapshot/export-blob", get(export_snapshot_blob::<G>))
-        .route("/internal/diag/page-in", post(diag_page_in::<G>))
         .with_state(state)
 }
 
@@ -266,113 +248,8 @@ async fn xrpc_cypher<G: GraphQueryExecutor>(
 // snapshot data between R2 and the Container's Vineyard store.
 // The Container itself doesn't need S3 HTTP access — the DO handles R2 I/O.
 
-/// Per-restore session state: holds the manifest and imported blob ObjectIds.
-/// This is cleared after rebuild completes.
-static IMPORT_SESSION: std::sync::LazyLock<Mutex<Option<SnapshotImportSession>>> =
-    std::sync::LazyLock::new(|| Mutex::new(None));
 
-struct SnapshotImportSession {
-    manifest: yata_engine::snapshot::SnapshotManifest,
-    vertex_blobs: HashMap<String, yata_store::ObjectId>,
-    edge_blobs: HashMap<String, yata_store::ObjectId>,
-}
-
-/// POST /internal/snapshot/import-manifest — Store manifest JSON for an in-progress restore.
-async fn import_snapshot_manifest<G: GraphQueryExecutor>(
-    State(_state): State<YataRestState<G>>,
-    body: axum::body::Bytes,
-) -> impl IntoResponse {
-    let manifest: yata_engine::snapshot::SnapshotManifest = match serde_json::from_slice(&body) {
-        Ok(m) => m,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("invalid manifest: {e}")})),
-            );
-        }
-    };
-    tracing::info!(
-        vertices = manifest.vertex_count,
-        edges = manifest.edge_count,
-        v_labels = manifest.vertex_labels.len(),
-        e_labels = manifest.edge_labels.len(),
-        "snapshot import: manifest received"
-    );
-    if let Ok(mut session) = IMPORT_SESSION.lock() {
-        *session = Some(SnapshotImportSession {
-            manifest,
-            vertex_blobs: HashMap::new(),
-            edge_blobs: HashMap::new(),
-        });
-    }
-    (StatusCode::OK, Json(serde_json::json!({"ok": true})))
-}
-
-#[derive(Deserialize)]
-struct ImportBlobParams {
-    label: String,
-    #[serde(rename = "type")]
-    blob_type: String, // "vertex" or "edge"
-}
-
-/// POST /internal/snapshot/import-blob?label=X&type=vertex — Import an Arrow IPC blob.
-async fn import_snapshot_blob<G: GraphQueryExecutor>(
-    State(state): State<YataRestState<G>>,
-    Query(params): Query<ImportBlobParams>,
-    body: axum::body::Bytes,
-) -> impl IntoResponse {
-    let (bt, r2_key) = match params.blob_type.as_str() {
-        "vertex" => (
-            yata_store::BlobType::ArrowVertexGroup,
-            format!("snap/v/{}.arrow", params.label),
-        ),
-        "edge" => (
-            yata_store::BlobType::ArrowEdgeGroup,
-            format!("snap/e/{}.arrow", params.label),
-        ),
-        other => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("unknown blob type: {other}")})),
-            );
-        }
-    };
-
-    let partition_id = IMPORT_SESSION
-        .lock()
-        .ok()
-        .and_then(|s| s.as_ref().map(|sess| sess.manifest.partition_id.get()))
-        .unwrap_or(0);
-
-    let obj_id = state.graph.import_blob(
-        &params.label,
-        bt,
-        partition_id,
-        &r2_key,
-        bytes::Bytes::from(body.to_vec()),
-    );
-
-    // Track the ObjectId in the import session
-    if let Ok(mut session) = IMPORT_SESSION.lock() {
-        if let Some(ref mut sess) = *session {
-            match params.blob_type.as_str() {
-                "vertex" => { sess.vertex_blobs.insert(params.label.clone(), obj_id); }
-                "edge" => { sess.edge_blobs.insert(params.label.clone(), obj_id); }
-                _ => {}
-            }
-        }
-    }
-
-    tracing::info!(
-        label = %params.label,
-        blob_type = %params.blob_type,
-        bytes = body.len(),
-        "snapshot import: blob received"
-    );
-    (StatusCode::OK, Json(serde_json::json!({"ok": true, "object_id": obj_id.0})))
-}
-
-/// POST /internal/snapshot/rebuild — Rebuild CSR from imported Vineyard blobs.
+/// POST /internal/snapshot/rebuild — Rebuild CSR from R2 ArrowFragment.
 async fn rebuild_from_snapshot<G: GraphQueryExecutor>(
     State(state): State<YataRestState<G>>,
 ) -> impl IntoResponse {
@@ -424,10 +301,10 @@ async fn trigger_snapshot_handler<G: GraphQueryExecutor>(
     }
 }
 
-/// GET /internal/snapshot/export-manifest — Return the current fragment manifest.
-async fn export_snapshot_manifest<G: GraphQueryExecutor>(
-    State(state): State<YataRestState<G>>,
-) -> impl IntoResponse {
+// Legacy snapshot import/export/diag endpoints removed.
+// ArrowFragment format: snapshot → R2 PUT (trigger_snapshot), page-in → R2 GET (ensure_labels).
+
+// ── FlightSQL ─────────────────────────────────────────────────────────
     let graph = state.graph.clone();
     let result = tokio::task::spawn_blocking(move || {
         graph.force_snapshot_flush();
