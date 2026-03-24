@@ -601,6 +601,9 @@ impl TieredGraphEngine {
         mutation_ctx: Option<&MutationContext>,
     ) -> Result<Vec<Vec<(String, String)>>, String> {
         let is_mutation = router::is_cypher_mutation(cypher);
+        if is_mutation {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
 
         // Cache lookup (reads only)
         if !is_mutation {
