@@ -8,8 +8,12 @@ description = "Vineyard-native ArrowFragment format for yata graph engine"
 
 [dependencies]
 yata-arrow = { workspace = true }
+yata-grin = { path = "../yata-grin" }
+yata-core = { path = "../yata-core" }
 
 arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
 
 bytes = { workspace = true }
 serde = { workspace = true }
