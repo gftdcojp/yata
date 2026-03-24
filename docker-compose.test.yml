@@ -1,11 +1,6 @@
-version: "3.8"
-
 # Local test: yata-server + MinIO (S3-compatible)
 # Usage:
 #   docker compose -f docker-compose.test.yml up -d
-#   # Wait for MinIO init, then:
-#   curl http://localhost:8081/health
-#   # Run test suite:
 #   cargo test -p yata-server --test e2e_minio -- --nocapture
 
 services:
@@ -99,6 +94,86 @@ services:
     volumes:
       - yata-data-p1:/data/yata
 
+  yata-p2:
+    build: { context: ., dockerfile: Dockerfile.test }
+    depends_on: { minio-init: { condition: service_completed_successfully } }
+    ports: ["8085:8081"]
+    environment:
+      RUST_LOG: info
+      YATA_S3_ENDPOINT: http://minio:9000
+      YATA_S3_BUCKET: yata
+      YATA_S3_ACCESS_KEY_ID: minioadmin
+      YATA_S3_SECRET_ACCESS_KEY: minioadmin
+      YATA_S3_REGION: us-east-1
+      YATA_S3_PREFIX: "yata/partitions/2/"
+      YATA_DATA_DIR: /data/yata
+      YATA_REST_PORT: "8081"
+      YATA_API_SECRET: test-token
+      YATA_HOT_PARTITION_ID: "2"
+      PERFORMER_ID: yata-test-p2
+    volumes: [yata-data-p2:/data/yata]
+
+  yata-p3:
+    build: { context: ., dockerfile: Dockerfile.test }
+    depends_on: { minio-init: { condition: service_completed_successfully } }
+    ports: ["8086:8081"]
+    environment:
+      RUST_LOG: info
+      YATA_S3_ENDPOINT: http://minio:9000
+      YATA_S3_BUCKET: yata
+      YATA_S3_ACCESS_KEY_ID: minioadmin
+      YATA_S3_SECRET_ACCESS_KEY: minioadmin
+      YATA_S3_REGION: us-east-1
+      YATA_S3_PREFIX: "yata/partitions/3/"
+      YATA_DATA_DIR: /data/yata
+      YATA_REST_PORT: "8081"
+      YATA_API_SECRET: test-token
+      YATA_HOT_PARTITION_ID: "3"
+      PERFORMER_ID: yata-test-p3
+    volumes: [yata-data-p3:/data/yata]
+
+  yata-p4:
+    build: { context: ., dockerfile: Dockerfile.test }
+    depends_on: { minio-init: { condition: service_completed_successfully } }
+    ports: ["8087:8081"]
+    environment:
+      RUST_LOG: info
+      YATA_S3_ENDPOINT: http://minio:9000
+      YATA_S3_BUCKET: yata
+      YATA_S3_ACCESS_KEY_ID: minioadmin
+      YATA_S3_SECRET_ACCESS_KEY: minioadmin
+      YATA_S3_REGION: us-east-1
+      YATA_S3_PREFIX: "yata/partitions/4/"
+      YATA_DATA_DIR: /data/yata
+      YATA_REST_PORT: "8081"
+      YATA_API_SECRET: test-token
+      YATA_HOT_PARTITION_ID: "4"
+      PERFORMER_ID: yata-test-p4
+    volumes: [yata-data-p4:/data/yata]
+
+  yata-p5:
+    build: { context: ., dockerfile: Dockerfile.test }
+    depends_on: { minio-init: { condition: service_completed_successfully } }
+    ports: ["8088:8081"]
+    environment:
+      RUST_LOG: info
+      YATA_S3_ENDPOINT: http://minio:9000
+      YATA_S3_BUCKET: yata
+      YATA_S3_ACCESS_KEY_ID: minioadmin
+      YATA_S3_SECRET_ACCESS_KEY: minioadmin
+      YATA_S3_REGION: us-east-1
+      YATA_S3_PREFIX: "yata/partitions/5/"
+      YATA_DATA_DIR: /data/yata
+      YATA_REST_PORT: "8081"
+      YATA_API_SECRET: test-token
+      YATA_HOT_PARTITION_ID: "5"
+      PERFORMER_ID: yata-test-p5
+    volumes: [yata-data-p5:/data/yata]
+
 volumes:
   yata-data:
   yata-data-p1:
+  yata-data-p2:
+  yata-data-p3:
+  yata-data-p4:
+  yata-data-p5:
