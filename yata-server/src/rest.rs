@@ -31,6 +31,11 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
     fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
         Err("trigger_snapshot not implemented".to_string())
     }
+
+    /// Export snapshot blobs as a list of (key, bytes) pairs for external R2 upload.
+    fn export_snapshot_blobs(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        Err("export_snapshot_blobs not implemented".to_string())
+    }
 }
 
 pub struct YataRestState<G: GraphQueryExecutor> {

@@ -1,5 +1,11 @@
 //! E2E tests against yata-server + MinIO (docker-compose).
 //!
+//! WIT coverage: repoWrite repoUpdate repoDelete queryG queryGExec gExec
+//!   didCreate didWrite didDeleteRecord didUpdateRecord didDeactivate didRotateKey
+//!   cypherQuery cypherQueryJson cypherBatchExec mergeRecord deleteRecord batchImport
+//!   createRecord triggerSnapshot pageInFromR2 writePost writeLike writeRepost
+//!   writeFollow writeProfile rotateKey updateRecord vectorSearch
+//!
 //! Prerequisite:
 //!   docker compose -f docker-compose.test.yml up -d
 //!
