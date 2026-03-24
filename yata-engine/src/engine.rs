@@ -369,7 +369,7 @@ impl TieredGraphEngine {
         match crate::loader::page_in_from_r2(
             &s3,
             &self.s3_prefix,
-            yata_core::PartitionId::from(0),
+            self.config.hot_partition_id,
         ) {
             Ok(store) => {
                 let vc = store.vertex_count();
@@ -779,7 +779,7 @@ impl TieredGraphEngine {
         match crate::loader::page_in_from_r2(
             &s3,
             &self.s3_prefix,
-            yata_core::PartitionId::from(0),
+            self.config.hot_partition_id,
         ) {
             Ok(store) => {
                 let vc = store.vertex_count();
@@ -908,18 +908,17 @@ impl TieredGraphEngine {
         let prefix = &self.s3_prefix;
 
         // Serialize CSR → ArrowFragment → MemoryBlobStore
+        // Each partition Container snapshots independently (prefix = yata/partitions/{N}/)
         let (v_count, e_count, blob_store, meta) = if let Ok(csr) = self.hot.lock() {
-            if let Some(single) = csr.as_single() {
-                let pid = single.partition_id_raw().get();
-                let frag = yata_vineyard::convert::csr_to_fragment(single, pid);
-                let vc = frag.ivnums.iter().sum::<u64>();
-                let ec = frag.edge_num();
-                let bs = yata_vineyard::blob::MemoryBlobStore::new();
-                let m = frag.serialize(&bs);
-                (vc, ec, bs, m)
-            } else {
-                return Err("snapshot not supported in partitioned mode".into());
-            }
+            let store = csr.as_single()
+                .ok_or_else(|| "no CSR store available".to_string())?;
+            let pid = store.partition_id_raw().get();
+            let frag = yata_vineyard::convert::csr_to_fragment(store, pid);
+            let vc = frag.ivnums.iter().sum::<u64>();
+            let ec = frag.edge_num();
+            let bs = yata_vineyard::blob::MemoryBlobStore::new();
+            let m = frag.serialize(&bs);
+            (vc, ec, bs, m)
         } else {
             return Err("failed to acquire CSR lock".into());
         };
@@ -954,7 +953,7 @@ impl TieredGraphEngine {
         let snap_manifest = serde_json::json!({
             "version": yata_core::SNAPSHOT_FORMAT_VERSION,
             "format": "arrow_fragment",
-            "partition_id": 0,
+            "partition_id": self.config.hot_partition_id.get(),
             "vertex_count": v_count,
             "edge_count": e_count,
             "blob_count": uploaded,

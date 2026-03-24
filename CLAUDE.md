@@ -17,7 +17,7 @@ Read model: yata Container (pure read)
         TieredGraphEngine → yata-cypher / yata-gie (push-based)
         No WAL. No FUSE. No background upload.
 
-R2 = Source of Truth (Arrow IPC per-label per-partition)
+R2 = Source of Truth (ArrowFragment per-label per-partition: snap/fragment/meta.json + snap/fragment/{blob_name})
 DiskVineyard = Container ephemeral disk cache (page-in/out, LRU evict)
 MmapVineyard = zero-copy mmap (500M edges/Container)
 CSR = In-memory graph topology (<1ms query)
@@ -33,7 +33,7 @@ Write (Pipeline + mergeRecord, PDS Worker):
     → Pipeline.send(): AT commit + MST update → ACK (~1ms, durable)
     → YATA_RPC.mergeRecord(): instant Cypher projection (changed records only)
     → fire-and-forget snapshot() + cron (every 1 min):
-        1. trigger_snapshot → R2 PUT (Arrow IPC per-label)
+        1. trigger_snapshot → csr_to_fragment() → R2 PUT (ArrowFragment: snap/fragment/meta.json + snap/fragment/{blob_name})
         2. R2 repo persistence (commits + records + CAS blocks + MST)
     → firehose: SSE (XRPC compat only, disabled for active use)
 
@@ -44,11 +44,11 @@ Read (yata Container = pure read model):
     → YATA_RPC.cypher → TieredGraphEngine
     → ensure_labels()
     → Vineyard blob hit (ephemeral disk cache) → CSR (0ms)
-    → Vineyard miss → R2 GET per-label Arrow IPC → Vineyard → CSR (lazy page-in)
+    → Vineyard miss → page_in_from_r2() → R2 GET ArrowFragment → NbrUnit zero-copy CSR (lazy page-in)
 
 Cold start (after Container sleep):
   → first query triggers ensure_labels()
-  → R2 GET manifest.json → R2 GET per-label Arrow IPC → Vineyard → CSR
+  → page_in_from_r2() → R2 GET snap/fragment/meta.json → R2 GET snap/fragment/{blob_name} → ArrowFragment → CSR
 
 PDS Container (Rust) は不要 — 全て TS Worker + Pipeline + YATA_RPC。
 ```
@@ -63,7 +63,7 @@ PDS Container (Rust) は不要 — 全て TS Worker + Pipeline + YATA_RPC。
 env.YATA.cypher(cypher, appId)   // unified Cypher path → /xrpc/ai.gftd.yata.cypher
 env.YATA.query(cypher, appId)    // read-only alias
 env.YATA.mutate(cypher, appId)   // CREATE → random partition, DELETE → broadcast
-env.YATA.sql(query, appId)       // Flight SQL → /xrpc/ai.gftd.yata.flightSqlQuery
+// env.YATA.sql() — FlightSQL 除去済み (yata-flight crate 除去済み、Cypher direct が標準)
 env.YATA.health()                // → partition-0 Container
 env.YATA.ping()                  // "pong" (no wake)
 env.YATA.stats()                 // → all partition stats
@@ -127,7 +127,7 @@ env.YATA.stats()                 // → all partition stats
 
 ## R2 Persistence (VERIFIED)
 
-R2 = source of truth. Write: mergeRecord fire-and-forget + cron (every 1 min) → `trigger_snapshot()` → R2 PUT (`ureq+rustls` sync). Read: `ensure_vineyard_blobs_from_r2()` → R2 GET per-label. `@cloudflare/containers` >=0.1.1 required. R2 repo persistence (commit chain + records + CAS blocks) for replay. FUSE/WAL/background upload/DO alarm 全除去済み。
+R2 = source of truth. Write: mergeRecord fire-and-forget + cron (every 1 min) → `trigger_snapshot()` → `csr_to_fragment()` (CSR→ArrowFragment) → R2 PUT (`ureq+rustls` sync). Read: `page_in_from_r2()` → R2 GET ArrowFragment → NbrUnit zero-copy CSR. R2 layout: `snap/fragment/meta.json` (label manifest) + `snap/fragment/{blob_name}` (ArrowFragment blobs). `@cloudflare/containers` >=0.1.1 required. R2 repo persistence (commit chain + records + CAS blocks) for replay. FUSE/WAL/background upload/DO alarm 全除去済み。
 
 WAL truncation: after R2 snapshot commit, `mark_committed(lsn)` + `truncate()` removes persisted entries.
 
