@@ -156,7 +156,12 @@ impl ArrowGraphStore {
 
     /// Load an edge label from Arrow IPC bytes. Builds lightweight CSR.
     pub fn load_edge_label(&mut self, label: &str, ipc_bytes: &[u8]) -> Result<usize, String> {
-        let cursor = std::io::Cursor::new(ipc_bytes);
+        let data = if ipc_bytes.len() >= 4 && &ipc_bytes[..4] == crate::arrow_codec::ARROW_MAGIC {
+            &ipc_bytes[4..]
+        } else {
+            ipc_bytes
+        };
+        let cursor = std::io::Cursor::new(data);
         let reader = StreamReader::try_new(cursor, None)
             .map_err(|e| format!("arrow ipc decode: {e}"))?;
 
@@ -544,6 +549,85 @@ impl yata_grin::Schema for ArrowGraphStore {
 
     fn vertex_primary_key(&self, _label: &str) -> Option<String> {
         Some("rkey".to_string()) // AT Protocol convention
+    }
+}
+
+impl yata_grin::Scannable for ArrowGraphStore {
+    fn scan_vertices(&self, label: &str, predicate: &Predicate) -> Vec<u32> {
+        let mut result = Vec::new();
+        for (&vid, (l, _, _)) in &self.vid_index {
+            if l != label { continue; }
+            if matches!(predicate, Predicate::True) || self.matches_predicate(vid, predicate) {
+                result.push(vid);
+            }
+        }
+        result
+    }
+
+    fn scan_vertices_by_label(&self, label: &str) -> Vec<u32> {
+        self.vid_index.iter()
+            .filter(|(_, (l, _, _))| l == label)
+            .map(|(&vid, _)| vid)
+            .collect()
+    }
+
+    fn scan_all_vertices(&self) -> Vec<u32> {
+        self.vid_index.keys().copied().collect()
+    }
+}
+
+impl ArrowGraphStore {
+    fn matches_predicate(&self, vid: u32, pred: &Predicate) -> bool {
+        match pred {
+            Predicate::True => true,
+            Predicate::Eq(key, val) => self.get_vertex_prop(vid, key).as_ref() == Some(val),
+            Predicate::Neq(key, val) => self.get_vertex_prop(vid, key).as_ref() != Some(val),
+            Predicate::StartsWith(key, prefix) => {
+                matches!(self.get_vertex_prop(vid, key), Some(PropValue::Str(s)) if s.starts_with(prefix))
+            }
+            Predicate::And(a, b) => self.matches_predicate(vid, a) && self.matches_predicate(vid, b),
+            Predicate::Or(a, b) => self.matches_predicate(vid, a) || self.matches_predicate(vid, b),
+            _ => true, // Lt/Gt/In — accept all (conservative)
+        }
+    }
+}
+
+impl yata_grin::Mutable for ArrowGraphStore {
+    fn add_vertex(&mut self, label: &str, props: &[(&str, PropValue)]) -> u32 {
+        let vid = self.next_vid.fetch_add(1, Ordering::Relaxed) as u32;
+        let mut prop_map = HashMap::new();
+        for (k, v) in props { prop_map.insert(k.to_string(), v.clone()); }
+        self.pending_vertices.push(PendingVertex { label: label.to_string(), props: prop_map });
+        self.vid_index.insert(vid, (label.to_string(), usize::MAX, self.pending_vertices.len() - 1));
+        if !self.vertex_label_set.contains(&label.to_string()) {
+            self.vertex_label_set.push(label.to_string());
+        }
+        vid
+    }
+
+    fn add_edge(&mut self, _src: u32, _dst: u32, label: &str, _props: &[(&str, PropValue)]) -> u32 {
+        let eid = self.next_eid.fetch_add(1, Ordering::Relaxed) as u32;
+        if !self.edge_label_set.contains(&label.to_string()) {
+            self.edge_label_set.push(label.to_string());
+        }
+        eid
+    }
+
+    fn set_vertex_prop(&mut self, vid: u32, key: &str, value: PropValue) {
+        self.pending_props.entry(vid).or_default().insert(key.to_string(), value);
+    }
+
+    fn delete_vertex(&mut self, vid: u32) {
+        self.vid_index.remove(&vid);
+    }
+
+    fn delete_edge(&mut self, _edge_id: u32) {
+        // Edge deletion from Arrow is a tombstone (not implemented in detail)
+    }
+
+    fn commit(&mut self) -> u64 {
+        self.commit();
+        self.next_vid.load(Ordering::Relaxed)
     }
 }
 
