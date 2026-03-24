@@ -223,6 +223,52 @@ pub fn page_in_from_r2(
     Ok(restore_csr_from_fragment(&frag, partition_id))
 }
 
+/// Page-in a single vertex label's chunk from R2 (selective chunk loading).
+///
+/// Fetches only `vertex_table_{label_id}_chunk_{chunk_id}.arrow` from R2.
+/// Returns the raw RecordBatch without CSR reconstruction (caller merges into existing store).
+///
+/// This is the building block for future on-demand chunk loading:
+/// query touches label X → check which chunks are loaded → page-in missing chunks only.
+pub fn page_in_vertex_chunk_from_r2(
+    s3: &yata_s3::s3::S3Client,
+    prefix: &str,
+    label_id: usize,
+    chunk_id: usize,
+) -> Result<arrow::record_batch::RecordBatch, String> {
+    let blob_key = format!("{prefix}snap/fragment/vertex_table_{label_id}_chunk_{chunk_id}");
+    let data = s3
+        .get_sync(&blob_key)
+        .map_err(|e| format!("R2 chunk fetch: {e}"))?
+        .ok_or_else(|| format!("chunk not found: vertex_table_{label_id}_chunk_{chunk_id}"))?;
+    yata_arrow::ipc_to_batch(&data)
+        .map_err(|e| format!("Arrow IPC decode chunk: {e}"))
+}
+
+/// Get the chunk count for a vertex label from fragment meta.
+/// Returns None if the label uses single-blob format (pre-chunking).
+pub fn vertex_label_chunk_count(
+    meta: &yata_vineyard::blob::ObjectMeta,
+    label_id: usize,
+) -> Option<usize> {
+    let key = format!("vertex_table_{}_chunks", label_id);
+    meta.get_field(&key).and_then(|v| v.as_i64()).map(|n| n as usize)
+}
+
+/// Fetch only the fragment meta.json from R2 (without loading any blobs).
+/// Useful for inspecting chunk layout before deciding what to page-in.
+pub fn fetch_fragment_meta(
+    s3: &yata_s3::s3::S3Client,
+    prefix: &str,
+) -> Result<yata_vineyard::blob::ObjectMeta, String> {
+    let meta_key = format!("{prefix}snap/fragment/meta.json");
+    let meta_bytes = s3.get_sync(&meta_key)
+        .map_err(|e| format!("R2 meta fetch: {e}"))?
+        .ok_or_else(|| "no fragment meta.json in R2".to_string())?;
+    serde_json::from_slice(&meta_bytes)
+        .map_err(|e| format!("parse fragment meta: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

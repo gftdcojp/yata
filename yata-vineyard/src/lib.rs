@@ -14,6 +14,6 @@ pub mod schema;
 mod tests;
 
 pub use blob::{BlobStore, MemoryBlobStore, ObjectId, ObjectMeta};
-pub use fragment::ArrowFragment;
+pub use fragment::{ArrowFragment, DEFAULT_CHUNK_ROWS, split_record_batch};
 pub use nbr::NbrUnit;
 pub use schema::{PropertyDef, PropertyGraphSchema, SchemaEntry};

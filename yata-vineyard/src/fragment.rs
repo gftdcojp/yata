@@ -19,6 +19,11 @@ use crate::blob::{BlobStore, ObjectId, ObjectMeta};
 use crate::nbr::{NbrUnit64, NBR_UNIT_64_SIZE};
 use crate::schema::PropertyGraphSchema;
 
+/// Default chunk size for row-group splitting. Vertex/edge tables with more rows
+/// than this threshold are split into multiple Arrow IPC blobs.
+/// 100K rows ≈ 2-10 MB per chunk depending on column count.
+pub const DEFAULT_CHUNK_ROWS: usize = 100_000;
+
 /// Vineyard-compatible ArrowFragment.
 ///
 /// Stores a single partition (fid) of a property graph using Arrow columnar format.
@@ -206,12 +211,31 @@ impl ArrowFragment {
         store.put("schema", Bytes::from(schema_json));
         meta.add_blob("schema");
 
-        // Vertex tables
+        // Vertex tables (chunked: large tables split into row-group chunks)
+        let chunk_size = std::env::var("YATA_CHUNK_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_CHUNK_ROWS);
+
         for (i, batch) in self.vertex_tables.iter().enumerate() {
-            let name = format!("vertex_table_{}", i);
-            let ipc_bytes = yata_arrow::batch_to_ipc(batch).unwrap_or_default();
-            store.put(&name, ipc_bytes);
-            meta.add_blob(&name);
+            let num_rows = batch.num_rows();
+            if num_rows <= chunk_size || chunk_size == 0 {
+                // Single blob (backward-compatible path)
+                let name = format!("vertex_table_{}", i);
+                let ipc_bytes = yata_arrow::batch_to_ipc(batch).unwrap_or_default();
+                store.put(&name, ipc_bytes);
+                meta.add_blob(&name);
+            } else {
+                // Chunked: split into N row-group blobs
+                let chunks = split_record_batch(batch, chunk_size);
+                meta.set_field(&format!("vertex_table_{}_chunks", i), chunks.len() as i64);
+                for (j, chunk) in chunks.iter().enumerate() {
+                    let name = format!("vertex_table_{}_chunk_{}", i, j);
+                    let ipc_bytes = yata_arrow::batch_to_ipc(chunk).unwrap_or_default();
+                    store.put(&name, ipc_bytes);
+                    meta.add_blob(&name);
+                }
+            }
         }
 
         // ivnums
@@ -223,12 +247,24 @@ impl ArrowFragment {
         store.put("ivnums", Bytes::from(ivnums_bytes));
         meta.add_blob("ivnums");
 
-        // Edge tables
+        // Edge tables (chunked: same as vertex tables)
         for (i, batch) in self.edge_tables.iter().enumerate() {
-            let name = format!("edge_table_{}", i);
-            let ipc_bytes = yata_arrow::batch_to_ipc(batch).unwrap_or_default();
-            store.put(&name, ipc_bytes);
-            meta.add_blob(&name);
+            let num_rows = batch.num_rows();
+            if num_rows <= chunk_size || chunk_size == 0 {
+                let name = format!("edge_table_{}", i);
+                let ipc_bytes = yata_arrow::batch_to_ipc(batch).unwrap_or_default();
+                store.put(&name, ipc_bytes);
+                meta.add_blob(&name);
+            } else {
+                let chunks = split_record_batch(batch, chunk_size);
+                meta.set_field(&format!("edge_table_{}_chunks", i), chunks.len() as i64);
+                for (j, chunk) in chunks.iter().enumerate() {
+                    let name = format!("edge_table_{}_chunk_{}", i, j);
+                    let ipc_bytes = yata_arrow::batch_to_ipc(chunk).unwrap_or_default();
+                    store.put(&name, ipc_bytes);
+                    meta.add_blob(&name);
+                }
+            }
         }
 
         // CSR topology
@@ -302,17 +338,29 @@ impl ArrowFragment {
         let schema: PropertyGraphSchema = serde_json::from_slice(&schema_bytes)
             .map_err(|e| FragmentError::SchemaParseError(e.to_string()))?;
 
-        // Vertex tables
+        // Vertex tables (chunked or single-blob, backward-compatible)
         let mut vertex_tables = Vec::with_capacity(vlabel_num);
         for i in 0..vlabel_num {
-            let name = format!("vertex_table_{}", i);
-            if meta.blobs.contains_key(&name) {
-                let ipc = store
-                    .get(&name)
-                    .ok_or(FragmentError::MissingBlob(name.clone()))?;
-                let batch =
-                    yata_arrow::ipc_to_batch(&ipc).map_err(|e| FragmentError::ArrowError(e.to_string()))?;
-                vertex_tables.push(batch);
+            let chunk_count_key = format!("vertex_table_{}_chunks", i);
+            let chunk_count = meta.get_field(&chunk_count_key).and_then(|v| v.as_i64());
+
+            if let Some(n) = chunk_count {
+                // Chunked format: load N chunks and concatenate
+                let batches = load_chunked_batches(store, &format!("vertex_table_{}", i), n as usize)?;
+                if let Some(merged) = concat_batches(&batches)? {
+                    vertex_tables.push(merged);
+                }
+            } else {
+                // Single-blob format (backward compat)
+                let name = format!("vertex_table_{}", i);
+                if meta.blobs.contains_key(&name) {
+                    let ipc = store
+                        .get(&name)
+                        .ok_or(FragmentError::MissingBlob(name.clone()))?;
+                    let batch =
+                        yata_arrow::ipc_to_batch(&ipc).map_err(|e| FragmentError::ArrowError(e.to_string()))?;
+                    vertex_tables.push(batch);
+                }
             }
         }
 
@@ -326,17 +374,27 @@ impl ArrowFragment {
             }
         }
 
-        // Edge tables
+        // Edge tables (chunked or single-blob, backward-compatible)
         let mut edge_tables = Vec::with_capacity(elabel_num);
         for i in 0..elabel_num {
-            let name = format!("edge_table_{}", i);
-            if meta.blobs.contains_key(&name) {
-                let ipc = store
-                    .get(&name)
-                    .ok_or(FragmentError::MissingBlob(name.clone()))?;
-                let batch =
-                    yata_arrow::ipc_to_batch(&ipc).map_err(|e| FragmentError::ArrowError(e.to_string()))?;
-                edge_tables.push(batch);
+            let chunk_count_key = format!("edge_table_{}_chunks", i);
+            let chunk_count = meta.get_field(&chunk_count_key).and_then(|v| v.as_i64());
+
+            if let Some(n) = chunk_count {
+                let batches = load_chunked_batches(store, &format!("edge_table_{}", i), n as usize)?;
+                if let Some(merged) = concat_batches(&batches)? {
+                    edge_tables.push(merged);
+                }
+            } else {
+                let name = format!("edge_table_{}", i);
+                if meta.blobs.contains_key(&name) {
+                    let ipc = store
+                        .get(&name)
+                        .ok_or(FragmentError::MissingBlob(name.clone()))?;
+                    let batch =
+                        yata_arrow::ipc_to_batch(&ipc).map_err(|e| FragmentError::ArrowError(e.to_string()))?;
+                    edge_tables.push(batch);
+                }
             }
         }
 
@@ -411,6 +469,56 @@ fn offsets_to_batch(offsets: &Int64Array) -> RecordBatch {
     )]));
     RecordBatch::try_new(schema, vec![Arc::new(offsets.clone()) as ArrayRef])
         .expect("offsets batch creation should not fail")
+}
+
+/// Split a RecordBatch into chunks of at most `chunk_size` rows.
+/// Returns a Vec of RecordBatch slices (zero-copy via Arrow slice).
+pub fn split_record_batch(batch: &RecordBatch, chunk_size: usize) -> Vec<RecordBatch> {
+    let total = batch.num_rows();
+    if total == 0 || chunk_size == 0 {
+        return vec![batch.clone()];
+    }
+    let mut chunks = Vec::with_capacity((total + chunk_size - 1) / chunk_size);
+    let mut offset = 0;
+    while offset < total {
+        let len = (total - offset).min(chunk_size);
+        chunks.push(batch.slice(offset, len));
+        offset += len;
+    }
+    chunks
+}
+
+/// Load chunked Arrow IPC blobs from a BlobStore and deserialize each.
+fn load_chunked_batches(
+    store: &dyn BlobStore,
+    prefix: &str,
+    count: usize,
+) -> Result<Vec<RecordBatch>, FragmentError> {
+    let mut batches = Vec::with_capacity(count);
+    for j in 0..count {
+        let name = format!("{}_chunk_{}", prefix, j);
+        let ipc = store
+            .get(&name)
+            .ok_or(FragmentError::MissingBlob(name.clone()))?;
+        let batch = yata_arrow::ipc_to_batch(&ipc)
+            .map_err(|e| FragmentError::ArrowError(e.to_string()))?;
+        batches.push(batch);
+    }
+    Ok(batches)
+}
+
+/// Concatenate multiple RecordBatches with the same schema into one.
+fn concat_batches(batches: &[RecordBatch]) -> Result<Option<RecordBatch>, FragmentError> {
+    if batches.is_empty() {
+        return Ok(None);
+    }
+    if batches.len() == 1 {
+        return Ok(Some(batches[0].clone()));
+    }
+    let schema = batches[0].schema();
+    arrow::compute::concat_batches(&schema, batches)
+        .map(Some)
+        .map_err(|e| FragmentError::ArrowError(e.to_string()))
 }
 
 #[derive(thiserror::Error, Debug)]

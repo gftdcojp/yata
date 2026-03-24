@@ -7,7 +7,7 @@ use bytes::Bytes;
 use std::sync::Arc;
 
 use crate::blob::{BlobStore, MemoryBlobStore};
-use crate::fragment::ArrowFragment;
+use crate::fragment::{ArrowFragment, split_record_batch};
 use crate::nbr::{self, NbrUnit64};
 use crate::schema::PropertyGraphSchema;
 

@@ -115,14 +115,15 @@ env.YATA.stats()                 // → all partition stats
 | Groot PK index | O(1) vertex lookup | merge_by_pk + prop_eq_index | `[IMPLEMENTED]` mergeRecord のみ、Cypher MERGE 未対応 |
 | Hash partition routing | vertex → partition | partition.rs PartitionAssignment::Hash | `[STUB]` 定義のみ、mutation flow 未結線 |
 | Chunk page-in | granular I/O | ArrowFragment per-label blob | `[PRODUCTION]` per-label 単位 (chunk 単位は `[STUB]`) |
-| LSMGraph tiered storage | multi-level auto | — | `[DESIGN]` コード 0 行 |
+| Arrow row-group chunk | sub-label granular I/O | — | `[DESIGN]` RecordBatch 境界で row-group 分割 page-in |
+| ~~LSMGraph tiered storage~~ | ~~multi-level auto~~ | — | `[DEPRECATED]` Arrow + snapshot compaction が LSM 本質を実現済み。置換: Arrow row-group chunk |
 | GART mutable CSR | HTGAP | MutableCsrStore + merge_by_pk | `[IMPLEMENTED]` mergeRecord のみ |
 | Distributed disk pool | cross-partition I/O | — | `[DESIGN]` コード 0 行 |
 | Gremlin | query language | — | not planned |
 | GRAPE (analytics) | vertex-centric | — | not planned |
 | GLE (learning) | GNN | — | not planned |
 
-**GraphScope parity summary**: 14 `[PRODUCTION]` + 5 `[IMPLEMENTED]` + 3 `[STUB]` + 2 `[DESIGN]` + 3 not planned.
+**GraphScope parity summary**: 14 `[PRODUCTION]` + 5 `[IMPLEMENTED]` + 3 `[STUB]` + 2 `[DESIGN]` + 1 `[DEPRECATED]` + 3 not planned.
 
 ## R2 Persistence `[PRODUCTION]`
 
@@ -200,8 +201,16 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
 `[DESIGN]` Phase 3a: Read replica routing
   status: コード 0 行。wrangler.jsonc YATA_READ_REPLICA_COUNT=0。index.ts に routing logic なし
 
-`[DESIGN]` Phase 4: LSMGraph 4-level tiered storage
-  status: コード 0 行
+`[DESIGN]` Phase 3b: Arrow row-group chunk page-in
+  status: コード 0 行。per-label ArrowFragment を RecordBatch 境界で row-group 分割し、
+  必要な chunk だけ page-in (10M vertex label → 100K chunk 単位)。
+  Arrow IPC native (LSM abstraction 不要)
+
+`[DEPRECATED]` LSMGraph 4-level tiered storage
+  reason: 現 ArrowFragment + snapshot compaction が LSM の本質 (immutable sorted runs + compaction) を
+  既に実現。Arrow columnar format と LSM row-oriented sorted runs の impedance mismatch。
+  CF Container ephemeral disk で multi-level local storage の意味が薄い。
+  置換先: Arrow row-group chunk page-in (Phase 3b)
 
 `[DESIGN]` Phase 4: Distributed disk pool (cross-partition Workers RPC I/O)
   status: コード 0 行
@@ -227,7 +236,7 @@ Storage (2 level + R2): [PRODUCTION]
   Level 1: Vineyard ephemeral (DiskVineyard/MmapVineyard) — ~100µs
   R2: Source of truth (Arrow IPC per-label) — ~3-5ms page-in
   Level 2 (distributed disk pool): [DESIGN] コード 0 行
-  Level 3 (chunk-level R2 page-in): [STUB] 関数定義のみ
+  Level 3 (Arrow row-group chunk page-in): [DESIGN] RecordBatch 境界分割 (LSMGraph は DEPRECATED)
 
 Partition fan-out: [PRODUCTION] = Level 0 + Level 1 のみ
   1 × standard-1     = ~20M nodes   (production 運用中)
@@ -238,7 +247,7 @@ Read latency:
   Level 0 hit: <1µs (CSR) — [PRODUCTION]
   Level 1 hit: ~100µs (mmap) — [PRODUCTION]
   Level 2 hit: ~1ms (Workers RPC) — [DESIGN]
-  Level 3 hit: ~2-5ms (R2 GET) — [STUB]
+  Level 3 hit: ~2-5ms (R2 GET, Arrow row-group chunk) — [DESIGN]
 ```
 
 ## Env Vars
