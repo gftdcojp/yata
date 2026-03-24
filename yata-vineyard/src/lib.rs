@@ -6,6 +6,7 @@
 //! Reference: https://github.com/v6d-io/v6d/blob/main/modules/graph/fragment/arrow_fragment.vineyard-mod
 
 pub mod blob;
+pub mod convert;
 pub mod fragment;
 pub mod nbr;
 pub mod schema;

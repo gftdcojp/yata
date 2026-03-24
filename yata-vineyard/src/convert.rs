@@ -7,17 +7,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt32Array,
-    UInt64Array,
+    ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use bytes::Bytes;
 
-use yata_grin::{Mutable, PropValue, Property, Scannable, Schema as GrinSchema};
+use yata_grin::{PropValue, Property, Scannable, Schema as GrinSchema};
 
 use crate::fragment::ArrowFragment;
 use crate::nbr::{self, NbrUnit64};
-use crate::schema::{PropertyGraphSchema, SchemaEntry};
+use crate::schema::PropertyGraphSchema;
 
 /// Convert a MutableCsrStore to an ArrowFragment.
 ///
@@ -98,8 +97,9 @@ where
     }
 
     // ── Edge tables + CSR topology ──
-    // Build per-(elabel, vlabel) adjacency lists
-    // vid_to_local: maps global vid to per-label local index
+    // Build per-(elabel, vlabel) adjacency using Topology::out_neighbors_by_label
+    // vid_to_local: maps vid to per-label local index
+    let mut vids_per_label: HashMap<String, Vec<u32>> = HashMap::new();
     let mut vid_to_local: HashMap<String, HashMap<u32, u64>> = HashMap::new();
     for label in &v_labels {
         let vids = Scannable::scan_vertices_by_label(store, label);
@@ -109,41 +109,33 @@ where
             .map(|(i, &vid)| (vid, i as u64))
             .collect();
         vid_to_local.insert(label.clone(), local_map);
+        vids_per_label.insert(label.clone(), vids);
     }
 
-    // Collect edges per edge label
     for elabel in &e_labels {
         let elabel_id = *elabel_map.get(elabel.as_str()).unwrap() as usize;
 
-        // Collect all edges with this label
-        let mut edges: Vec<(u32, u32, u32)> = Vec::new(); // (src, dst, eid)
-        let edge_count = store.edge_count();
-        for eid in 0..edge_count {
-            if let Some((src, dst, label)) = store.edge_endpoints(eid) {
-                if label == *elabel {
-                    edges.push((src, dst, eid));
-                }
-            }
-        }
-
-        // For each source vertex label, build CSR
+        // For each source vertex label, build CSR from out_neighbors_by_label
         for (vlabel_idx, vlabel) in v_labels.iter().enumerate() {
+            let vids = vids_per_label.get(vlabel.as_str()).unwrap();
             let local_map = vid_to_local.get(vlabel.as_str()).unwrap();
-            let vcount = local_map.len();
+            let vcount = vids.len();
             if vcount == 0 {
                 continue;
             }
 
-            // Outgoing edges from vertices of this label
             let mut oe_adj: Vec<Vec<NbrUnit64>> = vec![Vec::new(); vcount];
             let mut ie_adj: Vec<Vec<NbrUnit64>> = vec![Vec::new(); vcount];
 
-            for &(src, dst, eid) in &edges {
-                if let Some(&src_local) = local_map.get(&src) {
-                    oe_adj[src_local as usize].push(NbrUnit64::new(dst as u64, eid as u64));
+            for &vid in vids {
+                let src_local = local_map[&vid] as usize;
+                let out_nbrs = store.out_neighbors_by_label(vid, elabel);
+                for nbr in &out_nbrs {
+                    oe_adj[src_local].push(NbrUnit64::new(nbr.vid as u64, nbr.edge_id as u64));
                 }
-                if let Some(&dst_local) = local_map.get(&dst) {
-                    ie_adj[dst_local as usize].push(NbrUnit64::new(src as u64, eid as u64));
+                let in_nbrs = store.in_neighbors_by_label(vid, elabel);
+                for nbr in &in_nbrs {
+                    ie_adj[src_local].push(NbrUnit64::new(nbr.vid as u64, nbr.edge_id as u64));
                 }
             }
 
@@ -199,8 +191,6 @@ fn prop_value_to_arrow_type(v: &PropValue) -> DataType {
         PropValue::Str(_) => DataType::Utf8,
         PropValue::Bool(_) => DataType::Boolean,
         PropValue::Null => DataType::Utf8,
-        PropValue::UInt(_) => DataType::UInt64,
-        PropValue::Bytes(_) => DataType::Utf8, // base64 fallback
     }
 }
 
@@ -231,22 +221,11 @@ fn prop_values_to_arrow(name: &str, vals: &[PropValue]) -> (Field, ArrayRef) {
                 .collect();
             Arc::new(Int64Array::from(arr))
         }
-        DataType::UInt64 => {
-            let arr: Vec<Option<u64>> = vals
-                .iter()
-                .map(|v| match v {
-                    PropValue::UInt(n) => Some(*n),
-                    PropValue::Int(n) if *n >= 0 => Some(*n as u64),
-                    _ => None,
-                })
-                .collect();
-            Arc::new(UInt64Array::from(arr))
-        }
         DataType::Float64 => {
             let arr: Vec<Option<f64>> = vals
                 .iter()
                 .map(|v| match v {
-                    PropValue::Float(f) => Some(f.0),
+                    PropValue::Float(f) => Some(*f),
                     _ => None,
                 })
                 .collect();
@@ -269,11 +248,9 @@ fn prop_values_to_arrow(name: &str, vals: &[PropValue]) -> (Field, ArrayRef) {
                 .map(|v| match v {
                     PropValue::Str(s) => Some(s.clone()),
                     PropValue::Int(n) => Some(n.to_string()),
-                    PropValue::Float(f) => Some(f.0.to_string()),
+                    PropValue::Float(f) => Some(f.to_string()),
                     PropValue::Bool(b) => Some(b.to_string()),
                     PropValue::Null => None,
-                    PropValue::UInt(n) => Some(n.to_string()),
-                    PropValue::Bytes(b) => Some(format!("{:?}", b)),
                 })
                 .collect();
             Arc::new(StringArray::from(arr))

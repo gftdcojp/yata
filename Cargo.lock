@@ -3232,12 +3232,16 @@ name = "yata-vineyard"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-array",
+ "arrow-schema",
  "blake3",
  "bytes",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "yata-arrow",
+ "yata-core",
+ "yata-grin",
 ]
 
 [[package]]
