@@ -174,7 +174,6 @@ impl GraphStoreEnum {
         match self {
             GraphStoreEnum::Single(_) => 1,
             GraphStoreEnum::Partitioned(p) => p.partition_count(),
-            GraphStoreEnum::Arrow(a) => a.partition_count(),
             GraphStoreEnum::Arrow(_) => 1,
         }
     }
@@ -381,7 +380,7 @@ impl Mutable for GraphStoreEnum {
         match self {
             GraphStoreEnum::Single(s) => s.commit(),
             GraphStoreEnum::Partitioned(p) => p.commit(),
-            GraphStoreEnum::Arrow(a) => a.commit(),
+            GraphStoreEnum::Arrow(a) => Mutable::commit(a),
         }
     }
 }
@@ -397,6 +396,7 @@ impl GraphStoreEnum {
     ) -> yata_cypher::MemoryGraph {
         match self {
             GraphStoreEnum::Single(s) => s.to_filtered_memory_graph(labels, rel_types),
+            GraphStoreEnum::Arrow(_) => yata_cypher::MemoryGraph::new(),
             GraphStoreEnum::Partitioned(p) => {
                 // For partitioned mode, build from first partition that has data
                 // TODO: merge across partitions for full graph
@@ -450,8 +450,11 @@ impl GraphStoreEnum {
     ) -> u32 {
         match self {
             GraphStoreEnum::Single(s) => s.add_vertex_with_labels(labels, props),
+            GraphStoreEnum::Arrow(a) => {
+                let label = labels.first().map(|s| s.as_str()).unwrap_or("_default");
+                a.add_vertex(label, props)
+            }
             GraphStoreEnum::Partitioned(p) => {
-                // Use the first label for the Mutable::add_vertex call
                 let label = labels.first().map(|s| s.as_str()).unwrap_or("_default");
                 p.add_vertex(label, props)
             }
@@ -468,6 +471,10 @@ impl GraphStoreEnum {
         match self {
             GraphStoreEnum::Single(s) => {
                 s.add_vertex_with_labels_and_optional_global_id(global_vid, labels, props)
+            }
+            GraphStoreEnum::Arrow(a) => {
+                let label = labels.first().map(|s| s.as_str()).unwrap_or("_default");
+                a.add_vertex(label, props)
             }
             GraphStoreEnum::Partitioned(p) => {
                 let label = labels.first().map(|s| s.as_str()).unwrap_or("_default");
@@ -498,6 +505,7 @@ impl GraphStoreEnum {
     pub fn remove_vertices_by_label(&mut self, label: &str) {
         match self {
             GraphStoreEnum::Single(s) => s.remove_vertices_by_label(label),
+            GraphStoreEnum::Arrow(_) => {} // Arrow store: no LRU eviction
             GraphStoreEnum::Partitioned(p) => {
                 for part in p.partitions_mut() {
                     part.remove_vertices_by_label(label);
@@ -510,6 +518,7 @@ impl GraphStoreEnum {
     pub fn remove_edges_by_label(&mut self, rel_type: &str) {
         match self {
             GraphStoreEnum::Single(s) => s.remove_edges_by_label(rel_type),
+            GraphStoreEnum::Arrow(_) => {}
             GraphStoreEnum::Partitioned(p) => {
                 for part in p.partitions_mut() {
                     part.remove_edges_by_label(rel_type);
@@ -522,6 +531,7 @@ impl GraphStoreEnum {
     pub fn set_vertex_primary_key(&mut self, label: &str, key: &str) {
         match self {
             GraphStoreEnum::Single(s) => s.set_vertex_primary_key(label, key),
+            GraphStoreEnum::Arrow(_) => {} // Arrow: PK is always "rkey"
             GraphStoreEnum::Partitioned(p) => {
                 for part in p.partitions_mut() {
                     part.set_vertex_primary_key(label, key);
