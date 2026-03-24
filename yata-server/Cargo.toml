@@ -42,6 +42,8 @@ axum.workspace = true
 [dev-dependencies]
 tempfile = "3"
 yata-vineyard = { path = "../yata-vineyard" }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde_json = "1"
 arrow = { version = "53", features = ["ipc"] }
 arrow-array = "53"
 arrow-schema = "53"

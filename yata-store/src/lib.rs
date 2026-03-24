@@ -9,12 +9,14 @@
 //! - Mutations: append-only within current version, CSR rebuilt on commit (incremental for dirty labels)
 
 pub mod arrow_codec;
+pub mod arrow_store;
 pub mod blocks;
 pub mod graph_store_enum;
 pub mod mirror;
 pub mod partition;
 pub mod partitioned;
 pub mod vineyard;
+pub use arrow_store::ArrowGraphStore;
 pub use blocks::{EdgeBlock, LabelEdgeGroup, LabelVertexGroup, VertexBlock};
 pub use graph_store_enum::{GraphStoreEnum, MemoryBudget};
 pub use mirror::{MirrorEdge, MirrorRegistry, MirrorVertex};
