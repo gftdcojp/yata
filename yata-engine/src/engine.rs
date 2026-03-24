@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use yata_cypher::Graph;
 use yata_graph::{GraphStore, QueryableGraph};
@@ -162,8 +162,8 @@ impl MutationContext {
 /// Integrates: query routing, cache, RLS, snapshot persistence, vector search passthrough.
 pub struct TieredGraphEngine {
     config: TieredEngineConfig,
-    /// HOT tier: in-memory CSR store (single or partitioned).
-    hot: Arc<Mutex<yata_store::GraphStoreEnum>>,
+    /// HOT tier: in-memory CSR store. RwLock for concurrent reads, exclusive writes.
+    hot: Arc<RwLock<yata_store::GraphStoreEnum>>,
     /// GraphStore — vector search (yata-vex) only. NOT graph persistence.
     warm: GraphStore,
     /// Query result cache.
@@ -269,7 +269,7 @@ impl TieredGraphEngine {
         };
         Self {
             config,
-            hot: Arc::new(Mutex::new(hot_store)),
+            hot: Arc::new(RwLock::new(hot_store)),
             warm,
             cache: Arc::new(Mutex::new(cache)),
             // Default false: first read triggers page_in_from_r2.
@@ -391,7 +391,7 @@ impl TieredGraphEngine {
                 if let Ok(mut last) = self.last_snapshot_count.lock() {
                     *last = (vc as u64, ec as u64);
                 }
-                if let Ok(mut hot) = self.hot.lock() {
+                if let Ok(mut hot) = self.hot.write() {
                     *hot = yata_store::GraphStoreEnum::Single(store);
                     self.hot_initialized.store(true, Ordering::Relaxed);
                 }
@@ -457,7 +457,7 @@ impl TieredGraphEngine {
             self.ensure_hot();
 
             // Single MemoryGraph copy from CSR.
-            let mut g = if let Ok(csr) = self.hot.lock() {
+            let mut g = if let Ok(csr) = self.hot.read() {
                 QueryableGraph(csr.to_filtered_memory_graph(&[], &[]))
             } else {
                 return Err("failed to acquire CSR lock".to_string());
@@ -526,7 +526,7 @@ impl TieredGraphEngine {
                 let new_csr =
                     loader::rebuild_csr_from_graph_with_partition(&g, self.config.hot_partition_id);
 
-                if let Ok(mut hot) = self.hot.lock() {
+                if let Ok(mut hot) = self.hot.write() {
                     *hot = yata_store::GraphStoreEnum::Single(new_csr);
                     self.hot_initialized.store(true, Ordering::Relaxed);
                 }
@@ -625,7 +625,7 @@ impl TieredGraphEngine {
 
             // GIE path: Cypher → IR Plan → execute directly on CSR (zero MemoryGraph copy).
             // NOW supports RLS via SecurityFilter predicate pushdown (no MemoryGraph fallback).
-            if let Ok(csr) = self.hot.lock() {
+            if let Ok(csr) = self.hot.read() {
                 if let Some(single_csr) = csr.as_single() {
                     if let Ok(ast) = yata_cypher::parse(cypher) {
                         // Build SecurityScope from RLS params (if authenticated).
@@ -694,7 +694,7 @@ impl TieredGraphEngine {
 
         self.block_on(async {
             self.ensure_hot();
-            let mut g = if let Ok(csr) = self.hot.lock() {
+            let mut g = if let Ok(csr) = self.hot.read() {
                 QueryableGraph(csr.to_filtered_memory_graph(&[], &[]))
             } else {
                 return Err("failed to acquire CSR lock".to_string());
@@ -766,7 +766,7 @@ impl TieredGraphEngine {
                     }
                 }
 
-                if let Ok(mut hot) = self.hot.lock() {
+                if let Ok(mut hot) = self.hot.write() {
                     *hot = yata_store::GraphStoreEnum::Single(new_csr);
                     self.hot_initialized.store(true, Ordering::Relaxed);
                 }
@@ -797,7 +797,7 @@ impl TieredGraphEngine {
             Ok(store) => {
                 let vc = store.vertex_count();
                 let ec = store.edge_count();
-                if let Ok(mut hot) = self.hot.lock() {
+                if let Ok(mut hot) = self.hot.write() {
                     *hot = yata_store::GraphStoreEnum::Single(store);
                     self.hot_initialized.store(true, Ordering::Relaxed);
                 }
@@ -865,7 +865,7 @@ impl TieredGraphEngine {
         // Full dedup against R2 data happens during snapshot compaction.
         self.dirty.store(true, Ordering::Relaxed);
 
-        if let Ok(mut hot) = self.hot.lock() {
+        if let Ok(mut hot) = self.hot.write() {
             // Arrow store path (Vineyard-native, no CSR conversion)
             if let Some(arrow) = hot.as_arrow_mut() {
                 let vid = arrow.merge_by_pk(label, pk_key, pk_value, props);
@@ -899,7 +899,7 @@ impl TieredGraphEngine {
         self.ensure_labels(&[label], &[]);
         self.dirty.store(true, Ordering::Relaxed);
 
-        if let Ok(mut hot) = self.hot.lock() {
+        if let Ok(mut hot) = self.hot.write() {
             if let Some(arrow) = hot.as_arrow_mut() {
                 let deleted = arrow.delete_by_pk(label, pk_key, pk_value);
                 return Ok(deleted);
@@ -937,7 +937,7 @@ impl TieredGraphEngine {
             ) {
                 let existing_vc = existing.vertex_count();
                 if existing_vc > 0 {
-                    if let Ok(mut hot) = self.hot.lock() {
+                    if let Ok(mut hot) = self.hot.write() {
                         if let Some(single) = hot.as_single_mut() {
                             // Merge existing R2 data into current CSR
                             // (existing vertices that aren't in pending get added)
@@ -969,7 +969,7 @@ impl TieredGraphEngine {
         }
 
         // Serialize compacted CSR → ArrowFragment → MemoryBlobStore
-        let (v_count, e_count, blob_store, meta) = if let Ok(csr) = self.hot.lock() {
+        let (v_count, e_count, blob_store, meta) = if let Ok(csr) = self.hot.read() {
             let store = csr.as_single()
                 .ok_or_else(|| "no CSR store available".to_string())?;
             let pid = store.partition_id_raw().get();
@@ -1194,7 +1194,7 @@ mod tests {
         .unwrap();
 
         // Directly inspect HOT CSR
-        let csr = e.hot.lock().unwrap();
+        let csr = e.hot.read().unwrap();
         assert_eq!(csr.vertex_count(), 2, "HOT: vertex_count");
         assert!(
             e.hot_initialized.load(Ordering::Relaxed),
@@ -1230,7 +1230,7 @@ mod tests {
 
         // Before SET
         {
-            let csr = e.hot.lock().unwrap();
+            let csr = e.hot.read().unwrap();
             let vids = yata_grin::Scannable::scan_all_vertices(&*csr);
             let val = csr.vertex_prop(vids[0], "v");
             assert_eq!(
@@ -1244,7 +1244,7 @@ mod tests {
 
         // After SET — CSR must reflect new value
         {
-            let csr = e.hot.lock().unwrap();
+            let csr = e.hot.read().unwrap();
             let vids = yata_grin::Scannable::scan_all_vertices(&*csr);
             let val = csr.vertex_prop(vids[0], "v");
             assert_eq!(
@@ -1262,11 +1262,11 @@ mod tests {
 
         run_query(&e, "CREATE (:D {k: 'd1'})", &[], None).unwrap();
         run_query(&e, "CREATE (:D {k: 'd2'})", &[], None).unwrap();
-        assert_eq!(e.hot.lock().unwrap().vertex_count(), 2);
+        assert_eq!(e.hot.read().unwrap().vertex_count(), 2);
 
         run_query(&e, "MATCH (n:D {k: 'd1'}) DELETE n", &[], None).unwrap();
         assert_eq!(
-            e.hot.lock().unwrap().vertex_count(),
+            e.hot.read().unwrap().vertex_count(),
             1,
             "HOT: delete must reduce count"
         );
@@ -1285,7 +1285,7 @@ mod tests {
         )
         .unwrap();
 
-        let csr = e.hot.lock().unwrap();
+        let csr = e.hot.read().unwrap();
         assert_eq!(csr.vertex_count(), 2, "HOT: 2 vertices");
         assert_eq!(csr.edge_count(), 1, "HOT: 1 edge");
     }
