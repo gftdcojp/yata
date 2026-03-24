@@ -6,7 +6,6 @@ members = [
     "yata-grin",
     # Layer 1: core primitives
     "yata-arrow",
-    "yata-cbor",
     "yata-object",
     # Layer 1.5: Vineyard-native format
     "yata-vineyard",
@@ -26,7 +25,6 @@ members = [
     "yata-client",
     # Layer 5: dev
     "yata-bench",
-    "yata-git",
 ]
 
 [workspace.package]
@@ -51,7 +49,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Internal crate refs (workspace path deps)
 yata-core = { path = "yata-core" }
 yata-grin = { path = "yata-grin" }
-yata-cbor = { path = "yata-cbor" }
 yata-object = { path = "yata-object" }
 yata-store = { path = "yata-store" }
 yata-cypher = { path = "yata-cypher" }
@@ -65,14 +62,6 @@ yata-client = { path = "yata-client" }
 yata-arrow = { path = "yata-arrow" }
 yata-vineyard = { path = "yata-vineyard" }
 yata-flight = { path = "yata-flight" }
-# Signal/AT/Server deps
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-chacha20poly1305 = "0.10"
-hkdf = "0.12"
-zeroize = "1"
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
-serde_bytes = "0.11"
-cid = "0.11"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 # Arrow
@@ -123,14 +112,9 @@ indexmap = { version = "2", features = ["serde"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 
-# Internal crates
-
 # Parallelism
 rayon = "1.10"
 
 # WAL (rkyv zero-copy serialization + CRC)
 rkyv = { version = "0.8", features = ["bytecheck"] }
 crc32fast = "1"
-
-# Git (for yata-git)
-git2 = "0.19"

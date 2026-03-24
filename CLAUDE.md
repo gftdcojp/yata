@@ -86,6 +86,8 @@ env.YATA.stats()                 // → all partition stats
 | ~~`yata-signal`~~ | **除去済み** — Signal Protocol は `wproto-signal` に移行 |
 | ~~`yata-mdag`~~ | **除去済み** — MDAG commit chain は TS `wproto` (mst.ts/repo.ts/pipeline.ts) に完全移行。Rust 側不要 |
 | ~~`yata-cas`~~ | **除去済み** — CasStore trait + LocalCasStore は `yata-object::cas` にインライン化 |
+| ~~`yata-cbor`~~ | **除去済み** — AT Protocol dag-cbor remnant。`wproto::cbor` が authoritative |
+| ~~`yata-git`~~ | **除去済み** — k8s era legacy (git2/Raft/PVC)。Evolution repo は `infra/workers/git-server/` (JS + R2) に移行済み |
 | `yata-server` | XRPC API server (`/xrpc/ai.gftd.yata.*`)。Workers RPC only transport。`GraphQueryExecutor` trait (standalone, inline query method + snapshot ops) |
 
 ## GraphScope Parity
