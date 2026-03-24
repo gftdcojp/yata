@@ -1,8 +1,7 @@
-//! Vineyard-compatible blob storage abstraction.
+//! Name-based blob storage for ArrowFragment persistence.
 //!
-//! Vineyard stores objects as: Blob (raw bytes in shared memory) + ObjectMeta (JSON in etcd).
-//! This module provides the same separation with pluggable backends:
-//! - CF: R2 for blobs, in-process HashMap for metadata
+//! Blobs are stored by name (e.g., "vertex_table_0", "oe_offsets_0_0").
+//! R2 key = `snap/fragment/{name}`. No content-addressing (CAS removed).
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -23,26 +22,6 @@ impl std::fmt::Display for ObjectId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "o{:016x}", self.0)
     }
-}
-
-/// Blob ID (content-addressed by Blake3 hash).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct BlobId(pub [u8; 32]);
-
-impl BlobId {
-    pub fn from_data(data: &[u8]) -> Self {
-        Self(blake3::hash(data).into())
-    }
-}
-
-impl std::fmt::Display for BlobId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex_encode(&self.0))
-    }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 /// Metadata value (Vineyard's JSON tree value types).
@@ -119,31 +98,21 @@ impl From<bool> for MetaValue {
     }
 }
 
-/// Vineyard-compatible object metadata (maps to etcd JSON tree).
+/// Object metadata: maps blob names to their storage keys.
 ///
-/// In Vineyard, each object has a hierarchical metadata tree:
-/// ```json
-/// {
-///   "id": "o0000000000000001",
-///   "typename": "vineyard::ArrowFragment<int64,uint64>",
-///   "fields": { "fid": 0, "directed": true, ... },
-///   "members": {
-///     "vertex_tables_0": { ... nested ObjectMeta ... },
-///     ...
-///   }
-/// }
-/// ```
+/// Unlike CAS (content-addressed), blobs are name-addressed.
+/// R2 key = `snap/fragment/{name}`. No hash computation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectMeta {
     pub id: ObjectId,
-    /// Vineyard type name (e.g., "vineyard::NumericArray<int64>").
+    /// Vineyard type name (e.g., "vineyard::ArrowFragment<int64,uint64>").
     pub typename: String,
     /// Scalar fields.
     pub fields: HashMap<String, MetaValue>,
     /// Nested object references (member name → child ObjectMeta).
     pub members: HashMap<String, ObjectMeta>,
-    /// Associated blob IDs (buffer name → BlobId).
-    pub blobs: HashMap<String, BlobId>,
+    /// Blob names (logical name → storage name). Same key for put/get.
+    pub blobs: HashMap<String, String>,
 }
 
 impl ObjectMeta {
@@ -173,19 +142,19 @@ impl ObjectMeta {
         self.members.get(name)
     }
 
-    pub fn add_blob(&mut self, name: &str, blob_id: BlobId) {
-        self.blobs.insert(name.to_string(), blob_id);
+    pub fn add_blob(&mut self, name: &str) {
+        self.blobs.insert(name.to_string(), name.to_string());
     }
 }
 
-/// Blob storage trait. CF: R2 backend.
+/// Name-based blob store. Blobs identified by string name, not content hash.
 pub trait BlobStore: Send + Sync {
-    /// Get blob data by ID.
-    fn get(&self, id: &BlobId) -> Option<Bytes>;
-    /// Store blob data, returns its content-addressed BlobId.
-    fn put(&self, data: Bytes) -> BlobId;
-    /// Delete a blob.
-    fn delete(&self, id: &BlobId) -> bool;
+    /// Get blob data by name.
+    fn get(&self, name: &str) -> Option<Bytes>;
+    /// Store blob data by name.
+    fn put(&self, name: &str, data: Bytes);
+    /// Delete a blob by name.
+    fn delete(&self, name: &str) -> bool;
     /// Total stored bytes.
     fn total_bytes(&self) -> u64;
 }
@@ -193,7 +162,7 @@ pub trait BlobStore: Send + Sync {
 /// In-memory blob store (for testing and single-process use).
 #[derive(Clone)]
 pub struct MemoryBlobStore {
-    blobs: Arc<Mutex<HashMap<BlobId, Bytes>>>,
+    blobs: Arc<Mutex<HashMap<String, Bytes>>>,
 }
 
 impl MemoryBlobStore {
@@ -211,18 +180,16 @@ impl Default for MemoryBlobStore {
 }
 
 impl BlobStore for MemoryBlobStore {
-    fn get(&self, id: &BlobId) -> Option<Bytes> {
-        self.blobs.lock().unwrap().get(id).cloned()
+    fn get(&self, name: &str) -> Option<Bytes> {
+        self.blobs.lock().unwrap().get(name).cloned()
     }
 
-    fn put(&self, data: Bytes) -> BlobId {
-        let id = BlobId::from_data(&data);
-        self.blobs.lock().unwrap().insert(id, data);
-        id
+    fn put(&self, name: &str, data: Bytes) {
+        self.blobs.lock().unwrap().insert(name.to_string(), data);
     }
 
-    fn delete(&self, id: &BlobId) -> bool {
-        self.blobs.lock().unwrap().remove(id).is_some()
+    fn delete(&self, name: &str) -> bool {
+        self.blobs.lock().unwrap().remove(name).is_some()
     }
 
     fn total_bytes(&self) -> u64 {
