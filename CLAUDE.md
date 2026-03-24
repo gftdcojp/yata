@@ -115,7 +115,7 @@ env.YATA.stats()                 // → all partition stats
 | R2 FUSE mount | persistence I/O | **除去済み** — R2 direct GET (page-in) + trigger_snapshot (PUT) | done (FUSE removed) |
 | Groot PK index | O(1) vertex lookup | `merge_by_pk` + `prop_eq_index` (HashMap) | partial (Phase 2) — single mergeRecord only, NOT Cypher MERGE |
 | Hash partition routing | vertex → partition | `hash(pk_value) % partition_count` code in partition.rs | NOT WIRED — code exists but not wired into mutation flow |
-| Chunk page-in | granular I/O | `serialize_snapshot_chunked` (100K records/chunk, per-label) | NOT WIRED — code stub exists but not wired into page-in |
+| Chunk page-in | granular I/O | ArrowFragment per-(vlabel,elabel) blob — NbrUnit zero-copy CSR | done (ArrowFragment replaces legacy chunked Arrow IPC) |
 | LSMGraph tiered storage | multi-level auto | Level 0 RAM → Level 1 disk → Level 2 remote disk → Level 3 R2 | NOT IMPLEMENTED (design only) |
 | GART mutable CSR | HTGAP | MutableCsrStore + merge_by_pk + Pipeline epoch | partial (Phase 2) |
 | Distributed disk pool | cross-partition I/O | YataRPC.getChunk → remote partition MmapVineyard | NOT IMPLEMENTED (design only) |
@@ -123,7 +123,7 @@ env.YATA.stats()                 // → all partition stats
 | GRAPE (analytics) | vertex-centric | — | not planned |
 | GLE (learning) | GNN | — | not planned |
 
-**GraphScope parity: 16/23 done** + 2 partial (Groot PK, GART) + 4 code-exists-NOT-WIRED (Pegasus, Data shuffle, Hash routing, Chunk page-in) + 2 design-only (LSMGraph, Distributed disk pool). 3 not planned (Gremlin/GRAPE/GLE).
+**GraphScope parity: 17/23 done** + 2 partial (Groot PK, GART) + 3 code-exists-NOT-WIRED (Pegasus, Data shuffle, Hash routing) + 2 design-only (LSMGraph, Distributed disk pool). 3 not planned (Gremlin/GRAPE/GLE).
 
 ## R2 Persistence (VERIFIED)
 
@@ -151,14 +151,15 @@ Phase 1 (数億): Per-label Arrow IPC ✓ IMPLEMENTED
     PARTITION_COUNT=2 E2E: MERGE + query across partitions PASS (cold start ~30s)
     Production: PARTITION_COUNT=1 (single Container, <20M nodes 推奨)
 
-  Chunk-level page-in — UNIT VERIFIED, E2E UNVERIFIABLE at current scale
-    trigger_snapshot → serialize_snapshot_chunked_to_vineyard — WIRED
-    ensure_vineyard_blobs_from_r2 → chunk fallback — CODE ADDED
-    Unit tests: test_chunked_serialize_small_label + test_chunked_serialize_roundtrip PASS
-    E2E: >100K nodes per label required to trigger, impractical via API
+  ArrowFragment snapshot — E2E VERIFIED (2026-03-24, docker-compose + MinIO)
+    trigger_snapshot → csr_to_fragment → ArrowFragment::serialize → R2 PUT (2000x faster)
+    page_in_from_r2 → R2 GET → ArrowFragment::deserialize → restore_csr_from_fragment (NbrUnit zero-copy)
+    Per-partition snapshot: each Container writes to yata/partitions/{N}/snap/fragment/
+    Cold restart page-in: verified via docker-compose restart
+    mergeRecord XRPC: /xrpc/ai.gftd.yata.mergeRecord for label-routed writes
 
   GIE SecurityFilter — E2E VERIFIED (2026-03-23)
-    transpile_secured + vertex_passes_security — 1005 tests pass (9 SecurityFilter + 2 chunk)
+    transpile_secured + vertex_passes_security — 844 tests pass
     PDS → rlsScope (全 ~100 query 接続済み) → X-RLS-Scope → engine _rls_clearance → GIE path
     sensitivity_ord / owner_hash — AUTO-INJECTED on all writes (fnv1a32)
     E2E verified: sens=0 visible to all, sens=1 invisible to anon/public Clerk

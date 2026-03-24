@@ -17,18 +17,23 @@ Arrow-native graph database and event store with Raft consensus.
 │  yata-engine  yata-gie  yata-mdag                          │
 │  yata-bolt (Bolt v4)                                        │
 ├─────────────────────────────────────────────────────────────┤
-│                     Layer 3: Graph                           │
-│  yata-store (MutableCSR)  yata-graph  yata-vex               │
-│  yata-signal (Signal Protocol)                              │
+│                   Layer 4: Server                            │
+│  yata-server  yata-client                                   │
 ├─────────────────────────────────────────────────────────────┤
-│                    Layer 2: Storage                         │
-│  yata-cypher  yata-log  yata-s3  yata-client               │
+│                   Layer 3: Engine                            │
+│  yata-engine  yata-gie  yata-vex  yata-s3                   │
 ├─────────────────────────────────────────────────────────────┤
-│                 Layer 1: Core Primitives                    │
-│  yata-arrow  yata-cbor  yata-cas  yata-object  yata-ocel    │
+│                   Layer 2: Graph                             │
+│  yata-store (MutableCSR)  yata-graph  yata-cypher           │
 ├─────────────────────────────────────────────────────────────┤
-│                   Layer 0: Zero Deps                        │
-│  yata-core    yata-raft    yata-grin                        │
+│                Layer 1.5: Persistence Format                 │
+│  yata-vineyard (ArrowFragment, NbrUnit zero-copy CSR)       │
+├─────────────────────────────────────────────────────────────┤
+│                 Layer 1: Core Primitives                     │
+│  yata-arrow  yata-object                                    │
+├─────────────────────────────────────────────────────────────┤
+│                   Layer 0: Zero Deps                         │
+│  yata-core    yata-grin                                     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -36,22 +41,21 @@ Arrow-native graph database and event store with Raft consensus.
 
 | Crate | Description |
 |---|---|
-| **yata-core** | Core types, error handling, and storage traits |
-| **yata-raft** | Raft consensus (leader election, log replication) |
-| **yata-grin** | GRIN storage-agnostic graph traits (Topology, Property, Schema, Mutable, Partitioned) |
-| **yata-arrow** | Arrow IPC encode/decode and versioned SchemaRegistry |
-| **yata-cbor** | CBOR serialization for AT Protocol dag-cbor |
-| **yata-cas** | Content-addressable storage (Blake3) |
-| **yata-object** | Object storage abstraction (S3 write-through) |
-| **yata-ocel** | OCEL 2.0 event log types and Arrow schema |
+| **yata-core** | Core types (GlobalVid, PartitionId), error handling |
+| **yata-grin** | GRIN storage-agnostic graph traits (Topology, Property, Schema, Mutable) |
+| **yata-arrow** | Arrow IPC encode/decode |
+| **yata-object** | Object storage abstraction (CAS + S3 write-through) |
+| **yata-vineyard** | ArrowFragment format — NbrUnit zero-copy CSR, PropertyGraphSchema, BlobStore |
 | **yata-cypher** | Pure-Rust Cypher parser and execution engine |
-| **yata-log** | Append-only segmented event log (CRC32, compaction) |
-| **yata-s3** | S3/R2 adapter (S3CasStore + S3Sync + TieredObjectStore) |
-| **yata-client** | Async client API for broker |
-| **yata-store** | MutableCSR in-memory graph (WAL, MVCC snapshots) |
-| **yata-graph** | Graph store with CSR cache, yata-vex vector search, and query LRU |
-| **yata-signal** | Signal Protocol crypto (X3DH, Double Ratchet, Sender Keys) |
+| **yata-store** | MutableCSR in-memory graph, ArrowGraphStore, DiskVineyard/MmapVineyard |
+| **yata-graph** | Graph store with CSR cache, yata-vex vector search |
 | **yata-gie** | Graph Interactive Engine (IR operators, push-based executor) |
+| **yata-engine** | TieredGraphEngine — ArrowFragment snapshot/page-in, partition routing |
+| **yata-s3** | S3/R2 adapter (sync ureq+rustls, SigV4) |
+| **yata-vex** | Vector index (IVF_PQ + DiskANN) |
+| **yata-client** | Async client API |
+| **yata-server** | XRPC API server (Cypher, mergeRecord, triggerSnapshot) |
+| **yata-bench** | Benchmarks + trillion-scale test |
 | **yata-engine** | Tiered HTAP engine: HOT (CSR) + MDAG CAS persistence |
 | **yata-mdag** | Merkle DAG graph sync (CBOR blocks, time-travel checkout) |
 | **yata-bolt** | Bolt v4 wire protocol (Neo4j driver compatible) |
