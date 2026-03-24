@@ -1,8 +1,8 @@
-//! Embedded yata REST API — Cypher query endpoint for Worker WASM proxy.
+//! yata XRPC API — Cypher query endpoint for Workers RPC.
 //!
-//! Exposes `/api/cypher/query` and `/api/cypher/exec` for remote Cypher execution.
-//! All queries are RLS-scoped by X-GFTD-ORG-ID header.
-//! Auth: X-GFTD-APP-SECRET must match YATA_API_SECRET env var.
+//! XRPC-only: `/xrpc/ai.gftd.yata.cypher` (unified read+write).
+//! All queries are RLS-scoped via X-Magatama-Verified headers.
+//! Auth: X-Magatama-Verified: true (Workers RPC internal) or x-gftd-app-secret.
 
 use axum::{
     Json, Router,
@@ -65,12 +65,10 @@ pub fn router<G: GraphQueryExecutor>(state: YataRestState<G>) -> Router {
         .route("/health", get(health))
         .route("/healthz", get(health))
         .route("/readyz", get(health))
-        .route("/api/cypher/query", post(cypher_query::<G>))
-        .route("/api/cypher/exec", post(cypher_exec::<G>))
-        // Flight SQL — Arrow IPC over HTTP (CF Container compatible)
-        .route("/api/flight-sql/query", post(flight_sql_query::<G>))
-        // Trigger snapshot: serialize CSR → R2 PUT (Arrow IPC per-label)
-        .route("/api/snapshot", post(trigger_snapshot_handler::<G>))
+        // XRPC — primary API (Workers RPC only)
+        .route("/xrpc/ai.gftd.yata.cypher", post(xrpc_cypher::<G>))
+        .route("/xrpc/ai.gftd.yata.flightSqlQuery", post(flight_sql_query::<G>))
+        .route("/xrpc/ai.gftd.yata.triggerSnapshot", post(trigger_snapshot_handler::<G>))
         // DO R2 proxy snapshot endpoints
         .route("/internal/snapshot/import-manifest", post(import_snapshot_manifest::<G>))
         .route("/internal/snapshot/import-blob", post(import_snapshot_blob::<G>))
@@ -89,9 +87,37 @@ pub async fn serve<G: GraphQueryExecutor + Clone>(state: YataRestState<G>, port:
     Ok(())
 }
 
-fn authorize<G: GraphQueryExecutor>(headers: &HeaderMap, state: &YataRestState<G>) -> Result<String, StatusCode> {
-    // Empty api_secret = internal-only Container (DO fetch, no external route).
-    // Cloudflare guarantees only the owning Worker DO can reach this endpoint.
+/// Authorize via X-Magatama-Verified (Workers RPC internal) or x-gftd-app-secret.
+/// Returns (org_id, rls_scope_json).
+fn authorize<G: GraphQueryExecutor>(headers: &HeaderMap, state: &YataRestState<G>) -> Result<(String, Option<serde_json::Value>), StatusCode> {
+    // Workers RPC internal: X-Magatama-Verified: true
+    if let Some(verified) = headers.get("X-Magatama-Verified") {
+        if verified.to_str().unwrap_or("") == "true" {
+            let org_id = headers
+                .get("X-Magatama-Verified-Org")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("anon")
+                .to_string();
+            let rls_scope = headers
+                .get("X-RLS-Scope")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+            return Ok((org_id, rls_scope));
+        }
+    }
+    // Fallback: internal token
+    if let Some(token_hdr) = headers.get("X-Magatama-Internal-Token") {
+        let token = token_hdr.to_str().unwrap_or("");
+        if !state.api_secret.is_empty() && token == state.api_secret {
+            let org_id = headers
+                .get("X-Magatama-Org-Id")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("anon")
+                .to_string();
+            return Ok((org_id, None));
+        }
+    }
+    // Legacy: x-gftd-app-secret
     if !state.api_secret.is_empty() {
         let secret = headers
             .get("x-gftd-app-secret")
@@ -103,13 +129,11 @@ fn authorize<G: GraphQueryExecutor>(headers: &HeaderMap, state: &YataRestState<G
     }
     let org_id = headers
         .get("x-gftd-org-id")
+        .or_else(|| headers.get("X-Magatama-Verified-Org"))
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
+        .unwrap_or("anon")
         .to_string();
-    // Empty or "anon" org_id = no RLS filter (GIE fast path).
-    // Security is enforced by GIE SecurityFilter (vertex property: sensitivity_ord, owner_hash),
-    // not by org_id partition. appId/org_id is legacy routing only.
-    Ok(org_id)
+    Ok((org_id, None))
 }
 
 #[derive(Serialize)]
@@ -123,94 +147,118 @@ async fn health() -> impl IntoResponse {
     })
 }
 
+/// XRPC Cypher request: { statement, parameters? }
 #[derive(Deserialize)]
-struct CypherReq {
-    query: String,
+struct XrpcCypherReq {
+    statement: String,
     #[serde(default)]
-    params: String,
+    parameters: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Serialize)]
-struct QueryResp {
-    rows: Vec<Vec<(String, String)>>,
-}
-
-#[derive(Serialize)]
-struct ExecResp {
-    ok: bool,
-}
-
-#[derive(Serialize)]
-struct ErrResp {
-    error: String,
-}
-
-async fn cypher_query<G: GraphQueryExecutor>(
-    State(state): State<YataRestState<G>>,
-    headers: HeaderMap,
-    Json(req): Json<CypherReq>,
-) -> impl IntoResponse {
-    let org_id = match authorize(&headers, &state) {
-        Ok(o) => o,
-        Err(_) => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error":"unauthorized"})),
-            );
-        }
-    };
-    let params = parse_params(&req.params);
-    match state.graph.query(&req.query, &params, Some(&org_id)) {
-        Ok(rows) => (StatusCode::OK, Json(serde_json::json!({"rows": rows}))),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": e})),
-        ),
-    }
-}
-
-async fn cypher_exec<G: GraphQueryExecutor>(
-    State(state): State<YataRestState<G>>,
-    headers: HeaderMap,
-    Json(req): Json<CypherReq>,
-) -> impl IntoResponse {
-    let org_id = match authorize(&headers, &state) {
-        Ok(o) => o,
-        Err(_) => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error":"unauthorized"})),
-            );
-        }
-    };
-    let params = parse_params(&req.params);
-    match state.graph.query(&req.query, &params, Some(&org_id)) {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": e})),
-        ),
-    }
-}
-
-fn parse_params(json_str: &str) -> Vec<(String, String)> {
-    if json_str.is_empty() || json_str == "{}" {
-        return vec![];
-    }
-    let map: serde_json::Map<String, serde_json::Value> = match serde_json::from_str(json_str) {
-        Ok(m) => m,
-        Err(_) => return vec![],
-    };
-    map.into_iter()
+fn xrpc_parse_params(
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<(String, String)> {
+    params
+        .iter()
         .map(|(k, v)| {
-            let s = match &v {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Null => String::new(),
+            let encoded = match v {
+                serde_json::Value::String(s) => serde_json::to_string(s).unwrap_or_default(),
                 other => other.to_string(),
             };
-            (k, s)
+            (k.clone(), encoded)
         })
         .collect()
+}
+
+/// POST /xrpc/ai.gftd.yata.cypher — unified Cypher read+write.
+async fn xrpc_cypher<G: GraphQueryExecutor>(
+    State(state): State<YataRestState<G>>,
+    headers: HeaderMap,
+    Json(req): Json<XrpcCypherReq>,
+) -> impl IntoResponse {
+    let (org_id, rls_scope) = match authorize(&headers, &state) {
+        Ok(a) => a,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"code":"unauthenticated","message":"unauthorized"})),
+            );
+        }
+    };
+    let mut params = xrpc_parse_params(&req.parameters);
+    if !org_id.is_empty() && org_id != "anon" {
+        params.push(("_rls_org_id".to_string(), format!("\"{}\"", org_id)));
+    }
+    // Inject RLS scope metadata for governance-aware filtering
+    if let Some(ref scope) = rls_scope {
+        if let Some(ud) = scope.get("user_did").and_then(|v| v.as_str()) {
+            params.push(("_rls_user_did".to_string(), format!("\"{}\"", ud)));
+        }
+        if let Some(ad) = scope.get("actor_did").and_then(|v| v.as_str()) {
+            params.push(("_rls_actor_did".to_string(), format!("\"{}\"", ad)));
+        }
+        if let Some(cl) = scope.get("clearance").and_then(|v| v.as_str()) {
+            params.push(("_rls_clearance".to_string(), format!("\"{}\"", cl)));
+        }
+        if let Some(grants) = scope.get("consent_grants") {
+            if let Ok(json) = serde_json::to_string(grants) {
+                params.push(("_rls_consent_grants".to_string(), json));
+            }
+        }
+    }
+
+    let stmt = req.statement;
+    let org = org_id.clone();
+    let graph = state.graph.clone();
+    let result = tokio::task::spawn_blocking(move || graph.query(&stmt, &params, Some(&org))).await;
+
+    match result {
+        Ok(Ok(raw_rows)) => {
+            let columns: Vec<String> = if let Some(first) = raw_rows.first() {
+                first.iter().map(|(col, _)| col.clone()).collect()
+            } else {
+                Vec::new()
+            };
+            let filtered_rows: Vec<Vec<serde_json::Value>> = raw_rows
+                .into_iter()
+                .filter(|row| {
+                    for (k, v) in row {
+                        if k == "org_id" {
+                            let s: String = serde_json::from_str(v).unwrap_or_default();
+                            if !s.is_empty() && s != org_id && s != "anon" {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                })
+                .map(|row| {
+                    row.into_iter()
+                        .map(|(_, json_str)| {
+                            serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null)
+                        })
+                        .collect()
+                })
+                .collect();
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "columns": columns,
+                    "rows": filtered_rows,
+                    "org_id": org_id,
+                })),
+            )
+        }
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"code":"internal","message":e})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"code":"internal","message":e.to_string()})),
+        ),
+    }
 }
 
 // ── DO R2 proxy snapshot endpoints ────────────────────────────────────────
@@ -534,14 +582,14 @@ fn default_flight_params() -> String {
     "[]".to_string()
 }
 
-/// POST /api/flight-sql/query — returns Arrow IPC bytes
+/// POST /xrpc/ai.gftd.yata.flightSqlQuery — returns Arrow IPC bytes
 async fn flight_sql_query<G: GraphQueryExecutor>(
     State(state): State<YataRestState<G>>,
     headers: HeaderMap,
     Json(req): Json<FlightSqlReq>,
 ) -> impl IntoResponse {
-    let org_id = match authorize(&headers, &state) {
-        Ok(o) => o,
+    let (org_id, _) = match authorize(&headers, &state) {
+        Ok(a) => a,
         Err(_) => {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -856,23 +904,6 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let json = body_json(resp).await;
         assert_eq!(json["status"], "ok");
-    }
-
-    // ── parse_params ──────────────────────────────────────────────────
-
-    #[test]
-    fn test_parse_params_empty() {
-        assert!(parse_params("").is_empty());
-        assert!(parse_params("{}").is_empty());
-    }
-
-    #[test]
-    fn test_parse_params_string_values() {
-        let params = parse_params(r#"{"name": "Alice", "age": 30}"#);
-        assert_eq!(params.len(), 2);
-        let m: std::collections::HashMap<_, _> = params.into_iter().collect();
-        assert_eq!(m["name"], "Alice");
-        assert_eq!(m["age"], "30");
     }
 
 }

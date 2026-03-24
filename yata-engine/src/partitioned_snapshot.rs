@@ -13,7 +13,6 @@
 
 use std::collections::HashSet;
 
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use yata_core::PartitionId;
 use yata_store::MutableCsrStore;

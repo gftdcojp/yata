@@ -14,7 +14,7 @@ use s3::S3Client;
 use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
-use yata_cas::{CasStore, LocalCasStore};
+use yata_cas::CasStore;
 use yata_core::{
     Blake3Hash, ObjectId, ObjectManifest, ObjectMeta, ObjectStorage, Result, YataError,
 };

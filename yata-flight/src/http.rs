@@ -56,11 +56,6 @@ fn default_params() -> String {
 }
 
 #[derive(Serialize)]
-struct ExecResponse {
-    affected: i64,
-}
-
-#[derive(Serialize)]
 struct ErrorResponse {
     error: String,
 }

@@ -14,10 +14,10 @@ use std::time::Instant;
 
 use anyhow::Result;
 use serde::Serialize;
-use yata_core::{GlobalEid, GlobalVid, LocalEid, LocalVid, PartitionId};
+use yata_core::{GlobalVid, LocalVid, PartitionId};
 use yata_engine::frontier;
 use yata_engine::partition_query;
-use yata_grin::{Mutable, Predicate, PropValue, Property, Scannable, Schema, Topology};
+use yata_grin::{Mutable, Predicate, PropValue, Property, Topology};
 use yata_store::MutableCsrStore;
 use yata_store::partition::{PartitionAssignment, PartitionStoreSet};
 use yata_store::partition_wal::PartitionedWal;

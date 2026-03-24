@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use yata_cas::CasStore;
 use yata_core::{Blake3Hash, PartitionId};
-use yata_grin::{Mutable, PropValue, Property, Scannable, Schema, Topology};
+use yata_grin::{Mutable, PropValue, Property, Topology};
 use yata_store::MutableCsrStore;
 
 use crate::blocks::*;

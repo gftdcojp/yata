@@ -43,7 +43,7 @@ pub fn plan_distributed(plan: &QueryPlan, partition_count: u32) -> DistributedPl
             // Expand may cross partition boundaries — insert exchange after.
             LogicalOp::Expand {
                 dst_alias,
-                edge_label,
+                edge_label: _,
                 ..
             } => {
                 fragment_ops.push(op.clone());
@@ -78,7 +78,7 @@ pub fn plan_distributed(plan: &QueryPlan, partition_count: u32) -> DistributedPl
             // PathExpand: one exchange round per hop.
             LogicalOp::PathExpand {
                 dst_alias,
-                min_hops,
+                min_hops: _,
                 max_hops,
                 ..
             } => {

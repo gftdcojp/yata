@@ -34,7 +34,6 @@ pub fn install(port: u16) -> anyhow::Result<()> {
 /// Register metric descriptions (called once at startup).
 pub fn describe() {
     use metrics::describe_counter;
-    use metrics::describe_histogram;
 
     describe_counter!(names::LOG_APPENDS, "Total log append operations");
     describe_counter!(

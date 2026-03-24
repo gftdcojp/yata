@@ -171,21 +171,6 @@ pub async fn merkle_diff(
     Ok(diff)
 }
 
-/// Trait for extracting label from a group block.
-trait LabelGroup {
-    fn label(&self) -> &str;
-}
-impl LabelGroup for LabelVertexGroup {
-    fn label(&self) -> &str {
-        &self.label
-    }
-}
-impl LabelGroup for LabelEdgeGroup {
-    fn label(&self) -> &str {
-        &self.label
-    }
-}
-
 async fn load_vertex_cid_map(
     cas: &dyn CasStore,
     cids: &[Blake3Hash],

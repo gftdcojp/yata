@@ -19,7 +19,7 @@
 use anyhow::Result;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use yata_cypher::{Executor, Graph, MemoryGraph, NodeRef, RelRef, Value, parse};
