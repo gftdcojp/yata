@@ -252,7 +252,16 @@ impl TieredGraphEngine {
         let s3_prefix = std::env::var("YATA_S3_PREFIX").unwrap_or_default();
         let s3_client = Arc::new(Mutex::new(None));
 
-        let hot_store = yata_store::GraphStoreEnum::new(partition_count, hot_partition_id);
+        // Arrow store is default (Vineyard-native, no CSR conversion).
+        // Legacy CSR: set YATA_USE_CSR=true to fall back.
+        let use_csr = std::env::var("YATA_USE_CSR").unwrap_or_default() == "true";
+        let hot_store = if use_csr {
+            tracing::info!("using legacy MutableCsrStore (YATA_USE_CSR=true)");
+            yata_store::GraphStoreEnum::new(partition_count, hot_partition_id)
+        } else {
+            tracing::info!("using ArrowGraphStore (Vineyard-native, default)");
+            yata_store::GraphStoreEnum::new_arrow(hot_partition_id)
+        };
         Self {
             config,
             hot: Arc::new(Mutex::new(hot_store)),
