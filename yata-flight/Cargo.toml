@@ -9,7 +9,6 @@ description = "Arrow Flight SQL endpoint for yata graph engine"
 [features]
 default = ["http"]
 http = ["axum", "tower"]
-grpc = ["arrow-flight", "tonic", "futures"]
 
 [dependencies]
 yata-grin = { workspace = true }
@@ -27,11 +26,6 @@ sqlparser = { version = "0.53", features = ["visitor"] }
 # HTTP endpoint (CF Container — default)
 axum = { workspace = true, optional = true }
 tower = { version = "0.5", optional = true }
-
-# gRPC endpoint (opt-in)
-arrow-flight = { version = "53", features = ["flight-sql-experimental"], optional = true }
-tonic = { version = "0.12", optional = true }
-futures = { workspace = true, optional = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
