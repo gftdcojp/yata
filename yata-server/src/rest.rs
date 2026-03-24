@@ -54,6 +54,7 @@ pub fn router<G: GraphQueryExecutor>(state: YataRestState<G>) -> Router {
         .route("/readyz", get(health))
         // XRPC — primary API (Workers RPC only)
         .route("/xrpc/ai.gftd.yata.cypher", post(xrpc_cypher::<G>))
+        .route("/xrpc/ai.gftd.yata.mergeRecord", post(merge_record_handler::<G>))
         .route("/xrpc/ai.gftd.yata.triggerSnapshot", post(trigger_snapshot_handler::<G>))
         .route("/internal/snapshot/rebuild", post(rebuild_from_snapshot::<G>))
         .with_state(state)
@@ -270,8 +271,54 @@ async fn rebuild_from_snapshot<G: GraphQueryExecutor>(
     }
 }
 
-/// POST /api/snapshot — Trigger snapshot: serialize CSR → Arrow IPC → R2 PUT.
-/// Called by YataRPC.snapshot() for persistence.
+/// POST /xrpc/ai.gftd.yata.mergeRecord — Merge a record into CSR by label + PK.
+/// Used by YataRPC for label-routed writes (hash(label) % N → this partition).
+async fn merge_record_handler<G: GraphQueryExecutor>(
+    State(state): State<YataRestState<G>>,
+    headers: HeaderMap,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let (_, _) = match authorize(&headers, &state) {
+        Ok(a) => a,
+        Err(s) => return (s, Json(serde_json::json!({"error": "unauthorized"}))),
+    };
+
+    let label = req.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    let pk_key = req.get("pk_key").and_then(|v| v.as_str()).unwrap_or("rkey");
+    let pk_value = req.get("pk_value").and_then(|v| v.as_str()).unwrap_or("");
+    let props_val = req.get("props").cloned().unwrap_or(serde_json::Value::Object(Default::default()));
+
+    if label.is_empty() || pk_value.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "label and pk_value required"})));
+    }
+
+    // Convert JSON props to Cypher MERGE statement
+    let mut set_clauses = Vec::new();
+    if let Some(obj) = props_val.as_object() {
+        for (k, v) in obj {
+            let val_str = match v {
+                serde_json::Value::String(s) => format!("'{}'", s.replace('\'', "\\'")),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => format!("'{}'", v),
+            };
+            set_clauses.push(format!("n.{k} = {val_str}"));
+        }
+    }
+
+    let cypher = if set_clauses.is_empty() {
+        format!("MERGE (n:{label} {{{pk_key}: '{pk_value}'}})")
+    } else {
+        format!("MERGE (n:{label} {{{pk_key}: '{pk_value}'}}) SET {}", set_clauses.join(", "))
+    };
+
+    match state.graph.query(&cypher, &[], None) {
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true, "label": label, "pk": pk_value}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
+    }
+}
+
+/// POST /xrpc/ai.gftd.yata.triggerSnapshot — Trigger snapshot: CSR → ArrowFragment → R2.
 async fn trigger_snapshot_handler<G: GraphQueryExecutor>(
     State(state): State<YataRestState<G>>,
 ) -> impl IntoResponse {
