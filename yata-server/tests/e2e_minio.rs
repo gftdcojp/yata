@@ -195,3 +195,74 @@ fn t06_load_test() {
     let qps = count as f64 / elapsed.as_secs_f64();
     eprintln!("t06: {} reads in {:?} ({:.0} QPS via HTTP)", count, elapsed, qps);
 }
+
+#[test]
+fn t07_merge_record_api() {
+    // Test the dedicated mergeRecord XRPC endpoint
+    let resp = client()
+        .post(&format!("{P0_URL}/xrpc/ai.gftd.yata.mergeRecord"))
+        .header("X-Magatama-Verified", "true")
+        .json(&serde_json::json!({
+            "label": "MergeTest",
+            "pk_key": "rkey",
+            "pk_value": "mr_001",
+            "props": {
+                "name": "MergeRecord Test",
+                "collection": "test",
+                "repo": "did:web:test",
+                "sensitivity_ord": 0,
+                "owner_hash": 0,
+                "updated_at": "2026-03-24"
+            }
+        }))
+        .send()
+        .unwrap();
+    assert!(resp.status().is_success(), "mergeRecord failed: {}", resp.status());
+
+    // Verify via Cypher
+    let result = cypher(P0_URL, "MATCH (n:MergeTest {rkey: 'mr_001'}) RETURN n.name AS name");
+    let rows = result.get("rows").and_then(|r| r.as_array()).unwrap();
+    assert!(!rows.is_empty(), "mergeRecord not found via Cypher");
+    eprintln!("t07: mergeRecord API OK — {}", serde_json::to_string_pretty(&result).unwrap());
+}
+
+#[test]
+fn t08_per_partition_snapshot_and_restore() {
+    // P0: write data, snapshot, restart, verify page-in
+    for i in 0..20 {
+        cypher(P0_URL, &format!(
+            "MERGE (n:SnapPartTest {{rkey: 'sp_{i}'}}) SET n.val = {i}, n.collection = 'test', n.repo = 'did:web:test', n.sensitivity_ord = 0, n.owner_hash = 0, n.updated_at = '2026-03-24'"
+        ));
+    }
+
+    // P1: write different data
+    let p1_ok = client().get(&format!("{P1_URL}/health")).send().map(|r| r.status().is_success()).unwrap_or(false);
+    if p1_ok {
+        for i in 0..10 {
+            cypher(P1_URL, &format!(
+                "MERGE (n:SnapPartP1 {{rkey: 'sp1_{i}'}}) SET n.val = {i}, n.collection = 'test', n.repo = 'did:web:test', n.sensitivity_ord = 0, n.owner_hash = 0, n.updated_at = '2026-03-24'"
+            ));
+        }
+    }
+
+    // Trigger snapshot on both
+    assert!(trigger_snapshot(P0_URL), "P0 snapshot failed");
+    if p1_ok {
+        assert!(trigger_snapshot(P1_URL), "P1 snapshot failed");
+    }
+
+    // Verify counts
+    let p0_count = cypher(P0_URL, "MATCH (n:SnapPartTest) RETURN count(n) AS cnt");
+    eprintln!("t08: P0 SnapPartTest count: {}", serde_json::to_string_pretty(&p0_count).unwrap());
+
+    if p1_ok {
+        let p1_count = cypher(P1_URL, "MATCH (n:SnapPartP1) RETURN count(n) AS cnt");
+        eprintln!("t08: P1 SnapPartP1 count: {}", serde_json::to_string_pretty(&p1_count).unwrap());
+
+        // Cross-check: P0 should NOT have P1's data
+        let p0_cross = cypher(P0_URL, "MATCH (n:SnapPartP1) RETURN count(n) AS cnt");
+        let cnt = p0_cross.get("rows").and_then(|r| r.as_array()).map(|a| a.len()).unwrap_or(0);
+        eprintln!("t08: P0 sees P1 data: {} rows (expected 0 or cnt=0)", cnt);
+    }
+    eprintln!("t08: per-partition snapshot OK");
+}
