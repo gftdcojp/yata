@@ -180,6 +180,11 @@ pub struct TieredGraphEngine {
     s3_client: Arc<Mutex<Option<Arc<yata_s3::s3::S3Client>>>>,
     /// S3 key prefix for R2 read (e.g. "yata/").
     s3_prefix: String,
+    /// Dirty flag: set to true on any write (merge/delete). Cleared after snapshot.
+    /// Prevents redundant R2 uploads when no mutations occurred.
+    dirty: Arc<AtomicBool>,
+    /// Last snapshot vertex+edge count. Used to detect partial page-in corruption.
+    last_snapshot_count: Arc<Mutex<(u64, u64)>>,
 }
 
 impl TieredGraphEngine {
@@ -273,6 +278,8 @@ impl TieredGraphEngine {
             fragment_manifest: Arc::new(Mutex::new(None)),
             s3_client,
             s3_prefix,
+            dirty: Arc::new(AtomicBool::new(false)),
+            last_snapshot_count: Arc::new(Mutex::new((0, 0))),
         }
         // No startup restore — labels are lazy-loaded from R2 on first query (page-in).
         // Write path: Pipeline.send() + mergeRecord() (PDS Worker).
