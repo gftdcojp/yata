@@ -385,6 +385,9 @@ impl TieredGraphEngine {
                     tracing::debug!("R2 page-in: empty fragment, skipping");
                     return;
                 }
+                if let Ok(mut last) = self.last_snapshot_count.lock() {
+                    *last = (vc as u64, ec as u64);
+                }
                 if let Ok(mut hot) = self.hot.lock() {
                     *hot = yata_store::GraphStoreEnum::Single(store);
                     self.hot_initialized.store(true, Ordering::Relaxed);
@@ -856,6 +859,7 @@ impl TieredGraphEngine {
     ) -> Result<u32, String> {
         // Ensure label is loaded from R2 (page-in)
         self.ensure_labels(&[label], &[]);
+        self.dirty.store(true, Ordering::Relaxed);
 
         if let Ok(mut hot) = self.hot.lock() {
             // Arrow store path (Vineyard-native, no CSR conversion)
@@ -889,6 +893,7 @@ impl TieredGraphEngine {
         pk_value: &str,
     ) -> Result<bool, String> {
         self.ensure_labels(&[label], &[]);
+        self.dirty.store(true, Ordering::Relaxed);
 
         if let Ok(mut hot) = self.hot.lock() {
             if let Some(arrow) = hot.as_arrow_mut() {
@@ -910,12 +915,16 @@ impl TieredGraphEngine {
     /// Uses yata-vineyard ArrowFragment format with NbrUnit zero-copy CSR.
     /// ~2000x faster serialize, ~50% smaller blobs vs legacy SnapshotBundle.
     pub fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
+        // Skip if no mutations since last snapshot (avoid redundant R2 uploads)
+        if !self.dirty.load(Ordering::Relaxed) {
+            return Ok((0, 0));
+        }
+
         let s3 = self.get_s3_client()
             .ok_or_else(|| "S3 client not configured".to_string())?;
         let prefix = &self.s3_prefix;
 
         // Serialize CSR → ArrowFragment → MemoryBlobStore
-        // Each partition Container snapshots independently (prefix = yata/partitions/{N}/)
         let (v_count, e_count, blob_store, meta) = if let Ok(csr) = self.hot.lock() {
             let store = csr.as_single()
                 .ok_or_else(|| "no CSR store available".to_string())?;
@@ -934,6 +943,19 @@ impl TieredGraphEngine {
         if v_count == 0 && e_count == 0 {
             tracing::info!("snapshot skipped: CSR is empty (v=0, e=0), preserving existing R2 snapshot");
             return Ok((0, 0));
+        }
+
+        // Guard: never overwrite a larger R2 snapshot with a smaller one (partial page-in protection).
+        // If page-in loaded 1000 records but only 5 new writes came in, CSR has 5 → don't destroy 1000.
+        if let Ok(last) = self.last_snapshot_count.lock() {
+            let (last_v, last_e) = *last;
+            if last_v > 0 && v_count < last_v / 2 {
+                tracing::warn!(
+                    current_v = v_count, last_v, current_e = e_count, last_e,
+                    "snapshot skipped: CSR has fewer vertices than last snapshot (partial page-in?)"
+                );
+                return Ok((0, 0));
+            }
         }
 
         // Upload ArrowFragment blobs to R2
@@ -970,6 +992,12 @@ impl TieredGraphEngine {
         let data = bytes::Bytes::from(serde_json::to_vec(&snap_manifest).unwrap_or_default());
         if let Err(e) = s3.put_sync(&key, data) {
             tracing::error!(error = %e, "R2 snapshot manifest upload failed");
+        }
+
+        // Clear dirty flag and update last snapshot count
+        self.dirty.store(false, Ordering::Relaxed);
+        if let Ok(mut last) = self.last_snapshot_count.lock() {
+            *last = (v_count, e_count);
         }
 
         tracing::info!(vertices = v_count, edges = e_count, blobs = uploaded, "R2 ArrowFragment snapshot triggered");
