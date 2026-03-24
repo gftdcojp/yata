@@ -104,7 +104,13 @@ impl ArrowGraphStore {
     /// Load a vertex label from Arrow IPC bytes (Vineyard blob).
     /// Zero-decode: directly stores RecordBatch.
     pub fn load_vertex_label(&mut self, label: &str, ipc_bytes: &[u8]) -> Result<usize, String> {
-        let cursor = std::io::Cursor::new(ipc_bytes);
+        // Skip ARROW_MAGIC prefix if present
+        let data = if ipc_bytes.len() >= 4 && &ipc_bytes[..4] == crate::arrow_codec::ARROW_MAGIC {
+            &ipc_bytes[4..]
+        } else {
+            ipc_bytes
+        };
+        let cursor = std::io::Cursor::new(data);
         let reader = StreamReader::try_new(cursor, None)
             .map_err(|e| format!("arrow ipc decode: {e}"))?;
 
@@ -640,22 +646,23 @@ mod tests {
         // Encode a vertex group to Arrow IPC
         let group = LabelVertexGroup {
             label: "Article".into(),
+            count: 2,
             vertices: vec![
                 VertexBlock {
-                    global_vid: 0,
+                    vid: 0,
                     labels: vec!["Article".into()],
-                    props: [
+                    props: vec![
                         ("rkey".into(), PropValue::Str("r1".into())),
                         ("title".into(), PropValue::Str("Test Article".into())),
-                    ].into_iter().collect(),
+                    ],
                 },
                 VertexBlock {
-                    global_vid: 1,
+                    vid: 1,
                     labels: vec!["Article".into()],
-                    props: [
+                    props: vec![
                         ("rkey".into(), PropValue::Str("r2".into())),
                         ("title".into(), PropValue::Str("Another Article".into())),
-                    ].into_iter().collect(),
+                    ],
                 },
             ],
         };
@@ -667,7 +674,7 @@ mod tests {
 
         // Verify we can read properties directly from Arrow
         assert_eq!(store.vertex_count(), 2);
-        assert!(store.vertex_labels().contains(&"Article".to_string()));
+        assert!(yata_grin::Schema::vertex_labels(&store).contains(&"Article".to_string()));
 
         // PK lookup should work
         let vid = store.merge_by_pk("Article", "rkey", "r1", &[]);
