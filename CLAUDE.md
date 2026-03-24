@@ -84,6 +84,8 @@ env.YATA.stats()                 // → all partition stats
 | `yata-bench` | Benchmarks + trillion-scale test + 10K-10M scale benchmarks (scale_benchmark.rs) |
 | ~~`yata-at`~~ | **除去済み** — AT Protocol integration は `wproto-compat` に移行 |
 | ~~`yata-signal`~~ | **除去済み** — Signal Protocol は `wproto-signal` に移行 |
+| ~~`yata-mdag`~~ | **除去済み** — MDAG commit chain は TS `wproto` (mst.ts/repo.ts/pipeline.ts) に完全移行。Rust 側不要 |
+| ~~`yata-cas`~~ | **除去済み** — CasStore trait + LocalCasStore は `yata-object::cas` にインライン化 |
 | `yata-server` | XRPC API server (`/xrpc/ai.gftd.yata.*`)。Workers RPC only transport。`GraphQueryExecutor` trait (standalone, inline query method + snapshot ops) |
 
 ## GraphScope Parity
