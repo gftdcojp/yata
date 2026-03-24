@@ -114,6 +114,5 @@ rand = "0.8"
 # Parallelism
 rayon = "1.10"
 
-# WAL (rkyv zero-copy serialization + CRC)
+# rkyv zero-copy serialization (yata-core DurableWalOp types)
 rkyv = { version = "0.8", features = ["bytecheck"] }
-crc32fast = "1"

@@ -20,7 +20,6 @@ use yata_engine::partition_query;
 use yata_grin::{Mutable, Predicate, PropValue, Property, Topology};
 use yata_store::MutableCsrStore;
 use yata_store::partition::{PartitionAssignment, PartitionStoreSet};
-use yata_store::partition_wal::PartitionedWal;
 
 // ── Config ──
 
@@ -331,36 +330,8 @@ fn run_load(s: Scale) -> LoadReport {
     let result = frontier::traverse(&pss, gv0, 3, None, 50000);
     let frontier_3hop_ms = frontier_start.elapsed().as_millis() as u64;
 
-    // WAL benchmark
-    eprintln!("  load: WAL write/replay...");
-    let (wal_write_ms, wal_replay_ms) = {
-        let dir = tempfile::tempdir().unwrap();
-        let wal_nodes = s.nodes.min(100_000);
-        let mut pwal = PartitionedWal::open(dir.path(), s.partitions).unwrap();
-        let w_start = Instant::now();
-        for i in 0..wal_nodes {
-            let pid = (i % s.partitions as u64) as u32;
-            pwal.append(
-                pid,
-                yata_core::DurableWalOp::CreateVertex {
-                    node_id: format!("v{}", i),
-                    global_vid: None,
-                    labels: vec![format!("L{}", i % s.labels as u64)],
-                    props: vec![("rank".into(), yata_core::DurablePropValue::Int(i as i64))],
-                },
-            )
-            .unwrap();
-        }
-        let w_ms = w_start.elapsed().as_millis() as u64;
-
-        let r_start = Instant::now();
-        let mut replay_pss = PartitionStoreSet::new(PartitionAssignment::Hash {
-            partition_count: s.partitions,
-        });
-        pwal.replay_all(&mut replay_pss, 0).unwrap();
-        let r_ms = r_start.elapsed().as_millis() as u64;
-        (w_ms, r_ms)
-    };
+    // WAL benchmark (removed — write path moved to PDS Pipeline)
+    let (wal_write_ms, wal_replay_ms) = (0u64, 0u64);
 
     // Peak memory
     let peak_memory_mb = get_peak_rss_mb();
@@ -486,32 +457,7 @@ fn run_security(_s: Scale) -> SecurityReport {
         t.assert_true("id_partition_isolation", gv != gv2);
     }
 
-    // 5. WAL isolation: partition WALs are independent
-    {
-        let dir = tempfile::tempdir().unwrap();
-        let mut pwal = PartitionedWal::open(dir.path(), 2).unwrap();
-        pwal.append(
-            0,
-            yata_core::DurableWalOp::CreateVertex {
-                node_id: "secret".into(),
-                global_vid: None,
-                labels: vec!["Private".into()],
-                props: vec![(
-                    "key".into(),
-                    yata_core::DurablePropValue::Str("classified".into()),
-                )],
-            },
-        )
-        .unwrap();
-
-        // Partition 1's WAL should be empty
-        let p1_entries = pwal.scan_partition(1, 0).unwrap();
-        t.assert_eq("wal_isolation", p1_entries.len(), 0);
-
-        // Partition 0's WAL has the entry
-        let p0_entries = pwal.scan_partition(0, 0).unwrap();
-        t.assert_eq("wal_p0_has_entry", p0_entries.len(), 1);
-    }
+    // 5. WAL isolation: removed (write path moved to PDS Pipeline)
 
     let (run, pass, fail, failures) = t.report();
     SecurityReport {

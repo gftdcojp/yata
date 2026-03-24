@@ -6,7 +6,7 @@ license.workspace = true
 description = "Embedded broker: graph (Cypher) + objects (CAS), MDAG-native replication"
 
 [[bin]]
-name = "yata-server"
+name = "ai-gftd-yata-server"
 path = "src/main.rs"
 
 [lib]

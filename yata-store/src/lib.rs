@@ -10,15 +10,10 @@
 
 pub mod arrow_codec;
 pub mod blocks;
-pub mod durable_wal;
-pub mod durable_wal_conv;
 pub mod graph_store_enum;
-pub mod metis;
 pub mod mirror;
 pub mod partition;
-pub mod partition_wal;
 pub mod partitioned;
-pub mod streaming;
 pub mod vineyard;
 pub use blocks::{EdgeBlock, LabelEdgeGroup, LabelVertexGroup, VertexBlock};
 pub use graph_store_enum::{GraphStoreEnum, MemoryBudget};
