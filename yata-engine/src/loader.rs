@@ -198,17 +198,13 @@ pub fn page_in_from_r2(
     let meta: yata_vineyard::blob::ObjectMeta = serde_json::from_slice(&meta_bytes)
         .map_err(|e| format!("parse fragment meta: {e}"))?;
 
-    // 2. Fetch all blobs referenced in meta
+    // 2. Fetch all blobs referenced in meta (name-based, no CAS hash)
     let blob_store = MemoryBlobStore::new();
-    for (name, blob_id) in &meta.blobs {
+    for name in meta.blobs.keys() {
         let blob_key = format!("{prefix}snap/fragment/{name}");
         match s3.get_sync(&blob_key) {
             Ok(Some(data)) => {
-                // Put with same content → same BlobId (content-addressed)
-                let stored_id = blob_store.put(data);
-                if stored_id != *blob_id {
-                    tracing::warn!(name, "blob content hash mismatch (data may have changed)");
-                }
+                blob_store.put(name, data);
             }
             Ok(None) => {
                 tracing::warn!(name, "R2 blob not found, skipping");

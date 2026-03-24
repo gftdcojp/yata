@@ -13,7 +13,7 @@ pub mod schema;
 #[cfg(test)]
 mod tests;
 
-pub use blob::{BlobId, BlobStore, MemoryBlobStore, ObjectId, ObjectMeta};
+pub use blob::{BlobStore, MemoryBlobStore, ObjectId, ObjectMeta};
 pub use fragment::ArrowFragment;
 pub use nbr::NbrUnit;
 pub use schema::{PropertyDef, PropertyGraphSchema, SchemaEntry};

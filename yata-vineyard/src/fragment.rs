@@ -15,7 +15,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use bytes::Bytes;
 use std::sync::Arc;
 
-use crate::blob::{BlobId, BlobStore, ObjectId, ObjectMeta};
+use crate::blob::{BlobStore, ObjectId, ObjectMeta};
 use crate::nbr::{NbrUnit64, NBR_UNIT_64_SIZE};
 use crate::schema::PropertyGraphSchema;
 
@@ -203,14 +203,15 @@ impl ArrowFragment {
 
         // Schema
         let schema_json = serde_json::to_vec(&self.schema).unwrap_or_default();
-        let schema_blob_id = store.put(Bytes::from(schema_json));
-        meta.add_blob("schema", schema_blob_id);
+        store.put("schema", Bytes::from(schema_json));
+        meta.add_blob("schema");
 
         // Vertex tables
         for (i, batch) in self.vertex_tables.iter().enumerate() {
+            let name = format!("vertex_table_{}", i);
             let ipc_bytes = yata_arrow::batch_to_ipc(batch).unwrap_or_default();
-            let blob_id = store.put(ipc_bytes);
-            meta.add_blob(&format!("vertex_table_{}", i), blob_id);
+            store.put(&name, ipc_bytes);
+            meta.add_blob(&name);
         }
 
         // ivnums
@@ -219,34 +220,31 @@ impl ArrowFragment {
             .iter()
             .flat_map(|n| n.to_le_bytes())
             .collect::<Vec<u8>>();
-        let ivnums_blob_id = store.put(Bytes::from(ivnums_bytes));
-        meta.add_blob("ivnums", ivnums_blob_id);
+        store.put("ivnums", Bytes::from(ivnums_bytes));
+        meta.add_blob("ivnums");
 
         // Edge tables
         for (i, batch) in self.edge_tables.iter().enumerate() {
+            let name = format!("edge_table_{}", i);
             let ipc_bytes = yata_arrow::batch_to_ipc(batch).unwrap_or_default();
-            let blob_id = store.put(ipc_bytes);
-            meta.add_blob(&format!("edge_table_{}", i), blob_id);
+            store.put(&name, ipc_bytes);
+            meta.add_blob(&name);
         }
 
         // CSR topology
         for (elabel_id, vlabel_offsets) in self.oe_offsets.iter().enumerate() {
             for (vlabel_id, maybe_offsets) in vlabel_offsets.iter().enumerate() {
                 if let Some(offsets) = maybe_offsets {
+                    let name = format!("oe_offsets_{}_{}", elabel_id, vlabel_id);
                     let offsets_batch = offsets_to_batch(offsets);
                     let ipc = yata_arrow::batch_to_ipc(&offsets_batch).unwrap_or_default();
-                    let blob_id = store.put(ipc);
-                    meta.add_blob(
-                        &format!("oe_offsets_{}_{}", elabel_id, vlabel_id),
-                        blob_id,
-                    );
+                    store.put(&name, ipc);
+                    meta.add_blob(&name);
                 }
                 if let Some(nbrs) = self.oe_nbrs.get(elabel_id).and_then(|v| v.get(vlabel_id)).and_then(|n| n.as_ref()) {
-                    let blob_id = store.put(nbrs.clone());
-                    meta.add_blob(
-                        &format!("oe_nbrs_{}_{}", elabel_id, vlabel_id),
-                        blob_id,
-                    );
+                    let name = format!("oe_nbrs_{}_{}", elabel_id, vlabel_id);
+                    store.put(&name, nbrs.clone());
+                    meta.add_blob(&name);
                 }
             }
         }
@@ -254,20 +252,16 @@ impl ArrowFragment {
         for (elabel_id, vlabel_offsets) in self.ie_offsets.iter().enumerate() {
             for (vlabel_id, maybe_offsets) in vlabel_offsets.iter().enumerate() {
                 if let Some(offsets) = maybe_offsets {
+                    let name = format!("ie_offsets_{}_{}", elabel_id, vlabel_id);
                     let offsets_batch = offsets_to_batch(offsets);
                     let ipc = yata_arrow::batch_to_ipc(&offsets_batch).unwrap_or_default();
-                    let blob_id = store.put(ipc);
-                    meta.add_blob(
-                        &format!("ie_offsets_{}_{}", elabel_id, vlabel_id),
-                        blob_id,
-                    );
+                    store.put(&name, ipc);
+                    meta.add_blob(&name);
                 }
                 if let Some(nbrs) = self.ie_nbrs.get(elabel_id).and_then(|v| v.get(vlabel_id)).and_then(|n| n.as_ref()) {
-                    let blob_id = store.put(nbrs.clone());
-                    meta.add_blob(
-                        &format!("ie_nbrs_{}_{}", elabel_id, vlabel_id),
-                        blob_id,
-                    );
+                    let name = format!("ie_nbrs_{}_{}", elabel_id, vlabel_id);
+                    store.put(&name, nbrs.clone());
+                    meta.add_blob(&name);
                 }
             }
         }
@@ -299,24 +293,23 @@ impl ArrowFragment {
             .unwrap_or(0) as usize;
 
         // Schema
-        let schema_blob_id = meta
-            .blobs
-            .get("schema")
-            .ok_or(FragmentError::MissingBlob("schema".to_string()))?;
+        if !meta.blobs.contains_key("schema") {
+            return Err(FragmentError::MissingBlob("schema".to_string()));
+        }
         let schema_bytes = store
-            .get(schema_blob_id)
-            .ok_or(FragmentError::BlobNotFound(*schema_blob_id))?;
+            .get("schema")
+            .ok_or(FragmentError::MissingBlob("schema blob data".to_string()))?;
         let schema: PropertyGraphSchema = serde_json::from_slice(&schema_bytes)
             .map_err(|e| FragmentError::SchemaParseError(e.to_string()))?;
 
         // Vertex tables
         let mut vertex_tables = Vec::with_capacity(vlabel_num);
         for i in 0..vlabel_num {
-            let key = format!("vertex_table_{}", i);
-            if let Some(blob_id) = meta.blobs.get(&key) {
+            let name = format!("vertex_table_{}", i);
+            if meta.blobs.contains_key(&name) {
                 let ipc = store
-                    .get(blob_id)
-                    .ok_or(FragmentError::BlobNotFound(*blob_id))?;
+                    .get(&name)
+                    .ok_or(FragmentError::MissingBlob(name.clone()))?;
                 let batch =
                     yata_arrow::ipc_to_batch(&ipc).map_err(|e| FragmentError::ArrowError(e.to_string()))?;
                 vertex_tables.push(batch);
@@ -325,12 +318,10 @@ impl ArrowFragment {
 
         // ivnums
         let mut ivnums = vec![0u64; vlabel_num];
-        if let Some(blob_id) = meta.blobs.get("ivnums") {
-            if let Some(data) = store.get(blob_id) {
-                for (i, chunk) in data.chunks_exact(8).enumerate() {
-                    if i < vlabel_num {
-                        ivnums[i] = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
-                    }
+        if let Some(data) = store.get("ivnums") {
+            for (i, chunk) in data.chunks_exact(8).enumerate() {
+                if i < vlabel_num {
+                    ivnums[i] = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
                 }
             }
         }
@@ -338,11 +329,11 @@ impl ArrowFragment {
         // Edge tables
         let mut edge_tables = Vec::with_capacity(elabel_num);
         for i in 0..elabel_num {
-            let key = format!("edge_table_{}", i);
-            if let Some(blob_id) = meta.blobs.get(&key) {
+            let name = format!("edge_table_{}", i);
+            if meta.blobs.contains_key(&name) {
                 let ipc = store
-                    .get(blob_id)
-                    .ok_or(FragmentError::BlobNotFound(*blob_id))?;
+                    .get(&name)
+                    .ok_or(FragmentError::MissingBlob(name.clone()))?;
                 let batch =
                     yata_arrow::ipc_to_batch(&ipc).map_err(|e| FragmentError::ArrowError(e.to_string()))?;
                 edge_tables.push(batch);
@@ -357,10 +348,9 @@ impl ArrowFragment {
 
         for elabel_id in 0..elabel_num {
             for vlabel_id in 0..vlabel_num {
-                // OE offsets
-                let key = format!("oe_offsets_{}_{}", elabel_id, vlabel_id);
-                if let Some(blob_id) = meta.blobs.get(&key) {
-                    if let Some(ipc) = store.get(blob_id) {
+                let name = format!("oe_offsets_{}_{}", elabel_id, vlabel_id);
+                if meta.blobs.contains_key(&name) {
+                    if let Some(ipc) = store.get(&name) {
                         if let Ok(batch) = yata_arrow::ipc_to_batch(&ipc) {
                             if let Some(col) = batch.column_by_name("offsets") {
                                 if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
@@ -371,18 +361,14 @@ impl ArrowFragment {
                     }
                 }
 
-                // OE nbrs
-                let key = format!("oe_nbrs_{}_{}", elabel_id, vlabel_id);
-                if let Some(blob_id) = meta.blobs.get(&key) {
-                    if let Some(data) = store.get(blob_id) {
-                        oe_nbrs[elabel_id][vlabel_id] = Some(data);
-                    }
+                let name = format!("oe_nbrs_{}_{}", elabel_id, vlabel_id);
+                if let Some(data) = store.get(&name) {
+                    oe_nbrs[elabel_id][vlabel_id] = Some(data);
                 }
 
-                // IE offsets
-                let key = format!("ie_offsets_{}_{}", elabel_id, vlabel_id);
-                if let Some(blob_id) = meta.blobs.get(&key) {
-                    if let Some(ipc) = store.get(blob_id) {
+                let name = format!("ie_offsets_{}_{}", elabel_id, vlabel_id);
+                if meta.blobs.contains_key(&name) {
+                    if let Some(ipc) = store.get(&name) {
                         if let Ok(batch) = yata_arrow::ipc_to_batch(&ipc) {
                             if let Some(col) = batch.column_by_name("offsets") {
                                 if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
@@ -393,12 +379,9 @@ impl ArrowFragment {
                     }
                 }
 
-                // IE nbrs
-                let key = format!("ie_nbrs_{}_{}", elabel_id, vlabel_id);
-                if let Some(blob_id) = meta.blobs.get(&key) {
-                    if let Some(data) = store.get(blob_id) {
-                        ie_nbrs[elabel_id][vlabel_id] = Some(data);
-                    }
+                let name = format!("ie_nbrs_{}_{}", elabel_id, vlabel_id);
+                if let Some(data) = store.get(&name) {
+                    ie_nbrs[elabel_id][vlabel_id] = Some(data);
                 }
             }
         }
@@ -435,7 +418,7 @@ pub enum FragmentError {
     #[error("missing blob: {0}")]
     MissingBlob(String),
     #[error("blob not found in store: {0}")]
-    BlobNotFound(BlobId),
+    BlobNotFound(String),
     #[error("schema parse error: {0}")]
     SchemaParseError(String),
     #[error("arrow error: {0}")]

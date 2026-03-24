@@ -233,23 +233,18 @@ fn schema_from_fragment() {
 }
 
 #[test]
-fn blob_store_content_addressed() {
+fn blob_store_name_based() {
     let store = MemoryBlobStore::new();
-    let data1 = Bytes::from_static(b"hello");
-    let data2 = Bytes::from_static(b"hello");
-    let data3 = Bytes::from_static(b"world");
+    store.put("a", Bytes::from_static(b"hello"));
+    store.put("b", Bytes::from_static(b"world"));
 
-    let id1 = store.put(data1);
-    let id2 = store.put(data2);
-    let id3 = store.put(data3);
+    assert_eq!(store.get("a").unwrap(), &b"hello"[..]);
+    assert_eq!(store.get("b").unwrap(), &b"world"[..]);
+    assert!(store.get("c").is_none());
 
-    // Same content → same BlobId
-    assert_eq!(id1, id2);
-    // Different content → different BlobId
-    assert_ne!(id1, id3);
-
-    assert_eq!(store.get(&id1).unwrap(), &b"hello"[..]);
-    assert_eq!(store.get(&id3).unwrap(), &b"world"[..]);
+    // Overwrite
+    store.put("a", Bytes::from_static(b"updated"));
+    assert_eq!(store.get("a").unwrap(), &b"updated"[..]);
 }
 
 #[test]

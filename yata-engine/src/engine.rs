@@ -1002,10 +1002,10 @@ impl TieredGraphEngine {
             }
         }
 
-        // Upload ArrowFragment blobs to R2
+        // Upload ArrowFragment blobs to R2 (name-based, no CAS)
         let mut uploaded = 0u32;
-        for (name, blob_id) in &meta.blobs {
-            if let Some(data) = BlobStore::get(&blob_store, blob_id) {
+        for name in meta.blobs.keys() {
+            if let Some(data) = BlobStore::get(&blob_store, name) {
                 let full_key = format!("{prefix}snap/fragment/{name}");
                 if let Err(e) = s3.put_sync(&full_key, data) {
                     tracing::error!(name, error = %e, "R2 ArrowFragment blob upload failed");

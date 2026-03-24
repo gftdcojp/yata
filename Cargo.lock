@@ -3450,7 +3450,6 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-schema",
- "blake3",
  "bytes",
  "serde",
  "serde_json",

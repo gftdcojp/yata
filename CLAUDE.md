@@ -28,27 +28,28 @@ Deploy/config/ops details: `infra/cloudflare/container/yata/CLAUDE.md`
 ## Data Flow
 
 ```
-Write (Pipeline + mergeRecord, PDS Worker):
+Write (append-only, NO page-in):
   App → PDS_RPC.createRecord(repo, collection, record)
     → Pipeline.send(): AT commit + MST update → ACK (~1ms, durable)
-    → YATA_RPC.mergeRecord(): instant Cypher projection (changed records only)
-    → fire-and-forget snapshot() + cron (every 1 min):
-        1. trigger_snapshot → csr_to_fragment() → R2 PUT (ArrowFragment: snap/fragment/meta.json + snap/fragment/{blob_name})
-        2. R2 repo persistence (commits + records + CAS blocks + MST)
-    → firehose: SSE (XRPC compat only, disabled for active use)
+    → YATA_RPC.mergeRecord(): in-memory CSR append (PK dedup in-memory only, NO R2 read)
+    → dirty = true
 
   yata への直接 mutate は mergeRecord からのみ (app 直接禁止)
 
-Read (yata Container = pure read model):
+Snapshot compaction (cron 1min, dirty flag gated):
+  trigger_snapshot():
+    → dirty == false? → skip (no R2 I/O)
+    → hot_initialized == false? → page_in_from_r2 → merge R2 existing into CSR (PK dedup)
+    → csr_to_fragment() → name-based R2 PUT (no CAS hash)
+    → dirty = false, last_snapshot_count updated
+
+Read (ArrowFragment page-in, lazy):
   PDS_RPC.query / listRecords / getTimeline
     → YATA_RPC.cypher → TieredGraphEngine
-    → ensure_labels()
-    → Vineyard blob hit (ephemeral disk cache) → CSR (0ms)
-    → Vineyard miss → page_in_from_r2() → R2 GET ArrowFragment → NbrUnit zero-copy CSR (lazy page-in)
-
-Cold start (after Container sleep):
-  → first query triggers ensure_labels()
-  → page_in_from_r2() → R2 GET snap/fragment/meta.json → R2 GET snap/fragment/{blob_name} → ArrowFragment → CSR
+    → ensure_labels() → hot_initialized == false?
+      → page_in_from_r2() → R2 GET snap/fragment/{name} → ArrowFragment → NbrUnit zero-copy CSR
+      → hot_initialized = true
+    → CSR direct query (<1µs)
 
 PDS Container (Rust) は不要 — 全て TS Worker + Pipeline + YATA_RPC。
 ```
@@ -63,7 +64,6 @@ PDS Container (Rust) は不要 — 全て TS Worker + Pipeline + YATA_RPC。
 env.YATA.cypher(cypher, appId)   // unified Cypher path → /xrpc/ai.gftd.yata.cypher
 env.YATA.query(cypher, appId)    // read-only alias
 env.YATA.mutate(cypher, appId)   // CREATE → random partition, DELETE → broadcast
-// env.YATA.sql() — FlightSQL 除去済み (yata-flight crate 除去済み、Cypher direct が標準)
 env.YATA.health()                // → partition-0 Container
 env.YATA.ping()                  // "pong" (no wake)
 env.YATA.stats()                 // → all partition stats
@@ -84,7 +84,7 @@ env.YATA.stats()                 // → all partition stats
 | `yata-vex` | Vector index (IVF_PQ + DiskANN) |
 | `yata-bench` | Benchmarks + trillion-scale test |
 | `yata-server` | XRPC API server (`/xrpc/ai.gftd.yata.cypher` + `triggerSnapshot`)。GraphQueryExecutor trait |
-| ~~`yata-flight`~~ | **除去済み** — FlightSQL (SQL→Cypher 変換)。Cypher direct が標準 |
+| ~~`yata-flight`~~ | **除去済み** — Cypher direct が標準 |
 | ~~`yata-cbor`~~ | **除去済み** — AT Protocol dag-cbor。`wproto::cbor` が authoritative |
 | ~~`yata-git`~~ | **除去済み** — k8s era legacy。`infra/workers/git-server/` に移行 |
 | ~~`yata-at/signal/mdag/cas`~~ | **除去済み** — AT/Signal/MDAG/CAS は TS `wproto` に移行 |
@@ -127,7 +127,7 @@ env.YATA.stats()                 // → all partition stats
 
 ## R2 Persistence (VERIFIED)
 
-R2 = source of truth. **Dirty tracking**: `trigger_snapshot()` は dirty flag が true の時のみ R2 upload (cron 毎分の無駄な full upload 排除)。**Partial page-in protection**: `last_snapshot_count` で page-in 済み record 数を追跡、page-in 失敗後の少数 write で大きい R2 snapshot を上書きしない。Write: mergeRecord → dirty=true → `trigger_snapshot()` → `csr_to_fragment()` → R2 PUT。Read: `page_in_from_r2()` → R2 GET ArrowFragment → NbrUnit zero-copy CSR。R2 layout: `snap/fragment/meta.json` + `snap/fragment/{blob_name}`。**Page-in timing**: S3 configured → `hot_initialized=false` → first query triggers `page_in_from_r2()` (lazy)。S3 未設定 → `hot_initialized=true` → 空 CSR start (writes create new data)。
+R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in-memory CSR に append のみ)。PK dedup は in-memory 内のみ。R2 既存データとの dedup は snapshot compaction 時。**Dirty tracking**: dirty flag が true の時のみ snapshot upload。**Snapshot compaction**: R2 既存 + in-memory pending → merge by PK → ArrowFragment → R2 PUT。**Partial page-in protection**: `last_snapshot_count` で上書き防止。**Name-based blob** (CAS 除去): `snap/fragment/{name}` で直接 PUT/GET。Blake3 hash 不要。**Read page-in**: `hot_initialized=false` (default) → first query triggers `page_in_from_r2()` → R2 GET → ArrowFragment → CSR。
 
 ## CRITICAL: 3 概念は直交 — partition ≠ label ≠ security
 
