@@ -3,7 +3,7 @@
 //! Storage tiers:
 //!   Tier-M  MemoryGraph          — pure in-process (baseline)
 //!
-//! Graph persistence is via MDAG CAS (yata-mdag).
+//! Graph persistence is via R2 Arrow IPC (Pipeline + mergeRecord).
 //!
 //! Usage:
 //!   cargo run -p yata-bench --bin cypher-storage-bench --release
