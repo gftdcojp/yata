@@ -14,8 +14,6 @@ pub mod frontier;
 pub mod loader;
 pub mod partition_query;
 pub mod partition_router;
-pub mod partition_snapshot;
-pub mod partitioned_snapshot;
 pub mod rls;
 pub mod router;
 pub mod sharded_coordinator;
@@ -25,10 +23,4 @@ pub use config::{PersistenceMode, TieredEngineConfig};
 pub use engine::{MutationContext, TieredGraphEngine};
 pub use partition_query::PartitionQueryMetrics;
 pub use partition_router::{PartitionHints, PartitionScope, extract_partition_hints, route};
-pub use partitioned_snapshot::{
-    DirtyPartitionTracker, GlobalSnapshotManifest, SelectiveCheckpointResult, selective_checkpoint,
-};
-pub use snapshot::{
-    restore_snapshot_bundle, restore_snapshot_from_vineyard, serialize_snapshot,
-    serialize_snapshot_to_vineyard,
-};
+pub use snapshot::SnapshotManifest;

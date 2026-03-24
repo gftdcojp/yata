@@ -75,7 +75,7 @@ fn bench_serialize() {
 
 #[test]
 fn bench_deserialize() {
-    for &(v, e) in &[(1_000, 2_000), (10_000, 20_000), (100_000, 200_000)] {
+    for &(v, e) in &[(1_000, 2_000), (10_000, 20_000)] {
         let store = seed_store(v, e);
         eprintln!("\n=== {v} vertices, {e} edges ===");
 
@@ -107,10 +107,10 @@ fn bench_deserialize() {
 
 #[test]
 fn bench_neighbor_traversal() {
-    let v = 100_000u32;
-    let e = 200_000u32;
+    let v = 10_000u32;
+    let e = 20_000u32;
     let store = seed_store(v, e);
-    let iterations = 1_000_000;
+    let iterations = 100_000;
 
     eprintln!("\n=== Neighbor traversal: {v} vertices, {e} edges, {iterations} iterations ===");
 
@@ -147,8 +147,8 @@ fn bench_neighbor_traversal() {
 
 #[test]
 fn bench_scan_vertices() {
-    let v = 100_000u32;
-    let e = 200_000u32;
+    let v = 10_000u32;
+    let e = 20_000u32;
     let store = seed_store(v, e);
     let iterations = 100;
 

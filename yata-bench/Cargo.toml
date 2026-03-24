@@ -18,16 +18,8 @@ name = "cypher-transport-bench"
 path = "src/cypher_transport_bench.rs"
 
 [[bin]]
-name = "graph-scale-bench"
-path = "src/graph_scale_bench.rs"
-
-[[bin]]
 name = "trillion-scale-test"
 path = "src/trillion_scale_test.rs"
-
-[[bin]]
-name = "scale-benchmark"
-path = "src/scale_benchmark.rs"
 
 [dependencies]
 yata-core.workspace = true
