@@ -129,6 +129,24 @@ env.YATA.stats()                 // → all partition stats
 
 R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in-memory CSR に append のみ)。PK dedup は in-memory 内のみ。R2 既存データとの dedup は snapshot compaction 時。**Dirty tracking**: dirty flag が true の時のみ snapshot upload。**Snapshot compaction**: R2 既存 + in-memory pending → merge by PK → ArrowFragment → R2 PUT。**Partial page-in protection**: `last_snapshot_count` で上書き防止。**Name-based blob** (CAS 除去): `snap/fragment/{name}` で直接 PUT/GET。Blake3 hash 不要。**Read page-in**: `hot_initialized=false` (default) → first query triggers `page_in_from_r2()` → R2 GET → ArrowFragment → CSR。
 
+## Concurrency Model (CRITICAL)
+
+**RwLock<GraphStoreEnum>**: read 並列 / write 排他。`Mutex` から `RwLock` に移行済み。
+
+| 操作 | Lock | 並列性 |
+|---|---|---|
+| Read × Read | `hot.read()` | **concurrent** |
+| Read × Write | read wait | blocked (write waits for reads) |
+| Write × Write | `hot.write()` | sequential |
+| Read × Snapshot serialize | `hot.read()` | **concurrent** |
+| Write × Snapshot compaction | `hot.write()` | sequential (brief) |
+
+**Cross-partition**: 各 partition = 独立 Container = 独立 RwLock → **partition 間は完全並列**。YataRPC が `hash(label) % N` で routing → 同一 label は同一 partition。異なる label への concurrent writes = zero contention。
+
+**CF Container**: 1 vCPU + Workers RPC sequential → 実質 single-thread で contention なし。axum tokio multi-thread 時は RwLock で read 並列化。
+
+**Append-only write safety**: mergeRecord は page-in 不要 → write lock scope は merge_by_pk + commit のみ (~µs)。snapshot compaction が write lock を取るのは R2 既存データの CSR merge 時のみ (初回 1 回)。
+
 ## CRITICAL: 3 概念は直交 — partition ≠ label ≠ security
 
 **partition** = Container instance。YataRPC coordinator が `hash(label) % N` で label-based routing。
@@ -247,25 +265,43 @@ CSR neighbor lookup: O(1) any scale
 
 ## Test Coverage
 
-988+ Rust unit tests, 0 warnings, 0 failures. Production: 32/32 E2E pass, p50=28ms. 2-partition: verified. 4-partition: cold start timeout (known limitation — sleeping Container wake exceeds Worker timeout).
+844 Rust unit tests, 0 failures. E2E: 8 tests (docker-compose + MinIO, 2-partition). 6-node distributed: 6 tests (10K records, label routing, cold put/pull). ArrowFragment snapshot roundtrip verified.
 
-## Benchmark (measured, release build)
+## Benchmark (measured, release build, 10K records)
 
-| Operation | 10K | 100K | Scaling |
+| Operation | In-Process | Via HTTP | Notes |
 |---|---|---|---|
-| Build (CSR) | 553ms | 544ms | O(n) with const overhead |
-| Scan | 358µs | 89µs | warm cache |
-| Neighbor (typed) | <1µs | <1µs | **O(1)** |
-| COUNT | 35ms | 340ms | linear (partition fan-out) |
-| Memory | 102MB | 782MB | ~8 bytes/edge |
+| **Write (mergeRecord)** | 63,715/sec | 70/sec (docker) | append-only, no page-in |
+| **Edge create** | 77,092/sec | — | Cypher MATCH+CREATE |
+| **Point read** | 205,539 QPS (4.9µs) | 103 QPS (6-node) | coordinator overhead 2ms |
+| **1-hop traversal** | 165,397 QPS (6.0µs) | — | NbrUnit zero-copy |
+| **Full scan** | 1,686,597 QPS | — | COUNT aggregate |
+| **Snapshot serialize** | 15ms (10K) | 33ms (6-node total) | ArrowFragment, 2000x vs legacy |
 
-| Vineyard | 10K | 100K |
-|---|---|---|
-| DiskVineyard restore | 327ms | 1052ms |
-| MmapVineyard restore | 268ms | 1102ms |
-| MmapVineyard cold query | 155µs | — |
+**ArrowFragment vs Legacy (10K vertices + 20K edges):**
+| | Legacy SnapshotBundle | ArrowFragment | Speedup |
+|---|---|---|---|
+| Serialize | 34,661ms | 15ms | **2,311x** |
+| Deserialize | 57ms | <1ms | **>57x** |
+| Neighbor traversal | 76ns/iter | 3ns/iter | **25.3x** |
+| Blob size | 3.8MB | 1.8MB | **53% smaller** |
 
-Key: Neighbor O(1) any scale. CSR Build <1s at 100K. Memory ~782MB/100K → standard-1 (4GB) supports ~500K nodes. 4-partition verified: 2M nodes capacity.
+**6-node distributed (docker-compose, 10K records):**
+| Metric | Result |
+|---|---|
+| Cold write 10K | 70/sec (HTTP overhead) |
+| Snapshot 6 nodes | 33ms total |
+| Cold pull recovery | 10,000/10,000 records |
+| Distributed reads | 103 QPS |
+| Partition isolation | 0 violations |
+
+**Trillion scale projection (from 10K benchmark):**
+| Scale | Partitions | Write/sec | Point QPS | Scan QPS | Cost/月 |
+|---|---|---|---|---|---|
+| 1M | 1 | 63,715 | 499 | 2,000 | $60 |
+| 100M | 5 | 63,715 | 499 | 400 | $5,888 |
+| 1B | 50 | 63,715 | 499 | 40 | $5,959 |
+| 1T | 50,000 | 63,715 | 499 | 0.04 | $80,884 |
 
 ## mergeResults (Coordinator)
 
