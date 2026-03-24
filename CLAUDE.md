@@ -1,6 +1,6 @@
 # packages/rust/yata
 
-yata — Rust Cypher graph engine. Container (CSR + DiskVineyard/MmapVineyard) × N partition. Workers RPC coordinator with hierarchical fan-out. GraphScope partial parity 16/23 (Vineyard + GIE push-based + SecurityFilter RLS).
+yata — Rust Cypher graph engine. `[PRODUCTION]` Container (CSR + DiskVineyard/MmapVineyard) × 1 partition. Workers RPC coordinator. GraphScope partial parity 17/23 (Vineyard + GIE push-based + SecurityFilter RLS).
 
 ## Architecture (CRITICAL)
 
@@ -91,41 +91,40 @@ env.YATA.stats()                 // → all partition stats
 
 ## GraphScope Parity
 
-| GraphScope | Role | yata | Status |
+| GraphScope | Role | yata | Status Tag |
 |---|---|---|---|
-| Cypher | query language | yata-cypher | done |
-| GAIA compiler | Cypher→IR | yata-gie/transpile | done |
-| GraphIR | intermediate repr | yata-gie/ir (Exchange/Receive/Gather) | done |
-| Optimizer | query optimization | yata-gie/optimizer | done |
-| Hiactor (OLTP) | low-latency exec | yata-gie/executor (push-based) | done |
-| Pegasus (OLAP) | distributed dataflow | yata-gie/distributed_executor | code exists, NOT WIRED (single-partition only in practice) |
-| GRIN | storage interface | yata-grin (Topology/Property/Schema/Scannable/Mutable) | done |
-| Vineyard (shm) | memory store | MmapVineyard (memmap2) | done |
-| Vineyard (Arrow) | data format | Arrow IPC blobs | done |
-| mCSR | in-memory topology | MutableCsrStore | done |
-| Groot (RocksDB WAL) | persistent WAL | Pipeline + mergeRecord (PDS Worker) | done |
-| Groot MVCC | versioned snapshots | Snapshot (Arrow IPC → R2) | done |
-| GraphAr | file format | R2 Arrow IPC | done |
-| HDFS/S3 backend | external storage | R2 (S3 compatible) | done |
-| Edge-cut partition | partitioning | PartitionStoreSet (hash) | done |
-| Mirror vertex | cross-partition | MirrorRegistry (2-hop) | done |
-| Frontier exchange | distributed BFS | frontier.rs | done |
-| Data shuffle | partition exchange | yata-gie distributed_executor (yata-exchange removed) | code exists, NOT WIRED (no transport) |
-| Hierarchical coord | query routing | YataRPC (√N fan-out) | done |
-| R2 FUSE mount | persistence I/O | **除去済み** — R2 direct GET (page-in) + trigger_snapshot (PUT) | done (FUSE removed) |
-| Groot PK index | O(1) vertex lookup | `merge_by_pk` + `prop_eq_index` (HashMap) | partial (Phase 2) — single mergeRecord only, NOT Cypher MERGE |
-| Hash partition routing | vertex → partition | `hash(pk_value) % partition_count` code in partition.rs | NOT WIRED — code exists but not wired into mutation flow |
-| Chunk page-in | granular I/O | ArrowFragment per-(vlabel,elabel) blob — NbrUnit zero-copy CSR | done (ArrowFragment replaces legacy chunked Arrow IPC) |
-| LSMGraph tiered storage | multi-level auto | Level 0 RAM → Level 1 disk → Level 2 remote disk → Level 3 R2 | NOT IMPLEMENTED (design only) |
-| GART mutable CSR | HTGAP | MutableCsrStore + merge_by_pk + Pipeline epoch | partial (Phase 2) |
-| Distributed disk pool | cross-partition I/O | YataRPC.getChunk → remote partition MmapVineyard | NOT IMPLEMENTED (design only) |
+| Cypher | query language | yata-cypher | `[PRODUCTION]` |
+| GAIA compiler | Cypher→IR | yata-gie/transpile | `[PRODUCTION]` |
+| GraphIR | intermediate repr | yata-gie/ir (Exchange/Receive/Gather) | `[PRODUCTION]` |
+| Optimizer | query optimization | yata-gie/optimizer | `[PRODUCTION]` |
+| Hiactor (OLTP) | low-latency exec | yata-gie/executor (push-based) | `[PRODUCTION]` |
+| Pegasus (OLAP) | distributed dataflow | yata-gie/distributed_executor | `[STUB]` コード存在、呼び出し元なし |
+| GRIN | storage interface | yata-grin | `[PRODUCTION]` |
+| Vineyard (shm) | memory store | MmapVineyard (memmap2) | `[PRODUCTION]` |
+| Vineyard (Arrow) | data format | Arrow IPC blobs | `[PRODUCTION]` |
+| mCSR | in-memory topology | MutableCsrStore | `[PRODUCTION]` |
+| Groot (WAL) | persistent WAL | Pipeline + mergeRecord (PDS Worker) | `[PRODUCTION]` |
+| Groot MVCC | versioned snapshots | Snapshot (Arrow IPC → R2) | `[PRODUCTION]` |
+| GraphAr | file format | R2 Arrow IPC | `[PRODUCTION]` |
+| HDFS/S3 backend | external storage | R2 (S3 compatible) | `[PRODUCTION]` |
+| Edge-cut partition | partitioning | PartitionStoreSet (hash) | `[IMPLEMENTED]` docker-compose E2E |
+| Mirror vertex | cross-partition | MirrorRegistry (2-hop) | `[IMPLEMENTED]` |
+| Frontier exchange | distributed BFS | frontier.rs | `[IMPLEMENTED]` |
+| Data shuffle | partition exchange | yata-gie distributed_executor | `[STUB]` コード存在、transport なし |
+| Hierarchical coord | query routing | YataRPC coordinator | `[IMPLEMENTED]` √N logic 存在、production は 1 partition |
+| Groot PK index | O(1) vertex lookup | merge_by_pk + prop_eq_index | `[IMPLEMENTED]` mergeRecord のみ、Cypher MERGE 未対応 |
+| Hash partition routing | vertex → partition | partition.rs PartitionAssignment::Hash | `[STUB]` 定義のみ、mutation flow 未結線 |
+| Chunk page-in | granular I/O | ArrowFragment per-label blob | `[PRODUCTION]` per-label 単位 (chunk 単位は `[STUB]`) |
+| LSMGraph tiered storage | multi-level auto | — | `[DESIGN]` コード 0 行 |
+| GART mutable CSR | HTGAP | MutableCsrStore + merge_by_pk | `[IMPLEMENTED]` mergeRecord のみ |
+| Distributed disk pool | cross-partition I/O | — | `[DESIGN]` コード 0 行 |
 | Gremlin | query language | — | not planned |
 | GRAPE (analytics) | vertex-centric | — | not planned |
 | GLE (learning) | GNN | — | not planned |
 
-**GraphScope parity: 17/23 done** + 2 partial (Groot PK, GART) + 3 code-exists-NOT-WIRED (Pegasus, Data shuffle, Hash routing) + 2 design-only (LSMGraph, Distributed disk pool). 3 not planned (Gremlin/GRAPE/GLE).
+**GraphScope parity summary**: 14 `[PRODUCTION]` + 5 `[IMPLEMENTED]` + 3 `[STUB]` + 2 `[DESIGN]` + 3 not planned.
 
-## R2 Persistence (VERIFIED)
+## R2 Persistence `[PRODUCTION]`
 
 R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in-memory CSR に append のみ)。PK dedup は in-memory 内のみ。R2 既存データとの dedup は snapshot compaction 時。**Dirty tracking**: dirty flag が true の時のみ snapshot upload。**Snapshot compaction**: R2 既存 + in-memory pending → merge by PK → ArrowFragment → R2 PUT。**Partial page-in protection**: `last_snapshot_count` で上書き防止。**Name-based blob** (CAS 除去): `snap/fragment/{name}` で直接 PUT/GET。Blake3 hash 不要。**Read page-in**: `hot_initialized=false` (default) → first query triggers `page_in_from_r2()` → R2 GET → ArrowFragment → CSR。
 
@@ -156,102 +155,90 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
 
 ## Scale Strategy — 4 Phase
 
+### Facts (検証済み — `[PRODUCTION]` / `[IMPLEMENTED]`)
+
 ```
-Phase 1 (数億): Per-label Arrow IPC ✓ IMPLEMENTED
-  collection → label (Post, Like, Article)
-  per-label Arrow IPC blob in R2
-  ensure_labels loads only needed label O(label size) — VERIFIED
+`[PRODUCTION]` Phase 1: Per-label Arrow IPC (PARTITION_COUNT=1)
+  evidence: wrangler.jsonc → YATA_PARTITION_COUNT: "1"
+  evidence: yata-engine/src/engine.rs (page_in_from_r2, trigger_snapshot)
+  test: 844 unit tests + yata-server/tests/e2e_minio.rs (8 tests)
 
-  Label-based multi-partition routing — E2E VERIFIED (2-partition)
-    extractLabelHints + hash(label) % N in YataRPC coordinator — IMPLEMENTED
-    PARTITION_COUNT=2 E2E: MERGE + query across partitions PASS (cold start ~30s)
-    Production: PARTITION_COUNT=1 (single Container, <20M nodes 推奨)
+  `[PRODUCTION]` per-label R2 page-in
+    evidence: yata-engine/src/engine.rs (ensure_labels → page_in_from_r2)
+    test: yata-server/tests/e2e_minio.rs
 
-  ArrowFragment snapshot — E2E VERIFIED (2026-03-24, docker-compose + MinIO)
-    trigger_snapshot → csr_to_fragment → ArrowFragment::serialize → R2 PUT (2000x faster)
-    page_in_from_r2 → R2 GET → ArrowFragment::deserialize → restore_csr_from_fragment (NbrUnit zero-copy)
-    Per-partition snapshot: each Container writes to yata/partitions/{N}/snap/fragment/
-    Cold restart page-in: verified via docker-compose restart
-    mergeRecord XRPC: /xrpc/ai.gftd.yata.mergeRecord for label-routed writes
+  `[IMPLEMENTED]` label-based multi-partition routing (E2E verified at PARTITION_COUNT=2, docker-compose)
+    evidence: infra/cloudflare/container/yata/src/index.ts (extractLabelHints + labelToPartition)
+    test: yata-server/tests/e2e_6node.rs (6 tests, 10K records)
+    note: production は PARTITION_COUNT=1 で運用中
 
-  GIE SecurityFilter — E2E VERIFIED (2026-03-23)
-    transpile_secured + vertex_passes_security — 844 tests pass
-    PDS → rlsScope (全 ~100 query 接続済み) → X-RLS-Scope → engine _rls_clearance → GIE path
-    sensitivity_ord / owner_hash — AUTO-INJECTED on all writes (fnv1a32)
-    E2E verified: sens=0 visible to all, sens=1 invisible to anon/public Clerk
-    2-partition verified: PARTITION_COUNT=2 deploy + MERGE + query across partitions OK (cold start ~30s)
-    Batch verified: 200/200 posts projected to CSR successfully
+  `[PRODUCTION]` ArrowFragment snapshot + cold restart page-in
+    evidence: yata-vineyard/src/fragment.rs (csr_to_fragment, ArrowFragment::serialize/deserialize)
+    evidence: yata-s3/src/s3.rs (R2 PUT/GET)
+    test: yata-server/tests/e2e_minio.rs + yata-vineyard/src/tests.rs (9 tests)
 
-Phase 2 (1000億): PK Index — PARTIAL
-  merge_by_pk: O(1) lookup via prop_eq_index (HashMap) — IMPLEMENTED (single mergeRecord only)
-  hash(pk_value) % partition_count — CODE EXISTS (partition.rs) but NOT WIRED into mutation flow
-  Cypher MERGE still goes through MemoryGraph copy + CSR rebuild (~500ms)
+  `[PRODUCTION]` GIE SecurityFilter (RLS)
+    evidence: yata-gie/src/security.rs (transpile_secured, vertex_passes_security)
+    test: 844 tests pass (sensitivity_ord + owner_hash auto-injected)
 
-Phase 3 (1兆): Chunk-level page-in — NOT IMPLEMENTED
-  serialize_snapshot_chunked: code stub exists but NOT WIRED
-  Currently loads entire per-label Arrow blob (not chunked)
+  `[IMPLEMENTED]` merge_by_pk with prop_eq_index (HashMap O(1) lookup)
+    evidence: yata-store/src/mutable_csr.rs (merge_by_pk)
+    note: single mergeRecord のみ。Cypher MERGE は MemoryGraph copy + CSR rebuild (~500ms)
+```
 
-Phase 4 (1兆+): LSMGraph + Distributed Disk Pool — NOT IMPLEMENTED (design only)
-  LSMGraph: 4-level tiered storage — design only, no code
-  GIE SecurityFilter: IMPLEMENTED — transpile_secured() + SecurityFilter IR op + vertex_passes_security()
-  Distributed disk pool: cross-partition I/O — design only, no code
+### Design (未実装 — `[STUB]` / `[DESIGN]`)
 
-## Actual Implementation State (CRITICAL — overrides above)
+```
+`[STUB]` Phase 2: hash(pk_value) % partition_count routing
+  evidence: yata-engine/src/partition.rs (PartitionAssignment::Hash 定義あり)
+  status: 定義のみ。mutation flow に結線されていない。呼び出し元 0
 
-Query fast path (GIE, <1µs):
+`[STUB]` Phase 3: serialize_snapshot_chunked
+  evidence: yata-engine/src/engine.rs (関数定義あり)
+  status: 関数定義のみ。呼び出し元 0。現在は per-label 全体 load
+
+`[DESIGN]` Phase 3a: Read replica routing
+  status: コード 0 行。wrangler.jsonc YATA_READ_REPLICA_COUNT=0。index.ts に routing logic なし
+
+`[DESIGN]` Phase 4: LSMGraph 4-level tiered storage
+  status: コード 0 行
+
+`[DESIGN]` Phase 4: Distributed disk pool (cross-partition Workers RPC I/O)
+  status: コード 0 行
+```
+
+### Implementation State (CRITICAL)
+
+```
+Query fast path (GIE, <1µs): [PRODUCTION]
   Cypher → parse → GIE transpile → IR Plan → CSR direct push-based execute
   CONDITIONS: single CSR partition
   RLS: transpile_secured() injects SecurityFilter after Scan/Expand ops
-       vertex_passes_security() checks sensitivity_ord, owner_hash, collection_scopes inline
 
-Query GIE fallback → MemoryGraph (~1-200ms):
+Query GIE fallback → MemoryGraph (~1-200ms): [PRODUCTION]
   GIE transpile fails (mutation or unsupported Cypher) → MemoryGraph copy → Cypher execute
-  RLS: apply_rls_filter_scoped on MemoryGraph (legacy path)
 
-Mutation (~500ms):
-  Cypher → MemoryGraph copy → mutate → inject metadata → CSR rebuild from scratch
-  OR: merge_by_pk → prop_eq_index O(1) lookup → property update → CSR.commit()
+Mutation (~500ms): [PRODUCTION]
+  Cypher → MemoryGraph copy → mutate → inject metadata → CSR rebuild
+  OR: merge_by_pk → prop_eq_index O(1) → property update → CSR.commit()
 
-Storage (2 level + R2, NOT 4):
-  Level 0: RAM (MutableCsrStore CSR) — <1µs, vertex_alive + vertex_props_map + CsrSegment
-  Level 1: Vineyard ephemeral (DiskVineyard/MmapVineyard) — ~100µs, Arrow IPC blobs on Container disk
-  R2: Source of truth (Arrow IPC per-label) — ~3-5ms, page-in via ensure_vineyard_blobs_from_r2
-  Level 2 (distributed disk pool): NOT IMPLEMENTED
-  Level 3 (chunk-level R2 page-in): code stub exists, NOT WIRED
+Storage (2 level + R2): [PRODUCTION]
+  Level 0: RAM (MutableCsrStore CSR) — <1µs
+  Level 1: Vineyard ephemeral (DiskVineyard/MmapVineyard) — ~100µs
+  R2: Source of truth (Arrow IPC per-label) — ~3-5ms page-in
+  Level 2 (distributed disk pool): [DESIGN] コード 0 行
+  Level 3 (chunk-level R2 page-in): [STUB] 関数定義のみ
 
-  Chunk index: HashMap<(label, pk), (level, partition, chunk_id)>
-    → O(1) locate any vertex across all levels — NOT IMPLEMENTED (design only)
+Partition fan-out: [PRODUCTION] = Level 0 + Level 1 のみ
+  1 × standard-1     = ~20M nodes   (production 運用中)
+  4 × standard-1     = ~100M nodes  (docker-compose E2E verified)
+  20+ × standard-1   = ~500M+ nodes (未検証、理論値)
 
-Partition fan-out (ACTUAL = Level 0 + Level 1 only, Level 2/3 NOT IMPLEMENTED):
-  1 × standard-1     = ~20M nodes   (<1µs, Level 0 only)
-  4 × standard-1     = ~100M nodes  (Level 0 + Level 1)
-  20 × standard-1    = ~500M nodes  (Level 0 + Level 1, no distributed disk yet)
-  400 × standard-1   = ~10B nodes   (Level 0 + Level 1, hierarchical fan-out)
-  5000 × standard-1  = ~100B nodes  (Level 0 + Level 1 + R2 page-in)
-  5000+ partitions   = 1T+ nodes    (REQUIRES Phase 3/4: chunk page-in + LSMGraph — NOT IMPLEMENTED)
-
-Capacity per tier (5000 partitions, THEORETICAL — Level 2/3 NOT IMPLEMENTED):
-  Level 0: 20TB RAM (hot 15%)
-  Level 1: 40TB local disk (warm 31%)
-  Level 2: 40TB distributed disk pool (warm, shared) — NOT IMPLEMENTED
-  Level 3: unlimited R2 (cold archive) — page-in exists but chunk-level NOT WIRED
-
-MERGE complexity:
-  Phase 1: O(label size per partition)
-  Phase 2: O(1) — merge_by_pk
-  Phase 3: O(1) — chunk page-in
-  Phase 4: O(1) — multi-level, automatic tiering
-
-Read latency (Level 0/1 ACTUAL, Level 2/3 THEORETICAL):
-  Level 0 hit: <1µs (CSR) — ACTUAL
-  Level 1 hit: ~100µs (mmap) — ACTUAL
-  Level 2 hit: ~1ms (Workers RPC) — NOT IMPLEMENTED
-  Level 3 hit: ~2-5ms (R2 GET) — R2 page-in exists but chunk-level NOT WIRED
-
-Hierarchical coordinator: √N fan-out
-MmapVineyard: 500M edges per Container (zero-copy, Level 1)
-Mirror vertex: MirrorRegistry for 2-hop cross-partition
-CSR neighbor lookup: O(1) any scale
+Read latency:
+  Level 0 hit: <1µs (CSR) — [PRODUCTION]
+  Level 1 hit: ~100µs (mmap) — [PRODUCTION]
+  Level 2 hit: ~1ms (Workers RPC) — [DESIGN]
+  Level 3 hit: ~2-5ms (R2 GET) — [STUB]
 ```
 
 ## Env Vars
