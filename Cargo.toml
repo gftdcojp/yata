@@ -13,8 +13,6 @@ members = [
     "yata-cypher",
     "yata-store",
     "yata-graph",
-    # Layer 2.5: Flight SQL
-    "yata-flight",
     # Layer 3: graph engine
     "yata-gie",
     "yata-engine",

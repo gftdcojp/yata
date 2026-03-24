@@ -54,7 +54,6 @@ pub fn router<G: GraphQueryExecutor>(state: YataRestState<G>) -> Router {
         .route("/readyz", get(health))
         // XRPC — primary API (Workers RPC only)
         .route("/xrpc/ai.gftd.yata.cypher", post(xrpc_cypher::<G>))
-        .route("/xrpc/ai.gftd.yata.flightSqlQuery", post(flight_sql_query::<G>))
         .route("/xrpc/ai.gftd.yata.triggerSnapshot", post(trigger_snapshot_handler::<G>))
         .route("/internal/snapshot/rebuild", post(rebuild_from_snapshot::<G>))
         .with_state(state)
@@ -253,14 +252,6 @@ async fn xrpc_cypher<G: GraphQueryExecutor>(
 async fn rebuild_from_snapshot<G: GraphQueryExecutor>(
     State(state): State<YataRestState<G>>,
 ) -> impl IntoResponse {
-    let session = IMPORT_SESSION.lock().ok().and_then(|mut s| s.take());
-    let Some(sess) = session else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "no import session active (call import-manifest first)"})),
-        );
-    };
-
     let graph = state.graph.clone();
     let result = tokio::task::spawn_blocking(move || {
         graph.rebuild_from_r2();
@@ -269,19 +260,8 @@ async fn rebuild_from_snapshot<G: GraphQueryExecutor>(
 
     match result {
         Ok(()) => {
-            tracing::info!(
-                vertices = sess.manifest.vertex_count,
-                edges = sess.manifest.edge_count,
-                "snapshot import: CSR rebuilt from Vineyard"
-            );
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "vertex_count": sess.manifest.vertex_count,
-                    "edge_count": sess.manifest.edge_count,
-                })),
-            )
+            tracing::info!("CSR rebuilt from R2 ArrowFragment");
+            (StatusCode::OK, Json(serde_json::json!({"ok": true})))
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -304,309 +284,7 @@ async fn trigger_snapshot_handler<G: GraphQueryExecutor>(
 // Legacy snapshot import/export/diag endpoints removed.
 // ArrowFragment format: snapshot → R2 PUT (trigger_snapshot), page-in → R2 GET (ensure_labels).
 
-// ── FlightSQL ─────────────────────────────────────────────────────────
-    let graph = state.graph.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        graph.force_snapshot_flush();
-        graph.trigger_snapshot()
-    })
-    .await;
 
-    match result {
-        Ok(Ok((vc, ec))) => {
-            (StatusCode::OK, Json(serde_json::json!({
-                "vertex_count": vc,
-                "edge_count": ec,
-                "format": "arrow_fragment",
-            })))
-        }
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e})),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("snapshot task failed: {e}")})),
-        ),
-    }
-}
-
-#[derive(Deserialize)]
-struct ExportBlobParams {
-    object_id: u64,
-}
-
-/// GET /internal/snapshot/export-blob?object_id=N — Return a Vineyard blob by ObjectId.
-async fn export_snapshot_blob<G: GraphQueryExecutor>(
-    State(state): State<YataRestState<G>>,
-    Query(params): Query<ExportBlobParams>,
-) -> impl IntoResponse {
-    let obj_id = yata_store::ObjectId(params.object_id);
-    match state.graph.export_blob(obj_id) {
-        Some(data) => {
-            let response = axum::http::Response::builder()
-                .status(200)
-                .header("Content-Type", "application/octet-stream")
-                .header("Content-Length", data.len().to_string())
-                .body(axum::body::Body::from(data))
-                .unwrap();
-            response.into_response()
-        }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "blob not found"})),
-        )
-            .into_response(),
-    }
-}
-
-/// POST /internal/diag/page-in — Diagnostic: force ensure_labels + report S3/manifest/CSR state.
-async fn diag_page_in<G: GraphQueryExecutor>(
-    State(state): State<YataRestState<G>>,
-) -> impl IntoResponse {
-    let graph = state.graph.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        // 1. Check S3 env vars
-        let s3_endpoint = std::env::var("YATA_S3_ENDPOINT").unwrap_or_default();
-        let s3_bucket = std::env::var("YATA_S3_BUCKET").unwrap_or_default();
-        let s3_key_id = std::env::var("YATA_S3_KEY_ID").or_else(|_| std::env::var("YATA_S3_ACCESS_KEY_ID")).unwrap_or_default();
-        let s3_secret_len = std::env::var("YATA_S3_SECRET_KEY").or_else(|_| std::env::var("YATA_S3_SECRET_ACCESS_KEY")).unwrap_or_default().len();
-        let s3_prefix = std::env::var("YATA_S3_PREFIX").unwrap_or_default();
-
-        // 2. Manifest (not available in ArrowFragment mode — use query instead)
-
-        // 3. Try explicit page-in by querying typed label
-        let page_in_result = graph.query("MATCH (n:Post) RETURN count(n) AS cnt", &[], None);
-        let untyped_result = graph.query("MATCH (n) RETURN count(n) AS cnt", &[], None);
-
-        // 4. Check R2 blob directly
-        let mut r2_check = serde_json::json!(null);
-        if !s3_endpoint.is_empty() && !s3_bucket.is_empty() && s3_key_id.len() > 0 && s3_secret_len > 0 {
-            let s3_secret_val = std::env::var("YATA_S3_SECRET_KEY").or_else(|_| std::env::var("YATA_S3_SECRET_ACCESS_KEY")).unwrap_or_default();
-            let client = yata_s3::s3::S3Client::new(&s3_endpoint, &s3_bucket, &s3_key_id, &s3_secret_val, "auto");
-            let manifest_key = format!("{s3_prefix}snap/manifest.json");
-            let manifest_data = client.get_sync(&manifest_key);
-            let blob_key = format!("{s3_prefix}snap/v/Post.arrow");
-            let blob_data = client.get_sync(&blob_key);
-            r2_check = serde_json::json!({
-                "manifest_key": manifest_key,
-                "manifest_ok": manifest_data.as_ref().map(|d| d.is_some()).unwrap_or(false),
-                "manifest_bytes": manifest_data.as_ref().ok().and_then(|d| d.as_ref().map(|b| b.len())),
-                "blob_key": blob_key,
-                "blob_ok": blob_data.as_ref().map(|d| d.is_some()).unwrap_or(false),
-                "blob_bytes": blob_data.as_ref().ok().and_then(|d| d.as_ref().map(|b| b.len())),
-            });
-        }
-
-        serde_json::json!({
-            "s3_endpoint": s3_endpoint,
-            "s3_bucket": s3_bucket,
-            "s3_key_id_len": s3_key_id.len(),
-            "s3_secret_len": s3_secret_len,
-            "s3_prefix": s3_prefix,
-            "manifest": "ArrowFragment (no legacy manifest)",
-            "count_typed_post": page_in_result.as_ref().map(|rows| rows.len()).unwrap_or(0),
-            "count_typed_err": page_in_result.as_ref().err().map(|e| e.to_string()),
-            "count_untyped": untyped_result.as_ref().map(|rows| rows.len()).unwrap_or(0),
-            "r2_direct_check": r2_check,
-        })
-    }).await;
-
-    match result {
-        Ok(json) => (StatusCode::OK, Json(json)),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
-    }
-}
-
-// ── Flight SQL — Arrow IPC over HTTP ────────────────────────────────────────
-//
-// Translates SQL SELECT → Cypher MATCH via yata-flight sql_plan parser,
-// then returns result as Arrow IPC stream bytes.
-// Content-Type: application/vnd.apache.arrow.stream
-
-#[derive(Deserialize)]
-struct FlightSqlReq {
-    sql: String,
-    #[serde(default = "default_flight_params")]
-    params: String,
-}
-
-fn default_flight_params() -> String {
-    "[]".to_string()
-}
-
-/// POST /xrpc/ai.gftd.yata.flightSqlQuery — returns Arrow IPC bytes
-async fn flight_sql_query<G: GraphQueryExecutor>(
-    State(state): State<YataRestState<G>>,
-    headers: HeaderMap,
-    Json(req): Json<FlightSqlReq>,
-) -> impl IntoResponse {
-    let (org_id, _) = match authorize(&headers, &state) {
-        Ok(a) => a,
-        Err(_) => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "unauthorized".to_string().into_bytes(),
-            )
-                .into_response();
-        }
-    };
-
-    // Parse SQL → extract table name + columns + predicates
-    let plan = match yata_flight::sql_plan::parse_select(&req.sql) {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-    };
-
-    // Translate SQL plan to Cypher query for execution via graph host
-    let cypher = sql_plan_to_cypher(&plan);
-    let rows = match state.graph.query(&cypher, &[], Some(&org_id)) {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e})),
-            )
-                .into_response();
-        }
-    };
-
-    // Convert Cypher result rows to Arrow RecordBatch
-    let batch = match cypher_rows_to_arrow(&rows, &plan.columns) {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e})),
-            )
-                .into_response();
-        }
-    };
-
-    // Serialize to Arrow IPC stream
-    let ipc_bytes = match yata_arrow::batch_to_ipc(&batch) {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-    };
-
-    (
-        StatusCode::OK,
-        [("content-type", "application/vnd.apache.arrow.stream")],
-        ipc_bytes.to_vec(),
-    )
-        .into_response()
-}
-
-/// Translate SQL plan → Cypher query string.
-fn sql_plan_to_cypher(plan: &yata_flight::sql_plan::SqlPlan) -> String {
-    let mut cypher = format!("MATCH (n:{})", plan.table);
-
-    if !plan.predicates.is_empty() {
-        cypher.push_str(" WHERE ");
-        for (i, pred) in plan.predicates.iter().enumerate() {
-            if i > 0 {
-                cypher.push_str(" AND ");
-            }
-            let op = match pred.op {
-                yata_flight::sql_plan::CompareOp::Eq => "=",
-                yata_flight::sql_plan::CompareOp::Neq => "<>",
-                yata_flight::sql_plan::CompareOp::Lt => "<",
-                yata_flight::sql_plan::CompareOp::Gt => ">",
-                yata_flight::sql_plan::CompareOp::Lte => "<=",
-                yata_flight::sql_plan::CompareOp::Gte => ">=",
-            };
-            let val = match &pred.value {
-                yata_grin::PropValue::Int(n) => n.to_string(),
-                yata_grin::PropValue::Float(f) => f.to_string(),
-                yata_grin::PropValue::Str(s) => format!("'{}'", s.replace('\'', "\\'")),
-                yata_grin::PropValue::Bool(b) => b.to_string(),
-                yata_grin::PropValue::Null => "null".to_string(),
-            };
-            cypher.push_str(&format!("n.{} {} {}", pred.column, op, val));
-        }
-    }
-
-    cypher.push_str(" RETURN n");
-
-    if !plan.order_by.is_empty() {
-        cypher.push_str(" ORDER BY ");
-        for (i, o) in plan.order_by.iter().enumerate() {
-            if i > 0 {
-                cypher.push_str(", ");
-            }
-            cypher.push_str(&format!("n.{}", o.column));
-            if !o.ascending {
-                cypher.push_str(" DESC");
-            }
-        }
-    }
-
-    if let Some(limit) = plan.limit {
-        cypher.push_str(&format!(" LIMIT {}", limit));
-    }
-    if let Some(offset) = plan.offset {
-        cypher.push_str(&format!(" SKIP {}", offset));
-    }
-
-    cypher
-}
-
-/// Convert Cypher query result rows to Arrow RecordBatch.
-fn cypher_rows_to_arrow(
-    rows: &[Vec<(String, String)>],
-    _columns: &[String],
-) -> Result<arrow::record_batch::RecordBatch, String> {
-    use arrow::array::{StringBuilder, RecordBatch};
-    use arrow::datatypes::{DataType, Field, Schema};
-
-    if rows.is_empty() {
-        let schema = Arc::new(Schema::empty());
-        return Ok(RecordBatch::new_empty(schema));
-    }
-
-    // Discover columns from first row
-    let col_names: Vec<String> = rows[0].iter().map(|(k, _)| k.clone()).collect();
-    let fields: Vec<Field> = col_names
-        .iter()
-        .map(|name| Field::new(name.as_str(), DataType::Utf8, true))
-        .collect();
-    let schema = Arc::new(Schema::new(fields));
-
-    // Build string columns
-    let mut builders: Vec<StringBuilder> = col_names
-        .iter()
-        .map(|_| StringBuilder::new())
-        .collect();
-
-    for row in rows {
-        let row_map: HashMap<&str, &str> = row.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        for (i, col) in col_names.iter().enumerate() {
-            match row_map.get(col.as_str()) {
-                Some(v) => builders[i].append_value(v),
-                None => builders[i].append_null(),
-            }
-        }
-    }
-
-    let arrays: Vec<arrow::array::ArrayRef> = builders
-        .into_iter()
-        .map(|mut b| Arc::new(b.finish()) as arrow::array::ArrayRef)
-        .collect();
-
-    RecordBatch::try_new(schema, arrays).map_err(|e| e.to_string())
-}
 
 // ── TieredGraphEngine GraphQueryExecutor impl (standalone yata-server, no magatama-engine) ──
 
@@ -620,41 +298,12 @@ impl GraphQueryExecutor for yata_engine::TieredGraphEngine {
         self.query(cypher, params, rls_org_id)
     }
 
-    fn import_blob(
-        &self,
-        label: &str,
-        blob_type: yata_store::BlobType,
-        partition_id: u32,
-        _r2_key: &str,
-        data: bytes::Bytes,
-    ) -> yata_store::ObjectId {
-        use yata_store::vineyard::ObjectMeta;
-        let size_bytes = data.len() as u64;
-        self.vineyard().put(
-            ObjectMeta {
-                id: yata_store::ObjectId(0),
-                blob_type,
-                label: label.to_string(),
-                partition_id,
-                size_bytes,
-                r2_key: _r2_key.to_string(),
-                fields: std::collections::HashMap::new(),
-                created_at: 0,
-            },
-            data,
-        )
-    }
-
     fn rebuild_from_r2(&self) {
         self.restore_from_r2();
     }
 
     fn force_snapshot_flush(&self) {
         let _ = self.trigger_snapshot();
-    }
-
-    fn export_blob(&self, obj_id: yata_store::ObjectId) -> Option<bytes::Bytes> {
-        self.vineyard().get_blob(obj_id)
     }
 
     fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
@@ -698,24 +347,9 @@ mod tests {
             self.engine.query(cypher, params, rls_org_id)
         }
 
-        fn import_blob(
-            &self,
-            _label: &str,
-            _blob_type: yata_store::BlobType,
-            _partition_id: u32,
-            _r2_key: &str,
-            _data: bytes::Bytes,
-        ) -> yata_store::ObjectId {
-            yata_store::ObjectId(0)
-        }
-
         fn rebuild_from_r2(&self) {}
 
         fn force_snapshot_flush(&self) {}
-
-        fn export_blob(&self, _obj_id: yata_store::ObjectId) -> Option<bytes::Bytes> {
-            None
-        }
     }
 
     fn test_state() -> YataRestState<TestGraphExecutor> {

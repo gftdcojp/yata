@@ -22,7 +22,6 @@ yata-graph.workspace = true
 yata-s3.workspace = true
 yata-store.workspace = true
 yata-engine.workspace = true
-yata-flight.workspace = true
 yata-grin.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
