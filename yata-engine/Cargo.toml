@@ -14,6 +14,7 @@ yata-cypher = { path = "../yata-cypher" }
 yata-gie = { path = "../yata-gie" }
 yata-s3 = { path = "../yata-s3" }
 yata-vineyard = { path = "../yata-vineyard" }
+arrow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

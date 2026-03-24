@@ -105,7 +105,7 @@ impl ArrowGraphStore {
     /// Zero-decode: directly stores RecordBatch.
     pub fn load_vertex_label(&mut self, label: &str, ipc_bytes: &[u8]) -> Result<usize, String> {
         // Skip ARROW_MAGIC prefix if present
-        let data = if ipc_bytes.len() >= 4 && &ipc_bytes[..4] == crate::arrow_codec::ARROW_MAGIC {
+        let data = if ipc_bytes.len() >= 4 && &ipc_bytes[..4] == b"ARW\x01" {
             &ipc_bytes[4..]
         } else {
             ipc_bytes
@@ -156,7 +156,7 @@ impl ArrowGraphStore {
 
     /// Load an edge label from Arrow IPC bytes. Builds lightweight CSR.
     pub fn load_edge_label(&mut self, label: &str, ipc_bytes: &[u8]) -> Result<usize, String> {
-        let data = if ipc_bytes.len() >= 4 && &ipc_bytes[..4] == crate::arrow_codec::ARROW_MAGIC {
+        let data = if ipc_bytes.len() >= 4 && &ipc_bytes[..4] == b"ARW\x01" {
             &ipc_bytes[4..]
         } else {
             ipc_bytes
@@ -685,8 +685,6 @@ fn build_csr_from_edges(edges: &[(u32, u32, u32)], max_vid: u32) -> CsrSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow_codec;
-    use crate::blocks::{VertexBlock, LabelVertexGroup};
 
     #[test]
     fn test_merge_and_read() {
@@ -727,31 +725,20 @@ mod tests {
 
     #[test]
     fn test_load_from_arrow_ipc() {
-        // Encode a vertex group to Arrow IPC
-        let group = LabelVertexGroup {
-            label: "Article".into(),
-            count: 2,
-            vertices: vec![
-                VertexBlock {
-                    vid: 0,
-                    labels: vec!["Article".into()],
-                    props: vec![
-                        ("rkey".into(), PropValue::Str("r1".into())),
-                        ("title".into(), PropValue::Str("Test Article".into())),
-                    ],
-                },
-                VertexBlock {
-                    vid: 1,
-                    labels: vec!["Article".into()],
-                    props: vec![
-                        ("rkey".into(), PropValue::Str("r2".into())),
-                        ("title".into(), PropValue::Str("Another Article".into())),
-                    ],
-                },
-            ],
-        };
-
-        let ipc_bytes = arrow_codec::encode_vertex_group(&group).expect("encode");
+        use arrow::array::StringArray;
+        use arrow::datatypes::{Field, Schema as ArrowSchema};
+        use std::sync::Arc;
+        // Build Arrow IPC directly
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("rkey", arrow::datatypes::DataType::Utf8, false),
+            Field::new("title", arrow::datatypes::DataType::Utf8, false),
+        ]));
+        let rkeys = StringArray::from(vec!["r1", "r2"]);
+        let titles = StringArray::from(vec!["Test Article", "Another Article"]);
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema, vec![Arc::new(rkeys), Arc::new(titles)]
+        ).unwrap();
+        let ipc_bytes = yata_arrow::batch_to_ipc(&batch).unwrap();
         let mut store = ArrowGraphStore::new(PartitionId(0));
         let count = store.load_vertex_label("Article", &ipc_bytes).expect("load");
         assert_eq!(count, 2);

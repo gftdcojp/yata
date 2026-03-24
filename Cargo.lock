@@ -3295,6 +3295,7 @@ dependencies = [
 name = "yata-engine"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "bytes",
  "chrono",
  "indexmap",
@@ -3457,6 +3458,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "yata-arrow",
  "yata-core",
  "yata-cypher",
  "yata-grin",

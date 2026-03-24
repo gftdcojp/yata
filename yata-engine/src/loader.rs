@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use yata_core::PartitionId;
 use yata_cypher::Graph;
 use yata_graph::GraphStore;
-use yata_grin::{Mutable, PropValue};
+use yata_grin::{Mutable, PropValue, Topology};
 use yata_store::MutableCsrStore;
 
 /// Convert yata_cypher::Value → yata_grin::PropValue for CSR property storage.
@@ -113,91 +113,118 @@ pub fn rebuild_csr_from_graph_with_partition(
     csr
 }
 
-/// Load specific labels from Vineyard blobs into an existing MutableCsrStore.
-/// Returns the list of labels actually loaded (skips labels not in the manifest).
-pub fn ensure_labels_from_vineyard(
-    vineyard: &dyn yata_store::VineyardStore,
-    manifest: &yata_store::FragmentManifest,
-    labels: &[String],
-    store: &mut MutableCsrStore,
-) -> Result<Vec<String>, String> {
-    use yata_core::{GLOBAL_EID_PROP_KEY, GLOBAL_VID_PROP_KEY};
-    use yata_store::arrow_codec;
+/// Restore CSR from an ArrowFragment (deserialized from R2 blobs).
+///
+/// Reads vertex RecordBatch columns → add_vertex, then uses CSR topology
+/// from NbrUnit packed bytes for edge reconstruction.
+pub fn restore_csr_from_fragment(
+    frag: &yata_vineyard::ArrowFragment,
+    partition_id: PartitionId,
+) -> MutableCsrStore {
+    use arrow::array::{Int64Array, Float64Array, StringArray, BooleanArray};
 
-    let mut loaded = Vec::new();
+    let mut csr = MutableCsrStore::new_with_partition_id(partition_id);
 
-    for label in labels {
-        // Try vertex label
-        if let Some(&obj_id) = manifest.vertex_labels.get(label.as_str()) {
-            if let Some(data) = vineyard.get_blob(obj_id) {
-                let group = arrow_codec::decode_vertex_group(&data)
-                    .map_err(|e| format!("decode vertex group {label}: {e}"))?;
-                for vb in &group.vertices {
-                    let mut props_owned = vb.props.clone();
-                    let global_vid = props_owned
-                        .iter()
-                        .position(|(k, _)| k == GLOBAL_VID_PROP_KEY)
-                        .and_then(|idx| match props_owned.remove(idx).1 {
-                            PropValue::Int(v) if v >= 0 => Some(v as u64),
-                            _ => None,
-                        });
-                    let props: Vec<(&str, PropValue)> = props_owned
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.clone()))
-                        .collect();
-                    let labels_vec = if vb.labels.is_empty() {
-                        vec![group.label.clone()]
-                    } else {
-                        vb.labels.clone()
-                    };
-                    store.add_vertex_with_labels_and_optional_global_id(
-                        global_vid.map(Into::into),
-                        &labels_vec,
-                        &props,
-                    );
+    // Restore vertices per label
+    for (vlabel_id, entry) in frag.schema.vertex_entries.iter().enumerate() {
+        let label = &entry.label;
+        if let Some(batch) = frag.vertex_table(vlabel_id) {
+            for row in 0..batch.num_rows() {
+                let mut props: Vec<(&str, PropValue)> = Vec::new();
+                for prop_def in &entry.props {
+                    let col = batch.column_by_name(&prop_def.name);
+                    if let Some(col) = col {
+                        let val = if col.is_null(row) {
+                            PropValue::Null
+                        } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                            PropValue::Str(arr.value(row).to_string())
+                        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                            PropValue::Int(arr.value(row))
+                        } else if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+                            PropValue::Float(arr.value(row))
+                        } else if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
+                            PropValue::Bool(arr.value(row))
+                        } else {
+                            PropValue::Null
+                        };
+                        props.push((&prop_def.name, val));
+                    }
                 }
-                loaded.push(label.clone());
+                csr.add_vertex(label, &props);
             }
         }
-        // Try edge label
-        if let Some(&obj_id) = manifest.edge_labels.get(label.as_str()) {
-            if let Some(data) = vineyard.get_blob(obj_id) {
-                let group = arrow_codec::decode_edge_group(&data)
-                    .map_err(|e| format!("decode edge group {label}: {e}"))?;
-                for eb in &group.edges {
-                    let mut props_owned = eb.props.clone();
-                    let global_eid = props_owned
-                        .iter()
-                        .position(|(k, _)| k == GLOBAL_EID_PROP_KEY)
-                        .and_then(|idx| match props_owned.remove(idx).1 {
-                            PropValue::Int(v) if v >= 0 => Some(v as u64),
-                            _ => None,
-                        });
-                    let props: Vec<(&str, PropValue)> = props_owned
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.clone()))
-                        .collect();
-                    store.add_edge_with_optional_global_id(
-                        global_eid.map(Into::into),
-                        eb.src,
-                        eb.dst,
-                        &eb.label,
-                        &props,
-                    );
-                }
-                if !loaded.contains(label) {
-                    loaded.push(label.clone());
+    }
+
+    // Restore edges from NbrUnit CSR topology
+    for (elabel_id, edge_entry) in frag.schema.edge_entries.iter().enumerate() {
+        let edge_label = &edge_entry.label;
+        for (vlabel_id, _) in frag.schema.vertex_entries.iter().enumerate() {
+            // For each vertex in this label, extract outgoing neighbors
+            let vcount = frag.inner_vertex_num(vlabel_id);
+            for vid in 0..vcount {
+                if let Some(nbrs) = frag.out_neighbors(vlabel_id, elabel_id, vid) {
+                    for nbr in nbrs {
+                        // NbrUnit: vid = dst vertex, eid = edge id
+                        csr.add_edge(vid as u32, nbr.vid as u32, edge_label, &[]);
+                    }
                 }
             }
         }
     }
 
-    if !loaded.is_empty() {
-        store.commit();
-        tracing::info!(loaded = ?loaded, "labels loaded from Vineyard into CSR");
+    csr.commit();
+    tracing::info!(
+        vertices = csr.vertex_count(),
+        edges = csr.edge_count(),
+        "CSR restored from ArrowFragment"
+    );
+    csr
+}
+
+/// Page-in ArrowFragment from R2 and restore to CSR.
+/// Fetches `snap/fragment/meta.json` + individual blobs → ArrowFragment::deserialize → CSR.
+pub fn page_in_from_r2(
+    s3: &yata_s3::s3::S3Client,
+    prefix: &str,
+    partition_id: PartitionId,
+) -> Result<MutableCsrStore, String> {
+    use yata_vineyard::blob::{BlobStore, MemoryBlobStore};
+
+    // 1. Fetch fragment meta
+    let meta_key = format!("{prefix}snap/fragment/meta.json");
+    let meta_bytes = s3.get_sync(&meta_key)
+        .map_err(|e| format!("R2 meta fetch: {e}"))?
+        .ok_or_else(|| "no fragment meta.json in R2".to_string())?;
+    let meta: yata_vineyard::blob::ObjectMeta = serde_json::from_slice(&meta_bytes)
+        .map_err(|e| format!("parse fragment meta: {e}"))?;
+
+    // 2. Fetch all blobs referenced in meta
+    let blob_store = MemoryBlobStore::new();
+    for (name, blob_id) in &meta.blobs {
+        let blob_key = format!("{prefix}snap/fragment/{name}");
+        match s3.get_sync(&blob_key) {
+            Ok(Some(data)) => {
+                // Put with same content → same BlobId (content-addressed)
+                let stored_id = blob_store.put(data);
+                if stored_id != *blob_id {
+                    tracing::warn!(name, "blob content hash mismatch (data may have changed)");
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(name, "R2 blob not found, skipping");
+            }
+            Err(e) => {
+                tracing::warn!(name, error = %e, "R2 blob fetch failed, skipping");
+            }
+        }
     }
 
-    Ok(loaded)
+    // 3. Deserialize ArrowFragment
+    let frag = yata_vineyard::ArrowFragment::deserialize(&meta, &blob_store)
+        .map_err(|e| format!("ArrowFragment deserialize: {e}"))?;
+
+    // 4. Restore CSR
+    Ok(restore_csr_from_fragment(&frag, partition_id))
 }
 
 #[cfg(test)]

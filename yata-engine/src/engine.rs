@@ -352,84 +352,40 @@ impl TieredGraphEngine {
         self.ensure_labels_vineyard_only(vertex_labels, edge_labels);
     }
 
-    /// Page-in from Vineyard fragment manifest.
-    /// If manifest or blobs missing (Container disk wiped after sleep), fetch inline from R2.
-    /// Only fetches labels needed for this query (not all). 5s timeout per GET.
-    fn ensure_labels_vineyard_only(&self, vertex_labels: &[&str], edge_labels: &[&str]) {
-        let manifest = match self.fragment_manifest.lock().ok().and_then(|g| g.clone()) {
-            Some(m) => m,
-            None => {
-                // No manifest — sync fetch from R2 (single GET, 5s timeout)
-                self.try_load_manifest_from_r2();
-                match self.fragment_manifest.lock().ok().and_then(|g| g.clone()) {
-                    Some(m) => m,
-                    None => return,
-                }
-            }
-        };
-
-        let load_all = vertex_labels.is_empty() && edge_labels.is_empty();
-        let mut loaded = self.loaded_labels.lock().unwrap_or_else(|e| e.into_inner());
-
-        let mut labels_needed: Vec<String> = Vec::new();
-        if load_all {
-            for label in manifest
-                .vertex_labels
-                .keys()
-                .chain(manifest.edge_labels.keys())
-            {
-                if !loaded.contains(label) {
-                    labels_needed.push(label.clone());
-                }
-            }
-        } else {
-            for label in vertex_labels.iter().chain(edge_labels.iter()) {
-                let l = label.to_string();
-                if !loaded.contains(&l) {
-                    if manifest.vertex_labels.contains_key(&l)
-                        || manifest.edge_labels.contains_key(&l)
-                    {
-                        labels_needed.push(l);
-                    }
-                }
-            }
-        }
-
-        if labels_needed.is_empty() {
+    /// Page-in from R2 ArrowFragment snapshot.
+    /// Fetches `snap/fragment/meta.json` + blobs → ArrowFragment::deserialize → CSR restore.
+    /// Full graph is loaded atomically (no per-label partial page-in).
+    fn ensure_labels_vineyard_only(&self, _vertex_labels: &[&str], _edge_labels: &[&str]) {
+        // If already initialized with data, skip
+        if self.hot_initialized.load(Ordering::Relaxed) {
             return;
         }
 
-        // Inline R2 page-in for missing blobs (sync, per-label, 5s timeout each)
-        self.ensure_vineyard_blobs_from_r2(&manifest, &labels_needed);
+        let s3 = match self.get_s3_client() {
+            Some(s3) => s3.clone(),
+            None => return,
+        };
 
-        self.maybe_evict_labels(&mut loaded, labels_needed.len());
-
-        if let Ok(mut hot) = self.hot.lock() {
-            if let Some(single) = hot.as_single_mut() {
-                match crate::loader::ensure_labels_from_vineyard(
-                    self.vineyard.as_ref(),
-                    &manifest,
-                    &labels_needed,
-                    single,
-                ) {
-                    Ok(actually_loaded) => {
-                        if !actually_loaded.is_empty() {
-                            // Rebuild indexes so GIE can see page-in'd vertices via label_bitmap.
-                            single.commit();
-                        }
-                        for label in &actually_loaded {
-                            loaded.insert(label.clone());
-                        }
-                        tracing::info!(
-                            loaded = actually_loaded.len(),
-                            total = loaded.len(),
-                            "engine: labels page-in from Vineyard + commit"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("engine: Vineyard label load failed: {e}");
-                    }
+        match crate::loader::page_in_from_r2(
+            &s3,
+            &self.s3_prefix,
+            yata_core::PartitionId::from(0),
+        ) {
+            Ok(store) => {
+                let vc = store.vertex_count();
+                let ec = store.edge_count();
+                if vc == 0 && ec == 0 {
+                    tracing::debug!("R2 page-in: empty fragment, skipping");
+                    return;
                 }
+                if let Ok(mut hot) = self.hot.lock() {
+                    *hot = yata_store::GraphStoreEnum::Single(store);
+                    self.hot_initialized.store(true, Ordering::Relaxed);
+                }
+                tracing::info!(vertices = vc, edges = ec, "R2 ArrowFragment page-in complete");
+            }
+            Err(e) => {
+                tracing::debug!("R2 ArrowFragment page-in failed (may not exist yet): {e}");
             }
         }
     }
@@ -1034,36 +990,31 @@ impl TieredGraphEngine {
         self.fragment_manifest.lock().ok().and_then(|g| g.clone())
     }
 
-    /// Restore CSR from Vineyard fragment manifest (blobs already loaded).
-    pub fn restore_from_vineyard(&self, manifest: &FragmentManifest) {
-        let all_labels: Vec<String> = manifest.vertex_labels.keys()
-            .chain(manifest.edge_labels.keys())
-            .cloned()
-            .collect();
-        let mut store = yata_store::MutableCsrStore::new_with_partition_id(
-            yata_core::PartitionId::from(manifest.partition_id),
-        );
-        match crate::loader::ensure_labels_from_vineyard(
-            self.vineyard.as_ref(),
-            manifest,
-            &all_labels,
-            &mut store,
+    /// Restore CSR from R2 ArrowFragment snapshot.
+    pub fn restore_from_r2(&self) {
+        let s3 = match self.get_s3_client() {
+            Some(s3) => s3.clone(),
+            None => {
+                tracing::warn!("restore_from_r2: no S3 client configured");
+                return;
+            }
+        };
+        match crate::loader::page_in_from_r2(
+            &s3,
+            &self.s3_prefix,
+            yata_core::PartitionId::from(0),
         ) {
-            Ok(_loaded) => {
-                store.commit();
+            Ok(store) => {
                 let vc = store.vertex_count();
                 let ec = store.edge_count();
                 if let Ok(mut hot) = self.hot.lock() {
                     *hot = yata_store::GraphStoreEnum::Single(store);
                     self.hot_initialized.store(true, Ordering::Relaxed);
                 }
-                if let Ok(mut fm) = self.fragment_manifest.lock() {
-                    *fm = Some(manifest.clone());
-                }
-                tracing::info!(vertices = vc, edges = ec, "restored from Vineyard");
+                tracing::info!(vertices = vc, edges = ec, "restored from R2 ArrowFragment");
             }
             Err(e) => {
-                tracing::warn!("Vineyard restore failed: {e}");
+                tracing::warn!("R2 restore failed: {e}");
             }
         }
     }

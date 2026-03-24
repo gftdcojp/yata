@@ -33,12 +33,11 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
         data: bytes::Bytes,
     ) -> yata_store::ObjectId;
 
-    fn rebuild_from_manifest(&self, manifest: &yata_store::FragmentManifest);
+    fn rebuild_from_r2(&self);
 
     fn force_snapshot_flush(&self);
 
-    fn fragment_manifest(&self) -> Option<yata_store::FragmentManifest>;
-
+    
     fn export_blob(&self, obj_id: yata_store::ObjectId) -> Option<bytes::Bytes>;
 
     fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
@@ -385,20 +384,9 @@ async fn rebuild_from_snapshot<G: GraphQueryExecutor>(
         );
     };
 
-    let manifest = yata_store::FragmentManifest {
-        vertex_labels: sess.vertex_blobs,
-        edge_labels: sess.edge_blobs,
-        csr_object: None,
-        schema_object: None,
-        partition_id: sess.manifest.partition_id.get(),
-        timestamp_ns: sess.manifest.timestamp_ns,
-        vertex_count: sess.manifest.vertex_count,
-        edge_count: sess.manifest.edge_count,
-    };
-
     let graph = state.graph.clone();
     let result = tokio::task::spawn_blocking(move || {
-        graph.rebuild_from_manifest(&manifest);
+        graph.rebuild_from_r2();
     })
     .await;
 
@@ -441,33 +429,27 @@ async fn export_snapshot_manifest<G: GraphQueryExecutor>(
     State(state): State<YataRestState<G>>,
 ) -> impl IntoResponse {
     let graph = state.graph.clone();
-    let manifest = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         graph.force_snapshot_flush();
-        graph.fragment_manifest()
+        graph.trigger_snapshot()
     })
     .await;
 
-    match manifest {
-        Ok(Some(fm)) => {
-            let snap = serde_json::json!({
-                "vertex_count": fm.vertex_count,
-                "edge_count": fm.edge_count,
-                "partition_id": fm.partition_id,
-                "timestamp_ns": fm.timestamp_ns,
-                "vertex_labels": fm.vertex_labels.keys().collect::<Vec<_>>(),
-                "edge_labels": fm.edge_labels.keys().collect::<Vec<_>>(),
-                "vertex_object_ids": fm.vertex_labels.iter().map(|(k, v)| (k.clone(), v.0)).collect::<HashMap<String, u64>>(),
-                "edge_object_ids": fm.edge_labels.iter().map(|(k, v)| (k.clone(), v.0)).collect::<HashMap<String, u64>>(),
-            });
-            (StatusCode::OK, Json(snap))
+    match result {
+        Ok(Ok((vc, ec))) => {
+            (StatusCode::OK, Json(serde_json::json!({
+                "vertex_count": vc,
+                "edge_count": ec,
+                "format": "arrow_fragment",
+            })))
         }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "no snapshot manifest available"})),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("snapshot flush failed: {e}")})),
+            Json(serde_json::json!({"error": format!("snapshot task failed: {e}")})),
         ),
     }
 }
@@ -514,8 +496,7 @@ async fn diag_page_in<G: GraphQueryExecutor>(
         let s3_secret_len = std::env::var("YATA_S3_SECRET_KEY").or_else(|_| std::env::var("YATA_S3_SECRET_ACCESS_KEY")).unwrap_or_default().len();
         let s3_prefix = std::env::var("YATA_S3_PREFIX").unwrap_or_default();
 
-        // 2. Get manifest
-        let manifest = graph.fragment_manifest();
+        // 2. Manifest (not available in ArrowFragment mode — use query instead)
 
         // 3. Try explicit page-in by querying typed label
         let page_in_result = graph.query("MATCH (n:Post) RETURN count(n) AS cnt", &[], None);
@@ -546,12 +527,7 @@ async fn diag_page_in<G: GraphQueryExecutor>(
             "s3_key_id_len": s3_key_id.len(),
             "s3_secret_len": s3_secret_len,
             "s3_prefix": s3_prefix,
-            "manifest": manifest.as_ref().map(|m| serde_json::json!({
-                "vertex_count": m.vertex_count,
-                "edge_count": m.edge_count,
-                "vertex_labels": m.vertex_labels.keys().collect::<Vec<_>>(),
-                "edge_labels": m.edge_labels.keys().collect::<Vec<_>>(),
-            })),
+            "manifest": "ArrowFragment (no legacy manifest)",
             "count_typed_post": page_in_result.as_ref().map(|rows| rows.len()).unwrap_or(0),
             "count_typed_err": page_in_result.as_ref().err().map(|e| e.to_string()),
             "count_untyped": untyped_result.as_ref().map(|rows| rows.len()).unwrap_or(0),
@@ -792,16 +768,12 @@ impl GraphQueryExecutor for yata_engine::TieredGraphEngine {
         )
     }
 
-    fn rebuild_from_manifest(&self, manifest: &yata_store::FragmentManifest) {
-        self.restore_from_vineyard(manifest);
+    fn rebuild_from_r2(&self) {
+        self.restore_from_r2();
     }
 
     fn force_snapshot_flush(&self) {
         let _ = self.trigger_snapshot();
-    }
-
-    fn fragment_manifest(&self) -> Option<yata_store::FragmentManifest> {
-        self.fragment_manifest()
     }
 
     fn export_blob(&self, obj_id: yata_store::ObjectId) -> Option<bytes::Bytes> {
@@ -860,13 +832,9 @@ mod tests {
             yata_store::ObjectId(0)
         }
 
-        fn rebuild_from_manifest(&self, _manifest: &yata_store::FragmentManifest) {}
+        fn rebuild_from_r2(&self) {}
 
         fn force_snapshot_flush(&self) {}
-
-        fn fragment_manifest(&self) -> Option<yata_store::FragmentManifest> {
-            None
-        }
 
         fn export_blob(&self, _obj_id: yata_store::ObjectId) -> Option<bytes::Bytes> {
             None
