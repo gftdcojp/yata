@@ -75,20 +75,19 @@ env.YATA.stats()                 // → all partition stats
 |---|---|
 | `yata-core` | GlobalVid, LocalVid, PartitionId |
 | `yata-grin` | GRIN trait (Topology, Property, Schema, Scannable, Mutable) |
-| `yata-store` | MutableCsrStore, DiskVineyard, MmapVineyard, EdgeVineyard, PartitionStoreSet, GraphStoreEnum, MemoryBudget, StreamingAdjacency trait (streaming.rs), METIS greedy BFS partitioner (metis.rs) |
-| `yata-engine` | TieredGraphEngine, Frontier cross-partition BFS, ShardedCoordinator (sharded_coordinator.rs) |
+| `yata-vineyard` | **ArrowFragment format** (canonical snapshot/persistence format)。NbrUnit zero-copy CSR (25x faster neighbor traversal)。`csr_to_fragment()` (CSR→ArrowFragment) + `ArrowFragment::serialize/deserialize` (BlobStore↔R2)。PropertyGraphSchema (typed vertex/edge labels + Arrow property columns) |
+| `yata-store` | MutableCsrStore (mutable in-memory CSR, GRIN traits), ArrowGraphStore, DiskVineyard/MmapVineyard/EdgeVineyard (blob cache), PartitionStoreSet, GraphStoreEnum |
+| `yata-engine` | TieredGraphEngine, ArrowFragment snapshot (trigger_snapshot → R2), page-in (R2 → ArrowFragment → CSR), Frontier BFS, ShardedCoordinator |
 | `yata-cypher` | Full Cypher parser + executor (incl. untyped edge traversal) |
-| `yata-gie` | GIE push-based executor, IR (Exchange/Receive/Gather), distributed planner, distributed executor (distributed_executor.rs: push-based fragment execution with ExchangeTransport) |
-| `yata-s3` | R2 persistence (renamed from yata-b2). Read: sync R2 GET for page-in (`ensure_vineyard_blobs_from_r2`). Write: `trigger_snapshot()` → R2 PUT (called by mergeRecord fire-and-forget + cron) |
+| `yata-gie` | GIE push-based executor, IR (Exchange/Receive/Gather), distributed planner |
+| `yata-s3` | R2 persistence (sync ureq+rustls S3 client, SigV4)。`trigger_snapshot()` → R2 PUT、page-in → R2 GET |
 | `yata-vex` | Vector index (IVF_PQ + DiskANN) |
-| `yata-bench` | Benchmarks + trillion-scale test + 10K-10M scale benchmarks (scale_benchmark.rs) |
-| ~~`yata-at`~~ | **除去済み** — AT Protocol integration は `wproto-compat` に移行 |
-| ~~`yata-signal`~~ | **除去済み** — Signal Protocol は `wproto-signal` に移行 |
-| ~~`yata-mdag`~~ | **除去済み** — MDAG commit chain は TS `wproto` (mst.ts/repo.ts/pipeline.ts) に完全移行。Rust 側不要 |
-| ~~`yata-cas`~~ | **除去済み** — CasStore trait + LocalCasStore は `yata-object::cas` にインライン化 |
-| ~~`yata-cbor`~~ | **除去済み** — AT Protocol dag-cbor remnant。`wproto::cbor` が authoritative |
-| ~~`yata-git`~~ | **除去済み** — k8s era legacy (git2/Raft/PVC)。Evolution repo は `infra/workers/git-server/` (JS + R2) に移行済み |
-| `yata-server` | XRPC API server (`/xrpc/ai.gftd.yata.*`)。Workers RPC only transport。`GraphQueryExecutor` trait (standalone, inline query method + snapshot ops) |
+| `yata-bench` | Benchmarks + trillion-scale test |
+| `yata-server` | XRPC API server (`/xrpc/ai.gftd.yata.cypher` + `triggerSnapshot`)。GraphQueryExecutor trait |
+| ~~`yata-flight`~~ | **除去済み** — FlightSQL (SQL→Cypher 変換)。Cypher direct が標準 |
+| ~~`yata-cbor`~~ | **除去済み** — AT Protocol dag-cbor。`wproto::cbor` が authoritative |
+| ~~`yata-git`~~ | **除去済み** — k8s era legacy。`infra/workers/git-server/` に移行 |
+| ~~`yata-at/signal/mdag/cas`~~ | **除去済み** — AT/Signal/MDAG/CAS は TS `wproto` に移行 |
 
 ## GraphScope Parity
 

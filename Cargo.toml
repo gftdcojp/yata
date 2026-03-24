@@ -58,7 +58,6 @@ yata-server = { path = "yata-server" }
 yata-client = { path = "yata-client" }
 yata-arrow = { path = "yata-arrow" }
 yata-vineyard = { path = "yata-vineyard" }
-yata-flight = { path = "yata-flight" }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 # Arrow

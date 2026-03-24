@@ -2297,27 +2297,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sqlparser"
-version = "0.53.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05a528114c392209b3264855ad491fcce534b94a38771b0a0b97a79379275ce8"
-dependencies = [
- "log",
- "sqlparser_derive",
-]
-
-[[package]]
-name = "sqlparser_derive"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da5fc6819faabb412da764b99d3b713bb55083c11e7e0c00144d386cd6a1939c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3315,24 +3294,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "yata-flight"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "axum",
- "bytes",
- "serde",
- "serde_json",
- "sqlparser",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "yata-arrow",
- "yata-grin",
- "yata-store",
-]
-
-[[package]]
 name = "yata-gie"
 version = "0.1.0"
 dependencies = [
@@ -3434,7 +3395,6 @@ dependencies = [
  "yata-client",
  "yata-core",
  "yata-engine",
- "yata-flight",
  "yata-graph",
  "yata-grin",
  "yata-object",
