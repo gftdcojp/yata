@@ -61,6 +61,7 @@ pub fn router<G: GraphQueryExecutor>(state: YataRestState<G>) -> Router {
         .route("/xrpc/ai.gftd.yata.cypher", post(xrpc_cypher::<G>))
         .route("/xrpc/ai.gftd.yata.mergeRecord", post(merge_record_handler::<G>))
         .route("/xrpc/ai.gftd.yata.triggerSnapshot", post(trigger_snapshot_handler::<G>))
+        .route("/xrpc/ai.gftd.yata.exportSnapshot", post(export_snapshot_handler::<G>))
         .route("/internal/snapshot/rebuild", post(rebuild_from_snapshot::<G>))
         .with_state(state)
 }
@@ -333,6 +334,49 @@ async fn trigger_snapshot_handler<G: GraphQueryExecutor>(
     }
 }
 
+/// POST /xrpc/ai.gftd.yata.exportSnapshot — Export snapshot blobs for TS Worker R2 upload.
+/// Returns JSON: { blobs: [{key, data_b64}], meta_json, vertices, edges }
+async fn export_snapshot_handler<G: GraphQueryExecutor>(
+    State(state): State<YataRestState<G>>,
+) -> impl IntoResponse {
+    use base64::Engine as _;
+    let graph = state.graph.clone();
+    let result = tokio::task::spawn_blocking(move || graph.export_snapshot_blobs()).await;
+
+    match result {
+        Ok(Ok(blobs)) => {
+            let mut meta_json = String::new();
+            let mut blob_entries = Vec::new();
+
+            for (key, data) in &blobs {
+                if key.ends_with("meta.json") {
+                    meta_json = String::from_utf8_lossy(data).to_string();
+                }
+                blob_entries.push(serde_json::json!({
+                    "key": key,
+                    "data_b64": base64::engine::general_purpose::STANDARD.encode(data),
+                }));
+            }
+
+            let blob_count = blob_entries.len();
+            (StatusCode::OK, Json(serde_json::json!({
+                "blobs": blob_entries,
+                "meta_json": meta_json,
+                "vertices": blob_count,
+                "edges": 0,
+            })))
+        }
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("spawn_blocking failed: {e}")})),
+        ),
+    }
+}
+
 // Legacy snapshot import/export/diag endpoints removed.
 // ArrowFragment format: snapshot → R2 PUT (trigger_snapshot), page-in → R2 GET (ensure_labels).
 
@@ -360,6 +404,10 @@ impl GraphQueryExecutor for yata_engine::TieredGraphEngine {
 
     fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
         self.trigger_snapshot()
+    }
+
+    fn export_snapshot_blobs(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        self.export_snapshot_blobs()
     }
 }
 

@@ -1021,8 +1021,31 @@ impl TieredGraphEngine {
         // Upload fragment meta (ObjectMeta JSON)
         let meta_json = serde_json::to_vec(&meta).unwrap_or_default();
         let meta_key = format!("{prefix}snap/fragment/meta.json");
-        if let Err(e) = s3.put_sync(&meta_key, bytes::Bytes::from(meta_json)) {
+        if let Err(e) = s3.put_sync(&meta_key, bytes::Bytes::from(meta_json.clone())) {
             tracing::error!(error = %e, "R2 fragment meta upload failed");
+        }
+
+        // Write blobs to YATA_VINEYARD_DIR on disk (fallback/cache for Container process restarts)
+        if let Ok(vineyard_dir) = std::env::var("YATA_VINEYARD_DIR") {
+            let snap_dir = format!("{vineyard_dir}/snap/fragment");
+            if let Err(e) = std::fs::create_dir_all(&snap_dir) {
+                tracing::warn!(error = %e, "failed to create vineyard snap dir for disk cache");
+            } else {
+                for name in meta.blobs.keys() {
+                    if let Some(data) = BlobStore::get(&blob_store, name) {
+                        let path = format!("{snap_dir}/{name}");
+                        if let Err(e) = std::fs::write(&path, &data[..]) {
+                            tracing::warn!(path, error = %e, "failed to write blob to disk cache");
+                        }
+                    }
+                }
+                // Write meta.json to disk
+                let meta_path = format!("{snap_dir}/meta.json");
+                if let Err(e) = std::fs::write(&meta_path, &meta_json) {
+                    tracing::warn!(error = %e, "failed to write meta.json to disk cache");
+                }
+                tracing::debug!(snap_dir, "snapshot blobs written to disk cache");
+            }
         }
 
         // Upload manifest (backward-compat for existing page-in path)
@@ -1049,6 +1072,111 @@ impl TieredGraphEngine {
 
         tracing::info!(vertices = v_count, edges = e_count, blobs = uploaded, "R2 ArrowFragment snapshot triggered");
         Ok((v_count, e_count))
+    }
+
+    /// Export snapshot blobs for external upload (TS Worker → R2).
+    /// Returns Vec<(key, bytes)> for all ArrowFragment blobs + meta.json.
+    /// Does NOT upload to S3/R2 — caller handles persistence.
+    pub fn export_snapshot_blobs(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        // Compaction: merge R2 existing data if not yet initialized
+        if !self.hot_initialized.load(Ordering::Relaxed) {
+            if let Some(s3) = self.get_s3_client() {
+                if let Ok(existing) = crate::loader::page_in_from_r2(
+                    &s3, &self.s3_prefix, self.config.hot_partition_id,
+                ) {
+                    let existing_vc = existing.vertex_count();
+                    if existing_vc > 0 {
+                        if let Ok(mut hot) = self.hot.write() {
+                            if let Some(single) = hot.as_single_mut() {
+                                use yata_grin::{Scannable, Property, Schema as GrinSchema};
+                                for label in GrinSchema::vertex_labels(&existing) {
+                                    for vid in Scannable::scan_vertices_by_label(&existing, &label) {
+                                        let props: Vec<(String, yata_grin::PropValue)> = existing
+                                            .vertex_prop_keys(&label)
+                                            .iter()
+                                            .filter_map(|k| existing.vertex_prop(vid, k).map(|v| (k.clone(), v)))
+                                            .collect();
+                                        let props_ref: Vec<(&str, yata_grin::PropValue)> =
+                                            props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                                        if let Some(pk_val) = props.iter().find(|(k, _)| k == "rkey").map(|(_, v)| v.clone()) {
+                                            single.merge_by_pk(&label, "rkey", &pk_val, &props_ref);
+                                        } else {
+                                            single.add_vertex(&label, &props_ref);
+                                        }
+                                    }
+                                }
+                                single.commit();
+                                tracing::info!(existing_vertices = existing_vc, "compacted R2 data into CSR for export");
+                            }
+                        }
+                    }
+                }
+            }
+            self.hot_initialized.store(true, Ordering::Relaxed);
+        }
+
+        // Serialize CSR → ArrowFragment → MemoryBlobStore
+        let (v_count, e_count, blob_store, meta) = if let Ok(csr) = self.hot.read() {
+            let store = csr.as_single()
+                .ok_or_else(|| "no CSR store available".to_string())?;
+            let pid = store.partition_id_raw().get();
+            let frag = yata_vineyard::convert::csr_to_fragment(store, pid);
+            let vc = frag.ivnums.iter().sum::<u64>();
+            let ec = frag.edge_num();
+            let bs = yata_vineyard::blob::MemoryBlobStore::new();
+            let m = frag.serialize(&bs);
+            (vc, ec, bs, m)
+        } else {
+            return Err("failed to acquire CSR lock".into());
+        };
+
+        if v_count == 0 && e_count == 0 {
+            tracing::info!("export_snapshot_blobs: CSR is empty, returning empty");
+            return Ok(Vec::new());
+        }
+
+        let prefix = &self.s3_prefix;
+        let mut result = Vec::new();
+
+        // Collect all ArrowFragment blobs
+        for name in meta.blobs.keys() {
+            if let Some(data) = BlobStore::get(&blob_store, name) {
+                let full_key = format!("{prefix}snap/fragment/{name}");
+                result.push((full_key, data.to_vec()));
+            }
+        }
+
+        // Add meta.json
+        let meta_json = serde_json::to_vec(&meta).unwrap_or_default();
+        let meta_key = format!("{prefix}snap/fragment/meta.json");
+        result.push((meta_key, meta_json));
+
+        // Also write blobs to YATA_VINEYARD_DIR on disk (fallback/cache for Container restarts)
+        if let Ok(vineyard_dir) = std::env::var("YATA_VINEYARD_DIR") {
+            let snap_dir = format!("{vineyard_dir}/snap/fragment");
+            if let Err(e) = std::fs::create_dir_all(&snap_dir) {
+                tracing::warn!(error = %e, "failed to create vineyard snap dir");
+            } else {
+                for (key, data) in &result {
+                    // Extract filename from full key (last segment)
+                    let filename = key.rsplit('/').next().unwrap_or(key);
+                    let path = format!("{snap_dir}/{filename}");
+                    if let Err(e) = std::fs::write(&path, data) {
+                        tracing::warn!(path, error = %e, "failed to write snapshot blob to disk");
+                    }
+                }
+                tracing::info!(snap_dir, blobs = result.len(), "snapshot blobs written to disk cache");
+            }
+        }
+
+        // Clear dirty flag and update last snapshot count
+        self.dirty.store(false, Ordering::Relaxed);
+        if let Ok(mut last) = self.last_snapshot_count.lock() {
+            *last = (v_count, e_count);
+        }
+
+        tracing::info!(vertices = v_count, edges = e_count, blobs = result.len(), "export_snapshot_blobs complete");
+        Ok(result)
     }
 }
 
