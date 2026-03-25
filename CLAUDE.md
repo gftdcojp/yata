@@ -77,7 +77,7 @@ env.YATA.stats()                 // → all partition stats
 | `yata-grin` | GRIN trait (Topology, Property, Schema, Scannable, Mutable) |
 | `yata-vineyard` | **ArrowFragment format** (canonical snapshot/persistence format)。NbrUnit zero-copy CSR (25x faster neighbor traversal)。`csr_to_fragment()` (CSR→ArrowFragment) + `ArrowFragment::serialize/deserialize` (BlobStore↔R2)。**Arrow row-group chunk**: `split_record_batch` + byte-based chunking (32 MB default, `estimate_bytes_per_row`)。PropertyGraphSchema (typed vertex/edge labels + Arrow property columns) |
 | `yata-store` | MutableCsrStore (mutable in-memory CSR, GRIN traits), ArrowGraphStore, DiskVineyard/MmapVineyard/EdgeVineyard (blob cache), PartitionStoreSet, GraphStoreEnum |
-| `yata-engine` | TieredGraphEngine, ArrowFragment snapshot (trigger_snapshot → R2), page-in (R2 → ArrowFragment → CSR), selective chunk page-in API (`page_in_vertex_chunk_from_r2`), Frontier BFS, ShardedCoordinator |
+| `yata-engine` | TieredGraphEngine, ArrowFragment snapshot (trigger_snapshot → R2 + disk), 3-tier page-in (disk cache → R2 → CSR, `fetch_blob_cached`), label-selective page-in (`page_in_selective_from_r2`), incremental enrichment (`enrich_label_from_r2`), Frontier BFS, ShardedCoordinator |
 | `yata-cypher` | Full Cypher parser + executor (incl. untyped edge traversal) |
 | `yata-gie` | GIE push-based executor, IR (Exchange/Receive/Gather), distributed planner |
 | `yata-s3` | R2 persistence (sync ureq+rustls S3 client, SigV4)。`trigger_snapshot()` → R2 PUT、page-in → R2 GET |
@@ -127,7 +127,7 @@ env.YATA.stats()                 // → all partition stats
 
 ## R2 Persistence `[PRODUCTION]`
 
-R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in-memory CSR に append のみ)。PK dedup は in-memory 内のみ。R2 既存データとの dedup は snapshot compaction 時。**Dirty tracking**: dirty flag が true の時のみ snapshot upload。**Snapshot compaction**: R2 既存 + in-memory pending → merge by PK → ArrowFragment → R2 PUT。**Partial page-in protection**: `last_snapshot_count` で上書き防止。**Name-based blob** (CAS 除去): `snap/fragment/{name}` で直接 PUT/GET。Blake3 hash 不要。**Read page-in**: `hot_initialized=false` (default) → first query triggers `page_in_from_r2()` → R2 GET → ArrowFragment → CSR。**Arrow row-group chunk `[IMPLEMENTED]`**: 大きい vertex/edge table は byte-based で自動分割 (default 32 MB/chunk)。`estimate_bytes_per_row()` が Arrow buffer size から行単価を推定 → `target_bytes / bytes_per_row` で chunk row 数算出 (clamp [1K, 10M])。R2 key: `vertex_table_{i}_chunk_{j}` / meta field: `vertex_table_{i}_chunks`。Old single-blob format は deserialize 時に自動検出 (backward compat)。1B vertices でも ~数十 chunks (S3/R2 10億ファイル問題回避)。
+R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in-memory CSR に append のみ)。PK dedup は in-memory 内のみ。R2 既存データとの dedup は snapshot compaction 時。**Dirty tracking**: dirty flag が true の時のみ snapshot upload。**Snapshot compaction**: R2 既存 + in-memory pending → merge by PK → ArrowFragment → R2 PUT。**Partial page-in protection**: `last_snapshot_count` で上書き防止。**Name-based blob** (CAS 除去): `snap/fragment/{name}` で直接 PUT/GET。Blake3 hash 不要。**3-tier page-in `[IMPLEMENTED]`**: `fetch_blob_cached()` が disk cache (`YATA_VINEYARD_DIR/snap/fragment/`) → R2 GET → write-through to disk の順で blob を取得。Cold start with warm disk: ~100µs/blob (vs R2 ~3-5ms)。`trigger_snapshot` が disk にも書くため、Container restart 時は disk cache → R2 skip で高速復旧。**Arrow row-group chunk `[IMPLEMENTED]`**: 大きい vertex/edge table は byte-based で自動分割 (default 32 MB/chunk)。`estimate_bytes_per_row()` が Arrow buffer size から行単価を推定 → `target_bytes / bytes_per_row` で chunk row 数算出 (clamp [1K, 10M])。R2 key: `vertex_table_{i}_chunk_{j}` / meta field: `vertex_table_{i}_chunks`。Old single-blob format は deserialize 時に自動検出 (backward compat)。1B vertices でも ~数十 chunks (S3/R2 10億ファイル問題回避)。
 
 ## Concurrency Model (CRITICAL)
 
@@ -251,7 +251,7 @@ Mutation (~500ms): [PRODUCTION]
   Cypher → MemoryGraph copy → mutate → inject metadata → CSR rebuild
   OR: merge_by_pk → prop_eq_index O(1) → property update → CSR.commit()
 
-Storage (2 level + R2): [PRODUCTION]
+Storage (3-tier + R2): [IMPLEMENTED]
   Level 0: RAM (MutableCsrStore CSR) — <1µs
   Level 1: Vineyard ephemeral (DiskVineyard/MmapVineyard) — ~100µs
   R2: Source of truth (Arrow IPC per-label) — ~3-5ms page-in

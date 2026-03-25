@@ -5,6 +5,68 @@ use yata_graph::GraphStore;
 use yata_grin::{Mutable, PropValue, Topology};
 use yata_store::MutableCsrStore;
 
+// ── 3-Tier Blob Fetch: Disk Cache → R2 ──────────────────────────────
+
+/// Resolve the disk cache directory from YATA_VINEYARD_DIR env var.
+/// Returns `Some("{dir}/snap/fragment")` if set, None otherwise.
+fn disk_cache_dir() -> Option<String> {
+    std::env::var("YATA_VINEYARD_DIR").ok().map(|d| format!("{d}/snap/fragment"))
+}
+
+/// Fetch a blob by name with 3-tier strategy:
+///   1. Disk cache (`YATA_VINEYARD_DIR/snap/fragment/{name}`) — ~100µs
+///   2. R2 GET (`{prefix}snap/fragment/{name}`) — ~3-5ms
+///   3. On R2 hit: write to disk cache for next time
+///
+/// Returns the blob bytes, or None if not found in either tier.
+fn fetch_blob_cached(
+    s3: &yata_s3::s3::S3Client,
+    prefix: &str,
+    name: &str,
+    disk_dir: Option<&str>,
+) -> Option<bytes::Bytes> {
+    // Tier 1: disk cache
+    if let Some(dir) = disk_dir {
+        let path = format!("{dir}/{name}");
+        if let Ok(data) = std::fs::read(&path) {
+            tracing::trace!(name, "blob from disk cache");
+            return Some(bytes::Bytes::from(data));
+        }
+    }
+
+    // Tier 2: R2
+    let key = format!("{prefix}snap/fragment/{name}");
+    match s3.get_sync(&key) {
+        Ok(Some(data)) => {
+            // Write-through to disk cache
+            if let Some(dir) = disk_dir {
+                let path = format!("{dir}/{name}");
+                // Ensure parent dir exists for chunked blob names
+                if let Some(parent) = std::path::Path::new(&path).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(e) = std::fs::write(&path, &data[..]) {
+                    tracing::trace!(name, error = %e, "disk cache write failed (non-fatal)");
+                }
+            }
+            Some(data)
+        }
+        Ok(None) => {
+            tracing::warn!(name, "blob not found in R2");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(name, error = %e, "R2 blob fetch failed");
+            None
+        }
+    }
+}
+
+/// Check if a full snapshot exists on disk (meta.json present).
+fn disk_cache_has_snapshot(disk_dir: &str) -> bool {
+    std::path::Path::new(&format!("{disk_dir}/meta.json")).exists()
+}
+
 /// Convert yata_cypher::Value → yata_grin::PropValue for CSR property storage.
 pub fn cypher_to_prop(v: &yata_cypher::types::Value) -> PropValue {
     match v {
@@ -181,8 +243,10 @@ pub fn restore_csr_from_fragment(
     csr
 }
 
-/// Page-in ArrowFragment from R2 and restore to CSR.
-/// Fetches `snap/fragment/meta.json` + individual blobs → ArrowFragment::deserialize → CSR.
+/// Page-in ArrowFragment and restore to CSR.
+///
+/// 3-tier fetch: disk cache (`YATA_VINEYARD_DIR`) → R2 → write-through to disk.
+/// Cold start with warm disk: ~100µs per blob (vs ~3-5ms R2 GET).
 pub fn page_in_from_r2(
     s3: &yata_s3::s3::S3Client,
     prefix: &str,
@@ -190,28 +254,26 @@ pub fn page_in_from_r2(
 ) -> Result<MutableCsrStore, String> {
     use yata_vineyard::blob::{BlobStore, MemoryBlobStore};
 
-    // 1. Fetch fragment meta
-    let meta_key = format!("{prefix}snap/fragment/meta.json");
-    let meta_bytes = s3.get_sync(&meta_key)
-        .map_err(|e| format!("R2 meta fetch: {e}"))?
-        .ok_or_else(|| "no fragment meta.json in R2".to_string())?;
+    let disk_dir = disk_cache_dir();
+    let disk_ref = disk_dir.as_deref();
+
+    // 1. Fetch fragment meta (disk → R2)
+    let meta_bytes = fetch_blob_cached(s3, prefix, "meta.json", disk_ref)
+        .ok_or_else(|| "no fragment meta.json in disk or R2".to_string())?;
     let meta: yata_vineyard::blob::ObjectMeta = serde_json::from_slice(&meta_bytes)
         .map_err(|e| format!("parse fragment meta: {e}"))?;
 
-    // 2. Fetch all blobs referenced in meta (name-based, no CAS hash)
+    // 2. Fetch all blobs (disk → R2, write-through)
     let blob_store = MemoryBlobStore::new();
+    let mut disk_hits = 0u32;
+    let mut r2_hits = 0u32;
     for name in meta.blobs.keys() {
-        let blob_key = format!("{prefix}snap/fragment/{name}");
-        match s3.get_sync(&blob_key) {
-            Ok(Some(data)) => {
-                blob_store.put(name, data);
-            }
-            Ok(None) => {
-                tracing::warn!(name, "R2 blob not found, skipping");
-            }
-            Err(e) => {
-                tracing::warn!(name, error = %e, "R2 blob fetch failed, skipping");
-            }
+        let was_on_disk = disk_ref.map_or(false, |d| {
+            std::path::Path::new(&format!("{d}/{name}")).exists()
+        });
+        if let Some(data) = fetch_blob_cached(s3, prefix, name, disk_ref) {
+            blob_store.put(name, data);
+            if was_on_disk { disk_hits += 1; } else { r2_hits += 1; }
         }
     }
 
@@ -220,7 +282,14 @@ pub fn page_in_from_r2(
         .map_err(|e| format!("ArrowFragment deserialize: {e}"))?;
 
     // 4. Restore CSR
-    Ok(restore_csr_from_fragment(&frag, partition_id))
+    let csr = restore_csr_from_fragment(&frag, partition_id);
+    tracing::info!(
+        disk_hits, r2_hits,
+        total_blobs = meta.blobs.len(),
+        vertices = csr.vertex_count(),
+        "page-in complete (disk cache → R2)"
+    );
+    Ok(csr)
 }
 
 // ── Phase 3c: Label-Selective Page-In ──────────────────────────────
@@ -238,19 +307,22 @@ pub fn page_in_selective_from_r2(
 ) -> Result<(MutableCsrStore, yata_vineyard::blob::ObjectMeta, yata_vineyard::schema::PropertyGraphSchema, std::collections::HashSet<String>), String> {
     use yata_vineyard::blob::{BlobStore, MemoryBlobStore};
 
-    // 1. Fetch meta
-    let meta = fetch_fragment_meta(s3, prefix)?;
+    let disk_dir = disk_cache_dir();
+    let disk_ref = disk_dir.as_deref();
+
+    // 1. Fetch meta (disk → R2)
+    let meta_bytes = fetch_blob_cached(s3, prefix, "meta.json", disk_ref)
+        .ok_or("no fragment meta.json in disk or R2")?;
+    let meta: yata_vineyard::blob::ObjectMeta = serde_json::from_slice(&meta_bytes)
+        .map_err(|e| format!("parse fragment meta: {e}"))?;
 
     // 2. Build selective blob store
     let blob_store = MemoryBlobStore::new();
 
-    // Always fetch: schema, ivnums
+    // Always fetch: schema, ivnums (disk → R2)
     for name in ["schema", "ivnums"] {
-        let key = format!("{prefix}snap/fragment/{name}");
-        match s3.get_sync(&key) {
-            Ok(Some(data)) => blob_store.put(name, data),
-            Ok(None) => tracing::warn!(name, "R2 blob not found"),
-            Err(e) => tracing::warn!(name, error = %e, "R2 blob fetch failed"),
+        if let Some(data) = fetch_blob_cached(s3, prefix, name, disk_ref) {
+            blob_store.put(name, data);
         }
     }
 
@@ -268,7 +340,7 @@ pub fn page_in_selective_from_r2(
         .map(|(i, _)| i)
         .collect();
 
-    // 3. Fetch vertex tables for needed labels only (chunk-aware)
+    // 3. Fetch vertex tables for needed labels only (chunk-aware, disk → R2)
     for (i, _entry) in schema.vertex_entries.iter().enumerate() {
         if !needed_vlabel_ids.contains(&i) { continue; }
 
@@ -277,8 +349,7 @@ pub fn page_in_selective_from_r2(
             for j in 0..count as usize {
                 let name = format!("vertex_table_{}_chunk_{}", i, j);
                 if meta.blobs.contains_key(&name) {
-                    let key = format!("{prefix}snap/fragment/{name}");
-                    if let Ok(Some(data)) = s3.get_sync(&key) {
+                    if let Some(data) = fetch_blob_cached(s3, prefix, &name, disk_ref) {
                         blob_store.put(&name, data);
                     }
                 }
@@ -286,22 +357,18 @@ pub fn page_in_selective_from_r2(
         } else {
             let name = format!("vertex_table_{}", i);
             if meta.blobs.contains_key(&name) {
-                let key = format!("{prefix}snap/fragment/{name}");
-                if let Ok(Some(data)) = s3.get_sync(&key) {
+                if let Some(data) = fetch_blob_cached(s3, prefix, &name, disk_ref) {
                     blob_store.put(&name, data);
                 }
             }
         }
     }
 
-    // 4. Always fetch edge tables + CSR topology (small relative to vertex properties)
+    // 4. Always fetch edge tables + CSR topology (disk → R2)
     for name in meta.blobs.keys() {
         if name.starts_with("edge_table") || name.starts_with("oe_") || name.starts_with("ie_") {
-            let key = format!("{prefix}snap/fragment/{name}");
-            match s3.get_sync(&key) {
-                Ok(Some(data)) => blob_store.put(name, data),
-                Ok(None) => tracing::warn!(name, "R2 CSR blob not found"),
-                Err(e) => tracing::warn!(name, error = %e, "R2 CSR blob fetch failed"),
+            if let Some(data) = fetch_blob_cached(s3, prefix, name, disk_ref) {
+                blob_store.put(name, data);
             }
         }
     }
@@ -428,14 +495,16 @@ pub fn enrich_label_from_r2(
         .find(|(_, e)| e.label == label_name)
         .ok_or_else(|| format!("label not in schema: {label_name}"))?;
 
-    // Fetch vertex_table (chunk-aware)
+    let disk_dir = disk_cache_dir();
+    let disk_ref = disk_dir.as_deref();
+
+    // Fetch vertex_table (chunk-aware, disk → R2)
     let blob_store = MemoryBlobStore::new();
     let chunks_key = format!("vertex_table_{}_chunks", label_id);
     if let Some(count) = meta.get_field(&chunks_key).and_then(|v| v.as_i64()) {
         for j in 0..count as usize {
             let name = format!("vertex_table_{}_chunk_{}", label_id, j);
-            let key = format!("{prefix}snap/fragment/{name}");
-            if let Ok(Some(data)) = s3.get_sync(&key) {
+            if let Some(data) = fetch_blob_cached(s3, prefix, &name, disk_ref) {
                 blob_store.put(&name, data);
             }
         }
@@ -452,15 +521,14 @@ pub fn enrich_label_from_r2(
         apply_batch_properties(&batch, entry, csr, vid_offset);
     } else {
         let name = format!("vertex_table_{}", label_id);
-        let key = format!("{prefix}snap/fragment/{name}");
-        if let Ok(Some(data)) = s3.get_sync(&key) {
+        if let Some(data) = fetch_blob_cached(s3, prefix, &name, disk_ref) {
             let batch = yata_arrow::ipc_to_batch(&data)
                 .map_err(|e| format!("vertex table decode: {e}"))?;
             apply_batch_properties(&batch, entry, csr, vid_offset);
         }
     }
 
-    tracing::info!(label = label_name, vid_offset, "label properties enriched from R2");
+    tracing::info!(label = label_name, vid_offset, "label properties enriched (disk → R2)");
     Ok(())
 }
 
