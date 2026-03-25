@@ -371,14 +371,28 @@ impl TieredGraphEngine {
         self.ensure_labels_vineyard_only(vertex_labels, edge_labels);
     }
 
-    /// Page-in from R2 ArrowFragment snapshot (Phase 3c: 3-tier + label-selective).
+    /// 2-Phase Cold Start page-in (3-tier: disk cache → R2).
     ///
-    /// First call (cold start): ALWAYS full page-in (all labels with properties).
-    ///   Stubs are dangerous on cold start — queries for unloaded labels return empty.
-    /// Subsequent calls (hot): if new labels needed, incremental enrichment via selective fetch.
+    /// Phase 1 (cold start): Load topology-only (stubs + edges, ~25% data).
+    ///   CSR is immediately queryable for count/traversal. Properties are empty.
+    ///   hot_initialized = true after Phase 1.
+    ///
+    /// Phase 2 (on-demand): When query references labels, enrich stubs with properties.
+    ///   Only fetches vertex_table blobs for labels actually queried.
+    ///   Subsequent queries for same label = loaded_labels cache hit.
     fn ensure_labels_vineyard_only(&self, vertex_labels: &[&str], _edge_labels: &[&str]) {
-        // Hot path: check if all requested labels are already loaded
+        // Phase 2: topology loaded, check if requested label properties are loaded
         if self.hot_initialized.load(Ordering::Relaxed) {
+            if vertex_labels.is_empty() { return; }
+
+            let all_loaded = if let Ok(ll) = self.loaded_labels.lock() {
+                vertex_labels.iter().all(|l| ll.contains(*l))
+            } else { true };
+
+            if all_loaded { return; }
+
+            // On-demand property enrichment for new labels
+            self.enrich_new_labels(vertex_labels);
             return;
         }
 
@@ -387,34 +401,65 @@ impl TieredGraphEngine {
             None => return,
         };
 
-        // First page-in: ALWAYS full (3-tier: disk cache → R2).
-        // Selective page-in with stubs is only safe for incremental enrichment
-        // after all labels are already loaded with properties.
-        match crate::loader::page_in_from_r2(&s3, &self.s3_prefix, self.config.hot_partition_id) {
-            Ok(store) => {
+        // Phase 1: Topology-only page-in (stubs + edges, no vertex properties).
+        // Fast cold start — ~25% of data. Properties are loaded on-demand in Phase 2.
+        match crate::loader::page_in_topology_from_r2(
+            &s3, &self.s3_prefix, self.config.hot_partition_id,
+        ) {
+            Ok((store, meta, schema, offsets)) => {
                 let vc = store.vertex_count();
                 let ec = store.edge_count();
                 if vc == 0 && ec == 0 {
-                    tracing::debug!("R2 page-in: empty fragment, skipping");
+                    tracing::debug!("R2 topology page-in: empty fragment, skipping");
                     return;
                 }
                 if let Ok(mut last) = self.last_snapshot_count.lock() {
                     *last = (vc as u64, ec as u64);
                 }
-                // Mark all labels as loaded
-                if let Ok(mut ll) = self.loaded_labels.lock() {
-                    for label in yata_grin::Schema::vertex_labels(&store) {
-                        ll.insert(label);
-                    }
-                }
+                // loaded_labels is empty — no label properties loaded yet
+                if let Ok(mut cm) = self.cached_meta.lock() { *cm = Some(meta); }
+                if let Ok(mut cs) = self.cached_schema.lock() { *cs = Some(schema); }
+                if let Ok(mut lo) = self.label_vid_offsets.lock() { *lo = offsets; }
+
                 if let Ok(mut hot) = self.hot.write() {
                     *hot = yata_store::GraphStoreEnum::Single(store);
                     self.hot_initialized.store(true, Ordering::Relaxed);
                 }
-                tracing::info!(vertices = vc, edges = ec, "R2 full page-in complete (3-tier)");
+                tracing::info!(vertices = vc, edges = ec, "Phase 1: topology-only page-in complete");
+
+                // Immediately enrich requested labels (Phase 2 for the first query)
+                if !vertex_labels.is_empty() {
+                    self.enrich_new_labels(vertex_labels);
+                }
             }
             Err(e) => {
-                tracing::debug!("R2 page-in failed (may not exist yet): {e}");
+                // Fallback: full page-in (legacy path for safety)
+                tracing::warn!("topology page-in failed, falling back to full: {e}");
+                match crate::loader::page_in_from_r2(
+                    &s3, &self.s3_prefix, self.config.hot_partition_id,
+                ) {
+                    Ok(store) => {
+                        let vc = store.vertex_count();
+                        let ec = store.edge_count();
+                        if vc == 0 && ec == 0 { return; }
+                        if let Ok(mut last) = self.last_snapshot_count.lock() {
+                            *last = (vc as u64, ec as u64);
+                        }
+                        if let Ok(mut ll) = self.loaded_labels.lock() {
+                            for label in yata_grin::Schema::vertex_labels(&store) {
+                                ll.insert(label);
+                            }
+                        }
+                        if let Ok(mut hot) = self.hot.write() {
+                            *hot = yata_store::GraphStoreEnum::Single(store);
+                            self.hot_initialized.store(true, Ordering::Relaxed);
+                        }
+                        tracing::info!(vertices = vc, edges = ec, "full page-in fallback complete");
+                    }
+                    Err(e2) => {
+                        tracing::debug!("R2 page-in failed (may not exist yet): {e2}");
+                    }
+                }
             }
         }
     }

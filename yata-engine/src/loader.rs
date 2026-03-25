@@ -292,6 +292,96 @@ pub fn page_in_from_r2(
     Ok(csr)
 }
 
+// ── 2-Phase Cold Start: Topology-Only + On-Demand Property Enrichment ──
+
+/// Phase 1: Topology-only page-in from R2.
+///
+/// Loads meta + schema + ivnums + ALL CSR topology (offsets + nbr_units).
+/// Vertex properties are NOT loaded — stub vertices (label + VID only) are created.
+/// This is ~25% of total data size and allows query acceptance immediately.
+///
+/// Returns (CSR, meta, schema, label→vid_offset map).
+pub fn page_in_topology_from_r2(
+    s3: &yata_s3::s3::S3Client,
+    prefix: &str,
+    partition_id: PartitionId,
+) -> Result<(MutableCsrStore, yata_vineyard::blob::ObjectMeta, yata_vineyard::schema::PropertyGraphSchema, HashMap<String, u32>), String> {
+    use yata_vineyard::blob::{BlobStore, MemoryBlobStore};
+
+    let disk_dir = disk_cache_dir();
+    let disk_ref = disk_dir.as_deref();
+
+    // 1. Fetch meta
+    let meta_bytes = fetch_blob_cached(s3, prefix, "meta.json", disk_ref)
+        .ok_or("no fragment meta.json in disk or R2")?;
+    let meta: yata_vineyard::blob::ObjectMeta = serde_json::from_slice(&meta_bytes)
+        .map_err(|e| format!("parse fragment meta: {e}"))?;
+
+    // 2. Fetch schema + ivnums (always needed)
+    let blob_store = MemoryBlobStore::new();
+    for name in ["schema", "ivnums"] {
+        if let Some(data) = fetch_blob_cached(s3, prefix, name, disk_ref) {
+            blob_store.put(name, data);
+        }
+    }
+
+    let schema_bytes = blob_store.get("schema")
+        .ok_or("schema blob missing")?;
+    let schema: yata_vineyard::schema::PropertyGraphSchema =
+        serde_json::from_slice(&schema_bytes)
+            .map_err(|e| format!("parse schema: {e}"))?;
+
+    // 3. Fetch ALL CSR topology + edge tables (small, always needed for traversal)
+    for name in meta.blobs.keys() {
+        if name.starts_with("edge_table") || name.starts_with("oe_") || name.starts_with("ie_") {
+            if let Some(data) = fetch_blob_cached(s3, prefix, name, disk_ref) {
+                blob_store.put(name, data);
+            }
+        }
+    }
+
+    // 4. Do NOT fetch any vertex_table blobs — stubs only.
+    //    Build a filtered meta that excludes all vertex_table references.
+    let mut topo_meta = meta.clone();
+    for (i, _) in schema.vertex_entries.iter().enumerate() {
+        let single_name = format!("vertex_table_{}", i);
+        topo_meta.blobs.remove(&single_name);
+        let chunks_key = format!("vertex_table_{}_chunks", i);
+        if let Some(count) = meta.get_field(&chunks_key).and_then(|v| v.as_i64()) {
+            for j in 0..count as usize {
+                topo_meta.blobs.remove(&format!("vertex_table_{}_chunk_{}", i, j));
+            }
+        }
+        topo_meta.fields.remove(&chunks_key);
+    }
+
+    // 5. Deserialize topology-only ArrowFragment (no vertex tables → empty vertex_tables vec)
+    let frag = yata_vineyard::ArrowFragment::deserialize(&topo_meta, &blob_store)
+        .map_err(|e| format!("topology deserialize: {e}"))?;
+
+    // 6. Build CSR with stubs for ALL labels (VID ordering from ivnums)
+    let no_labels: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let csr = restore_csr_selective(&frag, partition_id, &no_labels);
+
+    // 7. Compute VID offsets per label
+    let mut offsets = HashMap::new();
+    let mut offset = 0u32;
+    for entry in &schema.vertex_entries {
+        offsets.insert(entry.label.clone(), offset);
+        let count = yata_grin::Scannable::scan_vertices_by_label(&csr, &entry.label).len();
+        offset += count as u32;
+    }
+
+    tracing::info!(
+        vertices = csr.vertex_count(),
+        edges = csr.edge_count(),
+        labels = schema.vertex_entries.len(),
+        "topology-only page-in complete (stubs, no properties)"
+    );
+
+    Ok((csr, meta, schema, offsets))
+}
+
 // ── Phase 3c: Label-Selective Page-In ──────────────────────────────
 
 /// Selective page-in: fetch meta+schema+ivnums+CSR topology from R2,
