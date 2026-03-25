@@ -222,7 +222,8 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
     subsequent: new label → fetch vertex_table → set_vertex_prop on existing stubs (incremental)
     no label hints → full page-in fallback (backward compat)
   state tracking: loaded_labels (property-loaded labels), cached_meta/schema (for incremental enrichment), label_vid_offsets
-  test: 854 workspace tests pass (no regression)
+  3-tier blob fetch: fetch_blob_cached() — disk cache (YATA_VINEYARD_DIR) → R2 GET → write-through。Container restart with warm disk: ~100µs/blob (R2 skip)
+  test: 854 workspace unit tests pass + e2e_phase3_loadtest (8 tests, docker-compose: 2-hop 541 QPS, label-selective 1,126 QPS)
 
 `[DEPRECATED]` LSMGraph 4-level tiered storage
   reason: 現 ArrowFragment + snapshot compaction が LSM の本質 (immutable sorted runs + compaction) を
@@ -283,7 +284,7 @@ Read latency:
 
 ## Test Coverage
 
-854 Rust unit tests, 0 failures. E2E: 8 tests (docker-compose + MinIO, 2-partition). 6-node distributed: 6 tests (10K records, label routing, cold put/pull). ArrowFragment snapshot roundtrip verified.
+854 Rust unit tests, 0 failures. E2E: 8 tests (docker-compose + MinIO, 2-partition). 6-node distributed: 6 tests (10K records, label routing, cold put/pull). Phase 3 load test: 8 tests (chunk snapshot, 2-hop traversal, label-selective reads, mixed load). ArrowFragment snapshot roundtrip verified.
 
 ## Benchmark (measured, release build, 10K records)
 
@@ -312,6 +313,18 @@ Read latency:
 | Cold pull recovery | 10,000/10,000 records |
 | Distributed reads | 103 QPS |
 | Partition isolation | 0 violations |
+
+**Phase 3 load test (docker-compose, 1-partition, 1,250 vertices + 300 edges, 5 labels):**
+| Metric | Result |
+|---|---|
+| Seed (mergeRecord via HTTP) | 178 nodes/sec |
+| 2-hop traversal (Person→KNOWS→Person→WORKS_AT→Company) | **541 QPS** |
+| Label-selective point reads (Person/Company) | **1,126 QPS** |
+| Mixed read/write (300R + 100W) | 260 ops/sec |
+| Full scan (50x) | 1,416 QPS |
+| Label scan (50x) | **1,837 QPS** (30% faster than full scan) |
+| Chunked snapshot (1,250 vertices) | 73-111ms |
+| test: `yata-server/tests/e2e_phase3_loadtest.rs` (8 tests pass) |
 
 **Trillion scale projection (from 10K benchmark):**
 | Scale | Partitions | Write/sec | Point QPS | Scan QPS | Cost/月 |
