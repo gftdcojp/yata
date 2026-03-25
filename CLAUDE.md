@@ -360,27 +360,22 @@ RUSTC_WRAPPER="" cargo zigbuild --manifest-path packages/server/yata/Cargo.toml 
 - **sccache 禁止**: `RUSTC_WRAPPER=""` 必須 (cc-rs が sccache 経由で C compiler を探して失敗)
 - **rest.rs 変更後は必ず rebuild** → バイナリが古いと `/xrpc/ai.gftd.yata.cypher` が 404
 
-## Known PDS Dispatch Issues (yata 側は正常、PDS 層の問題)
+## PDS Dispatch Fixes (2026-03-25)
 
-**R2 永続化 verified (2026-03-25)**: R2 に ArrowFragment 12 blobs, 10 vertex labels, 684 vertices 存在確認済み。3-tier page-in で全データ+プロパティ復元。以下は PDS dispatch 層 (`pds-dispatch.ts` / `pds-helpers.ts`) の問題:
+**R2 永続化 verified**: R2 に ArrowFragment 12 blobs, 10 vertex labels, 684 vertices 存在確認済み。
 
-| Issue | Root Cause | Location |
+| Issue | Fix | Location |
 |---|---|---|
-| `getProfile` displayName = DID | `GetProfile` は `Profile` label をクエリするが R2 snapshot に `Profile` は存在しない (runtime mergeRecord のみ)。`PDSProfile` (R2 に存在) を参照すべき | `pds-dispatch.ts:911` |
-| `listRecords` = 0 | `collectionToLabel("ai.gftd.apps.pds.magatama_app")` → `"Magatama_app"` (snake_case 未変換) ≠ R2 の `"MagatamaApp"` (PascalCase) | `pds-helpers.ts:220-227` |
+| `collectionToLabel` snake_case 未対応 | `.split(/[-_]/)` で snake_case + kebab-case 両対応 | `pds-helpers.ts:223` |
+| `buildProfileView` displayName fallback = DID | fallback を `didToHandle(actor)` に変更 (handle 表示) | `pds-helpers.ts:315` |
+| `GetProfile` が `Profile` label のみ参照 (R2 未永続化) | `PDSProfile` (R2 永続化) へ fallback 追加。display_name/description を PDSProfile から補完 | `pds-dispatch.ts:910-927` |
+| label consistency テスト未整備 | `pds-helpers.test.ts` に snake_case テスト 5 件 + label consistency check 追加 (214 tests pass) | `pds-helpers.test.ts` |
 
-**診断手順 (label ↔ collection mismatch を検出する方法)**:
+**診断手順 (label ↔ collection mismatch)**:
 ```bash
-# 1. R2 schema の label 一覧を確認
+# R2 schema の label 一覧
 npx wrangler r2 object get ai-gftd-graph/yata/snap/fragment/schema --remote --file /tmp/schema.json
 python3 -c "import json; [print(e['label']) for e in json.load(open('/tmp/schema.json'))['vertex_entries']]"
-
-# 2. PDS の collectionToLabel 変換結果を確認 (TS)
-# collection.split('.').pop().split('-').map(s => s[0].toUpperCase() + s.slice(1)).join('')
-
-# 3. 不一致を検出: R2 label vs collectionToLabel(collection)
-# R2: MagatamaApp, PDSProfile, ...
-# collectionToLabel("ai.gftd.apps.pds.magatama_app") → "Magatama_app" ← 不一致!
 ```
 
 ## 禁止事項
