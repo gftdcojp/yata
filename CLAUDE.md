@@ -224,6 +224,7 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
   state tracking: loaded_labels (property-loaded labels), cached_meta/schema (for incremental enrichment), label_vid_offsets
   3-tier blob fetch: fetch_blob_cached() — disk cache (YATA_VINEYARD_DIR) → R2 GET → write-through。Container restart with warm disk: ~100µs/blob (R2 skip)
   test: 854 workspace unit tests pass + e2e_phase3_loadtest (8 tests, docker-compose: 2-hop 541 QPS, label-selective 1,126 QPS)
+  production: `[PRODUCTION]` deploy verified (2026-03-25, image `20260325-0931`)。searchActors 424ms avg, getTimeline 271ms, listRecords 371ms, cold start 2.8s
 
 `[DEPRECATED]` LSMGraph 4-level tiered storage
   reason: 現 ArrowFragment + snapshot compaction が LSM の本質 (immutable sorted runs + compaction) を
@@ -325,6 +326,15 @@ Read latency:
 | Label scan (50x) | **1,837 QPS** (30% faster than full scan) |
 | Chunked snapshot (1,250 vertices) | 73-111ms |
 | test: `yata-server/tests/e2e_phase3_loadtest.rs` (8 tests pass) |
+
+**Production E2E (pds.gftd.ai → YataRPC → Container, 2026-03-25, image `20260325-0931`):**
+| Metric | Result | Notes |
+|---|---|---|
+| Cold start (container wake) | **2.8s** | Container sleep → wake + R2 page-in |
+| searchActors (warm, 20x avg) | **424ms** | PDS → YataRPC → Container → Cypher → edge cache |
+| getTimeline (2-hop) | **271ms** | Graph traversal through PDS |
+| listRecords (label-specific) | **371ms** | Label-selective page-in path |
+| createRecord | 63ms (auth required) | External write blocked — correct security |
 
 **Trillion scale projection (from 10K benchmark):**
 | Scale | Partitions | Write/sec | Point QPS | Scan QPS | Cost/月 |
