@@ -2109,4 +2109,657 @@ mod security_filter_tests {
         let results = execute(&plan, &store);
         assert_eq!(results.len(), 4, "bypass scope should return all posts");
     }
+
+    #[test]
+    fn test_security_filter_combined_rbac_and_consent() {
+        let store = security_store();
+        let scope = SecurityScope {
+            max_sensitivity_ord: 0,
+            collection_scopes: vec!["ai.gftd.apps.yabai.".into()],
+            allowed_owner_hashes: vec![4000], // consent for restricted post owner
+            ..Default::default()
+        };
+        let mut plan = PlanBuilder::new().scan("Post", "p").build();
+        plan.push(LogicalOp::SecurityFilter {
+            aliases: vec!["p".into()],
+            scope,
+        });
+        let results = execute(&plan, &store);
+        // public (sens=0) + yabai (RBAC) + malak restricted (consent for owner 4000) = 3
+        assert_eq!(
+            results.len(),
+            3,
+            "combined RBAC + consent should grant access to 3 posts"
+        );
+    }
+
+    #[test]
+    fn test_security_filter_empty_scope_denies_above_public() {
+        let store = security_store();
+        let scope = SecurityScope {
+            max_sensitivity_ord: 0,
+            collection_scopes: vec![],
+            allowed_owner_hashes: vec![],
+            bypass: false,
+        };
+        let mut plan = PlanBuilder::new().scan("Post", "p").build();
+        plan.push(LogicalOp::SecurityFilter {
+            aliases: vec!["p".into()],
+            scope,
+        });
+        let results = execute(&plan, &store);
+        assert_eq!(results.len(), 1, "empty scope should only see public posts");
+    }
+}
+
+#[cfg(test)]
+mod eval_expr_tests {
+    use super::*;
+    use crate::ir::Expr;
+
+    fn test_store() -> MutableCsrStore {
+        let mut store = MutableCsrStore::new();
+        store.add_vertex(
+            "Person",
+            &[
+                ("name", PropValue::Str("Alice".into())),
+                ("age", PropValue::Int(30)),
+                ("score", PropValue::Float(95.5)),
+                ("active", PropValue::Bool(true)),
+            ],
+        );
+        store.add_vertex(
+            "Person",
+            &[
+                ("name", PropValue::Str("Bob".into())),
+                ("age", PropValue::Int(25)),
+            ],
+        );
+        store.commit();
+        store
+    }
+
+    #[test]
+    fn test_eval_literal_int() {
+        let store = test_store();
+        let record = Record::with_binding("n", 0);
+        let val = eval_expr(&Expr::Lit(PropValue::Int(42)), &record, &store);
+        assert_eq!(val, PropValue::Int(42));
+    }
+
+    #[test]
+    fn test_eval_literal_string() {
+        let store = test_store();
+        let record = Record::with_binding("n", 0);
+        let val = eval_expr(
+            &Expr::Lit(PropValue::Str("hello".into())),
+            &record,
+            &store,
+        );
+        assert_eq!(val, PropValue::Str("hello".into()));
+    }
+
+    #[test]
+    fn test_eval_literal_null() {
+        let store = test_store();
+        let record = Record::with_binding("n", 0);
+        let val = eval_expr(&Expr::Lit(PropValue::Null), &record, &store);
+        assert_eq!(val, PropValue::Null);
+    }
+
+    #[test]
+    fn test_eval_prop_existing() {
+        let store = test_store();
+        let record = Record::with_binding("n", 0);
+        let val = eval_expr(&Expr::Prop("n".into(), "name".into()), &record, &store);
+        assert_eq!(val, PropValue::Str("Alice".into()));
+    }
+
+    #[test]
+    fn test_eval_prop_missing() {
+        let store = test_store();
+        let record = Record::with_binding("n", 0);
+        let val = eval_expr(&Expr::Prop("n".into(), "email".into()), &record, &store);
+        assert_eq!(val, PropValue::Null);
+    }
+
+    #[test]
+    fn test_eval_prop_unbound_variable() {
+        let store = test_store();
+        let record = Record::with_binding("n", 0);
+        let val = eval_expr(&Expr::Prop("m".into(), "name".into()), &record, &store);
+        assert_eq!(val, PropValue::Null);
+    }
+
+    #[test]
+    fn test_eval_alias_unwraps() {
+        let store = test_store();
+        let record = Record::with_binding("n", 0);
+        let val = eval_expr(
+            &Expr::Alias(
+                Box::new(Expr::Prop("n".into(), "age".into())),
+                "person_age".into(),
+            ),
+            &record,
+            &store,
+        );
+        assert_eq!(val, PropValue::Int(30));
+    }
+
+    #[test]
+    fn test_eval_func_returns_null() {
+        let store = test_store();
+        let record = Record::with_binding("n", 0);
+        // Func evaluation in eval_expr returns Null (handled by Aggregate path)
+        let val = eval_expr(
+            &Expr::Func("count".into(), vec![Expr::Var("n".into())]),
+            &record,
+            &store,
+        );
+        assert_eq!(val, PropValue::Null);
+    }
+
+    #[test]
+    fn test_eval_var_with_props_returns_json() {
+        let store = test_store();
+        let record = Record::with_binding("n", 0);
+        let val = eval_expr(&Expr::Var("n".into()), &record, &store);
+        // Should return JSON-serialized properties
+        match &val {
+            PropValue::Str(s) => {
+                assert!(s.contains("name"), "should contain name property");
+                assert!(s.contains("Alice"), "should contain Alice");
+                assert!(s.contains("age"), "should contain age property");
+            }
+            _ => panic!("eval_expr(Var) with props should return Str, got: {val:?}"),
+        }
+    }
+
+    #[test]
+    fn test_eval_var_unbound_returns_first_value() {
+        let store = test_store();
+        let mut record = Record::new();
+        record.values.push(PropValue::Str("fallback".into()));
+        let val = eval_expr(&Expr::Var("unknown".into()), &record, &store);
+        assert_eq!(val, PropValue::Str("fallback".into()));
+    }
+
+    #[test]
+    fn test_eval_var_empty_record() {
+        let store = test_store();
+        let record = Record::new();
+        let val = eval_expr(&Expr::Var("n".into()), &record, &store);
+        assert_eq!(val, PropValue::Null);
+    }
+}
+
+#[cfg(test)]
+mod predicate_match_tests {
+    use super::*;
+    use crate::planner::PlanBuilder;
+
+    fn test_store() -> MutableCsrStore {
+        let mut store = MutableCsrStore::new();
+        store.add_vertex(
+            "Person",
+            &[
+                ("name", PropValue::Str("Alice".into())),
+                ("age", PropValue::Int(30)),
+                ("city", PropValue::Str("Tokyo".into())),
+            ],
+        );
+        store.add_vertex(
+            "Person",
+            &[
+                ("name", PropValue::Str("Bob".into())),
+                ("age", PropValue::Int(25)),
+                ("city", PropValue::Str("Osaka".into())),
+            ],
+        );
+        store.add_vertex(
+            "Person",
+            &[
+                ("name", PropValue::Str("Charlie".into())),
+                ("age", PropValue::Int(35)),
+                ("city", PropValue::Str("Tokyo".into())),
+            ],
+        );
+        store.commit();
+        store
+    }
+
+    #[test]
+    fn test_filter_or_predicate() {
+        let store = test_store();
+        let plan = PlanBuilder::new()
+            .scan("Person", "n")
+            .filter(Predicate::Or(
+                Box::new(Predicate::Eq("name".into(), PropValue::Str("Alice".into()))),
+                Box::new(Predicate::Eq("name".into(), PropValue::Str("Charlie".into()))),
+            ))
+            .build();
+        let results = execute(&plan, &store);
+        assert_eq!(results.len(), 2, "OR should match Alice and Charlie");
+    }
+
+    #[test]
+    fn test_filter_and_predicate() {
+        let store = test_store();
+        let plan = PlanBuilder::new()
+            .scan("Person", "n")
+            .filter(Predicate::And(
+                Box::new(Predicate::Eq("city".into(), PropValue::Str("Tokyo".into()))),
+                Box::new(Predicate::Gt("age".into(), PropValue::Int(28))),
+            ))
+            .build();
+        let results = execute(&plan, &store);
+        assert_eq!(results.len(), 2, "AND should match Alice(30,Tokyo) and Charlie(35,Tokyo)");
+    }
+
+    #[test]
+    fn test_filter_in_predicate() {
+        let store = test_store();
+        let plan = PlanBuilder::new()
+            .scan("Person", "n")
+            .filter(Predicate::In(
+                "name".into(),
+                vec![
+                    PropValue::Str("Alice".into()),
+                    PropValue::Str("Bob".into()),
+                ],
+            ))
+            .build();
+        let results = execute(&plan, &store);
+        assert_eq!(results.len(), 2, "IN should match Alice and Bob");
+    }
+
+    #[test]
+    fn test_filter_starts_with_predicate() {
+        let store = test_store();
+        let plan = PlanBuilder::new()
+            .scan("Person", "n")
+            .filter(Predicate::StartsWith("city".into(), "Tok".into()))
+            .build();
+        let results = execute(&plan, &store);
+        assert_eq!(results.len(), 2, "StartsWith('Tok') should match Tokyo residents");
+    }
+
+    #[test]
+    fn test_filter_true_predicate() {
+        let store = test_store();
+        let plan = PlanBuilder::new()
+            .scan("Person", "n")
+            .filter(Predicate::True)
+            .build();
+        let results = execute(&plan, &store);
+        assert_eq!(results.len(), 3, "True predicate should match all");
+    }
+
+    #[test]
+    fn test_filter_lt_predicate() {
+        let store = test_store();
+        let plan = PlanBuilder::new()
+            .scan("Person", "n")
+            .filter(Predicate::Lt("age".into(), PropValue::Int(30)))
+            .build();
+        let results = execute(&plan, &store);
+        assert_eq!(results.len(), 1, "Lt(30) should match only Bob(25)");
+    }
+}
+
+#[cfg(test)]
+mod result_to_rows_tests {
+    use super::*;
+    use crate::ir::{AggOp, Expr};
+    use crate::planner::PlanBuilder;
+
+    fn test_store() -> MutableCsrStore {
+        let mut store = MutableCsrStore::new();
+        store.add_vertex(
+            "Person",
+            &[
+                ("name", PropValue::Str("Alice".into())),
+                ("age", PropValue::Int(30)),
+            ],
+        );
+        store.add_vertex(
+            "Person",
+            &[
+                ("name", PropValue::Str("Bob".into())),
+                ("age", PropValue::Int(25)),
+            ],
+        );
+        store.commit();
+        store
+    }
+
+    #[test]
+    fn test_result_to_rows_project() {
+        let store = test_store();
+        let plan = PlanBuilder::new()
+            .scan("Person", "n")
+            .project(vec![
+                Expr::Prop("n".into(), "name".into()),
+                Expr::Prop("n".into(), "age".into()),
+            ])
+            .build();
+        let records = execute(&plan, &store);
+        let rows = result_to_rows(&records, &plan);
+        assert_eq!(rows.len(), 2);
+        // Check column names
+        assert_eq!(rows[0][0].0, "n.name");
+        assert_eq!(rows[0][1].0, "n.age");
+    }
+
+    #[test]
+    fn test_result_to_rows_aggregate() {
+        let store = test_store();
+        let plan = PlanBuilder::new()
+            .scan("Person", "n")
+            .aggregate(
+                vec![],
+                vec![("cnt".into(), AggOp::Count, Expr::Var("n".into()))],
+            )
+            .build();
+        let records = execute(&plan, &store);
+        let rows = result_to_rows(&records, &plan);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].0, "cnt");
+        assert_eq!(rows[0][0].1, "2");
+    }
+
+    #[test]
+    fn test_result_to_rows_with_alias() {
+        let store = test_store();
+        let plan = PlanBuilder::new()
+            .scan("Person", "n")
+            .project(vec![Expr::Alias(
+                Box::new(Expr::Prop("n".into(), "name".into())),
+                "person_name".into(),
+            )])
+            .build();
+        let records = execute(&plan, &store);
+        let rows = result_to_rows(&records, &plan);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].0, "person_name");
+    }
+
+    #[test]
+    fn test_result_to_rows_empty() {
+        let store = test_store();
+        let plan = PlanBuilder::new()
+            .scan("NonExistent", "n")
+            .project(vec![Expr::Prop("n".into(), "name".into())])
+            .build();
+        let records = execute(&plan, &store);
+        let rows = result_to_rows(&records, &plan);
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_prop_value_to_json_null() {
+        assert_eq!(prop_value_to_json(&PropValue::Null), "null");
+    }
+
+    #[test]
+    fn test_prop_value_to_json_bool() {
+        assert_eq!(prop_value_to_json(&PropValue::Bool(true)), "true");
+        assert_eq!(prop_value_to_json(&PropValue::Bool(false)), "false");
+    }
+
+    #[test]
+    fn test_prop_value_to_json_int() {
+        assert_eq!(prop_value_to_json(&PropValue::Int(42)), "42");
+    }
+
+    #[test]
+    fn test_prop_value_to_json_float() {
+        assert_eq!(prop_value_to_json(&PropValue::Float(3.14)), "3.14");
+    }
+
+    #[test]
+    fn test_prop_value_to_json_string() {
+        let val = prop_value_to_json(&PropValue::Str("hello".into()));
+        assert_eq!(val, "\"hello\"");
+    }
+
+    #[test]
+    fn test_prop_value_to_json_object_passthrough() {
+        // JSON object strings should be passed through raw
+        let json_obj = r#"{"name":"Alice","age":30}"#;
+        let val = prop_value_to_json(&PropValue::Str(json_obj.into()));
+        assert_eq!(val, json_obj);
+    }
+
+    #[test]
+    fn test_prop_value_to_json_array_passthrough() {
+        let json_arr = r#"[1,2,3]"#;
+        let val = prop_value_to_json(&PropValue::Str(json_arr.into()));
+        assert_eq!(val, json_arr);
+    }
+}
+
+#[cfg(test)]
+mod prop_value_cmp_tests {
+    use super::*;
+
+    #[test]
+    fn test_cmp_int() {
+        assert_eq!(
+            prop_value_cmp(&PropValue::Int(1), &PropValue::Int(2)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            prop_value_cmp(&PropValue::Int(2), &PropValue::Int(2)),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            prop_value_cmp(&PropValue::Int(3), &PropValue::Int(2)),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_cmp_float() {
+        assert_eq!(
+            prop_value_cmp(&PropValue::Float(1.0), &PropValue::Float(2.0)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            prop_value_cmp(&PropValue::Float(2.0), &PropValue::Float(2.0)),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_cmp_str() {
+        assert_eq!(
+            prop_value_cmp(
+                &PropValue::Str("Alice".into()),
+                &PropValue::Str("Bob".into())
+            ),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            prop_value_cmp(
+                &PropValue::Str("Bob".into()),
+                &PropValue::Str("Alice".into())
+            ),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_cmp_bool() {
+        assert_eq!(
+            prop_value_cmp(&PropValue::Bool(false), &PropValue::Bool(true)),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_cmp_null_ordering() {
+        // Null < anything
+        assert_eq!(
+            prop_value_cmp(&PropValue::Null, &PropValue::Int(0)),
+            std::cmp::Ordering::Less
+        );
+        // anything > Null
+        assert_eq!(
+            prop_value_cmp(&PropValue::Int(0), &PropValue::Null),
+            std::cmp::Ordering::Greater
+        );
+        // Null == Null
+        assert_eq!(
+            prop_value_cmp(&PropValue::Null, &PropValue::Null),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_cmp_mixed_types() {
+        // Different types compare as Equal (fallback)
+        assert_eq!(
+            prop_value_cmp(&PropValue::Int(1), &PropValue::Str("1".into())),
+            std::cmp::Ordering::Equal
+        );
+    }
+}
+
+#[cfg(test)]
+mod exchange_passthrough_tests {
+    use super::*;
+    use crate::ir::{ExchangeKind, Expr, LogicalOp};
+
+    fn test_store() -> MutableCsrStore {
+        let mut store = MutableCsrStore::new();
+        store.add_vertex("Person", &[("name", PropValue::Str("Alice".into()))]);
+        store.add_vertex("Person", &[("name", PropValue::Str("Bob".into()))]);
+        store.commit();
+        store
+    }
+
+    #[test]
+    fn test_exchange_passthrough() {
+        let store = test_store();
+        let records = vec![
+            Record::with_binding("n", 0),
+            Record::with_binding("n", 1),
+        ];
+        let op = LogicalOp::Exchange {
+            routing_key: Expr::Var("n".into()),
+            kind: ExchangeKind::HashShuffle,
+        };
+        let result = execute_op(&op, records.clone(), &store);
+        assert_eq!(result.len(), 2, "Exchange should pass through all records");
+    }
+
+    #[test]
+    fn test_receive_passthrough() {
+        let store = test_store();
+        let records = vec![
+            Record::with_binding("n", 0),
+            Record::with_binding("n", 1),
+        ];
+        let op = LogicalOp::Receive {
+            source_partitions: vec![0, 1],
+        };
+        let result = execute_op(&op, records.clone(), &store);
+        assert_eq!(result.len(), 2, "Receive should pass through all records");
+    }
+}
+
+#[cfg(test)]
+mod collect_aggregate_tests {
+    use super::*;
+    use crate::ir::{AggOp, Expr};
+    use crate::planner::PlanBuilder;
+
+    #[test]
+    fn test_collect_returns_count_fallback() {
+        let mut store = MutableCsrStore::new();
+        store.add_vertex("Item", &[("name", PropValue::Str("A".into()))]);
+        store.add_vertex("Item", &[("name", PropValue::Str("B".into()))]);
+        store.add_vertex("Item", &[("name", PropValue::Str("C".into()))]);
+        store.commit();
+
+        let plan = PlanBuilder::new()
+            .scan("Item", "n")
+            .aggregate(
+                vec![],
+                vec![(
+                    "collected".into(),
+                    AggOp::Collect,
+                    Expr::Prop("n".into(), "name".into()),
+                )],
+            )
+            .build();
+        let results = execute(&plan, &store);
+        assert_eq!(results.len(), 1);
+        // Collect currently falls back to count
+        assert_eq!(results[0].values[0], PropValue::Int(3));
+    }
+
+    #[test]
+    fn test_avg_empty_returns_null() {
+        let mut store = MutableCsrStore::new();
+        store.commit();
+
+        let plan = PlanBuilder::new()
+            .scan("NonExistent", "n")
+            .aggregate(
+                vec![],
+                vec![(
+                    "avg_val".into(),
+                    AggOp::Avg,
+                    Expr::Prop("n".into(), "age".into()),
+                )],
+            )
+            .build();
+        let results = execute(&plan, &store);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].values[0], PropValue::Null, "AVG of empty set should be Null");
+    }
+
+    #[test]
+    fn test_min_empty_returns_null() {
+        let mut store = MutableCsrStore::new();
+        store.commit();
+
+        let plan = PlanBuilder::new()
+            .scan("NonExistent", "n")
+            .aggregate(
+                vec![],
+                vec![(
+                    "min_val".into(),
+                    AggOp::Min,
+                    Expr::Prop("n".into(), "age".into()),
+                )],
+            )
+            .build();
+        let results = execute(&plan, &store);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].values[0], PropValue::Null, "MIN of empty set should be Null");
+    }
+
+    #[test]
+    fn test_max_empty_returns_null() {
+        let mut store = MutableCsrStore::new();
+        store.commit();
+
+        let plan = PlanBuilder::new()
+            .scan("NonExistent", "n")
+            .aggregate(
+                vec![],
+                vec![(
+                    "max_val".into(),
+                    AggOp::Max,
+                    Expr::Prop("n".into(), "age".into()),
+                )],
+            )
+            .build();
+        let results = execute(&plan, &store);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].values[0], PropValue::Null, "MAX of empty set should be Null");
+    }
 }

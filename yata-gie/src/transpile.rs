@@ -674,4 +674,367 @@ mod tests {
             .any(|op| matches!(op, LogicalOp::Distinct { .. }));
         assert!(has_distinct, "DISTINCT should produce Distinct op");
     }
+
+    // ── Mutation rejection tests ─────────────────────────────────────
+
+    #[test]
+    fn test_set_rejected() {
+        let query = yata_cypher::parse("MATCH (n:Person) SET n.age = 40 RETURN n").unwrap();
+        let result = transpile(&query);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TranspileError::UnsupportedClause(s) => assert_eq!(s, "SET"),
+            e => panic!("expected UnsupportedClause(SET), got: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_delete_rejected() {
+        let query = yata_cypher::parse("MATCH (n:Person) DELETE n").unwrap();
+        let result = transpile(&query);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TranspileError::UnsupportedClause(s) => assert_eq!(s, "DELETE"),
+            e => panic!("expected UnsupportedClause(DELETE), got: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_merge_rejected() {
+        let query = yata_cypher::parse("MERGE (n:Person {name: 'Alice'}) RETURN n").unwrap();
+        let result = transpile(&query);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TranspileError::UnsupportedClause(s) => assert_eq!(s, "MERGE"),
+            e => panic!("expected UnsupportedClause(MERGE), got: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_create_node_rejected() {
+        let query = yata_cypher::parse("CREATE (n:Person {name: 'Bob'})").unwrap();
+        let result = transpile(&query);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TranspileError::UnsupportedClause(s) => assert_eq!(s, "CREATE"),
+            e => panic!("expected UnsupportedClause(CREATE), got: {e}"),
+        }
+    }
+
+    // ── Predicate transpilation tests ────────────────────────────────
+
+    #[test]
+    fn test_or_predicate() {
+        let query = yata_cypher::parse(
+            r#"MATCH (n:Person) WHERE n.age = 25 OR n.age = 35 RETURN n"#,
+        )
+        .unwrap();
+        let plan = transpile(&query).unwrap();
+        // Should have either a Filter with Or or a Scan with pushed-down Or
+        let has_or = plan.ops.iter().any(|op| match op {
+            LogicalOp::Filter {
+                predicate: Predicate::Or(_, _),
+            } => true,
+            LogicalOp::Scan {
+                predicate: Some(Predicate::Or(_, _)),
+                ..
+            } => true,
+            _ => false,
+        });
+        assert!(has_or, "OR predicate should appear in Filter or Scan");
+    }
+
+    #[test]
+    fn test_neq_predicate() {
+        let query = yata_cypher::parse(
+            r#"MATCH (n:Person) WHERE n.name <> "Alice" RETURN n"#,
+        )
+        .unwrap();
+        let plan = transpile(&query).unwrap();
+        let has_neq = plan.ops.iter().any(|op| match op {
+            LogicalOp::Filter {
+                predicate: Predicate::Neq(_, _),
+            } => true,
+            LogicalOp::Scan {
+                predicate: Some(Predicate::Neq(_, _)),
+                ..
+            } => true,
+            _ => false,
+        });
+        assert!(has_neq, "NEQ predicate should appear in plan");
+    }
+
+    #[test]
+    fn test_lt_predicate() {
+        let query = yata_cypher::parse(
+            r#"MATCH (n:Person) WHERE n.age < 30 RETURN n"#,
+        )
+        .unwrap();
+        let plan = transpile(&query).unwrap();
+        let has_lt = plan.ops.iter().any(|op| match op {
+            LogicalOp::Filter {
+                predicate: Predicate::Lt(_, _),
+            } => true,
+            LogicalOp::Scan {
+                predicate: Some(Predicate::Lt(_, _)),
+                ..
+            } => true,
+            _ => false,
+        });
+        assert!(has_lt, "LT predicate should appear in plan");
+    }
+
+    // ── Aggregate function tests ─────────────────────────────────────
+
+    #[test]
+    fn test_sum_aggregate() {
+        let query = yata_cypher::parse("MATCH (n:Person) RETURN sum(n.age) AS total").unwrap();
+        let plan = transpile(&query).unwrap();
+        let agg = plan.ops.iter().find(|op| matches!(op, LogicalOp::Aggregate { .. }));
+        assert!(agg.is_some(), "should produce Aggregate op for sum()");
+        if let Some(LogicalOp::Aggregate { aggs, .. }) = agg {
+            assert_eq!(aggs.len(), 1);
+            assert!(matches!(aggs[0].1, AggOp::Sum));
+        }
+    }
+
+    #[test]
+    fn test_avg_aggregate() {
+        let query = yata_cypher::parse("MATCH (n:Person) RETURN avg(n.age) AS average").unwrap();
+        let plan = transpile(&query).unwrap();
+        let agg = plan.ops.iter().find(|op| matches!(op, LogicalOp::Aggregate { .. }));
+        assert!(agg.is_some(), "should produce Aggregate op for avg()");
+        if let Some(LogicalOp::Aggregate { aggs, .. }) = agg {
+            assert!(matches!(aggs[0].1, AggOp::Avg));
+        }
+    }
+
+    #[test]
+    fn test_min_aggregate() {
+        let query = yata_cypher::parse("MATCH (n:Person) RETURN min(n.age) AS youngest").unwrap();
+        let plan = transpile(&query).unwrap();
+        let agg = plan.ops.iter().find(|op| matches!(op, LogicalOp::Aggregate { .. }));
+        assert!(agg.is_some());
+        if let Some(LogicalOp::Aggregate { aggs, .. }) = agg {
+            assert!(matches!(aggs[0].1, AggOp::Min));
+        }
+    }
+
+    #[test]
+    fn test_max_aggregate() {
+        let query = yata_cypher::parse("MATCH (n:Person) RETURN max(n.age) AS oldest").unwrap();
+        let plan = transpile(&query).unwrap();
+        let agg = plan.ops.iter().find(|op| matches!(op, LogicalOp::Aggregate { .. }));
+        assert!(agg.is_some());
+        if let Some(LogicalOp::Aggregate { aggs, .. }) = agg {
+            assert!(matches!(aggs[0].1, AggOp::Max));
+        }
+    }
+
+    #[test]
+    fn test_collect_aggregate() {
+        let query =
+            yata_cypher::parse("MATCH (n:Person) RETURN collect(n.name) AS names").unwrap();
+        let plan = transpile(&query).unwrap();
+        let agg = plan.ops.iter().find(|op| matches!(op, LogicalOp::Aggregate { .. }));
+        assert!(agg.is_some());
+        if let Some(LogicalOp::Aggregate { aggs, .. }) = agg {
+            assert!(matches!(aggs[0].1, AggOp::Collect));
+        }
+    }
+
+    #[test]
+    fn test_count_star() {
+        let query = yata_cypher::parse("MATCH (n:Person) RETURN count(n)").unwrap();
+        let plan = transpile(&query).unwrap();
+        let agg = plan.ops.iter().find(|op| matches!(op, LogicalOp::Aggregate { .. }));
+        assert!(agg.is_some());
+        if let Some(LogicalOp::Aggregate { aggs, .. }) = agg {
+            assert!(matches!(aggs[0].1, AggOp::Count));
+        }
+    }
+
+    // ── Aggregate with GROUP BY ──────────────────────────────────────
+
+    #[test]
+    fn test_group_by_with_count() {
+        let query = yata_cypher::parse(
+            "MATCH (n:Person) RETURN n.dept, count(n) AS cnt",
+        )
+        .unwrap();
+        let plan = transpile(&query).unwrap();
+        let agg = plan.ops.iter().find(|op| matches!(op, LogicalOp::Aggregate { .. }));
+        assert!(agg.is_some());
+        if let Some(LogicalOp::Aggregate { group_by, aggs }) = agg {
+            assert_eq!(group_by.len(), 1, "should have 1 group-by key");
+            assert_eq!(aggs.len(), 1, "should have 1 aggregate");
+        }
+    }
+
+    // ── Skip/Limit combination ───────────────────────────────────────
+
+    #[test]
+    fn test_skip_and_limit_combined() {
+        let query =
+            yata_cypher::parse("MATCH (n:Person) RETURN n.name SKIP 1 LIMIT 2").unwrap();
+        let plan = transpile(&query).unwrap();
+        let limit = plan.ops.iter().find(|op| matches!(op, LogicalOp::Limit { .. }));
+        assert!(limit.is_some(), "should produce Limit op for SKIP+LIMIT");
+        if let Some(LogicalOp::Limit { count, offset }) = limit {
+            assert_eq!(*count, 2);
+            assert_eq!(*offset, 1);
+        }
+    }
+
+    // ── Expression transpilation ─────────────────────────────────────
+
+    #[test]
+    fn test_return_alias() {
+        let query =
+            yata_cypher::parse("MATCH (n:Person) RETURN n.name AS person_name").unwrap();
+        let plan = transpile(&query).unwrap();
+        let project = plan.ops.iter().find(|op| matches!(op, LogicalOp::Project { .. }));
+        assert!(project.is_some());
+        if let Some(LogicalOp::Project { exprs }) = project {
+            assert_eq!(exprs.len(), 1);
+            assert!(
+                matches!(&exprs[0], ir::Expr::Alias(_, alias) if alias == "person_name"),
+                "should have alias 'person_name'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_return_literal() {
+        let query = yata_cypher::parse("MATCH (n:Person) RETURN 42, n.name").unwrap();
+        let plan = transpile(&query).unwrap();
+        let project = plan.ops.iter().find(|op| matches!(op, LogicalOp::Project { .. }));
+        assert!(project.is_some());
+        if let Some(LogicalOp::Project { exprs }) = project {
+            assert!(
+                exprs.iter().any(|e| matches!(e, ir::Expr::Lit(PropValue::Int(42)))),
+                "should have literal 42 in projections"
+            );
+        }
+    }
+
+    // ── Transpile_secured tests ──────────────────────────────────────
+
+    #[test]
+    fn test_transpile_secured_injects_after_scan() {
+        let query = yata_cypher::parse("MATCH (n:Person) RETURN n.name").unwrap();
+        let scope = ir::SecurityScope {
+            max_sensitivity_ord: 1,
+            ..Default::default()
+        };
+        let plan = transpile_secured(&query, scope).unwrap();
+        // SecurityFilter should appear right after Scan
+        let scan_idx = plan.ops.iter().position(|op| matches!(op, LogicalOp::Scan { .. }));
+        assert!(scan_idx.is_some());
+        let next = &plan.ops[scan_idx.unwrap() + 1];
+        assert!(
+            matches!(next, LogicalOp::SecurityFilter { .. }),
+            "SecurityFilter should be injected after Scan, got: {next:?}"
+        );
+    }
+
+    #[test]
+    fn test_transpile_secured_injects_after_expand() {
+        let query =
+            yata_cypher::parse("MATCH (a:Person)-[:KNOWS]->(b) RETURN b.name").unwrap();
+        let scope = ir::SecurityScope {
+            max_sensitivity_ord: 1,
+            ..Default::default()
+        };
+        let plan = transpile_secured(&query, scope).unwrap();
+        // Should have SecurityFilter after both Scan and Expand
+        let security_count = plan
+            .ops
+            .iter()
+            .filter(|op| matches!(op, LogicalOp::SecurityFilter { .. }))
+            .count();
+        assert!(
+            security_count >= 2,
+            "should inject SecurityFilter after both Scan and Expand, got {security_count}"
+        );
+    }
+
+    #[test]
+    fn test_transpile_secured_bypass_no_filter() {
+        let query = yata_cypher::parse("MATCH (n:Person) RETURN n.name").unwrap();
+        let scope = ir::SecurityScope {
+            bypass: true,
+            ..Default::default()
+        };
+        let plan = transpile_secured(&query, scope).unwrap();
+        let has_security = plan
+            .ops
+            .iter()
+            .any(|op| matches!(op, LogicalOp::SecurityFilter { .. }));
+        assert!(
+            !has_security,
+            "bypass scope should not inject SecurityFilter"
+        );
+    }
+
+    // ── Edge direction tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_left_direction_edge() {
+        let query =
+            yata_cypher::parse("MATCH (a:Person)<-[:KNOWS]-(b) RETURN a, b").unwrap();
+        let plan = transpile(&query).unwrap();
+        let expand = plan.ops.iter().find(|op| matches!(op, LogicalOp::Expand { .. }));
+        assert!(expand.is_some(), "should have Expand op");
+    }
+
+    // ── Multiple return items without aggregation ────────────────────
+
+    #[test]
+    fn test_multiple_return_items() {
+        let query =
+            yata_cypher::parse("MATCH (n:Person) RETURN n.name, n.age").unwrap();
+        let plan = transpile(&query).unwrap();
+        let project = plan.ops.iter().find(|op| matches!(op, LogicalOp::Project { .. }));
+        assert!(project.is_some());
+        if let Some(LogicalOp::Project { exprs }) = project {
+            assert_eq!(exprs.len(), 2, "should have 2 projected expressions");
+        }
+    }
+
+    // ── Inline property predicate with multiple props ────────────────
+
+    #[test]
+    fn test_inline_multi_props() {
+        let query = yata_cypher::parse(
+            "MATCH (n:Person {name: 'Alice', age: 30}) RETURN n",
+        )
+        .unwrap();
+        let plan = transpile(&query).unwrap();
+        let scan = plan.ops.iter().find(|op| matches!(op, LogicalOp::Scan { .. }));
+        if let Some(LogicalOp::Scan { predicate: Some(Predicate::And(_, _)), .. }) = scan {
+            // Multiple inline props should produce And predicate
+        } else if let Some(LogicalOp::Scan { predicate: Some(_), .. }) = scan {
+            // At least some predicate from inline props
+        } else {
+            panic!("expected Scan with predicate from inline props");
+        }
+    }
+
+    // ── Path expand with typed edge ──────────────────────────────────
+
+    #[test]
+    fn test_path_expand_typed() {
+        let ops = plan_ops("MATCH (a:Person)-[:KNOWS*2..5]->(b) RETURN b");
+        let path = ops.iter().find(|o| o.contains("PathExpand"));
+        assert!(path.is_some(), "should produce PathExpand op");
+        assert!(
+            path.unwrap().contains("KNOWS"),
+            "PathExpand should have KNOWS edge label"
+        );
+        assert!(
+            path.unwrap().contains("2..5"),
+            "PathExpand should have correct hop range"
+        );
+    }
 }

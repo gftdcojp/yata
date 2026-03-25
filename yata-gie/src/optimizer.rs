@@ -309,4 +309,177 @@ mod tests {
         let optimized = optimize(plan);
         assert_eq!(optimized.ops.len(), 1);
     }
+
+    #[test]
+    fn test_multiple_filters_pushdown_and_merge() {
+        // Scan -> Expand -> Filter1 -> Filter2 -> Project
+        // After pushdown: Scan -> Filter1 -> Filter2 -> Expand -> Project
+        // After merge: Scan(And(pred1, pred2)) -> Expand -> Project
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: None,
+                },
+                LogicalOp::Expand {
+                    src_alias: "n".into(),
+                    edge_label: "KNOWS".into(),
+                    dst_alias: "m".into(),
+                    direction: yata_grin::Direction::Out,
+                },
+                LogicalOp::Filter {
+                    predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
+                },
+                LogicalOp::Filter {
+                    predicate: Predicate::Eq("name".into(), PropValue::Str("Alice".into())),
+                },
+                LogicalOp::Project {
+                    exprs: vec![Expr::Var("m".into())],
+                },
+            ],
+        };
+        let optimized = optimize(plan);
+        // Both filters should be pushed down and merged into scan
+        assert!(
+            optimized.ops.len() <= 4,
+            "optimization should reduce op count, got {}",
+            optimized.ops.len()
+        );
+        // Scan should have a predicate
+        match &optimized.ops[0] {
+            LogicalOp::Scan {
+                predicate: Some(_), ..
+            } => {}
+            _ => panic!("expected Scan with merged predicate after optimization"),
+        }
+    }
+
+    #[test]
+    fn test_optimize_idempotent() {
+        // Optimizing an already-optimized plan should produce the same result
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: Some(Predicate::Eq("age".into(), PropValue::Int(30))),
+                },
+                LogicalOp::Expand {
+                    src_alias: "n".into(),
+                    edge_label: "KNOWS".into(),
+                    dst_alias: "m".into(),
+                    direction: yata_grin::Direction::Out,
+                },
+                LogicalOp::Project {
+                    exprs: vec![Expr::Var("m".into())],
+                },
+            ],
+        };
+        let first = optimize(plan.clone());
+        let second = optimize(first.clone());
+        assert_eq!(first.ops.len(), second.ops.len());
+    }
+
+    #[test]
+    fn test_filter_not_pushed_past_project() {
+        // Filter after Project should NOT be pushed down
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: None,
+                },
+                LogicalOp::Project {
+                    exprs: vec![Expr::Prop("n".into(), "name".into())],
+                },
+                LogicalOp::Filter {
+                    predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
+                },
+            ],
+        };
+        let optimized = optimize(plan);
+        // Project should still precede Filter (not swap)
+        let project_idx = optimized
+            .ops
+            .iter()
+            .position(|op| matches!(op, LogicalOp::Project { .. }));
+        let filter_idx = optimized
+            .ops
+            .iter()
+            .position(|op| matches!(op, LogicalOp::Filter { .. }));
+        if let (Some(p), Some(f)) = (project_idx, filter_idx) {
+            assert!(
+                p < f,
+                "Filter after Project should not be reordered: project@{p} filter@{f}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_only_adjacent_scan_filter() {
+        // Scan -> Project -> Filter should NOT merge (not adjacent)
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: None,
+                },
+                LogicalOp::Project {
+                    exprs: vec![Expr::Var("n".into())],
+                },
+                LogicalOp::Filter {
+                    predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
+                },
+            ],
+        };
+        let optimized = merge_adjacent_scans(plan);
+        assert_eq!(
+            optimized.ops.len(),
+            3,
+            "non-adjacent Scan+Filter should not merge"
+        );
+        // Scan should still have no predicate
+        match &optimized.ops[0] {
+            LogicalOp::Scan {
+                predicate: None, ..
+            } => {}
+            _ => panic!("Scan should remain without predicate"),
+        }
+    }
+
+    #[test]
+    fn test_pushdown_preserves_security_filter() {
+        // SecurityFilter should not be affected by pushdown
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Post".into(),
+                    alias: "p".into(),
+                    predicate: None,
+                },
+                LogicalOp::SecurityFilter {
+                    aliases: vec!["p".into()],
+                    scope: crate::ir::SecurityScope::default(),
+                },
+                LogicalOp::Expand {
+                    src_alias: "p".into(),
+                    edge_label: "REPLIED_TO".into(),
+                    dst_alias: "r".into(),
+                    direction: yata_grin::Direction::Out,
+                },
+                LogicalOp::Filter {
+                    predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
+                },
+            ],
+        };
+        let optimized = optimize(plan);
+        let has_security = optimized
+            .ops
+            .iter()
+            .any(|op| matches!(op, LogicalOp::SecurityFilter { .. }));
+        assert!(has_security, "SecurityFilter should be preserved after optimization");
+    }
 }
