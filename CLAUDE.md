@@ -1,6 +1,6 @@
 # packages/rust/yata
 
-yata — Rust Cypher graph engine. `[PRODUCTION]` Container (CSR + DiskVineyard/MmapVineyard) × 1 partition. Workers RPC coordinator. GraphScope parity 20/24 (14 PRODUCTION + 6 IMPLEMENTED)。Vineyard + GIE push-based + SecurityFilter RLS + Arrow row-group chunk page-in。
+yata — Rust Cypher graph engine. `[PRODUCTION]` Container (CSR + DiskVineyard/MmapVineyard) × 1 partition. Workers RPC coordinator. GraphScope parity 21/25 (14 PRODUCTION + 7 IMPLEMENTED)。Vineyard + GIE push-based + SecurityFilter RLS + Arrow row-group chunk + label-selective page-in。
 
 ## Architecture (CRITICAL)
 
@@ -123,7 +123,7 @@ env.YATA.stats()                 // → all partition stats
 | GRAPE (analytics) | vertex-centric | — | not planned |
 | GLE (learning) | GNN | — | not planned |
 
-**GraphScope parity summary**: 14 `[PRODUCTION]` + 6 `[IMPLEMENTED]` + 2 `[STUB]` + 1 `[DESIGN]` + 1 `[DEPRECATED]` + 3 not planned.
+**GraphScope parity summary**: 14 `[PRODUCTION]` + 7 `[IMPLEMENTED]` + 2 `[STUB]` + 1 `[DESIGN]` + 1 `[DEPRECATED]` + 3 not planned.
 
 ## R2 Persistence `[PRODUCTION]`
 
@@ -211,8 +211,18 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
     YATA_CHUNK_TARGET_BYTES (byte target) / YATA_CHUNK_ROWS (row override) で上書き可能。
   R2 最適化: 32 MB/chunk → 1B vertices でも ~数十 chunks (10億ファイル問題回避)
   backward-compat: old single-blob format auto-detected on deserialize
-  note: production は default byte target (32MB) で snapshot。selective chunk page-in API は ready だが
-  engine の ensure_labels は full page-in のまま (selective routing は Phase 3c)
+  note: production は default byte target (32MB) で snapshot
+
+`[IMPLEMENTED]` Phase 3c: Label-selective page-in (ensure_labels)
+  evidence: yata-engine/src/loader.rs (page_in_selective_from_r2, restore_csr_selective, enrich_label_from_r2, apply_batch_properties, extract_arrow_value)
+  evidence: yata-engine/src/engine.rs (ensure_labels_vineyard_only rewritten, enrich_new_labels, cached_meta/cached_schema/label_vid_offsets)
+  mechanism:
+    1st call: fetch meta+schema+ivnums+ALL CSR topology + only requested label vertex_tables
+              non-requested labels → stub vertices (VID ordering preserved, 0 properties, 0 R2 fetch)
+    subsequent: new label → fetch vertex_table → set_vertex_prop on existing stubs (incremental)
+    no label hints → full page-in fallback (backward compat)
+  state tracking: loaded_labels (property-loaded labels), cached_meta/schema (for incremental enrichment), label_vid_offsets
+  test: 854 workspace tests pass (no regression)
 
 `[DEPRECATED]` LSMGraph 4-level tiered storage
   reason: 現 ArrowFragment + snapshot compaction が LSM の本質 (immutable sorted runs + compaction) を
@@ -228,9 +238,11 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
 
 ```
 Query fast path (GIE, <1µs): [PRODUCTION]
-  Cypher → parse → GIE transpile → IR Plan → CSR direct push-based execute
+  Cypher → parse → extract_pushdown_hints → ensure_labels (selective page-in) →
+  GIE transpile → IR Plan → CSR direct push-based execute
   CONDITIONS: single CSR partition
   RLS: transpile_secured() injects SecurityFilter after Scan/Expand ops
+  Page-in: label-selective (Phase 3c) — needed labels get properties, others get stubs
 
 Query GIE fallback → MemoryGraph (~1-200ms): [PRODUCTION]
   GIE transpile fails (mutation or unsupported Cypher) → MemoryGraph copy → Cypher execute
