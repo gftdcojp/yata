@@ -148,21 +148,91 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
 
 **Append-only write safety**: mergeRecord は page-in 不要 → write lock scope は merge_by_pk + commit のみ (~µs)。snapshot compaction が write lock を取るのは R2 既存データの CSR merge 時のみ (初回 1 回)。
 
-## Snapshot Model (Compaction, NOT Append-Only R2)
+## Snapshot Model — Dirty Label Delta `[DESIGN]`
 
-**R2 snapshot は snapshot compaction model。** `trigger_snapshot()` は CSR の全内容を ArrowFragment として R2 PUT (上書き)。WAL-based append-only ではない。
+### Facts (現状 `[PRODUCTION]`)
 
-**Durability は Pipeline WAL が保証。** Pipeline → R2 JSON (10s flush) が WAL source of truth。yata snapshot は CSR の performance cache であり、Pipeline WAL から rebuild 可能。
+**現行**: `trigger_snapshot()` は CSR 全内容を ArrowFragment として R2 PUT (full compaction overwrite)。dirty flag (boolean) でゲート。
 
-| 層 | Model | Durability |
-|---|---|---|
-| **Pipeline WAL** | Append-only (R2 JSON) | **source of truth** — `Pipeline.send()` resolve = durable |
-| **yata R2 snapshot** | Compaction (full PUT overwrite) | **performance cache** — CSR cold start 復旧用 |
+**Durability は Pipeline WAL が保証。** Pipeline → R2 JSON (10s flush) が WAL source of truth。yata snapshot は CSR の performance checkpoint であり、Pipeline WAL から rebuild 可能。
+
+| 層 | Model | Durability | Shannon 冗長度 |
+|---|---|---|---|
+| **Pipeline WAL** | Append-only (R2 JSON, `pipeline/wal/`) | **source of truth** — `Pipeline.send()` resolve = durable | 0% (唯一の authoritative write) |
+| **yata R2 snapshot** | Full compaction PUT (`snap/fragment/`) | **performance checkpoint** — CSR cold start 復旧用 | ~100% (Pipeline WAL と同一データの二重永続化) |
 
 **Page-in safety (CRITICAL, 2026-03-25 fix)**:
 - `ensure_labels` の R2 page-in は CSR を **merge** (上書きではない)。既存 `mergeRecord` データを保護
 - Empty fragment / R2 error でも `hot_initialized = true` を設定し、再 page-in による上書きを防止
 - `trigger_snapshot` compaction は R2 既存 + CSR pending を merge → full ArrowFragment PUT
+
+### Design: Dirty Label Delta Snapshot
+
+**Shannon 最適: dirty label のみ差分 PUT。** Per-label ArrowFragment 構造と完全整合。
+
+```
+mergeRecord("PDSProfile", ...) → dirty_labels.insert("PDSProfile")
+
+trigger_snapshot():
+  if dirty_labels.is_empty() { return; }  // nothing to write
+  for label in dirty_labels:
+    serialize label → PUT snap/fragment/{label}_vertex_table_0  // この label blob のみ
+  PUT snap/fragment/meta.json  // 更新された label manifest
+  dirty_labels.clear()
+  dirty.store(false)
+
+cold start page-in:
+  GET snap/fragment/meta.json → 全 label の blob 名一覧
+  for label in meta.vertex_entries:
+    GET snap/fragment/{blob_name}  // per-label GET (変更なし)
+```
+
+**Shannon 効率比較**:
+
+| Model | R2 Write/snapshot | Cold Start Read | η (N=1M, Δ=100) |
+|---|---|---|---|
+| **現行: Full Compaction** | O(N) bytes (全 CSR) | O(N) bytes (全 fragment) | ~0.01% (100/1M 変更で 1M 転送) |
+| **Dirty Label Delta** | O(Δ labels) bytes (dirty のみ) | O(N) bytes (変更なし) | **~85%** (dirty label のみ転送) |
+| **Pipeline WAL Replay** | 0 (snapshot 廃止) | O(WAL) bytes (全 replay) | ~98% (二重永続化排除) |
+| **Checkpoint + WAL Tail** | O(N) bytes (低頻度) + O(Δ) WAL | O(checkpoint) + O(tail) | ~95% |
+
+**実装 (yata-engine):**
+
+```rust
+// dirty: AtomicBool → dirty_labels: Mutex<HashSet<String>>
+struct TieredGraphEngine {
+    dirty_labels: Mutex<HashSet<String>>,  // per-label dirty tracking
+    // ... existing fields
+}
+
+// mergeRecord
+fn merge_record(&self, label: &str, ...) {
+    // ... existing merge logic
+    if let Ok(mut dl) = self.dirty_labels.lock() { dl.insert(label.to_string()); }
+}
+
+// trigger_snapshot (delta)
+fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
+    let dirty = if let Ok(mut dl) = self.dirty_labels.lock() {
+        let d: HashSet<String> = dl.drain().collect(); d
+    } else { return Ok((0, 0)); };
+    if dirty.is_empty() { return Ok((0, 0)); }
+
+    let hot = self.hot.read().map_err(|e| e.to_string())?;
+    for label in &dirty {
+        let blob = serialize_label_blob(&hot, label)?;
+        s3.put(&format!("{}/snap/fragment/{}_vertex_table_0", prefix, label), &blob)?;
+    }
+    // Update meta.json with current full label manifest
+    let meta = build_meta_json(&hot)?;
+    s3.put(&format!("{}/snap/fragment/meta.json", prefix), &meta)?;
+    Ok((dirty.len() as u64, 0))
+}
+```
+
+**Migration**: `dirty: AtomicBool` を `dirty_labels: Mutex<HashSet<String>>` に置換。cold start page-in は変更なし (per-label GET は既存)。`trigger_snapshot` のみ delta PUT に変更。backward compat: meta.json format は不変。
+
+**禁止**: Pipeline WAL replay を snapshot の代替にすること (cold start 数十秒は許容不可)。snapshot checkpoint は cold start <5s のために維持。
 
 ## CRITICAL: 3 概念は直交 — partition ≠ label ≠ security
 
