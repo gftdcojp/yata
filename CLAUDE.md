@@ -148,6 +148,22 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
 
 **Append-only write safety**: mergeRecord は page-in 不要 → write lock scope は merge_by_pk + commit のみ (~µs)。snapshot compaction が write lock を取るのは R2 既存データの CSR merge 時のみ (初回 1 回)。
 
+## Snapshot Model (Compaction, NOT Append-Only R2)
+
+**R2 snapshot は snapshot compaction model。** `trigger_snapshot()` は CSR の全内容を ArrowFragment として R2 PUT (上書き)。WAL-based append-only ではない。
+
+**Durability は Pipeline WAL が保証。** Pipeline → R2 JSON (10s flush) が WAL source of truth。yata snapshot は CSR の performance cache であり、Pipeline WAL から rebuild 可能。
+
+| 層 | Model | Durability |
+|---|---|---|
+| **Pipeline WAL** | Append-only (R2 JSON) | **source of truth** — `Pipeline.send()` resolve = durable |
+| **yata R2 snapshot** | Compaction (full PUT overwrite) | **performance cache** — CSR cold start 復旧用 |
+
+**Page-in safety (CRITICAL, 2026-03-25 fix)**:
+- `ensure_labels` の R2 page-in は CSR を **merge** (上書きではない)。既存 `mergeRecord` データを保護
+- Empty fragment / R2 error でも `hot_initialized = true` を設定し、再 page-in による上書きを防止
+- `trigger_snapshot` compaction は R2 既存 + CSR pending を merge → full ArrowFragment PUT
+
 ## CRITICAL: 3 概念は直交 — partition ≠ label ≠ security
 
 **partition** = Container instance。YataRPC coordinator が `hash(label) % N` で label-based routing。
