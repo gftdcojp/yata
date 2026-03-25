@@ -371,25 +371,13 @@ impl TieredGraphEngine {
         self.ensure_labels_vineyard_only(vertex_labels, edge_labels);
     }
 
-    /// Label-selective page-in from R2 ArrowFragment snapshot (Phase 3c).
+    /// Page-in from R2 ArrowFragment snapshot (Phase 3c: 3-tier + label-selective).
     ///
-    /// First call: fetch meta+schema+ivnums+CSR topology + requested label properties.
-    ///   Non-requested labels get stub vertices (VID ordering preserved, no R2 fetch for properties).
-    /// Subsequent calls: if new labels needed, fetch their vertex_table and enrich existing stubs.
+    /// First call (cold start): ALWAYS full page-in (all labels with properties).
+    ///   Stubs are dangerous on cold start — queries for unloaded labels return empty.
+    /// Subsequent calls (hot): if new labels needed, incremental enrichment via selective fetch.
     fn ensure_labels_vineyard_only(&self, vertex_labels: &[&str], _edge_labels: &[&str]) {
-        // Fast path: check if all requested labels are already loaded
-        if self.hot_initialized.load(Ordering::Relaxed) && !vertex_labels.is_empty() {
-            let all_loaded = if let Ok(ll) = self.loaded_labels.lock() {
-                vertex_labels.iter().all(|l| ll.contains(*l))
-            } else { true };
-
-            if all_loaded { return; }
-
-            // Incremental enrichment: load properties for new labels
-            self.enrich_new_labels(vertex_labels);
-            return;
-        }
-
+        // Hot path: check if all requested labels are already loaded
         if self.hot_initialized.load(Ordering::Relaxed) {
             return;
         }
@@ -399,102 +387,34 @@ impl TieredGraphEngine {
             None => return,
         };
 
-        // Build needed labels set
-        let needed: HashSet<String> = vertex_labels.iter().map(|s| s.to_string()).collect();
-
-        if needed.is_empty() {
-            // No label hints → fall back to full page-in
-            match crate::loader::page_in_from_r2(&s3, &self.s3_prefix, self.config.hot_partition_id) {
-                Ok(store) => {
-                    let vc = store.vertex_count();
-                    let ec = store.edge_count();
-                    if vc == 0 && ec == 0 {
-                        tracing::debug!("R2 page-in: empty fragment, skipping");
-                        return;
-                    }
-                    if let Ok(mut last) = self.last_snapshot_count.lock() {
-                        *last = (vc as u64, ec as u64);
-                    }
-                    // Mark all labels as loaded
-                    if let Ok(mut ll) = self.loaded_labels.lock() {
-                        if let Ok(hot) = self.hot.read() {
-                            if let Some(single) = hot.as_single() {
-                                for label in <yata_store::MutableCsrStore as yata_grin::Schema>::vertex_labels(single) {
-                                    ll.insert(label);
-                                }
-                            }
-                        }
-                    }
-                    if let Ok(mut hot) = self.hot.write() {
-                        *hot = yata_store::GraphStoreEnum::Single(store);
-                        self.hot_initialized.store(true, Ordering::Relaxed);
-                    }
-                    tracing::info!(vertices = vc, edges = ec, "R2 full page-in complete");
-                }
-                Err(e) => {
-                    tracing::debug!("R2 page-in failed (may not exist yet): {e}");
-                }
-            }
-            return;
-        }
-
-        // Selective page-in: fetch only needed label properties
-        match crate::loader::page_in_selective_from_r2(
-            &s3, &self.s3_prefix, self.config.hot_partition_id, &needed,
-        ) {
-            Ok((store, meta, schema, loaded)) => {
+        // First page-in: ALWAYS full (3-tier: disk cache → R2).
+        // Selective page-in with stubs is only safe for incremental enrichment
+        // after all labels are already loaded with properties.
+        match crate::loader::page_in_from_r2(&s3, &self.s3_prefix, self.config.hot_partition_id) {
+            Ok(store) => {
                 let vc = store.vertex_count();
                 let ec = store.edge_count();
                 if vc == 0 && ec == 0 {
-                    tracing::debug!("R2 selective page-in: empty fragment, skipping");
+                    tracing::debug!("R2 page-in: empty fragment, skipping");
                     return;
                 }
-
-                // Compute VID offsets per label from scan (for incremental enrichment)
-                let mut offsets = HashMap::new();
-                let mut offset = 0u32;
-                for entry in &schema.vertex_entries {
-                    offsets.insert(entry.label.clone(), offset);
-                    let count = yata_grin::Scannable::scan_vertices_by_label(&store, &entry.label).len();
-                    offset += count as u32;
-                }
-
                 if let Ok(mut last) = self.last_snapshot_count.lock() {
                     *last = (vc as u64, ec as u64);
                 }
+                // Mark all labels as loaded
                 if let Ok(mut ll) = self.loaded_labels.lock() {
-                    for label in &loaded {
-                        ll.insert(label.clone());
+                    for label in yata_grin::Schema::vertex_labels(&store) {
+                        ll.insert(label);
                     }
                 }
-                if let Ok(mut cm) = self.cached_meta.lock() { *cm = Some(meta); }
-                if let Ok(mut cs) = self.cached_schema.lock() { *cs = Some(schema); }
-                if let Ok(mut lo) = self.label_vid_offsets.lock() { *lo = offsets; }
-
                 if let Ok(mut hot) = self.hot.write() {
                     *hot = yata_store::GraphStoreEnum::Single(store);
                     self.hot_initialized.store(true, Ordering::Relaxed);
                 }
-                tracing::info!(
-                    vertices = vc, edges = ec,
-                    loaded_labels = loaded.len(),
-                    "R2 selective page-in complete"
-                );
+                tracing::info!(vertices = vc, edges = ec, "R2 full page-in complete (3-tier)");
             }
             Err(e) => {
-                tracing::debug!("R2 selective page-in failed, falling back to full: {e}");
-                // Fallback to full page-in
-                if let Ok(store) = crate::loader::page_in_from_r2(
-                    &s3, &self.s3_prefix, self.config.hot_partition_id,
-                ) {
-                    let vc = store.vertex_count();
-                    if vc > 0 {
-                        if let Ok(mut hot) = self.hot.write() {
-                            *hot = yata_store::GraphStoreEnum::Single(store);
-                            self.hot_initialized.store(true, Ordering::Relaxed);
-                        }
-                    }
-                }
+                tracing::debug!("R2 page-in failed (may not exist yet): {e}");
             }
         }
     }
