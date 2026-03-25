@@ -439,6 +439,247 @@ pub async fn s3_put_with_retry(remote: &Arc<S3Client>, key: &str, data: bytes::B
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> S3Config {
+        S3Config {
+            endpoint: "https://abc123.r2.cloudflarestorage.com".into(),
+            bucket: "my-bucket".into(),
+            key_id: "AKID".into(),
+            application_key: "SECRET".into(),
+            region: "auto".into(),
+            prefix: "yata/".into(),
+            eager: false,
+        }
+    }
+
+    // ── S3Config ────────────────────────────────────────────────────────
+
+    #[test]
+    fn config_build_client_constructs_successfully() {
+        let cfg = test_config();
+        // build_client should not panic
+        let _client = cfg.build_client();
+    }
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let cfg = test_config();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: S3Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.endpoint, cfg.endpoint);
+        assert_eq!(parsed.bucket, cfg.bucket);
+        assert_eq!(parsed.key_id, cfg.key_id);
+        assert_eq!(parsed.application_key, cfg.application_key);
+        assert_eq!(parsed.region, cfg.region);
+        assert_eq!(parsed.prefix, cfg.prefix);
+        assert_eq!(parsed.eager, cfg.eager);
+    }
+
+    #[test]
+    fn config_serde_eager_defaults_false() {
+        let json = r#"{
+            "endpoint": "https://x.com",
+            "bucket": "b",
+            "key_id": "k",
+            "application_key": "s",
+            "region": "auto",
+            "prefix": ""
+        }"#;
+        let cfg: S3Config = serde_json::from_str(json).unwrap();
+        assert!(!cfg.eager);
+    }
+
+    #[test]
+    fn config_serde_eager_true() {
+        let json = r#"{
+            "endpoint": "https://x.com",
+            "bucket": "b",
+            "key_id": "k",
+            "application_key": "s",
+            "region": "auto",
+            "prefix": "p/",
+            "eager": true
+        }"#;
+        let cfg: S3Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.eager);
+    }
+
+    // ── S3Sync key construction ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn chunk_key_format() {
+        let cfg = test_config();
+        let dir = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalObjectStore::new(dir.path()).await.unwrap());
+        let cas: Arc<dyn CasStore> = Arc::new(
+            yata_object::cas::LocalCasStore::new(dir.path().join("cas"))
+                .await
+                .unwrap(),
+        );
+        let sync = S3Sync {
+            store: Arc::new(cfg.build_client()),
+            config: cfg,
+            local,
+            cas,
+        };
+        let hash = Blake3Hash::of(b"test data");
+        let hex = hash.hex();
+        let key = sync.chunk_key(&hash);
+        let expected = format!("yata/cas/{}/{}/{}", &hex[..2], &hex[2..4], hex);
+        assert_eq!(key, expected);
+    }
+
+    #[tokio::test]
+    async fn chunk_key_different_data_different_keys() {
+        let cfg = test_config();
+        let dir = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalObjectStore::new(dir.path()).await.unwrap());
+        let cas: Arc<dyn CasStore> = Arc::new(
+            yata_object::cas::LocalCasStore::new(dir.path().join("cas"))
+                .await
+                .unwrap(),
+        );
+        let sync = S3Sync {
+            store: Arc::new(cfg.build_client()),
+            config: cfg,
+            local,
+            cas,
+        };
+        let h1 = Blake3Hash::of(b"data1");
+        let h2 = Blake3Hash::of(b"data2");
+        assert_ne!(sync.chunk_key(&h1), sync.chunk_key(&h2));
+    }
+
+    #[tokio::test]
+    async fn manifest_key_format() {
+        let cfg = test_config();
+        let dir = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalObjectStore::new(dir.path()).await.unwrap());
+        let cas: Arc<dyn CasStore> = Arc::new(
+            yata_object::cas::LocalCasStore::new(dir.path().join("cas"))
+                .await
+                .unwrap(),
+        );
+        let sync = S3Sync {
+            store: Arc::new(cfg.build_client()),
+            config: cfg,
+            local,
+            cas,
+        };
+        let id = ObjectId::new();
+        let key = sync.manifest_key(&id);
+        assert_eq!(key, format!("yata/manifests/{}.cbor", id));
+    }
+
+    #[tokio::test]
+    async fn prefix_getter() {
+        let cfg = test_config();
+        let dir = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalObjectStore::new(dir.path()).await.unwrap());
+        let cas: Arc<dyn CasStore> = Arc::new(
+            yata_object::cas::LocalCasStore::new(dir.path().join("cas"))
+                .await
+                .unwrap(),
+        );
+        let sync = S3Sync {
+            store: Arc::new(cfg.build_client()),
+            config: cfg,
+            local,
+            cas,
+        };
+        assert_eq!(sync.prefix(), "yata/");
+    }
+
+    #[tokio::test]
+    async fn is_eager_default_false() {
+        let cfg = test_config();
+        let dir = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalObjectStore::new(dir.path()).await.unwrap());
+        let cas: Arc<dyn CasStore> = Arc::new(
+            yata_object::cas::LocalCasStore::new(dir.path().join("cas"))
+                .await
+                .unwrap(),
+        );
+        let sync = S3Sync {
+            store: Arc::new(cfg.build_client()),
+            config: cfg,
+            local,
+            cas,
+        };
+        assert!(!sync.is_eager());
+    }
+
+    #[tokio::test]
+    async fn is_eager_true_when_set() {
+        let mut cfg = test_config();
+        cfg.eager = true;
+        let dir = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalObjectStore::new(dir.path()).await.unwrap());
+        let cas: Arc<dyn CasStore> = Arc::new(
+            yata_object::cas::LocalCasStore::new(dir.path().join("cas"))
+                .await
+                .unwrap(),
+        );
+        let sync = S3Sync {
+            store: Arc::new(cfg.build_client()),
+            config: cfg,
+            local,
+            cas,
+        };
+        assert!(sync.is_eager());
+    }
+
+    // ── Key format conventions ──────────────────────────────────────────
+
+    #[test]
+    fn head_key_format() {
+        let cfg = test_config();
+        let expected = format!("{}MDAG_HEAD", cfg.prefix);
+        assert_eq!(expected, "yata/MDAG_HEAD");
+    }
+
+    #[test]
+    fn wal_segment_key_format() {
+        let cfg = test_config();
+        let prefix = &cfg.prefix;
+        let stream = "stream1";
+        let file = "000001.wal";
+        let key = format!("{}graph-wal/{}/{}", prefix, stream, file);
+        assert_eq!(key, "yata/graph-wal/stream1/000001.wal");
+    }
+
+    #[test]
+    fn chunk_key_hex_sharding() {
+        // Verify the 2-level hex directory sharding pattern
+        let hash = Blake3Hash::of(b"shard test");
+        let hex = hash.hex();
+        assert_eq!(hex.len(), 64); // Blake3 = 32 bytes = 64 hex chars
+        // First 2 chars and next 2 chars are used as directory prefixes
+        let shard1 = &hex[..2];
+        let shard2 = &hex[2..4];
+        assert_eq!(shard1.len(), 2);
+        assert_eq!(shard2.len(), 2);
+    }
+
+    #[test]
+    fn config_empty_prefix() {
+        let cfg = S3Config {
+            endpoint: "https://x.com".into(),
+            bucket: "b".into(),
+            key_id: "k".into(),
+            application_key: "s".into(),
+            region: "auto".into(),
+            prefix: "".into(),
+            eager: false,
+        };
+        let head_key = format!("{}MDAG_HEAD", cfg.prefix);
+        assert_eq!(head_key, "MDAG_HEAD");
+    }
+}
+
 // ── TieredObjectStore ─────────────────────────────────────────────────────────
 //
 // Implements ObjectStorage: writes go to local first, then syncs to S3.

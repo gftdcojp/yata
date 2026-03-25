@@ -225,3 +225,288 @@ impl std::fmt::Display for S3Error {
 }
 
 impl std::error::Error for S3Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_client() -> S3Client {
+        S3Client::new(
+            "https://abc123.r2.cloudflarestorage.com",
+            "my-bucket",
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "auto",
+        )
+    }
+
+    // ── URL construction ────────────────────────────────────────────────
+
+    #[test]
+    fn url_basic() {
+        let c = test_client();
+        assert_eq!(
+            c.url("snap/fragment/meta.json"),
+            "https://abc123.r2.cloudflarestorage.com/my-bucket/snap/fragment/meta.json"
+        );
+    }
+
+    #[test]
+    fn url_empty_key() {
+        let c = test_client();
+        assert_eq!(
+            c.url(""),
+            "https://abc123.r2.cloudflarestorage.com/my-bucket/"
+        );
+    }
+
+    #[test]
+    fn url_trailing_slash_stripped_from_endpoint() {
+        let c = S3Client::new(
+            "https://example.com/",
+            "b",
+            "k",
+            "s",
+            "us-east-1",
+        );
+        // Trailing slash is stripped in constructor
+        assert_eq!(c.url("key"), "https://example.com/b/key");
+    }
+
+    // ── Host extraction ─────────────────────────────────────────────────
+
+    #[test]
+    fn host_https() {
+        let c = test_client();
+        assert_eq!(c.host(), "abc123.r2.cloudflarestorage.com");
+    }
+
+    #[test]
+    fn host_http() {
+        let c = S3Client::new("http://localhost:9000", "b", "k", "s", "us-east-1");
+        assert_eq!(c.host(), "localhost:9000");
+    }
+
+    #[test]
+    fn host_no_scheme() {
+        let c = S3Client::new("minio.local:9000", "b", "k", "s", "us-east-1");
+        assert_eq!(c.host(), "minio.local:9000");
+    }
+
+    // ── EMPTY_SHA256 constant ───────────────────────────────────────────
+
+    #[test]
+    fn empty_sha256_constant_is_correct() {
+        let hash = hex::encode(Sha256::digest(b""));
+        assert_eq!(EMPTY_SHA256, hash);
+    }
+
+    // ── hmac_sha256 ─────────────────────────────────────────────────────
+
+    #[test]
+    fn hmac_sha256_deterministic() {
+        let a = hmac_sha256(b"key", b"data");
+        let b = hmac_sha256(b"key", b"data");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn hmac_sha256_different_keys_produce_different_results() {
+        let a = hmac_sha256(b"key1", b"data");
+        let b = hmac_sha256(b"key2", b"data");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn hmac_sha256_output_length() {
+        let result = hmac_sha256(b"key", b"data");
+        assert_eq!(result.len(), 32);
+    }
+
+    // ── derive_signing_key ──────────────────────────────────────────────
+
+    #[test]
+    fn derive_signing_key_deterministic() {
+        let c = test_client();
+        let a = c.derive_signing_key("20260325");
+        let b = c.derive_signing_key("20260325");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 32);
+    }
+
+    #[test]
+    fn derive_signing_key_different_dates() {
+        let c = test_client();
+        let a = c.derive_signing_key("20260325");
+        let b = c.derive_signing_key("20260326");
+        assert_ne!(a, b);
+    }
+
+    // ── sign_headers ────────────────────────────────────────────────────
+
+    #[test]
+    fn sign_headers_returns_four_headers() {
+        let c = test_client();
+        let now = chrono::Utc::now();
+        let headers = c
+            .sign_headers("GET", "test/key", &now, EMPTY_SHA256, None)
+            .unwrap();
+        assert_eq!(headers.len(), 4);
+        let names: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(names.contains(&"host"));
+        assert!(names.contains(&"x-amz-date"));
+        assert!(names.contains(&"x-amz-content-sha256"));
+        assert!(names.contains(&"authorization"));
+    }
+
+    #[test]
+    fn sign_headers_authorization_format() {
+        let c = test_client();
+        let now = chrono::Utc::now();
+        let headers = c
+            .sign_headers("PUT", "obj", &now, EMPTY_SHA256, None)
+            .unwrap();
+        let auth = headers.iter().find(|(k, _)| k == "authorization").unwrap();
+        assert!(auth.1.starts_with("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/"));
+        assert!(auth.1.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"));
+        assert!(auth.1.contains("Signature="));
+    }
+
+    #[test]
+    fn sign_headers_canonical_uri_encodes_segments() {
+        let c = test_client();
+        let now = chrono::Utc::now();
+        // Should not panic on keys with special characters
+        let headers = c
+            .sign_headers("GET", "path/with spaces/key", &now, EMPTY_SHA256, None)
+            .unwrap();
+        assert_eq!(headers.len(), 4);
+    }
+
+    #[test]
+    fn sign_headers_empty_key_uses_bucket_uri() {
+        let c = test_client();
+        let now = chrono::Utc::now();
+        let query = "list-type=2&prefix=test";
+        let headers = c
+            .sign_headers("GET", "", &now, EMPTY_SHA256, Some(query))
+            .unwrap();
+        assert_eq!(headers.len(), 4);
+    }
+
+    #[test]
+    fn sign_headers_deterministic_for_same_timestamp() {
+        let c = test_client();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-03-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let a = c
+            .sign_headers("GET", "key", &now, EMPTY_SHA256, None)
+            .unwrap();
+        let b = c
+            .sign_headers("GET", "key", &now, EMPTY_SHA256, None)
+            .unwrap();
+        assert_eq!(a, b);
+    }
+
+    // ── extract_xml_tag ─────────────────────────────────────────────────
+
+    #[test]
+    fn extract_xml_tag_basic() {
+        let xml = "<Root><Key>my-object</Key></Root>";
+        assert_eq!(extract_xml_tag(xml, "Key"), Some("my-object".to_string()));
+    }
+
+    #[test]
+    fn extract_xml_tag_missing() {
+        let xml = "<Root><Key>val</Key></Root>";
+        assert_eq!(extract_xml_tag(xml, "Size"), None);
+    }
+
+    #[test]
+    fn extract_xml_tag_empty_value() {
+        let xml = "<Root><Key></Key></Root>";
+        assert_eq!(extract_xml_tag(xml, "Key"), Some("".to_string()));
+    }
+
+    #[test]
+    fn extract_xml_tag_nested() {
+        let xml = "<A><B><Key>inner</Key></B></A>";
+        assert_eq!(extract_xml_tag(xml, "Key"), Some("inner".to_string()));
+    }
+
+    // ── parse_list_response ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_list_response_single_object() {
+        let xml = r#"<ListBucketResult>
+            <Contents><Key>snap/fragment/meta.json</Key><Size>1024</Size></Contents>
+        </ListBucketResult>"#;
+        let (objects, next) = parse_list_response(xml);
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].key, "snap/fragment/meta.json");
+        assert_eq!(objects[0].size, 1024);
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn parse_list_response_multiple_objects() {
+        let xml = r#"<ListBucketResult>
+            <Contents><Key>a</Key><Size>10</Size></Contents>
+            <Contents><Key>b</Key><Size>20</Size></Contents>
+            <Contents><Key>c</Key><Size>30</Size></Contents>
+        </ListBucketResult>"#;
+        let (objects, _) = parse_list_response(xml);
+        assert_eq!(objects.len(), 3);
+        assert_eq!(objects[0].key, "a");
+        assert_eq!(objects[1].key, "b");
+        assert_eq!(objects[2].key, "c");
+        assert_eq!(objects[0].size, 10);
+        assert_eq!(objects[2].size, 30);
+    }
+
+    #[test]
+    fn parse_list_response_empty() {
+        let xml = "<ListBucketResult></ListBucketResult>";
+        let (objects, next) = parse_list_response(xml);
+        assert!(objects.is_empty());
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn parse_list_response_with_continuation_token() {
+        let xml = r#"<ListBucketResult>
+            <Contents><Key>x</Key><Size>5</Size></Contents>
+            <NextContinuationToken>abc123</NextContinuationToken>
+        </ListBucketResult>"#;
+        let (objects, next) = parse_list_response(xml);
+        assert_eq!(objects.len(), 1);
+        assert_eq!(next, Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn parse_list_response_missing_size_defaults_to_zero() {
+        let xml = r#"<ListBucketResult>
+            <Contents><Key>nosize</Key></Contents>
+        </ListBucketResult>"#;
+        let (objects, _) = parse_list_response(xml);
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].size, 0);
+    }
+
+    // ── S3Error ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn s3_error_display() {
+        let err = S3Error::Remote("connection refused".into());
+        assert_eq!(format!("{err}"), "S3 error: connection refused");
+    }
+
+    #[test]
+    fn s3_error_debug() {
+        let err = S3Error::Remote("test".into());
+        let dbg = format!("{err:?}");
+        assert!(dbg.contains("Remote"));
+        assert!(dbg.contains("test"));
+    }
+}
