@@ -215,16 +215,15 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
 
 `[IMPLEMENTED]` Phase 3c: Label-selective page-in (ensure_labels)
   evidence: yata-engine/src/loader.rs (page_in_selective_from_r2, restore_csr_selective, enrich_label_from_r2, apply_batch_properties, extract_arrow_value)
-  evidence: yata-engine/src/engine.rs (ensure_labels_vineyard_only rewritten, enrich_new_labels, cached_meta/cached_schema/label_vid_offsets)
+  evidence: yata-engine/src/engine.rs (ensure_labels_vineyard_only, enrich_new_labels, cached_meta/cached_schema/label_vid_offsets)
   mechanism:
-    1st call: fetch meta+schema+ivnums+ALL CSR topology + only requested label vertex_tables
-              non-requested labels → stub vertices (VID ordering preserved, 0 properties, 0 R2 fetch)
-    subsequent: new label → fetch vertex_table → set_vertex_prop on existing stubs (incremental)
-    no label hints → full page-in fallback (backward compat)
-  state tracking: loaded_labels (property-loaded labels), cached_meta/schema (for incremental enrichment), label_vid_offsets
+    **cold start (1st call): ALWAYS full page-in** (3-tier: disk cache → R2)。
+      selective page-in with stubs on cold start は property-loss regression を引き起こすため禁止 (2026-03-25 hotfix)。
+      全 label を full properties で load → loaded_labels に全登録。
+    incremental (hot_initialized=true 後): page_in_selective_from_r2 で新 label のみ fetch → set_vertex_prop。
   3-tier blob fetch: fetch_blob_cached() — disk cache (YATA_VINEYARD_DIR) → R2 GET → write-through。Container restart with warm disk: ~100µs/blob (R2 skip)
-  test: 854 workspace unit tests pass + e2e_phase3_loadtest (8 tests, docker-compose: 2-hop 541 QPS, label-selective 1,126 QPS)
-  production: `[PRODUCTION]` deploy verified (2026-03-25, image `20260325-0931`)。searchActors 424ms avg, getTimeline 271ms, listRecords 371ms, cold start 2.8s
+  test: 854 workspace unit tests pass + e2e_phase3_loadtest (8 tests) + docker-compose cold restart verified (60 nodes, 3 labels, property access OK)
+  production: `[PRODUCTION]` deploy verified (2026-03-25, image `20260325-0945`)。searchActors 10 actors, getTimeline 1 item, cold restart data intact
 
 `[DEPRECATED]` LSMGraph 4-level tiered storage
   reason: 現 ArrowFragment + snapshot compaction が LSM の本質 (immutable sorted runs + compaction) を
@@ -240,11 +239,11 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
 
 ```
 Query fast path (GIE, <1µs): [PRODUCTION]
-  Cypher → parse → extract_pushdown_hints → ensure_labels (selective page-in) →
+  Cypher → parse → extract_pushdown_hints → ensure_labels (3-tier full page-in on cold start) →
   GIE transpile → IR Plan → CSR direct push-based execute
   CONDITIONS: single CSR partition
   RLS: transpile_secured() injects SecurityFilter after Scan/Expand ops
-  Page-in: label-selective (Phase 3c) — needed labels get properties, others get stubs
+  Page-in: cold start = full page-in (disk → R2)。hot = incremental enrichment only
 
 Query GIE fallback → MemoryGraph (~1-200ms): [PRODUCTION]
   GIE transpile fails (mutation or unsupported Cypher) → MemoryGraph copy → Cypher execute
@@ -327,7 +326,7 @@ Read latency:
 | Chunked snapshot (1,250 vertices) | 73-111ms |
 | test: `yata-server/tests/e2e_phase3_loadtest.rs` (8 tests pass) |
 
-**Production E2E (pds.gftd.ai → YataRPC → Container, 2026-03-25, image `20260325-0931`):**
+**Production E2E (pds.gftd.ai → YataRPC → Container, 2026-03-25, image `20260325-0945`):**
 | Metric | Result | Notes |
 |---|---|---|
 | Cold start (container wake) | **2.8s** | Container sleep → wake + R2 page-in |
