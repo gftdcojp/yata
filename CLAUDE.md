@@ -47,8 +47,9 @@ Read (ArrowFragment page-in, lazy):
   PDS_RPC.query / listRecords / getTimeline
     → YATA_RPC.cypher → TieredGraphEngine
     → ensure_labels() → hot_initialized == false?
-      → page_in_from_r2() → R2 GET snap/fragment/{name} → ArrowFragment → NbrUnit zero-copy CSR
-      → hot_initialized = true
+      → page_in_from_r2() → R2 GET snap/fragment/{name} → ArrowFragment
+      → CSR に merge (既存 mergeRecord データを保護。empty/error でも hot_initialized = true)
+      → hot_initialized = true (再 page-in による上書き防止)
     → CSR direct query (<1µs)
 
 PDS Container (Rust) は不要 — 全て TS Worker + Pipeline + YATA_RPC。
