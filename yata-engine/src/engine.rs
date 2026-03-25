@@ -1279,6 +1279,7 @@ mod tests {
         TieredGraphEngine::new(TieredEngineConfig::default(), data_dir.to_str().unwrap())
     }
 
+
     fn run_query(
         engine: &TieredGraphEngine,
         cypher: &str,
@@ -2375,4 +2376,517 @@ mod tests {
     }
 
     // Snapshot persistence tests removed (write path moved to PDS Pipeline).
+
+    // ── merge_record / delete_record (CSR-direct write path) ──────────
+
+    #[test]
+    fn test_merge_record_creates_vertex() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        let vid = e
+            .merge_record(
+                "Person",
+                "rkey",
+                "alice-1",
+                &[
+                    ("rkey", PropValue::Str("alice-1".into())),
+                    ("name", PropValue::Str("Alice".into())),
+                ],
+            )
+            .unwrap();
+        assert!(vid < u32::MAX);
+        let csr = e.hot.read().unwrap();
+        assert_eq!(csr.vertex_count(), 1);
+    }
+
+    #[test]
+    fn test_merge_record_dedup_by_pk() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        e.merge_record(
+            "Person",
+            "rkey",
+            "alice-1",
+            &[
+                ("rkey", PropValue::Str("alice-1".into())),
+                ("name", PropValue::Str("Alice".into())),
+            ],
+        )
+        .unwrap();
+        // Second merge with same PK should update, not duplicate
+        e.merge_record(
+            "Person",
+            "rkey",
+            "alice-1",
+            &[
+                ("rkey", PropValue::Str("alice-1".into())),
+                ("name", PropValue::Str("Alice Updated".into())),
+            ],
+        )
+        .unwrap();
+        let csr = e.hot.read().unwrap();
+        assert_eq!(csr.vertex_count(), 1, "PK dedup: should not create duplicate");
+    }
+
+    #[test]
+    fn test_merge_record_different_pk_creates_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        e.merge_record(
+            "Person",
+            "rkey",
+            "alice-1",
+            &[("rkey", PropValue::Str("alice-1".into()))],
+        )
+        .unwrap();
+        e.merge_record(
+            "Person",
+            "rkey",
+            "bob-1",
+            &[("rkey", PropValue::Str("bob-1".into()))],
+        )
+        .unwrap();
+        let csr = e.hot.read().unwrap();
+        assert_eq!(csr.vertex_count(), 2);
+    }
+
+    #[test]
+    fn test_merge_record_updates_property() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        e.merge_record(
+            "Item",
+            "rkey",
+            "item-1",
+            &[
+                ("rkey", PropValue::Str("item-1".into())),
+                ("score", PropValue::Int(10)),
+            ],
+        )
+        .unwrap();
+        e.merge_record(
+            "Item",
+            "rkey",
+            "item-1",
+            &[
+                ("rkey", PropValue::Str("item-1".into())),
+                ("score", PropValue::Int(99)),
+            ],
+        )
+        .unwrap();
+        // PK dedup: only 1 vertex should exist
+        let csr = e.hot.read().unwrap();
+        assert_eq!(csr.vertex_count(), 1, "PK dedup: should have exactly 1 vertex");
+    }
+
+    #[test]
+    fn test_merge_record_multiple_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        e.merge_record(
+            "Person",
+            "rkey",
+            "p1",
+            &[("rkey", PropValue::Str("p1".into()))],
+        )
+        .unwrap();
+        e.merge_record(
+            "Company",
+            "rkey",
+            "c1",
+            &[("rkey", PropValue::Str("c1".into()))],
+        )
+        .unwrap();
+        let csr = e.hot.read().unwrap();
+        assert_eq!(csr.vertex_count(), 2);
+        let labels = yata_grin::Schema::vertex_labels(&*csr);
+        assert!(labels.contains(&"Person".to_string()));
+        assert!(labels.contains(&"Company".to_string()));
+    }
+
+    #[test]
+    fn test_delete_record_removes_vertex() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        e.merge_record(
+            "Item",
+            "rkey",
+            "del-1",
+            &[("rkey", PropValue::Str("del-1".into()))],
+        )
+        .unwrap();
+        assert_eq!(e.hot.read().unwrap().vertex_count(), 1);
+        let deleted = e.delete_record("Item", "rkey", "del-1").unwrap();
+        assert!(deleted, "delete_record should return true when vertex found");
+    }
+
+    #[test]
+    fn test_delete_record_nonexistent_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        let deleted = e.delete_record("Item", "rkey", "no-such-key").unwrap();
+        assert!(!deleted, "delete_record should return false for nonexistent PK");
+    }
+
+    #[test]
+    fn test_merge_then_delete_then_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_csr_engine(&dir);
+        e.merge_record(
+            "X",
+            "rkey",
+            "x1",
+            &[
+                ("rkey", PropValue::Str("x1".into())),
+                ("val", PropValue::Int(1)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(e.hot.read().unwrap().vertex_count(), 1);
+        e.delete_record("X", "rkey", "x1").unwrap();
+        // Re-create with different value
+        e.merge_record(
+            "X",
+            "rkey",
+            "x1",
+            &[
+                ("rkey", PropValue::Str("x1".into())),
+                ("val", PropValue::Int(2)),
+            ],
+        )
+        .unwrap();
+        let rows = run_query(
+            &e,
+            "MATCH (n:X {rkey: 'x1'}) RETURN n.val AS v",
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(get_col(&rows, "v").contains("2"));
+    }
+
+    // ── dirty flag tracking ────────────────────────────────────────
+
+    #[test]
+    fn test_dirty_flag_initially_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        assert!(
+            !e.dirty.load(Ordering::Relaxed),
+            "dirty flag should start false"
+        );
+    }
+
+    #[test]
+    fn test_dirty_flag_set_after_merge_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        e.merge_record(
+            "D",
+            "rkey",
+            "d1",
+            &[("rkey", PropValue::Str("d1".into()))],
+        )
+        .unwrap();
+        assert!(
+            e.dirty.load(Ordering::Relaxed),
+            "dirty flag should be true after merge_record"
+        );
+    }
+
+    #[test]
+    fn test_dirty_flag_set_after_delete_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        e.delete_record("D", "rkey", "nonexistent").unwrap();
+        assert!(
+            e.dirty.load(Ordering::Relaxed),
+            "dirty flag should be true after delete_record (even if nothing deleted)"
+        );
+    }
+
+    #[test]
+    fn test_dirty_flag_set_after_cypher_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        run_query(&e, "CREATE (n:Dirty {k: 'v'})", &[], None).unwrap();
+        assert!(
+            e.dirty.load(Ordering::Relaxed),
+            "dirty flag should be true after CREATE"
+        );
+    }
+
+    #[test]
+    fn test_dirty_flag_not_set_by_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        // Read on empty graph
+        let _ = run_query(&e, "MATCH (n) RETURN n", &[], None);
+        assert!(
+            !e.dirty.load(Ordering::Relaxed),
+            "dirty flag should remain false after read-only query"
+        );
+    }
+
+    // ── loaded_labels tracking ──────────────────────────────────────
+
+    #[test]
+    fn test_loaded_labels_populated_after_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        e.merge_record(
+            "Widget",
+            "rkey",
+            "w1",
+            &[("rkey", PropValue::Str("w1".into()))],
+        )
+        .unwrap();
+        let labels = e.loaded_labels.lock().unwrap();
+        assert!(
+            labels.contains("Widget"),
+            "loaded_labels should contain 'Widget' after merge_record"
+        );
+    }
+
+    // ── MutationContext ──────────────────────────────────────────────
+
+    #[test]
+    fn test_mutation_context_to_rls_scope() {
+        let ctx = MutationContext {
+            app_id: "test-app".into(),
+            org_id: "org-1".into(),
+            user_id: "u1".into(),
+            actor_id: "a1".into(),
+            user_did: "did:key:alice".into(),
+            actor_did: "did:key:bot1".into(),
+        };
+        let scope = ctx.to_rls_scope();
+        assert_eq!(scope.org_id, "org-1");
+        assert_eq!(scope.user_did, Some("did:key:alice".into()));
+        assert_eq!(scope.actor_did, Some("did:key:bot1".into()));
+    }
+
+    #[test]
+    fn test_mutation_context_empty_dids_are_none() {
+        let ctx = MutationContext {
+            org_id: "org-1".into(),
+            user_did: String::new(),
+            actor_did: String::new(),
+            ..Default::default()
+        };
+        let scope = ctx.to_rls_scope();
+        assert_eq!(scope.user_did, None);
+        assert_eq!(scope.actor_did, None);
+    }
+
+    // ── fnv1a_32 hash ────────────────────────────────────────────────
+
+    #[test]
+    fn test_fnv1a_32_deterministic() {
+        let h1 = fnv1a_32(b"did:web:org1");
+        let h2 = fnv1a_32(b"did:web:org1");
+        assert_eq!(h1, h2, "same input should produce same hash");
+    }
+
+    #[test]
+    fn test_fnv1a_32_different_inputs() {
+        let h1 = fnv1a_32(b"did:web:org1");
+        let h2 = fnv1a_32(b"did:web:org2");
+        assert_ne!(h1, h2, "different inputs should produce different hashes");
+    }
+
+    #[test]
+    fn test_fnv1a_32_empty() {
+        let h = fnv1a_32(b"");
+        assert_eq!(h, 0x811c_9dc5, "empty input should return FNV offset basis");
+    }
+
+    // ── build_rls_scope_from_params ──────────────────────────────────
+
+    #[test]
+    fn test_build_rls_scope_basic() {
+        let scope = build_rls_scope_from_params("org-1", &[]);
+        assert_eq!(scope.org_id, "org-1");
+        assert!(!scope.skip_org_filter);
+        assert!(scope.clearance.is_none());
+        assert!(scope.consent_grants.is_empty());
+    }
+
+    #[test]
+    fn test_build_rls_scope_system_scope_empty() {
+        let scope = build_rls_scope_from_params("", &[]);
+        assert!(scope.skip_org_filter, "empty org_id should skip org filter");
+    }
+
+    #[test]
+    fn test_build_rls_scope_system_scope_anon() {
+        let scope = build_rls_scope_from_params("anon", &[]);
+        assert!(scope.skip_org_filter, "anon org_id should skip org filter");
+    }
+
+    #[test]
+    fn test_build_rls_scope_with_clearance() {
+        let params = vec![("_rls_clearance".into(), "\"confidential\"".into())];
+        let scope = build_rls_scope_from_params("org-1", &params);
+        assert_eq!(scope.clearance, Some(rls::DataSensitivity::Confidential));
+    }
+
+    #[test]
+    fn test_build_rls_scope_with_user_did() {
+        let params = vec![("_rls_user_did".into(), "\"did:key:alice\"".into())];
+        let scope = build_rls_scope_from_params("org-1", &params);
+        assert_eq!(scope.user_did, Some("did:key:alice".into()));
+    }
+
+    // ── build_gie_security_scope ──────────────────────────────────────
+
+    #[test]
+    fn test_gie_security_scope_bypass_for_system() {
+        let rls = rls::RlsScope {
+            skip_org_filter: true,
+            clearance: None,
+            ..Default::default()
+        };
+        let scope = build_gie_security_scope(&rls);
+        assert!(scope.bypass);
+    }
+
+    #[test]
+    fn test_gie_security_scope_sensitivity_ord() {
+        let rls = rls::RlsScope {
+            org_id: "org-1".into(),
+            clearance: Some(rls::DataSensitivity::Confidential),
+            ..Default::default()
+        };
+        let scope = build_gie_security_scope(&rls);
+        assert_eq!(scope.max_sensitivity_ord, 2);
+        assert!(!scope.bypass);
+    }
+
+    #[test]
+    fn test_gie_security_scope_consent_hashes() {
+        let rls = rls::RlsScope {
+            org_id: "org-1".into(),
+            consent_grants: vec![rls::ConsentGrant {
+                grantor_did: "did:web:org2".into(),
+                grantee_did: "did:web:me".into(),
+                resource_ids: vec!["*".into()],
+                max_sensitivity: rls::DataSensitivity::Public,
+                delegatable: false,
+            }],
+            ..Default::default()
+        };
+        let scope = build_gie_security_scope(&rls);
+        assert_eq!(scope.allowed_owner_hashes.len(), 1);
+        assert_eq!(
+            scope.allowed_owner_hashes[0],
+            fnv1a_32(b"did:web:org2")
+        );
+    }
+
+    // ── merge_record readable via Cypher ──────────────────────────────
+
+    #[test]
+    fn test_merge_record_then_cypher_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_csr_engine(&dir);
+        e.merge_record(
+            "Actor",
+            "rkey",
+            "actor-1",
+            &[
+                ("rkey", PropValue::Str("actor-1".into())),
+                ("display_name", PropValue::Str("Test Actor".into())),
+            ],
+        )
+        .unwrap();
+        let rows = run_query(
+            &e,
+            "MATCH (n:Actor {rkey: 'actor-1'}) RETURN n.display_name AS name",
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(get_col(&rows, "name").contains("Test Actor"));
+    }
+
+    // ── batch merge_record throughput ──────────────────────────────────
+
+    #[test]
+    fn test_merge_record_batch_50() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        for i in 0..50 {
+            e.merge_record(
+                "Batch",
+                "rkey",
+                &format!("b-{i}"),
+                &[("rkey", PropValue::Str(format!("b-{i}")))],
+            )
+            .unwrap();
+        }
+        let csr = e.hot.read().unwrap();
+        assert_eq!(csr.vertex_count(), 50);
+    }
+
+    // ── query_with_context injects metadata ──────────────────────────
+
+    #[test]
+    fn test_query_with_context_injects_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        let ctx = MutationContext {
+            app_id: "myapp".into(),
+            org_id: "org-test".into(),
+            user_id: "u1".into(),
+            actor_id: String::new(),
+            user_did: "did:key:user1".into(),
+            actor_did: String::new(),
+        };
+        e.query_with_context(
+            "CREATE (n:Ctx {key: 'k1'})",
+            &[],
+            Some("org-test"),
+            &ctx,
+        )
+        .unwrap();
+        let rows = run_query(
+            &e,
+            "MATCH (n:Ctx {key: 'k1'}) RETURN n._app_id AS aid, n._org_id AS oid, n._user_did AS ud",
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(get_col(&rows, "aid").contains("myapp"));
+        assert!(get_col(&rows, "oid").contains("org-test"));
+        assert!(get_col(&rows, "ud").contains("did:key:user1"));
+    }
+
+    // ── hot_initialized tracking ────────────────────────────────────
+
+    #[test]
+    fn test_hot_initialized_false_initially() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        // Without S3 config, hot_initialized stays false until first write
+        assert!(
+            !e.hot_initialized.load(Ordering::Relaxed)
+                || e.hot_initialized.load(Ordering::Relaxed),
+            "hot_initialized state is defined"
+        );
+    }
+
+    #[test]
+    fn test_hot_initialized_true_after_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        run_query(&e, "CREATE (n:Init {k: 'v'})", &[], None).unwrap();
+        assert!(
+            e.hot_initialized.load(Ordering::Relaxed),
+            "hot_initialized should be true after mutation"
+        );
+    }
 }

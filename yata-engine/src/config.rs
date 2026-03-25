@@ -110,3 +110,53 @@ impl Default for TieredEngineConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config_values() {
+        let cfg = TieredEngineConfig::default();
+        assert_eq!(cfg.hot_max_vertices, 50_000);
+        assert_eq!(cfg.hot_max_edges, 200_000);
+        assert_eq!(cfg.cache_max_entries, 256);
+        assert_eq!(cfg.cache_ttl_secs, 30);
+        assert_eq!(cfg.adj_expansion_limit, 5_000);
+        assert_eq!(cfg.runtime_workers, 2);
+        assert_eq!(cfg.vineyard_budget_mb, 256);
+        assert_eq!(cfg.partition_count, 1);
+        assert_eq!(cfg.persistence_mode, PersistenceMode::Snapshot);
+    }
+
+    #[test]
+    fn test_default_config_partition_id_is_zero() {
+        let cfg = TieredEngineConfig::default();
+        assert_eq!(cfg.hot_partition_id, PartitionId::from(0));
+    }
+
+    #[test]
+    fn test_persistence_mode_snapshot_is_only_variant() {
+        let mode = PersistenceMode::Snapshot;
+        assert_eq!(mode, PersistenceMode::Snapshot);
+    }
+
+    #[test]
+    fn test_default_batch_commit_threshold() {
+        let cfg = TieredEngineConfig::default();
+        // Default is 1 (immediate) unless YATA_BATCH_COMMIT_THRESHOLD env is set
+        assert!(cfg.batch_commit_threshold >= 1);
+    }
+
+    #[test]
+    fn test_default_lazy_label_max() {
+        let cfg = TieredEngineConfig::default();
+        assert_eq!(cfg.lazy_label_max_loaded, 12);
+    }
+
+    #[test]
+    fn test_default_ocel_events_off() {
+        let cfg = TieredEngineConfig::default();
+        assert!(!cfg.enable_ocel_events);
+    }
+}

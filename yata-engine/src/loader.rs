@@ -728,4 +728,143 @@ mod tests {
         assert_eq!(csr.partition_id_raw(), PartitionId::from(9));
         assert_eq!(csr.vertex_count(), 1);
     }
+
+    // ── cypher_to_prop conversion ────────────────────────────────────
+
+    #[test]
+    fn test_cypher_to_prop_null() {
+        let v = cypher_to_prop(&yata_cypher::types::Value::Null);
+        assert!(matches!(v, PropValue::Null));
+    }
+
+    #[test]
+    fn test_cypher_to_prop_bool() {
+        assert!(matches!(
+            cypher_to_prop(&yata_cypher::types::Value::Bool(true)),
+            PropValue::Bool(true)
+        ));
+        assert!(matches!(
+            cypher_to_prop(&yata_cypher::types::Value::Bool(false)),
+            PropValue::Bool(false)
+        ));
+    }
+
+    #[test]
+    fn test_cypher_to_prop_int() {
+        let v = cypher_to_prop(&yata_cypher::types::Value::Int(42));
+        assert_eq!(v, PropValue::Int(42));
+    }
+
+    #[test]
+    fn test_cypher_to_prop_float() {
+        if let PropValue::Float(f) = cypher_to_prop(&yata_cypher::types::Value::Float(3.14)) {
+            assert!((f - 3.14).abs() < 1e-10);
+        } else {
+            panic!("expected Float");
+        }
+    }
+
+    #[test]
+    fn test_cypher_to_prop_string() {
+        let v = cypher_to_prop(&yata_cypher::types::Value::Str("hello".into()));
+        assert_eq!(v, PropValue::Str("hello".into()));
+    }
+
+    #[test]
+    fn test_cypher_to_prop_list_falls_back_to_string() {
+        let v = cypher_to_prop(&yata_cypher::types::Value::List(vec![
+            yata_cypher::types::Value::Int(1),
+        ]));
+        // Lists are converted to string representation
+        match v {
+            PropValue::Str(_) => {}
+            _ => panic!("expected Str for list fallback, got: {:?}", v),
+        }
+    }
+
+    // ── rebuild_csr_from_graph ────────────────────────────────────────
+
+    #[test]
+    fn test_rebuild_csr_with_edges() {
+        let mut graph = MemoryGraph::new();
+        graph.add_node(NodeRef {
+            id: "a".into(),
+            labels: vec!["Person".into()],
+            props: IndexMap::new(),
+        });
+        graph.add_node(NodeRef {
+            id: "b".into(),
+            labels: vec!["Person".into()],
+            props: IndexMap::new(),
+        });
+        graph.add_rel(yata_cypher::RelRef {
+            id: "e1".into(),
+            src: "a".into(),
+            dst: "b".into(),
+            rel_type: "KNOWS".into(),
+            props: IndexMap::new(),
+        });
+
+        let csr = rebuild_csr_from_graph(&QueryableGraph(graph));
+        assert_eq!(csr.vertex_count(), 2);
+        assert_eq!(csr.edge_count(), 1);
+    }
+
+    #[test]
+    fn test_rebuild_csr_with_properties() {
+        use yata_grin::Property;
+        let mut graph = MemoryGraph::new();
+        let mut props = IndexMap::new();
+        props.insert("name".into(), yata_cypher::types::Value::Str("Alice".into()));
+        props.insert("age".into(), yata_cypher::types::Value::Int(30));
+        graph.add_node(NodeRef {
+            id: "a".into(),
+            labels: vec!["Person".into()],
+            props,
+        });
+
+        let csr = rebuild_csr_from_graph(&QueryableGraph(graph));
+        assert_eq!(csr.vertex_count(), 1);
+        let vids = yata_grin::Scannable::scan_all_vertices(&csr);
+        let name = Property::vertex_prop(&csr, vids[0], "name");
+        assert_eq!(name, Some(PropValue::Str("Alice".into())));
+    }
+
+    #[test]
+    fn test_rebuild_csr_empty_graph() {
+        let graph = MemoryGraph::new();
+        let csr = rebuild_csr_from_graph(&QueryableGraph(graph));
+        assert_eq!(csr.vertex_count(), 0);
+        assert_eq!(csr.edge_count(), 0);
+    }
+
+    // ── vertex_label_chunk_count ──────────────────────────────────────
+
+    #[test]
+    fn test_vertex_label_chunk_count_none_for_missing() {
+        let meta = yata_vineyard::blob::ObjectMeta {
+            id: yata_vineyard::blob::ObjectId(0),
+            typename: String::new(),
+            fields: HashMap::new(),
+            members: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+        assert_eq!(vertex_label_chunk_count(&meta, 0), None);
+    }
+
+    #[test]
+    fn test_vertex_label_chunk_count_some_when_present() {
+        let mut meta = yata_vineyard::blob::ObjectMeta {
+            id: yata_vineyard::blob::ObjectId(0),
+            typename: String::new(),
+            fields: HashMap::new(),
+            members: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+        meta.fields.insert(
+            "vertex_table_0_chunks".into(),
+            yata_vineyard::blob::MetaValue::Int(5),
+        );
+        assert_eq!(vertex_label_chunk_count(&meta, 0), Some(5));
+    }
 }
