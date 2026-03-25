@@ -77,7 +77,7 @@ env.YATA.stats()                 // → all partition stats
 | `yata-grin` | GRIN trait (Topology, Property, Schema, Scannable, Mutable) |
 | `yata-vineyard` | **ArrowFragment format** (canonical snapshot/persistence format)。NbrUnit zero-copy CSR (25x faster neighbor traversal)。`csr_to_fragment()` (CSR→ArrowFragment) + `ArrowFragment::serialize/deserialize` (BlobStore↔R2)。**Arrow row-group chunk**: `split_record_batch` + byte-based chunking (32 MB default, `estimate_bytes_per_row`)。PropertyGraphSchema (typed vertex/edge labels + Arrow property columns) |
 | `yata-store` | MutableCsrStore (mutable in-memory CSR, GRIN traits), ArrowGraphStore, DiskVineyard/MmapVineyard/EdgeVineyard (blob cache), PartitionStoreSet, GraphStoreEnum |
-| `yata-engine` | TieredGraphEngine, ArrowFragment snapshot (trigger_snapshot → R2 + disk), 3-tier page-in (disk cache → R2 → CSR, `fetch_blob_cached`), label-selective page-in (`page_in_selective_from_r2`), incremental enrichment (`enrich_label_from_r2`), Frontier BFS, ShardedCoordinator |
+| `yata-engine` | TieredGraphEngine, ArrowFragment snapshot (trigger_snapshot → R2 + disk), 2-phase cold start (`page_in_topology_from_r2` + on-demand `enrich_label_from_r2`), 3-tier blob fetch (`fetch_blob_cached`: disk → R2 → write-through), Frontier BFS, ShardedCoordinator |
 | `yata-cypher` | Full Cypher parser + executor (incl. untyped edge traversal) |
 | `yata-gie` | GIE push-based executor, IR (Exchange/Receive/Gather), distributed planner |
 | `yata-s3` | R2 persistence (sync ureq+rustls S3 client, SigV4)。`trigger_snapshot()` → R2 PUT、page-in → R2 GET |
@@ -127,7 +127,7 @@ env.YATA.stats()                 // → all partition stats
 
 ## R2 Persistence `[PRODUCTION]`
 
-R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in-memory CSR に append のみ)。PK dedup は in-memory 内のみ。R2 既存データとの dedup は snapshot compaction 時。**Dirty tracking**: dirty flag が true の時のみ snapshot upload。**Snapshot compaction**: R2 既存 + in-memory pending → merge by PK → ArrowFragment → R2 PUT。**Partial page-in protection**: `last_snapshot_count` で上書き防止。**Name-based blob** (CAS 除去): `snap/fragment/{name}` で直接 PUT/GET。Blake3 hash 不要。**3-tier page-in `[IMPLEMENTED]`**: `fetch_blob_cached()` が disk cache (`YATA_VINEYARD_DIR/snap/fragment/`) → R2 GET → write-through to disk の順で blob を取得。Cold start with warm disk: ~100µs/blob (vs R2 ~3-5ms)。`trigger_snapshot` が disk にも書くため、Container restart 時は disk cache → R2 skip で高速復旧。**Arrow row-group chunk `[IMPLEMENTED]`**: 大きい vertex/edge table は byte-based で自動分割 (default 32 MB/chunk)。`estimate_bytes_per_row()` が Arrow buffer size から行単価を推定 → `target_bytes / bytes_per_row` で chunk row 数算出 (clamp [1K, 10M])。R2 key: `vertex_table_{i}_chunk_{j}` / meta field: `vertex_table_{i}_chunks`。Old single-blob format は deserialize 時に自動検出 (backward compat)。1B vertices でも ~数十 chunks (S3/R2 10億ファイル問題回避)。
+R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in-memory CSR に append のみ)。PK dedup は in-memory 内のみ。R2 既存データとの dedup は snapshot compaction 時。**Dirty tracking**: dirty flag が true の時のみ snapshot upload。**Snapshot compaction**: R2 既存 + in-memory pending → merge by PK → ArrowFragment → R2 PUT。**Partial page-in protection**: `last_snapshot_count` で上書き防止。**Name-based blob** (CAS 除去): `snap/fragment/{name}` で直接 PUT/GET。Blake3 hash 不要。**2-Phase Cold Start `[IMPLEMENTED]`**: Phase 1: `page_in_topology_from_r2` — meta+schema+ivnums+CSR topology のみ load (vertex properties skip, ~25% data)。stub vertices で VID ordering 確立、query 即受付可能。Phase 2: query の label hints → `enrich_label_from_r2` で on-demand property load → `set_vertex_prop`。**3-tier blob fetch**: `fetch_blob_cached()` — disk cache → R2 GET → write-through。**Arrow row-group chunk `[IMPLEMENTED]`**: 大きい vertex/edge table は byte-based で自動分割 (default 32 MB/chunk)。`estimate_bytes_per_row()` が Arrow buffer size から行単価を推定 → `target_bytes / bytes_per_row` で chunk row 数算出 (clamp [1K, 10M])。R2 key: `vertex_table_{i}_chunk_{j}` / meta field: `vertex_table_{i}_chunks`。Old single-blob format は deserialize 時に自動検出 (backward compat)。1B vertices でも ~数十 chunks (S3/R2 10億ファイル問題回避)。
 
 ## Concurrency Model (CRITICAL)
 
@@ -213,17 +213,20 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
   backward-compat: old single-blob format auto-detected on deserialize
   note: production は default byte target (32MB) で snapshot
 
-`[IMPLEMENTED]` Phase 3c: Label-selective page-in (ensure_labels)
-  evidence: yata-engine/src/loader.rs (page_in_selective_from_r2, restore_csr_selective, enrich_label_from_r2, apply_batch_properties, extract_arrow_value)
-  evidence: yata-engine/src/engine.rs (ensure_labels_vineyard_only, enrich_new_labels, cached_meta/cached_schema/label_vid_offsets)
+`[IMPLEMENTED]` Phase 3c: 2-Phase Cold Start + On-Demand Property Enrichment
+  evidence: yata-engine/src/loader.rs (page_in_topology_from_r2, restore_csr_selective, enrich_label_from_r2, apply_batch_properties, extract_arrow_value)
+  evidence: yata-engine/src/engine.rs (ensure_labels_vineyard_only 2-phase, enrich_new_labels, cached_meta/cached_schema/label_vid_offsets)
   mechanism:
-    **cold start (1st call): ALWAYS full page-in** (3-tier: disk cache → R2)。
-      selective page-in with stubs on cold start は property-loss regression を引き起こすため禁止 (2026-03-25 hotfix)。
-      全 label を full properties で load → loaded_labels に全登録。
-    incremental (hot_initialized=true 後): page_in_selective_from_r2 で新 label のみ fetch → set_vertex_prop。
-  3-tier blob fetch: fetch_blob_cached() — disk cache (YATA_VINEYARD_DIR) → R2 GET → write-through。Container restart with warm disk: ~100µs/blob (R2 skip)
-  test: 854 workspace unit tests pass + e2e_phase3_loadtest (8 tests) + docker-compose cold restart verified (60 nodes, 3 labels, property access OK)
-  production: `[PRODUCTION]` deploy verified (2026-03-25, image `20260325-0945`)。searchActors 10 actors, getTimeline 1 item, cold restart data intact
+    **Phase 1 (cold start): topology-only page-in** (~25% data)。
+      page_in_topology_from_r2: meta+schema+ivnums+ALL CSR offsets/nbrs → stub vertices (VID ordering OK, 0 properties)。
+      hot_initialized=true 直後から query 受付可能 (count/traversal は properties 不要)。
+    **Phase 2 (on-demand): per-query property enrichment**。
+      query の label hints → loaded_labels に未登録の label → enrich_label_from_r2 → set_vertex_prop on stubs。
+      同一 label の 2 回目以降は loaded_labels cache hit (0 R2 fetch)。
+    **fallback**: topology page-in 失敗時は full page-in (legacy path)。
+  3-tier blob fetch: fetch_blob_cached() — disk cache (YATA_VINEYARD_DIR) → R2 GET → write-through
+  test: 854 unit tests + docker-compose 2-phase cold restart verified (60 nodes, 3 labels, property access OK, 2nd restart disk cache warm)
+  production: `[PRODUCTION]` deploy verified (2026-03-25, image `20260325-1000`)。searchActors 5, getTimeline 4
 
 `[DEPRECATED]` LSMGraph 4-level tiered storage
   reason: 現 ArrowFragment + snapshot compaction が LSM の本質 (immutable sorted runs + compaction) を
@@ -239,11 +242,13 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
 
 ```
 Query fast path (GIE, <1µs): [PRODUCTION]
-  Cypher → parse → extract_pushdown_hints → ensure_labels (3-tier full page-in on cold start) →
+  Cypher → parse → extract_pushdown_hints → ensure_labels (2-phase) →
   GIE transpile → IR Plan → CSR direct push-based execute
   CONDITIONS: single CSR partition
   RLS: transpile_secured() injects SecurityFilter after Scan/Expand ops
-  Page-in: cold start = full page-in (disk → R2)。hot = incremental enrichment only
+  Page-in (2-phase):
+    Phase 1 (cold): topology-only (stubs + edges, ~25% data, disk → R2)
+    Phase 2 (on-demand): per-label property enrichment (query label hints → enrich stubs)
 
 Query GIE fallback → MemoryGraph (~1-200ms): [PRODUCTION]
   GIE transpile fails (mutation or unsupported Cypher) → MemoryGraph copy → Cypher execute
@@ -326,7 +331,7 @@ Read latency:
 | Chunked snapshot (1,250 vertices) | 73-111ms |
 | test: `yata-server/tests/e2e_phase3_loadtest.rs` (8 tests pass) |
 
-**Production E2E (pds.gftd.ai → YataRPC → Container, 2026-03-25, image `20260325-0945`):**
+**Production E2E (pds.gftd.ai → YataRPC → Container, 2026-03-25, image `20260325-1000`):**
 | Metric | Result | Notes |
 |---|---|---|
 | Cold start (container wake) | **2.8s** | Container sleep → wake + R2 page-in |
