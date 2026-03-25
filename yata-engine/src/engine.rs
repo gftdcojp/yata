@@ -397,7 +397,8 @@ impl TieredGraphEngine {
                 let vc = store.vertex_count();
                 let ec = store.edge_count();
                 if vc == 0 && ec == 0 {
-                    tracing::debug!("R2 page-in: empty fragment, skipping");
+                    tracing::debug!("R2 page-in: empty fragment, marking hot_initialized to prevent re-page-in overwriting mergeRecord data");
+                    self.hot_initialized.store(true, Ordering::Relaxed);
                     return;
                 }
                 if let Ok(mut last) = self.last_snapshot_count.lock() {
@@ -409,13 +410,47 @@ impl TieredGraphEngine {
                     }
                 }
                 if let Ok(mut hot) = self.hot.write() {
-                    *hot = yata_store::GraphStoreEnum::Single(store);
+                    // Merge R2 data into existing CSR (preserves mergeRecord data added since restart).
+                    // If CSR is empty (typical cold start), this is equivalent to overwrite.
+                    if let Some(existing) = hot.as_single_mut() {
+                        let existing_vc = yata_grin::Topology::vertex_count(existing);
+                        if existing_vc > 0 {
+                            // CSR has data from mergeRecord — merge R2 into it (R2 data as base, existing as overlay)
+                            use yata_grin::{Scannable, Property, Schema as GrinSchema};
+                            for label in GrinSchema::vertex_labels(&store) {
+                                for vid in Scannable::scan_vertices_by_label(&store, &label) {
+                                    let props: Vec<(String, yata_grin::PropValue)> = store
+                                        .vertex_prop_keys(&label)
+                                        .iter()
+                                        .filter_map(|k| store.vertex_prop(vid, k).map(|v| (k.clone(), v)))
+                                        .collect();
+                                    let props_ref: Vec<(&str, yata_grin::PropValue)> =
+                                        props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                                    if let Some(pk_val) = props.iter().find(|(k, _)| k == "rkey").map(|(_, v)| v.clone()) {
+                                        existing.merge_by_pk(&label, "rkey", &pk_val, &props_ref);
+                                    } else {
+                                        existing.add_vertex(&label, &props_ref);
+                                    }
+                                }
+                            }
+                            existing.commit();
+                            tracing::info!(r2_vertices = vc, existing_vertices = existing_vc, "R2 merge into existing CSR (preserving mergeRecord data)");
+                        } else {
+                            // CSR is empty — direct overwrite (typical cold start)
+                            *hot = yata_store::GraphStoreEnum::Single(store);
+                            tracing::info!(vertices = vc, edges = ec, "R2 full page-in complete (3-tier: disk→R2)");
+                        }
+                    } else {
+                        *hot = yata_store::GraphStoreEnum::Single(store);
+                        tracing::info!(vertices = vc, edges = ec, "R2 full page-in complete (3-tier: disk→R2)");
+                    }
                     self.hot_initialized.store(true, Ordering::Relaxed);
                 }
-                tracing::info!(vertices = vc, edges = ec, "R2 full page-in complete (3-tier: disk→R2)");
             }
             Err(e) => {
                 tracing::debug!("R2 page-in failed (may not exist yet): {e}");
+                // Mark hot_initialized to prevent repeated page-in attempts that could overwrite mergeRecord data
+                self.hot_initialized.store(true, Ordering::Relaxed);
             }
         }
     }
