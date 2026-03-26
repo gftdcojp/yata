@@ -315,7 +315,7 @@ RUSTC_WRAPPER="" cargo zigbuild --manifest-path packages/server/yata/Cargo.toml 
 |---|---|---|
 | `collectionToLabel` snake_case 未対応 | `.split(/[-_]/)` で snake_case + kebab-case 両対応 | `pds-helpers.ts:223` |
 | `buildProfileView` displayName fallback = DID | fallback を `didToHandle(actor)` に変更 (handle 表示) | `pds-helpers.ts:315` |
-| `GetProfile` が `Profile` label のみ参照 (R2 未永続化) | `PDSProfile` (R2 永続化) へ fallback 追加。display_name/description を PDSProfile から補完 | `pds-dispatch.ts:910-927` |
+| `AppBskyActorGetProfile` が `Profile` label のみ参照 (R2 未永続化) | `PDSProfile` (R2 永続化) へ fallback 追加。display_name/description を PDSProfile から補完 | `pds-dispatch.ts:910-927` |
 | label consistency テスト未整備 | `pds-helpers.test.ts` に snake_case テスト 5 件 + label consistency check 追加 (214 tests pass) | `pds-helpers.test.ts` |
 
 **診断手順 (label ↔ collection mismatch)**:
