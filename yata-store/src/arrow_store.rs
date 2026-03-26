@@ -62,6 +62,8 @@ pub struct ArrowGraphStore {
     csr: HashMap<String, CsrSegment>,
     /// VID → (label, batch_index, row_index) for O(1) property lookup.
     vid_index: HashMap<u32, (String, usize, usize)>,
+    /// EID → (label, batch_index, row_index) for O(1) edge property lookup.
+    eid_index: HashMap<u32, (String, usize, usize)>,
     /// PK index: (label, pk_key) → { pk_value → vid }.
     pk_index: HashMap<(String, String), HashMap<String, u32>>,
     /// Pending vertex mutations (WAL buffer).
@@ -80,6 +82,8 @@ pub struct ArrowGraphStore {
     partition_id: PartitionId,
     /// Loaded labels (to avoid re-loading).
     loaded_labels: std::collections::HashSet<String>,
+    /// Tombstone set for deleted edges (cleared on CSR rebuild / next snapshot).
+    deleted_edges: std::collections::HashSet<u32>,
 }
 
 impl ArrowGraphStore {
@@ -89,6 +93,7 @@ impl ArrowGraphStore {
             edge_batches: HashMap::new(),
             csr: HashMap::new(),
             vid_index: HashMap::new(),
+            eid_index: HashMap::new(),
             pk_index: HashMap::new(),
             pending_vertices: Vec::new(),
             pending_props: HashMap::new(),
@@ -98,6 +103,7 @@ impl ArrowGraphStore {
             edge_label_set: Vec::new(),
             partition_id,
             loaded_labels: std::collections::HashSet::new(),
+            deleted_edges: std::collections::HashSet::new(),
         }
     }
 
@@ -185,6 +191,7 @@ impl ArrowGraphStore {
                         let src = srcs.value(row) as u32;
                         let dst = dsts.value(row) as u32;
                         let eid = self.next_eid.fetch_add(1, Ordering::Relaxed) as u32;
+                        self.eid_index.insert(eid, (label.to_string(), batches.len(), row));
                         edges.push((src, dst, eid));
                     }
                 }
@@ -377,7 +384,8 @@ impl Topology for ArrowGraphStore {
     }
 
     fn edge_count(&self) -> usize {
-        self.next_eid.load(Ordering::Relaxed) as usize
+        let total = self.next_eid.load(Ordering::Relaxed) as usize;
+        total.saturating_sub(self.deleted_edges.len())
     }
 
     fn has_vertex(&self, vid: u32) -> bool {
@@ -389,7 +397,9 @@ impl Topology for ArrowGraphStore {
             .map(|seg| {
                 let v = vid as usize;
                 if v + 1 < seg.out_offsets.len() {
-                    (seg.out_offsets[v + 1] - seg.out_offsets[v]) as usize
+                    let start = seg.out_offsets[v] as usize;
+                    let end = seg.out_offsets[v + 1] as usize;
+                    (start..end).filter(|&i| !self.deleted_edges.contains(&seg.out_edge_ids[i])).count()
                 } else { 0 }
             })
             .sum()
@@ -400,7 +410,9 @@ impl Topology for ArrowGraphStore {
             .map(|seg| {
                 let v = vid as usize;
                 if v + 1 < seg.in_offsets.len() {
-                    (seg.in_offsets[v + 1] - seg.in_offsets[v]) as usize
+                    let start = seg.in_offsets[v] as usize;
+                    let end = seg.in_offsets[v + 1] as usize;
+                    (start..end).filter(|&i| !self.deleted_edges.contains(&seg.in_edge_ids[i])).count()
                 } else { 0 }
             })
             .sum()
@@ -414,6 +426,7 @@ impl Topology for ArrowGraphStore {
                 let start = seg.out_offsets[v] as usize;
                 let end = seg.out_offsets[v + 1] as usize;
                 for i in start..end {
+                    if self.deleted_edges.contains(&seg.out_edge_ids[i]) { continue; }
                     result.push(Neighbor {
                         vid: seg.out_targets[i],
                         edge_id: seg.out_edge_ids[i],
@@ -433,6 +446,7 @@ impl Topology for ArrowGraphStore {
                 let start = seg.in_offsets[v] as usize;
                 let end = seg.in_offsets[v + 1] as usize;
                 for i in start..end {
+                    if self.deleted_edges.contains(&seg.in_edge_ids[i]) { continue; }
                     result.push(Neighbor {
                         vid: seg.in_sources[i],
                         edge_id: seg.in_edge_ids[i],
@@ -482,8 +496,33 @@ impl Property for ArrowGraphStore {
         self.get_vertex_prop(vid, key)
     }
 
-    fn edge_prop(&self, _edge_id: u32, _key: &str) -> Option<PropValue> {
-        // Edge properties from Arrow batches (TODO: wire edge prop lookup)
+    fn edge_prop(&self, edge_id: u32, key: &str) -> Option<PropValue> {
+        // Skip internal topology columns
+        if key == "_src" || key == "_dst" {
+            return None;
+        }
+
+        let (label, batch_idx, row_idx) = self.eid_index.get(&edge_id)?;
+        let batches = self.edge_batches.get(label.as_str())?;
+        let batch = batches.get(*batch_idx)?;
+        let schema = batch.schema();
+        let col_idx = schema.fields().iter().position(|f| f.name() == key)?;
+        let col = batch.column(col_idx);
+
+        if col.is_null(*row_idx) {
+            return None;
+        }
+
+        if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+            return Some(PropValue::Str(arr.value(*row_idx).to_string()));
+        }
+        if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+            return Some(PropValue::Int(arr.value(*row_idx)));
+        }
+        if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+            return Some(PropValue::Float(arr.value(*row_idx)));
+        }
+
         None
     }
 

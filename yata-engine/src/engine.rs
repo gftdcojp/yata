@@ -183,6 +183,9 @@ pub struct TieredGraphEngine {
     /// Dirty flag: set to true on any write (merge/delete). Cleared after snapshot.
     /// Prevents redundant R2 uploads when no mutations occurred.
     dirty: Arc<AtomicBool>,
+    /// Per-label dirty tracking: labels mutated since last snapshot.
+    /// Enables future delta PUT (only dirty labels serialized).
+    dirty_labels: Arc<Mutex<HashSet<String>>>,
     /// Last snapshot vertex+edge count. Used to detect partial page-in corruption.
     last_snapshot_count: Arc<Mutex<(u64, u64)>>,
     /// Cached fragment meta from R2 (for incremental label enrichment).
@@ -288,6 +291,7 @@ impl TieredGraphEngine {
             s3_client,
             s3_prefix,
             dirty: Arc::new(AtomicBool::new(false)),
+            dirty_labels: Arc::new(Mutex::new(HashSet::new())),
             last_snapshot_count: Arc::new(Mutex::new((0, 0))),
             cached_meta: Arc::new(Mutex::new(None)),
             cached_schema: Arc::new(Mutex::new(None)),
@@ -367,8 +371,8 @@ impl TieredGraphEngine {
     ///    — re-page-in from Vineyard is Arrow decode only (no R2 fetch)
     ///
     /// If `labels` is empty, loads ALL labels (mutation path fallback).
-    fn ensure_labels(&self, vertex_labels: &[&str], edge_labels: &[&str]) {
-        self.ensure_labels_vineyard_only(vertex_labels, edge_labels);
+    fn ensure_labels(&self, vertex_labels: &[&str]) {
+        self.ensure_labels_vineyard_only(vertex_labels);
     }
 
     /// Full page-in from R2 ArrowFragment snapshot (3-tier: disk cache → R2).
@@ -381,7 +385,7 @@ impl TieredGraphEngine {
     /// After cold start (hot_initialized=true):
     ///   New labels created via mergeRecord are immediately available (in-memory).
     ///   The 3-tier blob fetch (disk → R2) accelerates cold start (~100µs vs ~3-5ms per blob).
-    fn ensure_labels_vineyard_only(&self, vertex_labels: &[&str], _edge_labels: &[&str]) {
+    fn ensure_labels_vineyard_only(&self, vertex_labels: &[&str]) {
         // Phase 1: Initial cold start — selective page-in (topology + needed labels only)
         if !self.hot_initialized.load(Ordering::Relaxed) {
             let s3 = match self.get_s3_client() {
@@ -1014,6 +1018,9 @@ impl TieredGraphEngine {
         // PK dedup is done within the in-memory store only.
         // Full dedup against R2 data happens during snapshot compaction.
         self.dirty.store(true, Ordering::Relaxed);
+        if let Ok(mut dl) = self.dirty_labels.lock() {
+            dl.insert(label.to_string());
+        }
 
         if let Ok(mut hot) = self.hot.write() {
             // Arrow store path (Vineyard-native, no CSR conversion)
@@ -1048,6 +1055,9 @@ impl TieredGraphEngine {
     ) -> Result<bool, String> {
         self.ensure_labels(&[label], &[]);
         self.dirty.store(true, Ordering::Relaxed);
+        if let Ok(mut dl) = self.dirty_labels.lock() {
+            dl.insert(label.to_string());
+        }
 
         if let Ok(mut hot) = self.hot.write() {
             if let Some(arrow) = hot.as_arrow_mut() {
@@ -1070,7 +1080,12 @@ impl TieredGraphEngine {
     /// Snapshot compacts: R2 existing + in-memory new → full ArrowFragment → R2 PUT.
     pub fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
         // Skip if no mutations since last snapshot
-        if !self.dirty.load(Ordering::Relaxed) {
+        let has_dirty_labels = if let Ok(dl) = self.dirty_labels.lock() {
+            !dl.is_empty()
+        } else {
+            false
+        };
+        if !self.dirty.load(Ordering::Relaxed) && !has_dirty_labels {
             return Ok((0, 0));
         }
 
