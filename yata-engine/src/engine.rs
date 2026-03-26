@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use yata_cypher::Graph;
@@ -194,6 +194,9 @@ pub struct TieredGraphEngine {
     cached_schema: Arc<Mutex<Option<yata_vineyard::schema::PropertyGraphSchema>>>,
     /// Per-label VID offset (label → first VID). Computed once during initial page-in.
     label_vid_offsets: Arc<Mutex<HashMap<String, u32>>>,
+    /// Pending write count since last snapshot. Used with batch_commit_threshold
+    /// to avoid triggering snapshots on every single write.
+    pending_writes: Arc<AtomicUsize>,
 }
 
 impl TieredGraphEngine {
@@ -296,6 +299,7 @@ impl TieredGraphEngine {
             cached_meta: Arc::new(Mutex::new(None)),
             cached_schema: Arc::new(Mutex::new(None)),
             label_vid_offsets: Arc::new(Mutex::new(HashMap::new())),
+            pending_writes: Arc::new(AtomicUsize::new(0)),
         }
         // No startup restore — labels are lazy-loaded from R2 on first query (page-in).
         // Write path: Pipeline.send() + mergeRecord() (PDS Worker).
@@ -580,26 +584,21 @@ impl TieredGraphEngine {
             return Ok(Vec::new());
         }
 
-        // Collect all label hints across all statements for a single label load.
+        // Collect all vertex label hints across all statements for a single label load.
         let mut all_vlabels = Vec::new();
-        let mut all_elabels = Vec::new();
         for (cypher, _) in statements {
-            if let Some((vl, el)) = router::extract_mutation_hints(cypher) {
+            if let Some((vl, _el)) = router::extract_mutation_hints(cypher) {
                 all_vlabels.extend(vl);
-                all_elabels.extend(el);
             }
         }
         all_vlabels.sort();
         all_vlabels.dedup();
-        all_elabels.sort();
-        all_elabels.dedup();
 
         let vl_refs: Vec<&str> = all_vlabels.iter().map(|s| s.as_str()).collect();
-        let el_refs: Vec<&str> = all_elabels.iter().map(|s| s.as_str()).collect();
-        if !vl_refs.is_empty() || !el_refs.is_empty() {
-            self.ensure_labels(&vl_refs, &el_refs);
+        if !vl_refs.is_empty() {
+            self.ensure_labels(&vl_refs);
         } else {
-            self.ensure_labels(&[], &[]);
+            self.ensure_labels(&[]);
         }
 
         let rls_owned = rls_org_id.map(String::from);
@@ -770,12 +769,11 @@ impl TieredGraphEngine {
         if !is_mutation {
             self.ensure_hot();
 
-            // Load only labels referenced in Cypher (on demand from CAS)
-            let (hints_labels, hints_rels) =
+            // Load only vertex labels referenced in Cypher (on demand from CAS)
+            let (hints_labels, _hints_rels) =
                 router::extract_pushdown_hints(cypher).unwrap_or_default();
             let vl_refs: Vec<&str> = hints_labels.iter().map(|s| s.as_str()).collect();
-            let el_refs: Vec<&str> = hints_rels.iter().map(|s| s.as_str()).collect();
-            self.ensure_labels(&vl_refs, &el_refs);
+            self.ensure_labels(&vl_refs);
 
             // GIE path: Cypher → IR Plan → execute directly on CSR (zero MemoryGraph copy).
             // NOW supports RLS via SecurityFilter predicate pushdown (no MemoryGraph fallback).
@@ -838,11 +836,10 @@ impl TieredGraphEngine {
         // Mutation path: load only labels referenced in Cypher (targeted).
         // Falls back to load-all only when AST extraction finds no labels.
         if let Some((vlabels, elabels)) = router::extract_mutation_hints(cypher) {
-            let vl_refs: Vec<&str> = vlabels.iter().map(|s| s.as_str()).collect();
             let el_refs: Vec<&str> = elabels.iter().map(|s| s.as_str()).collect();
-            self.ensure_labels(&vl_refs, &el_refs);
+            self.ensure_labels(&vl_refs);
         } else {
-            self.ensure_labels(&[], &[]);
+            self.ensure_labels(&[]);
         }
         let rls_owned = rls_org_id.map(String::from);
 
@@ -1030,6 +1027,7 @@ impl TieredGraphEngine {
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     ll.insert(label.to_string());
                 }
+                self.pending_writes.fetch_add(1, Ordering::Relaxed);
                 return Ok(vid);
             }
             // CSR path
@@ -1040,6 +1038,7 @@ impl TieredGraphEngine {
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     ll.insert(label.to_string());
                 }
+                self.pending_writes.fetch_add(1, Ordering::Relaxed);
                 return Ok(vid);
             }
         }
@@ -1053,7 +1052,7 @@ impl TieredGraphEngine {
         pk_key: &str,
         pk_value: &str,
     ) -> Result<bool, String> {
-        self.ensure_labels(&[label], &[]);
+        self.ensure_labels(&[label]);
         self.dirty.store(true, Ordering::Relaxed);
         if let Ok(mut dl) = self.dirty_labels.lock() {
             dl.insert(label.to_string());
@@ -1226,8 +1225,11 @@ impl TieredGraphEngine {
             tracing::error!(error = %e, "R2 snapshot manifest upload failed");
         }
 
-        // Clear dirty flag and update last snapshot count
+        // Clear dirty flag, dirty labels, and update last snapshot count
         self.dirty.store(false, Ordering::Relaxed);
+        if let Ok(mut dl) = self.dirty_labels.lock() {
+            dl.clear();
+        }
         if let Ok(mut last) = self.last_snapshot_count.lock() {
             *last = (v_count, e_count);
         }
@@ -1331,8 +1333,11 @@ impl TieredGraphEngine {
             }
         }
 
-        // Clear dirty flag and update last snapshot count
+        // Clear dirty flag, dirty labels, and update last snapshot count
         self.dirty.store(false, Ordering::Relaxed);
+        if let Ok(mut dl) = self.dirty_labels.lock() {
+            dl.clear();
+        }
         if let Ok(mut last) = self.last_snapshot_count.lock() {
             *last = (v_count, e_count);
         }

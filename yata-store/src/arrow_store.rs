@@ -210,6 +210,8 @@ impl ArrowGraphStore {
         self.edge_batches.insert(label.to_string(), batches);
         self.csr.insert(label.to_string(), csr);
         self.loaded_labels.insert(label.to_string());
+        // CSR rebuilt from Arrow source — clear tombstones for this label's edges
+        self.deleted_edges.clear();
         Ok(edges.len())
     }
 
@@ -464,11 +466,12 @@ impl Topology for ArrowGraphStore {
         if v + 1 >= seg.out_offsets.len() { return vec![]; }
         let start = seg.out_offsets[v] as usize;
         let end = seg.out_offsets[v + 1] as usize;
-        (start..end).map(|i| Neighbor {
-            vid: seg.out_targets[i],
-            edge_id: seg.out_edge_ids[i],
-            edge_label: edge_label.to_string(),
-        }).collect()
+        (start..end).filter(|&i| !self.deleted_edges.contains(&seg.out_edge_ids[i]))
+            .map(|i| Neighbor {
+                vid: seg.out_targets[i],
+                edge_id: seg.out_edge_ids[i],
+                edge_label: edge_label.to_string(),
+            }).collect()
     }
 
     fn in_neighbors_by_label(&self, vid: u32, edge_label: &str) -> Vec<Neighbor> {
@@ -477,11 +480,12 @@ impl Topology for ArrowGraphStore {
         if v + 1 >= seg.in_offsets.len() { return vec![]; }
         let start = seg.in_offsets[v] as usize;
         let end = seg.in_offsets[v + 1] as usize;
-        (start..end).map(|i| Neighbor {
-            vid: seg.in_sources[i],
-            edge_id: seg.in_edge_ids[i],
-            edge_label: edge_label.to_string(),
-        }).collect()
+        (start..end).filter(|&i| !self.deleted_edges.contains(&seg.in_edge_ids[i]))
+            .map(|i| Neighbor {
+                vid: seg.in_sources[i],
+                edge_id: seg.in_edge_ids[i],
+                edge_label: edge_label.to_string(),
+            }).collect()
     }
 }
 
@@ -660,8 +664,8 @@ impl yata_grin::Mutable for ArrowGraphStore {
         self.vid_index.remove(&vid);
     }
 
-    fn delete_edge(&mut self, _edge_id: u32) {
-        // Edge deletion from Arrow is a tombstone (not implemented in detail)
+    fn delete_edge(&mut self, edge_id: u32) {
+        self.deleted_edges.insert(edge_id);
     }
 
     fn commit(&mut self) -> u64 {
@@ -800,5 +804,71 @@ mod tests {
         assert_eq!(store.vertex_count(), 1);
         assert!(store.delete_by_pk("Post", "rkey", "to_delete"));
         assert_eq!(store.vertex_count(), 0);
+    }
+
+    #[test]
+    fn test_delete_edge_tombstone() {
+        use arrow::array::{StringArray, Int64Array};
+        use arrow::datatypes::{Field, Schema as ArrowSchema, DataType};
+        use std::sync::Arc;
+
+        let mut store = ArrowGraphStore::new(PartitionId(0));
+
+        // Create 3 vertices (VIDs 0, 1, 2)
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("rkey", DataType::Utf8, false),
+        ]));
+        let rkeys = StringArray::from(vec!["a", "b", "c"]);
+        let vbatch = arrow::record_batch::RecordBatch::try_new(
+            schema, vec![Arc::new(rkeys)]
+        ).unwrap();
+        let vipc = yata_arrow::batch_to_ipc(&vbatch).unwrap();
+        store.load_vertex_label("Node", &vipc).unwrap();
+        assert_eq!(store.vertex_count(), 3);
+
+        // Create edges: 0->1 (eid=0), 0->2 (eid=1), 2->1 (eid=2)
+        let eschema = Arc::new(ArrowSchema::new(vec![
+            Field::new("_src", DataType::Int64, false),
+            Field::new("_dst", DataType::Int64, false),
+        ]));
+        let srcs = Int64Array::from(vec![0i64, 0, 2]);
+        let dsts = Int64Array::from(vec![1i64, 2, 1]);
+        let ebatch = arrow::record_batch::RecordBatch::try_new(
+            eschema, vec![Arc::new(srcs), Arc::new(dsts)]
+        ).unwrap();
+        let eipc = yata_arrow::batch_to_ipc(&ebatch).unwrap();
+        store.load_edge_label("KNOWS", &eipc).unwrap();
+
+        // Verify initial state
+        assert_eq!(store.edge_count(), 3);
+        assert_eq!(store.out_degree(0), 2);
+        assert_eq!(store.in_degree(1), 2); // from 0 and 2
+        assert_eq!(store.out_neighbors(0).len(), 2);
+        assert_eq!(store.in_neighbors(1).len(), 2);
+
+        // Delete edge 0 (0->1)
+        use yata_grin::Mutable;
+        store.delete_edge(0);
+
+        // Verify tombstone filtering
+        assert_eq!(store.edge_count(), 2);
+        assert_eq!(store.out_degree(0), 1); // only 0->2 remains
+        assert_eq!(store.in_degree(1), 1); // only 2->1 remains
+        let out = store.out_neighbors(0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].vid, 2);
+        let in_n = store.in_neighbors(1);
+        assert_eq!(in_n.len(), 1);
+        assert_eq!(in_n[0].vid, 2);
+
+        // by_label variants also filter
+        assert_eq!(store.out_neighbors_by_label(0, "KNOWS").len(), 1);
+        assert_eq!(store.in_neighbors_by_label(1, "KNOWS").len(), 1);
+
+        // Delete another edge
+        store.delete_edge(2); // 2->1
+        assert_eq!(store.edge_count(), 1);
+        assert_eq!(store.in_degree(1), 0);
+        assert_eq!(store.in_neighbors(1).len(), 0);
     }
 }
