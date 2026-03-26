@@ -43,13 +43,16 @@ Snapshot compaction (cron 1min, dirty flag gated):
     → csr_to_fragment() → name-based R2 PUT (no CAS hash)
     → dirty = false, last_snapshot_count updated
 
-Read (ArrowFragment page-in, lazy):
+Read (ArrowFragment page-in, lazy + label-selective):
   PDS_RPC.query / listRecords / getTimeline
     → YATA_RPC.cypher → TieredGraphEngine
-    → ensure_labels() → hot_initialized == false?
-      → page_in_from_r2() → R2 GET snap/fragment/{name} → ArrowFragment
+    → ensure_labels(vertex_labels) → hot_initialized == false?
+      → label hints あり: page_in_selective_from_r2(needed_labels) → topology + needed labels のみ
+      → label hints なし: page_in_topology_from_r2() → topology のみ (stub vertices)
       → CSR に merge (既存 mergeRecord データを保護。empty/error でも hot_initialized = true)
       → hot_initialized = true (再 page-in による上書き防止)
+    → hot_initialized == true && 未 load label あり?
+      → enrich_new_labels() → per-label on-demand enrichment (R2 GET vertex_table_{i} のみ)
     → CSR direct query (<1µs)
 
 PDS Container (Rust) は不要 — 全て TS Worker + Pipeline + YATA_RPC。
@@ -215,7 +218,7 @@ Production: PARTITION_COUNT=1, per-label Arrow IPC, full page-in (3-tier: disk�
 - **Query fallback** (~1-200ms): GIE fails → MemoryGraph copy → Cypher execute
 - **Mutation** (~500ms): MemoryGraph copy → mutate → CSR rebuild。merge_by_pk = prop_eq_index O(1)
 - **Storage**: RAM (CSR <1us) → disk cache (~100us) → R2 source of truth (~3-5ms)
-- **Cold start**: full page-in (ALL labels, ALL properties)。3-tier blob fetch (disk → R2 → write-through)
+- **Cold start**: **label-selective page-in** (topology + query-needed labels only)。3-tier blob fetch (disk → R2 → write-through)。後続 query で on-demand enrich (enrich_new_labels)
 - **Chunk**: Arrow row-group 32 MB/chunk byte-based。1B vertices でも ~数十 chunks
 - **Partition fan-out**: 1x standard-1 = ~20M nodes (production)。4x standard-1 = ~100M (E2E verified)
 
