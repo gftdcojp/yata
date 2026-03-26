@@ -381,77 +381,110 @@ impl TieredGraphEngine {
     /// After cold start (hot_initialized=true):
     ///   New labels created via mergeRecord are immediately available (in-memory).
     ///   The 3-tier blob fetch (disk → R2) accelerates cold start (~100µs vs ~3-5ms per blob).
-    fn ensure_labels_vineyard_only(&self, _vertex_labels: &[&str], _edge_labels: &[&str]) {
-        if self.hot_initialized.load(Ordering::Relaxed) {
+    fn ensure_labels_vineyard_only(&self, vertex_labels: &[&str], _edge_labels: &[&str]) {
+        // Phase 1: Initial cold start — selective page-in (topology + needed labels only)
+        if !self.hot_initialized.load(Ordering::Relaxed) {
+            let s3 = match self.get_s3_client() {
+                Some(s3) => s3.clone(),
+                None => return,
+            };
+
+            // Build needed label set from query hints (empty = topology-only bootstrap)
+            let needed: std::collections::HashSet<String> = vertex_labels.iter()
+                .map(|l| l.to_string())
+                .collect();
+
+            let page_in_result = if needed.is_empty() {
+                // No label hints — use topology-only page-in (fastest cold start)
+                crate::loader::page_in_topology_from_r2(&s3, &self.s3_prefix, self.config.hot_partition_id)
+                    .map(|(store, meta, schema, offsets)| {
+                        // Cache meta/schema/offsets for incremental enrichment
+                        if let Ok(mut cm) = self.cached_meta.lock() { *cm = Some(meta); }
+                        if let Ok(mut cs) = self.cached_schema.lock() { *cs = Some(schema); }
+                        if let Ok(mut lo) = self.label_vid_offsets.lock() { *lo = offsets; }
+                        (store, std::collections::HashSet::<String>::new())
+                    })
+            } else {
+                // Label hints available — selective page-in (topology + needed labels)
+                crate::loader::page_in_selective_from_r2(&s3, &self.s3_prefix, self.config.hot_partition_id, &needed)
+                    .map(|(store, meta, schema, loaded)| {
+                        // Cache meta/schema for incremental enrichment
+                        let mut offsets = std::collections::HashMap::new();
+                        let mut offset = 0u32;
+                        for entry in &schema.vertex_entries {
+                            offsets.insert(entry.label.clone(), offset);
+                            let count = yata_grin::Scannable::scan_vertices_by_label(&store, &entry.label).len();
+                            offset += count as u32;
+                        }
+                        if let Ok(mut cm) = self.cached_meta.lock() { *cm = Some(meta); }
+                        if let Ok(mut cs) = self.cached_schema.lock() { *cs = Some(schema); }
+                        if let Ok(mut lo) = self.label_vid_offsets.lock() { *lo = offsets; }
+                        (store, loaded)
+                    })
+            };
+
+            match page_in_result {
+                Ok((store, loaded_labels)) => {
+                    let vc = yata_grin::Topology::vertex_count(&store);
+                    let ec = yata_grin::Topology::edge_count(&store);
+                    if vc == 0 && ec == 0 {
+                        tracing::debug!("R2 page-in: empty fragment");
+                        self.hot_initialized.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    if let Ok(mut last) = self.last_snapshot_count.lock() {
+                        *last = (vc as u64, ec as u64);
+                    }
+                    if let Ok(mut ll) = self.loaded_labels.lock() {
+                        for label in &loaded_labels {
+                            ll.insert(label.clone());
+                        }
+                    }
+                    if let Ok(mut hot) = self.hot.write() {
+                        if let Some(existing) = hot.as_single_mut() {
+                            let existing_vc = yata_grin::Topology::vertex_count(existing);
+                            if existing_vc > 0 {
+                                use yata_grin::{Scannable, Property, Schema as GrinSchema};
+                                for label in GrinSchema::vertex_labels(&store) {
+                                    for vid in Scannable::scan_vertices_by_label(&store, &label) {
+                                        let props: Vec<(String, yata_grin::PropValue)> = store
+                                            .vertex_prop_keys(&label)
+                                            .iter()
+                                            .filter_map(|k| store.vertex_prop(vid, k).map(|v| (k.clone(), v)))
+                                            .collect();
+                                        let props_ref: Vec<(&str, yata_grin::PropValue)> =
+                                            props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                                        if let Some(pk_val) = props.iter().find(|(k, _)| k == "rkey").map(|(_, v)| v.clone()) {
+                                            existing.merge_by_pk(&label, "rkey", &pk_val, &props_ref);
+                                        } else {
+                                            existing.add_vertex(&label, &props_ref);
+                                        }
+                                    }
+                                }
+                                existing.commit();
+                                tracing::info!(r2_vertices = vc, existing_vc, loaded = loaded_labels.len(), "selective merge into existing CSR");
+                            } else {
+                                *hot = yata_store::GraphStoreEnum::Single(store);
+                                tracing::info!(vertices = vc, edges = ec, loaded = loaded_labels.len(), "selective page-in complete (3-tier: disk→R2)");
+                            }
+                        } else {
+                            *hot = yata_store::GraphStoreEnum::Single(store);
+                            tracing::info!(vertices = vc, edges = ec, loaded = loaded_labels.len(), "selective page-in complete (3-tier: disk→R2)");
+                        }
+                        self.hot_initialized.store(true, Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("R2 page-in failed (may not exist yet): {e}");
+                    self.hot_initialized.store(true, Ordering::Relaxed);
+                }
+            }
             return;
         }
 
-        let s3 = match self.get_s3_client() {
-            Some(s3) => s3.clone(),
-            None => return,
-        };
-
-        // Full page-in: all labels, all properties, 3-tier (disk cache → R2).
-        match crate::loader::page_in_from_r2(&s3, &self.s3_prefix, self.config.hot_partition_id) {
-            Ok(store) => {
-                let vc = store.vertex_count();
-                let ec = store.edge_count();
-                if vc == 0 && ec == 0 {
-                    tracing::debug!("R2 page-in: empty fragment, marking hot_initialized to prevent re-page-in overwriting mergeRecord data");
-                    self.hot_initialized.store(true, Ordering::Relaxed);
-                    return;
-                }
-                if let Ok(mut last) = self.last_snapshot_count.lock() {
-                    *last = (vc as u64, ec as u64);
-                }
-                if let Ok(mut ll) = self.loaded_labels.lock() {
-                    for label in yata_grin::Schema::vertex_labels(&store) {
-                        ll.insert(label);
-                    }
-                }
-                if let Ok(mut hot) = self.hot.write() {
-                    // Merge R2 data into existing CSR (preserves mergeRecord data added since restart).
-                    // If CSR is empty (typical cold start), this is equivalent to overwrite.
-                    if let Some(existing) = hot.as_single_mut() {
-                        let existing_vc = yata_grin::Topology::vertex_count(existing);
-                        if existing_vc > 0 {
-                            // CSR has data from mergeRecord — merge R2 into it (R2 data as base, existing as overlay)
-                            use yata_grin::{Scannable, Property, Schema as GrinSchema};
-                            for label in GrinSchema::vertex_labels(&store) {
-                                for vid in Scannable::scan_vertices_by_label(&store, &label) {
-                                    let props: Vec<(String, yata_grin::PropValue)> = store
-                                        .vertex_prop_keys(&label)
-                                        .iter()
-                                        .filter_map(|k| store.vertex_prop(vid, k).map(|v| (k.clone(), v)))
-                                        .collect();
-                                    let props_ref: Vec<(&str, yata_grin::PropValue)> =
-                                        props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-                                    if let Some(pk_val) = props.iter().find(|(k, _)| k == "rkey").map(|(_, v)| v.clone()) {
-                                        existing.merge_by_pk(&label, "rkey", &pk_val, &props_ref);
-                                    } else {
-                                        existing.add_vertex(&label, &props_ref);
-                                    }
-                                }
-                            }
-                            existing.commit();
-                            tracing::info!(r2_vertices = vc, existing_vertices = existing_vc, "R2 merge into existing CSR (preserving mergeRecord data)");
-                        } else {
-                            // CSR is empty — direct overwrite (typical cold start)
-                            *hot = yata_store::GraphStoreEnum::Single(store);
-                            tracing::info!(vertices = vc, edges = ec, "R2 full page-in complete (3-tier: disk→R2)");
-                        }
-                    } else {
-                        *hot = yata_store::GraphStoreEnum::Single(store);
-                        tracing::info!(vertices = vc, edges = ec, "R2 full page-in complete (3-tier: disk→R2)");
-                    }
-                    self.hot_initialized.store(true, Ordering::Relaxed);
-                }
-            }
-            Err(e) => {
-                tracing::debug!("R2 page-in failed (may not exist yet): {e}");
-                // Mark hot_initialized to prevent repeated page-in attempts that could overwrite mergeRecord data
-                self.hot_initialized.store(true, Ordering::Relaxed);
-            }
+        // Phase 2: Incremental enrichment — load new labels on demand
+        if !vertex_labels.is_empty() {
+            self.enrich_new_labels(vertex_labels);
         }
     }
 
