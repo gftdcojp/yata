@@ -1,6 +1,6 @@
 # packages/rust/yata
 
-yata — Rust Cypher graph engine. `[PRODUCTION]` Container (CSR + DiskVineyard/MmapVineyard) × 1 partition. Workers RPC coordinator. GraphScope parity 21/25 (14 PRODUCTION + 7 IMPLEMENTED)。Vineyard + GIE push-based + SecurityFilter RLS + Arrow row-group chunk + label-selective page-in。
+yata — Rust Cypher graph engine. `[PRODUCTION]` Container (CSR + DiskVineyard/MmapVineyard) × 1 partition. Workers RPC coordinator. GraphScope parity 21/25 (14 PRODUCTION + 7 IMPLEMENTED)。Vineyard + GIE push-based + SecurityFilter RLS + Arrow row-group chunk + label-selective page-in + edge property lookup + edge tombstone deletion + dirty label tracking + batch commit threshold + adaptive √N fan-out。
 
 ## Architecture (CRITICAL)
 
@@ -115,11 +115,11 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
 
 **Append-only write safety**: mergeRecord は page-in 不要 → write lock scope は merge_by_pk + commit のみ (~µs)。snapshot compaction が write lock を取るのは R2 既存データの CSR merge 時のみ (初回 1 回)。
 
-## Snapshot Model — Dirty Label Delta `[DESIGN]`
+## Snapshot Model — Dirty Label Delta `[IMPLEMENTED tracking, DESIGN delta PUT]`
 
 ### Facts (現状 `[PRODUCTION]`)
 
-**現行**: `trigger_snapshot()` は CSR 全内容を ArrowFragment として R2 PUT (full compaction overwrite)。dirty flag (boolean) でゲート。
+**現行**: `trigger_snapshot()` は CSR 全内容を ArrowFragment として R2 PUT (full compaction overwrite)。`dirty: AtomicBool` + `dirty_labels: Mutex<HashSet<String>>` で per-label dirty tracking 実装済み (2026-03-26)。`pending_writes: AtomicUsize` + `batch_commit_threshold` で snapshot 頻度制御 (2026-03-26)。Delta PUT (dirty label のみ R2 PUT) は future optimization。
 
 **Durability は Pipeline WAL が保証。** Pipeline → R2 JSON (10s flush) が WAL source of truth。yata snapshot は CSR の performance checkpoint であり、Pipeline WAL から rebuild 可能。
 
@@ -214,9 +214,9 @@ Production: PARTITION_COUNT=1, per-label Arrow IPC, full page-in (3-tier: disk�
 
 ### Key behaviors
 
-- **Query fast path** (GIE, <1us): Cypher → parse → ensure_labels (full page-in) → GIE transpile → CSR push-based execute
+- **Query fast path** (GIE, <1us): Cypher → parse → ensure_labels (selective page-in) → GIE transpile → CSR push-based execute
 - **Query fallback** (~1-200ms): GIE fails → MemoryGraph copy → Cypher execute
-- **Mutation** (~500ms): MemoryGraph copy → mutate → CSR rebuild。merge_by_pk = prop_eq_index O(1)
+- **Mutation** (~500ms): MemoryGraph copy → mutate → CSR rebuild。merge_by_pk = prop_eq_index O(1)。Edge deletion = tombstone HashSet (O(1) lookup in neighbor iteration)
 - **Storage**: RAM (CSR <1us) → disk cache (~100us) → R2 source of truth (~3-5ms)
 - **Cold start**: **label-selective page-in** (topology + query-needed labels only)。3-tier blob fetch (disk → R2 → write-through)。後続 query で on-demand enrich (enrich_new_labels)
 - **Chunk**: Arrow row-group 32 MB/chunk byte-based。1B vertices でも ~数十 chunks
@@ -228,8 +228,8 @@ Production: PARTITION_COUNT=1, per-label Arrow IPC, full page-in (3-tier: disk�
 |---|---|---|
 | `YATA_S3_*` | (empty) | R2 endpoint/bucket/key/secret/prefix |
 | `YATA_MMAP_VINEYARD` | `false` | Enable MmapVineyard (zero-copy) |
-| `YATA_DIRECT_FAN_OUT_LIMIT` | `8` | Below this, direct fan-out; above, hierarchical √N |
-| `YATA_BATCH_COMMIT_THRESHOLD` | `10` | R2 snapshot upload triggers after this many WAL commits |
+| `YATA_DIRECT_FAN_OUT_LIMIT` | `8` | Below this, direct fan-out; above, hierarchical √N `[IMPLEMENTED]` (companion Worker adaptive routing) |
+| `YATA_BATCH_COMMIT_THRESHOLD` | `10` | R2 snapshot skipped if pending_writes < threshold `[IMPLEMENTED]` (engine.rs pending_writes gate) |
 | `YATA_CHUNK_TARGET_BYTES` | `33554432` (32 MB) | Arrow row-group chunk target byte size per blob。R2/S3 最適 8-64 MB |
 | `YATA_CHUNK_ROWS` | (unset) | 設定時は byte-based estimation を override し固定 row 数で chunk 分割 |
 
