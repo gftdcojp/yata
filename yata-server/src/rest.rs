@@ -399,7 +399,7 @@ impl GraphQueryExecutor for yata_engine::TieredGraphEngine {
     }
 
     fn force_snapshot_flush(&self) {
-        let _ = self.trigger_snapshot();
+        let _ = self.trigger_snapshot_force();
     }
 
     fn trigger_snapshot(&self) -> Result<(u64, u64), String> {

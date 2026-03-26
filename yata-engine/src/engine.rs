@@ -770,7 +770,7 @@ impl TieredGraphEngine {
             self.ensure_hot();
 
             // Load only vertex labels referenced in Cypher (on demand from CAS)
-            let (hints_labels, _hints_rels) =
+            let (hints_labels, hints_rels) =
                 router::extract_pushdown_hints(cypher).unwrap_or_default();
             let vl_refs: Vec<&str> = hints_labels.iter().map(|s| s.as_str()).collect();
             self.ensure_labels(&vl_refs);
@@ -835,8 +835,8 @@ impl TieredGraphEngine {
 
         // Mutation path: load only labels referenced in Cypher (targeted).
         // Falls back to load-all only when AST extraction finds no labels.
-        if let Some((vlabels, elabels)) = router::extract_mutation_hints(cypher) {
-            let el_refs: Vec<&str> = elabels.iter().map(|s| s.as_str()).collect();
+        if let Some((vlabels, _elabels)) = router::extract_mutation_hints(cypher) {
+            let vl_refs: Vec<&str> = vlabels.iter().map(|s| s.as_str()).collect();
             self.ensure_labels(&vl_refs);
         } else {
             self.ensure_labels(&[]);
@@ -1078,6 +1078,15 @@ impl TieredGraphEngine {
     /// Append-only writes don't page-in, so in-memory CSR may only have new records.
     /// Snapshot compacts: R2 existing + in-memory new → full ArrowFragment → R2 PUT.
     pub fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
+        self.trigger_snapshot_inner(false)
+    }
+
+    /// Force-trigger R2 snapshot, bypassing the batch_commit_threshold check.
+    pub fn trigger_snapshot_force(&self) -> Result<(u64, u64), String> {
+        self.trigger_snapshot_inner(true)
+    }
+
+    fn trigger_snapshot_inner(&self, force: bool) -> Result<(u64, u64), String> {
         // Skip if no mutations since last snapshot
         let has_dirty_labels = if let Ok(dl) = self.dirty_labels.lock() {
             !dl.is_empty()
@@ -1086,6 +1095,12 @@ impl TieredGraphEngine {
         };
         if !self.dirty.load(Ordering::Relaxed) && !has_dirty_labels {
             return Ok((0, 0));
+        }
+
+        // Check batch_commit_threshold: skip snapshot if not enough pending writes
+        let pending = self.pending_writes.load(Ordering::Relaxed);
+        if pending < self.config.batch_commit_threshold as usize && !force {
+            return Ok((0, 0)); // Not enough writes to justify snapshot
         }
 
         let s3 = self.get_s3_client()
@@ -1225,8 +1240,9 @@ impl TieredGraphEngine {
             tracing::error!(error = %e, "R2 snapshot manifest upload failed");
         }
 
-        // Clear dirty flag, dirty labels, and update last snapshot count
+        // Clear dirty flag, dirty labels, pending writes, and update last snapshot count
         self.dirty.store(false, Ordering::Relaxed);
+        self.pending_writes.store(0, Ordering::Relaxed);
         if let Ok(mut dl) = self.dirty_labels.lock() {
             dl.clear();
         }
@@ -1333,8 +1349,9 @@ impl TieredGraphEngine {
             }
         }
 
-        // Clear dirty flag, dirty labels, and update last snapshot count
+        // Clear dirty flag, dirty labels, pending writes, and update last snapshot count
         self.dirty.store(false, Ordering::Relaxed);
+        self.pending_writes.store(0, Ordering::Relaxed);
         if let Ok(mut dl) = self.dirty_labels.lock() {
             dl.clear();
         }
