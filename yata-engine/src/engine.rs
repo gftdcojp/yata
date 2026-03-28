@@ -1107,10 +1107,11 @@ impl TieredGraphEngine {
             .ok_or_else(|| "S3 client not configured".to_string())?;
         let prefix = &self.s3_prefix;
 
-        // Compaction: merge R2 existing data into in-memory CSR before snapshot.
-        // This ensures append-only writes get merged with prior R2 data.
-        if !self.hot_initialized.load(Ordering::Relaxed) {
-            // Page-in existing R2 data first, then merge with pending writes
+        // Compaction: ALWAYS merge R2 existing data into in-memory CSR before snapshot.
+        // This ensures append-only writes get merged with prior R2 data, preventing vertex loss.
+        // Previously gated by hot_initialized (first-time only) — now runs every snapshot to
+        // guarantee R2 source of truth is never overwritten with incomplete CSR data.
+        {
             if let Ok(existing) = crate::loader::page_in_from_r2(
                 &s3, prefix, self.config.hot_partition_id,
             ) {
@@ -1118,9 +1119,8 @@ impl TieredGraphEngine {
                 if existing_vc > 0 {
                     if let Ok(mut hot) = self.hot.write() {
                         if let Some(single) = hot.as_single_mut() {
-                            // Merge existing R2 data into current CSR
-                            // (existing vertices that aren't in pending get added)
                             use yata_grin::{Scannable, Property, Schema as GrinSchema};
+                            let mut merged = 0u64;
                             for label in GrinSchema::vertex_labels(&existing) {
                                 for vid in Scannable::scan_vertices_by_label(&existing, &label) {
                                     let props: Vec<(String, yata_grin::PropValue)> = existing
@@ -1130,16 +1130,16 @@ impl TieredGraphEngine {
                                         .collect();
                                     let props_ref: Vec<(&str, yata_grin::PropValue)> =
                                         props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-                                    // merge_by_pk handles dedup: if PK exists in pending, skip
                                     if let Some(pk_val) = props.iter().find(|(k, _)| k == "rkey").map(|(_, v)| v.clone()) {
                                         single.merge_by_pk(&label, "rkey", &pk_val, &props_ref);
                                     } else {
                                         single.add_vertex(&label, &props_ref);
                                     }
+                                    merged += 1;
                                 }
                             }
                             single.commit();
-                            tracing::info!(existing_vertices = existing_vc, "compacted R2 data into CSR");
+                            tracing::info!(existing_vertices = existing_vc, merged, "compacted R2 data into CSR");
                         }
                     }
                 }
@@ -1258,8 +1258,8 @@ impl TieredGraphEngine {
     /// Returns Vec<(key, bytes)> for all ArrowFragment blobs + meta.json.
     /// Does NOT upload to S3/R2 — caller handles persistence.
     pub fn export_snapshot_blobs(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
-        // Compaction: merge R2 existing data if not yet initialized
-        if !self.hot_initialized.load(Ordering::Relaxed) {
+        // Compaction: ALWAYS merge R2 existing data into CSR before export (same as trigger_snapshot)
+        {
             if let Some(s3) = self.get_s3_client() {
                 if let Ok(existing) = crate::loader::page_in_from_r2(
                     &s3, &self.s3_prefix, self.config.hot_partition_id,
@@ -1269,6 +1269,7 @@ impl TieredGraphEngine {
                         if let Ok(mut hot) = self.hot.write() {
                             if let Some(single) = hot.as_single_mut() {
                                 use yata_grin::{Scannable, Property, Schema as GrinSchema};
+                                let mut merged = 0u64;
                                 for label in GrinSchema::vertex_labels(&existing) {
                                     for vid in Scannable::scan_vertices_by_label(&existing, &label) {
                                         let props: Vec<(String, yata_grin::PropValue)> = existing
@@ -1283,10 +1284,11 @@ impl TieredGraphEngine {
                                         } else {
                                             single.add_vertex(&label, &props_ref);
                                         }
+                                        merged += 1;
                                     }
                                 }
                                 single.commit();
-                                tracing::info!(existing_vertices = existing_vc, "compacted R2 data into CSR for export");
+                                tracing::info!(existing_vertices = existing_vc, merged, "compacted R2 data into CSR for export");
                             }
                         }
                     }
