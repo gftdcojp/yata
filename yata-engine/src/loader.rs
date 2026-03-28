@@ -884,11 +884,10 @@ pub fn replay_wal_from_r2(
     csr: &mut MutableCsrStore,
     since_snapshot_ms: u64,
 ) -> Result<u64, String> {
-    let bucket = std::env::var("YATA_S3_BUCKET").unwrap_or_default();
     let wal_prefix = "pipeline/wal/";
 
     // List WAL objects in R2
-    let objects = s3.list_objects(&bucket, wal_prefix)
+    let objects = s3.list_sync(wal_prefix)
         .map_err(|e| format!("WAL list failed: {e}"))?;
 
     if objects.is_empty() {
@@ -899,10 +898,12 @@ pub fn replay_wal_from_r2(
     let mut replayed = 0u64;
     let mut errors = 0u64;
 
-    for obj_key in &objects {
+    for obj in &objects {
+        let obj_key = &obj.key;
         // Fetch WAL JSON
-        let data = match s3.get_object(&bucket, obj_key) {
-            Ok(d) => d,
+        let data = match s3.get_sync(obj_key) {
+            Ok(Some(d)) => d,
+            Ok(None) => continue,
             Err(e) => {
                 tracing::warn!(key = %obj_key, error = %e, "WAL replay: skip unreadable file");
                 errors += 1;
@@ -968,10 +969,8 @@ pub fn replay_wal_from_r2(
                     ("sensitivity_ord", PropValue::Str("0".to_string())),
                 ];
 
-                // Base64 encode value
-                use base64::Engine;
-                let value_b64 = base64::engine::general_purpose::STANDARD.encode(record_json.as_bytes());
-                let value_b64_owned = value_b64;
+                // Base64 encode value (inline, no external crate)
+                let value_b64_owned = simple_base64_encode(record_json.as_bytes());
 
                 // Parse record JSON for top-level props (displayName, etc.)
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&record_json) {
@@ -1003,6 +1002,23 @@ pub fn replay_wal_from_r2(
     csr.commit();
     tracing::info!(replayed, errors, wal_files = objects.len(), "WAL replay complete");
     Ok(replayed)
+}
+
+/// Simple base64 encode (standard alphabet, with padding). No external crate needed.
+fn simple_base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        result.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        result.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 { result.push(CHARS[((triple >> 6) & 0x3F) as usize] as char); } else { result.push('='); }
+        if chunk.len() > 2 { result.push(CHARS[(triple & 0x3F) as usize] as char); } else { result.push('='); }
+    }
+    result
 }
 
 /// Convert AT Protocol collection NSID to yata graph label (PascalCase).
