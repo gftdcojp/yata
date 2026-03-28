@@ -868,3 +868,160 @@ mod tests {
         assert_eq!(vertex_label_chunk_count(&meta, 0), Some(5));
     }
 }
+
+// ── WAL Replay: Pipeline R2 → CSR Recovery ──────────────────────────
+
+/// Replay Pipeline WAL records from R2 into a CSR store.
+///
+/// Pipeline WAL is stored at `pipeline/wal/{timestamp}/` in R2 as JSON files.
+/// Each file contains an array of records with `ops` and `records` fields.
+/// This function lists WAL files, parses them, and merges records into the CSR.
+///
+/// The `since_snapshot` timestamp (ms) is used to skip WAL entries older than
+/// the last known snapshot. If 0, replays ALL WAL entries.
+pub fn replay_wal_from_r2(
+    s3: &yata_s3::s3::S3Client,
+    csr: &mut MutableCsrStore,
+    since_snapshot_ms: u64,
+) -> Result<u64, String> {
+    let bucket = std::env::var("YATA_S3_BUCKET").unwrap_or_default();
+    let wal_prefix = "pipeline/wal/";
+
+    // List WAL objects in R2
+    let objects = s3.list_objects(&bucket, wal_prefix)
+        .map_err(|e| format!("WAL list failed: {e}"))?;
+
+    if objects.is_empty() {
+        tracing::info!("WAL replay: no WAL files found");
+        return Ok(0);
+    }
+
+    let mut replayed = 0u64;
+    let mut errors = 0u64;
+
+    for obj_key in &objects {
+        // Fetch WAL JSON
+        let data = match s3.get_object(&bucket, obj_key) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(key = %obj_key, error = %e, "WAL replay: skip unreadable file");
+                errors += 1;
+                continue;
+            }
+        };
+
+        // Parse WAL records (array of {seq, rev, cid, repo, ops, created, records})
+        let records: Vec<serde_json::Value> = match serde_json::from_slice(&data) {
+            Ok(v) => {
+                if let serde_json::Value::Array(arr) = v { arr } else { vec![v] }
+            }
+            Err(e) => {
+                tracing::warn!(key = %obj_key, error = %e, "WAL replay: skip unparseable file");
+                errors += 1;
+                continue;
+            }
+        };
+
+        for record in &records {
+            // Skip records older than snapshot
+            let created = record.get("created").and_then(|v| v.as_u64()).unwrap_or(0);
+            if since_snapshot_ms > 0 && created < since_snapshot_ms {
+                continue;
+            }
+
+            // Parse ops: [{action, collection, rkey}]
+            let ops_str = record.get("ops").and_then(|v| v.as_str()).unwrap_or("[]");
+            let ops: Vec<serde_json::Value> = serde_json::from_str(ops_str).unwrap_or_default();
+
+            // Parse records: {"collection/rkey": "json"}
+            let records_str = record.get("records").and_then(|v| v.as_str()).unwrap_or("{}");
+            let records_map: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(records_str).unwrap_or_default();
+
+            let repo = record.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+
+            for op in &ops {
+                let action = op.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                let collection = op.get("collection").and_then(|v| v.as_str()).unwrap_or("");
+                let rkey = op.get("rkey").and_then(|v| v.as_str()).unwrap_or("");
+
+                if action != "create" || collection.is_empty() || rkey.is_empty() {
+                    continue;
+                }
+
+                // Derive label from collection (same as PDS collectionToLabel)
+                let label = collection_to_label(collection);
+
+                // Get record JSON
+                let record_key = format!("{collection}/{rkey}");
+                let record_json = match records_map.get(&record_key) {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(v) => v.to_string(),
+                    None => continue,
+                };
+
+                // Build props from record
+                let mut props: Vec<(&str, PropValue)> = vec![
+                    ("rkey", PropValue::Str(rkey.to_string())),
+                    ("collection", PropValue::Str(collection.to_string())),
+                    ("repo", PropValue::Str(repo.to_string())),
+                    ("sensitivity_ord", PropValue::Str("0".to_string())),
+                ];
+
+                // Base64 encode value
+                use base64::Engine;
+                let value_b64 = base64::engine::general_purpose::STANDARD.encode(record_json.as_bytes());
+                let value_b64_owned = value_b64;
+
+                // Parse record JSON for top-level props (displayName, etc.)
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&record_json) {
+                    // Extract common props
+                    for key in ["did", "display_name", "displayName", "description", "handle", "sensitivity", "status"] {
+                        if let Some(serde_json::Value::String(v)) = parsed.get(key) {
+                            let prop_key = if key == "displayName" { "display_name" } else { key };
+                            props.push((prop_key, PropValue::Str(v.clone())));
+                        }
+                    }
+                }
+
+                // We need to push value_b64 as a prop but it was moved. Re-derive.
+                // Actually, let's use a separate vec for owned strings
+                let label_owned = label.clone();
+                let rkey_pv = PropValue::Str(rkey.to_string());
+
+                // Build final props with value_b64
+                let mut final_props: Vec<(String, PropValue)> = props.iter().map(|(k,v)| (k.to_string(), v.clone())).collect();
+                final_props.push(("value_b64".to_string(), PropValue::Str(value_b64_owned)));
+                let final_refs: Vec<(&str, PropValue)> = final_props.iter().map(|(k,v)| (k.as_str(), v.clone())).collect();
+
+                csr.merge_by_pk(&label_owned, "rkey", &rkey_pv, &final_refs);
+                replayed += 1;
+            }
+        }
+    }
+
+    csr.commit();
+    tracing::info!(replayed, errors, wal_files = objects.len(), "WAL replay complete");
+    Ok(replayed)
+}
+
+/// Convert AT Protocol collection NSID to yata graph label (PascalCase).
+/// e.g. "app.bsky.feed.post" → "Post", "ai.gftd.apps.shinshi.model" → "Model"
+fn collection_to_label(collection: &str) -> String {
+    let last = collection.rsplit('.').next().unwrap_or(collection);
+    // Split by _ or - and PascalCase
+    last.split(|c: char| c == '_' || c == '-')
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let mut c = s.chars();
+            match c.next() {
+                Some(first) => {
+                    let mut r = first.to_uppercase().to_string();
+                    r.extend(c);
+                    r
+                }
+                None => String::new(),
+            }
+        })
+        .collect()
+}

@@ -479,6 +479,19 @@ impl TieredGraphEngine {
                             *hot = yata_store::GraphStoreEnum::Single(store);
                             tracing::info!(vertices = vc, edges = ec, loaded = loaded_labels.len(), "selective page-in complete (3-tier: disk→R2)");
                         }
+                        // WAL replay: recover records written after last snapshot
+                        if let Some(single) = hot.as_single_mut() {
+                            if let Some(s3_for_wal) = self.get_s3_client() {
+                                match crate::loader::replay_wal_from_r2(&s3_for_wal, single, 0) {
+                                    Ok(n) if n > 0 => {
+                                        single.commit();
+                                        tracing::info!(replayed = n, "WAL replay into CSR complete");
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => tracing::warn!("WAL replay failed (non-fatal): {e}"),
+                                }
+                            }
+                        }
                         self.hot_initialized.store(true, Ordering::Relaxed);
                     }
                 }
