@@ -41,6 +41,9 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
 pub struct YataRestState<G: GraphQueryExecutor> {
     pub graph: Arc<G>,
     pub api_secret: String,
+    /// When true, reject write operations (mergeRecord, triggerSnapshot, mutation cypher).
+    /// Set via YATA_READONLY env var for read replica containers.
+    pub readonly: bool,
 }
 
 impl<G: GraphQueryExecutor> Clone for YataRestState<G> {
@@ -48,6 +51,7 @@ impl<G: GraphQueryExecutor> Clone for YataRestState<G> {
         Self {
             graph: self.graph.clone(),
             api_secret: self.api_secret.clone(),
+            readonly: self.readonly,
         }
     }
 }
@@ -279,11 +283,15 @@ async fn rebuild_from_snapshot<G: GraphQueryExecutor>(
 
 /// POST /xrpc/ai.gftd.yata.mergeRecord — Merge a record into CSR by label + PK.
 /// Used by YataRPC for label-routed writes (hash(label) % N → this partition).
+/// Rejected with 405 on read-only containers (YATA_READONLY=true).
 async fn merge_record_handler<G: GraphQueryExecutor>(
     State(state): State<YataRestState<G>>,
     headers: HeaderMap,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    if state.readonly {
+        return (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"error": "read-only container: mergeRecord rejected"})));
+    }
     let (_, _) = match authorize(&headers, &state) {
         Ok(a) => a,
         Err(s) => return (s, Json(serde_json::json!({"error": "unauthorized"}))),
@@ -325,9 +333,13 @@ async fn merge_record_handler<G: GraphQueryExecutor>(
 }
 
 /// POST /xrpc/ai.gftd.yata.triggerSnapshot — Trigger snapshot: CSR → ArrowFragment → R2.
+/// Rejected with 405 on read-only containers (YATA_READONLY=true).
 async fn trigger_snapshot_handler<G: GraphQueryExecutor>(
     State(state): State<YataRestState<G>>,
 ) -> impl IntoResponse {
+    if state.readonly {
+        return (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"error": "read-only container: triggerSnapshot rejected"})));
+    }
     match state.graph.trigger_snapshot() {
         Ok((v, e)) => (StatusCode::OK, Json(serde_json::json!({"vertices": v, "edges": e}))),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": err}))),
@@ -336,9 +348,13 @@ async fn trigger_snapshot_handler<G: GraphQueryExecutor>(
 
 /// POST /xrpc/ai.gftd.yata.exportSnapshot — Export snapshot blobs for TS Worker R2 upload.
 /// Returns JSON: { blobs: [{key, data_b64}], meta_json, vertices, edges }
+/// Rejected with 405 on read-only containers (YATA_READONLY=true).
 async fn export_snapshot_handler<G: GraphQueryExecutor>(
     State(state): State<YataRestState<G>>,
 ) -> impl IntoResponse {
+    if state.readonly {
+        return (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"error": "read-only container: exportSnapshot rejected"})));
+    }
     use base64::Engine as _;
     let graph = state.graph.clone();
     let result = tokio::task::spawn_blocking(move || graph.export_snapshot_blobs()).await;
@@ -457,6 +473,7 @@ mod tests {
         YataRestState {
             graph,
             api_secret: "test-secret".to_string(),
+            readonly: false,
         }
     }
 

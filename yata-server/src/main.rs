@@ -37,9 +37,15 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(8081);
 
+    let readonly = std::env::var("YATA_READONLY").unwrap_or_default() == "true";
+    if readonly {
+        tracing::info!("read-only mode: write endpoints (mergeRecord, triggerSnapshot) disabled");
+    }
+
     let state = rest::YataRestState {
         graph: engine.clone(),
         api_secret,
+        readonly,
     };
     let router = rest::router(state);
 
