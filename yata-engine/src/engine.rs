@@ -1392,167 +1392,103 @@ impl TieredGraphEngine {
         Ok(result)
     }
 
-    /// Cold start for Read Container in WalProjection mode:
-    ///
-    /// **L1 path (preferred)**: CompactionManifest → compacted Arrow IPC segment → WAL tail replay.
-    /// **Legacy path (fallback)**: YataFragment checkpoint → checkpoint_seq → WAL segment replay.
-    ///
-    /// The L1 path is Shannon-optimal: single Arrow IPC format, no YataFragment deserialize.
+    /// Cold start: L1 compacted segment (mmap disk → R2 GET) + WAL tail replay.
+    /// Legacy ArrowFragment path removed. Triggered by ensure_labels on first query.
     pub fn wal_cold_start(&self) -> Result<u64, String> {
         let s3 = self.get_s3_client()
             .ok_or_else(|| "S3 client not configured".to_string())?;
         let prefix = &self.s3_prefix;
         let pid = self.config.hot_partition_id.get();
 
-        // Try L1 compacted segment first
+        // Load compacted segment (mmap disk cache → R2 GET)
         let manifest_key = crate::compaction::manifest_r2_key(prefix, pid);
-        let compaction_manifest = match s3.get_sync(&manifest_key) {
-            Ok(Some(data)) => serde_json::from_slice::<crate::compaction::CompactionManifest>(&data).ok(),
-            _ => None,
-        };
-
-        let checkpoint_seq = if let Some(ref manifest) = compaction_manifest {
-            // L1 path: mmap-first cold start (Phase 4)
-            // Priority: disk cache (mmap, ~100µs) → R2 GET (~3-5ms) → legacy fallback
-            tracing::info!(
-                compacted_seq = manifest.compacted_seq,
-                entries = manifest.entry_count,
-                labels = manifest.labels.len(),
-                "cold start: L1 compacted segment"
-            );
-
-            let segment_filename = manifest.compacted_segment_key
-                .rsplit('/').next().unwrap_or("compacted.arrow");
-
-            // Try disk cache first (mmap, zero R2 fetch)
-            let disk_path = std::env::var("YATA_VINEYARD_DIR").ok().map(|d| {
-                format!("{d}/log/compacted/{pid}/{segment_filename}")
-            });
-
-            let loaded = if let Some(ref path) = disk_path {
-                if std::path::Path::new(path).exists() {
-                    // Phase 4: mmap reattach — O(1) open + O(N_labels) index build
-                    match yata_store::ArrowWalStore::from_file(std::path::Path::new(path)) {
-                        Ok(store) => {
-                            tracing::info!(
-                                path, vertices = store.len(),
-                                "cold start: mmap'd from disk cache (zero R2 fetch)"
-                            );
-                            // Apply to CSR via GRIN traits (vertex data only)
-                            self.apply_arrow_wal_store(&store)?;
-                            true
-                        }
-                        Err(e) => {
-                            tracing::warn!(path, error = %e, "disk cache mmap failed, trying R2");
-                            false
-                        }
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if !loaded {
-                // R2 GET fallback
-                match s3.get_sync(&manifest.compacted_segment_key) {
-                    Ok(Some(data)) => {
-                        let entries = crate::arrow_wal::deserialize_segment_auto(
-                            &manifest.compacted_segment_key,
-                            &data,
+        let checkpoint_seq = match s3.get_sync(&manifest_key) {
+            Ok(Some(data)) => {
+                match serde_json::from_slice::<crate::compaction::CompactionManifest>(&data) {
+                    Ok(manifest) => {
+                        tracing::info!(
+                            compacted_seq = manifest.compacted_seq,
+                            entries = manifest.entry_count,
+                            labels = manifest.labels.len(),
+                            "cold start: loading compacted segment"
                         );
-                        if !entries.is_empty() {
-                            self.wal_apply(&entries)?;
-                            tracing::info!(
-                                applied = entries.len(),
-                                "cold start: L1 compacted segment applied from R2"
-                            );
-                        }
-                        // Write to disk cache for next mmap reattach
-                        if let Some(ref path) = disk_path {
-                            if let Some(parent) = std::path::Path::new(path).parent() {
-                                let _ = std::fs::create_dir_all(parent);
+                        let filename = manifest.compacted_segment_key
+                            .rsplit('/').next().unwrap_or("compacted.arrow");
+                        let disk_path = std::env::var("YATA_VINEYARD_DIR").ok()
+                            .map(|d| format!("{d}/log/compacted/{pid}/{filename}"));
+
+                        // Try disk cache mmap first
+                        let loaded = disk_path.as_ref().map_or(false, |path| {
+                            if !std::path::Path::new(path).exists() { return false; }
+                            match yata_store::ArrowWalStore::from_file(std::path::Path::new(path)) {
+                                Ok(store) => {
+                                    tracing::info!(path, vertices = store.len(), "cold start: mmap from disk");
+                                    self.apply_arrow_wal_store(&store).is_ok()
+                                }
+                                Err(_) => false,
                             }
-                            let _ = std::fs::write(path, &data);
-                            tracing::debug!(path, "wrote compacted segment to disk cache");
+                        });
+
+                        if !loaded {
+                            // R2 GET
+                            if let Ok(Some(data)) = s3.get_sync(&manifest.compacted_segment_key) {
+                                let entries = crate::arrow_wal::deserialize_segment_auto(
+                                    &manifest.compacted_segment_key, &data,
+                                );
+                                if !entries.is_empty() {
+                                    let _ = self.wal_apply(&entries);
+                                    tracing::info!(applied = entries.len(), "cold start: compacted segment from R2");
+                                }
+                                // Cache to disk for next mmap
+                                if let Some(ref path) = disk_path {
+                                    if let Some(parent) = std::path::Path::new(path).parent() {
+                                        let _ = std::fs::create_dir_all(parent);
+                                    }
+                                    let _ = std::fs::write(path, &data);
+                                }
+                            }
                         }
+                        manifest.compacted_seq
                     }
-                    Ok(None) => {
-                        tracing::warn!(key = %manifest.compacted_segment_key, "compacted segment not found, falling back to legacy");
-                        self.restore_from_r2();
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to load compacted segment, falling back to legacy");
-                        self.restore_from_r2();
-                    }
+                    Err(_) => 0,
                 }
             }
-
-            // Also load legacy ArrowFragment snapshot (contains edge topology + vertex data
-            // not captured by WAL — WAL only has mergeRecord vertex entries).
-            // restore_from_r2 does CSR merge (not replace), so compacted WAL data is preserved.
-            self.restore_from_r2();
-            tracing::info!("cold start: legacy ArrowFragment merged on top of compacted WAL");
-
-            manifest.compacted_seq
-        } else {
-            // Legacy path: YataFragment checkpoint
-            tracing::info!("cold start: no compaction manifest, using legacy YataFragment path");
-            self.restore_from_r2();
-
-            // Read legacy checkpoint metadata
-            let checkpoint_key = crate::wal::checkpoint_meta_r2_key(prefix, pid);
-            match s3.get_sync(&checkpoint_key) {
-                Ok(Some(data)) => {
-                    if let Ok(meta) = serde_json::from_slice::<crate::wal::CheckpointMeta>(&data) {
-                        tracing::info!(checkpoint_seq = meta.checkpoint_seq, "loaded legacy checkpoint metadata");
-                        meta.checkpoint_seq
-                    } else {
-                        0
-                    }
-                }
-                _ => {
-                    tracing::info!("no checkpoint metadata found, starting from seq 0");
-                    0
-                }
+            _ => {
+                tracing::info!("cold start: no compaction manifest (run gftd yata migrate)");
+                self.hot_initialized.store(true, Ordering::Relaxed);
+                0
             }
         };
 
-        // Step 3: Replay WAL segments from R2 after checkpoint_seq
-        // List segments in the partition directory
-        let segment_prefix = format!("{prefix}wal/segments/{pid}/");
-        let segment_objects = s3.list_sync(&segment_prefix).unwrap_or_default();
+        // Replay WAL segments after compacted_seq (use segment registry from head.json)
+        let head_key = format!("{prefix}wal/meta/{pid}/head.json");
+        let segment_keys: Vec<String> = match s3.get_sync(&head_key) {
+            Ok(Some(data)) => serde_json::from_slice::<serde_json::Value>(&data)
+                .ok()
+                .and_then(|v| v.get("segments").cloned())
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+
         let mut replayed = 0u64;
-        for obj in &segment_objects {
-            let key = &obj.key;
-            // Parse seq range from filename: {seq_start:020}-{seq_end:020}.{ndjson|arrow}
+        for key in &segment_keys {
             if let Some(filename) = key.rsplit('/').next() {
-                // Strip either extension
                 let stripped = filename.strip_suffix(".ndjson")
                     .or_else(|| filename.strip_suffix(".arrow"));
                 if let Some(stripped) = stripped {
                     let parts: Vec<&str> = stripped.split('-').collect();
                     if parts.len() == 2 {
-                        if let (Ok(_seg_start), Ok(seg_end)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
-                            if seg_end <= checkpoint_seq {
-                                continue; // Already included in checkpoint
-                            }
-                            match s3.get_sync(key) {
-                                Ok(Some(data)) => {
-                                    // Auto-detect format from key extension
-                                    let mut entries = crate::arrow_wal::deserialize_segment_auto(key, &data);
-                                    // Filter entries already in checkpoint
-                                    entries.retain(|e| e.seq > checkpoint_seq);
-                                    if !entries.is_empty() {
-                                        let count = entries.len();
-                                        self.wal_apply(&entries)?;
-                                        replayed += count as u64;
-                                        tracing::info!(seg_end, applied = count, format = %if key.ends_with(".arrow") { "arrow" } else { "ndjson" }, "replayed WAL segment");
-                                    }
+                        if let Ok(seg_end) = parts[1].parse::<u64>() {
+                            if seg_end <= checkpoint_seq { continue; }
+                            if let Ok(Some(data)) = s3.get_sync(key) {
+                                let mut entries = crate::arrow_wal::deserialize_segment_auto(key, &data);
+                                entries.retain(|e| e.seq > checkpoint_seq);
+                                if !entries.is_empty() {
+                                    let count = entries.len();
+                                    let _ = self.wal_apply(&entries);
+                                    replayed += count as u64;
                                 }
-                                Ok(None) => tracing::warn!(key, "WAL segment not found in R2"),
-                                Err(e) => tracing::warn!(key, error = %e, "failed to read WAL segment"),
                             }
                         }
                     }
@@ -1560,7 +1496,7 @@ impl TieredGraphEngine {
             }
         }
 
-        tracing::info!(checkpoint_seq, replayed, "WAL cold start complete");
+        tracing::info!(checkpoint_seq, replayed, "cold start complete");
         Ok(checkpoint_seq)
     }
 
