@@ -15,9 +15,9 @@ pub mod optimizer;
 pub mod planner;
 pub mod transpile;
 
-pub use distributed_executor::{ExchangeTransport, MemoryExchangeTransport, execute_fragment};
+pub use distributed_executor::{ExchangeTransport, MemoryExchangeTransport, execute_fragment, execute_step, ExchangePayload};
 pub use distributed_planner::{plan_distributed, requires_distribution};
-pub use executor::{Record, execute, execute_op, eval_expr};
+pub use executor::{Record, MaterializedRecord, execute, execute_op, eval_expr};
 pub use ir::{AggOp, DistributedPlan, ExchangeKind, Expr, LogicalOp, PartitionPlanFragment, QueryPlan, SecurityScope};
 pub use optimizer::optimize;
 pub use planner::{PlanBuilder, plan_scan, plan_traversal};

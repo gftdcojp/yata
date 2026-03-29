@@ -1,10 +1,11 @@
 //! Intermediate Representation for graph query plans.
 //! Decouples query language (Cypher/Gremlin) from execution engine.
 
+use serde::{Deserialize, Serialize};
 use yata_grin::{Direction, Predicate, PropValue};
 
 /// A column expression in the query plan.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Expr {
     /// Variable reference: "n" -> vertex/edge bound to variable.
     Var(String),
@@ -19,7 +20,7 @@ pub enum Expr {
 }
 
 /// Logical query plan operator.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicalOp {
     /// Scan vertices by label. Binds to alias.
     Scan {
@@ -87,8 +88,8 @@ pub enum LogicalOp {
     },
 }
 
-/// How records are exchanged between partitions (IR defined, NOT WIRED — no transport).
-#[derive(Debug, Clone)]
+/// How records are exchanged between partitions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExchangeKind {
     /// Hash-partition by routing key (for joins, expands across partitions).
     HashShuffle,
@@ -99,7 +100,7 @@ pub enum ExchangeKind {
 }
 
 /// Aggregation operation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AggOp {
     Count,
     Sum,
@@ -111,7 +112,7 @@ pub enum AggOp {
 
 /// Security scope for GIE SecurityFilter — derived from PDS AuthContext.
 /// Enables GIE fast path (<1µs) WITH security enforcement (no MemoryGraph fallback).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecurityScope {
     /// Maximum sensitivity ordinal the viewer can access (0=public, 1=internal, 2=confidential, 3=restricted).
     pub max_sensitivity_ord: u8,
@@ -126,7 +127,7 @@ pub struct SecurityScope {
 }
 
 /// A query plan: sequence of logical operators forming a pipeline.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryPlan {
     pub ops: Vec<LogicalOp>,
 }
@@ -158,7 +159,7 @@ impl Default for QueryPlan {
 /// A plan fragment assigned to a specific partition for distributed execution.
 /// The distributed planner splits a QueryPlan into per-partition fragments
 /// with explicit Exchange/Receive boundaries.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartitionPlanFragment {
     /// Target partition ID.
     pub partition_id: u32,
@@ -171,7 +172,7 @@ pub struct PartitionPlanFragment {
 }
 
 /// Specification for outbound data exchange.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExchangeSpec {
     /// Round index (for multi-round iterative queries like variable-hop).
     pub round: u32,
@@ -182,7 +183,7 @@ pub struct ExchangeSpec {
 }
 
 /// Specification for inbound data receive.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReceiveSpec {
     /// Round index.
     pub round: u32,
@@ -191,7 +192,7 @@ pub struct ReceiveSpec {
 }
 
 /// A distributed query plan: collection of partition fragments.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DistributedPlan {
     /// Per-partition plan fragments.
     pub fragments: Vec<PartitionPlanFragment>,

@@ -14,7 +14,7 @@ pub enum PropValue {
 }
 
 /// Direction for edge traversal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
     Out,
     In,
@@ -22,7 +22,7 @@ pub enum Direction {
 }
 
 /// Predicate for storage-level filtering (pushdown).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Predicate {
     True,
     Eq(String, PropValue),

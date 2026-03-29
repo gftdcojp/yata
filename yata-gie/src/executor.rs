@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
 use yata_grin::*;
 use yata_store::MutableCsrStore;
 
@@ -17,6 +18,56 @@ use crate::ir::*;
 pub struct Record {
     pub bindings: HashMap<String, u32>,
     pub values: Vec<PropValue>,
+}
+
+/// Materialized record for cross-partition exchange.
+/// Carries rkey-based identifiers instead of partition-local vertex IDs.
+/// Serializable for HTTP transport between coordinator and containers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializedRecord {
+    /// alias → rkey (globally unique vertex identifier)
+    pub bindings: HashMap<String, String>,
+    /// alias → label (vertex type)
+    pub labels: HashMap<String, String>,
+    /// Projected output values
+    pub values: Vec<PropValue>,
+}
+
+impl MaterializedRecord {
+    /// Convert a local Record to a MaterializedRecord by resolving vids to rkeys.
+    pub fn from_record(record: &Record, store: &MutableCsrStore) -> Self {
+        use yata_grin::Property;
+        let mut bindings = HashMap::new();
+        let mut labels = HashMap::new();
+        for (alias, &vid) in &record.bindings {
+            if let PropValue::Str(rkey) = Property::vertex_prop(store, vid, "rkey").unwrap_or(PropValue::Null) {
+                bindings.insert(alias.clone(), rkey);
+            } else {
+                bindings.insert(alias.clone(), format!("vid:{vid}"));
+            }
+            let vlabels: Vec<String> = Property::vertex_labels(store, vid);
+            if let Some(first_label) = vlabels.first() {
+                labels.insert(alias.clone(), first_label.to_string());
+            }
+        }
+        Self { bindings, labels, values: record.values.clone() }
+    }
+
+    /// Resolve a MaterializedRecord back to a local Record by looking up rkeys.
+    pub fn to_record(&self, store: &MutableCsrStore) -> Option<Record> {
+        let mut bindings = HashMap::new();
+        for (alias, rkey) in &self.bindings {
+            let label = self.labels.get(alias).map(|s| s.as_str()).unwrap_or("");
+            let pred = Predicate::Eq("rkey".to_string(), PropValue::Str(rkey.clone()));
+            let vids = store.scan_vertices(label, &pred);
+            if let Some(&vid) = vids.first() {
+                bindings.insert(alias.clone(), vid);
+            } else {
+                return None; // Vertex not found on this partition
+            }
+        }
+        Some(Record { bindings, values: self.values.clone() })
+    }
 }
 
 impl Record {

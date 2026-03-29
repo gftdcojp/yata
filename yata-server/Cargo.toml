@@ -22,6 +22,7 @@ yata-s3.workspace = true
 yata-store.workspace = true
 yata-engine.workspace = true
 yata-grin.workspace = true
+yata-gie = { path = "../yata-gie" }
 arrow.workspace = true
 async-trait.workspace = true
 base64.workspace = true

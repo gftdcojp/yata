@@ -1,27 +1,35 @@
 # packages/rust/yata
 
-yata — Rust Cypher graph engine. `[PRODUCTION]` Container (CSR + DiskBlobCache/MmapBlobCache) × 1 partition. Workers RPC coordinator. GraphScope parity 21/25 (14 PRODUCTION + 7 IMPLEMENTED)。GIE push-based + Design E SecurityScope (CSR policy vertex lookup, parameter-based RLS 除去済み) + label-selective page-in + edge property lookup + edge tombstone deletion + **per-label delta compaction** (dirty labels only, clean labels = zero R2 I/O) + adaptive √N fan-out + CpmStats observability + cypherBatch + delta-apply mutation (CP5)。
+yata — Rust Cypher graph engine. `[PRODUCTION]` Container (CSR → **Sorted COO 移行中**) × 1 partition. Workers RPC coordinator. GraphScope parity 21/25 (14 PRODUCTION + 7 IMPLEMENTED)。GIE push-based + Design E SecurityScope (policy vertex lookup, parameter-based RLS 除去済み) + label-selective page-in + edge property lookup + edge tombstone deletion + **per-label delta compaction** (dirty labels only, clean labels = zero R2 I/O) + adaptive √N fan-out + CpmStats observability + cypherBatch + delta-apply mutation (CP5)。**Target: Sorted COO** — CSR rebuild 排除、mutable snapshot 排除、granular page-in。設計: `docs/260329-yata-coo-sorted-design.md`
 
 ## Architecture (CRITICAL)
 
 ```
 Write model: Pipeline.send() (durable) + YATA_RPC.mergeRecord() (instant projection)
   → Pipeline: AT Protocol commit chain + MST (durable, 0 data loss)
-  → mergeRecord: Cypher projection → yata Container → WAL append + CSR merge
+  → mergeRecord: COO L0 buffer append (O(1), no rebuild) + WAL ring append
   → dirty_labels.insert(label)
 
 Read model: yata Container (pure read)
   Workers RPC (YataRPC) → hierarchical coordinator (√N fan-out)
     → N × Container (Rust, standard-1, 4GB RAM, 8GB disk)
       Each Container:
-        R2 (Arrow IPC) → DiskBlobCache/MmapBlobCache → MutableCsrStore (<1ms)
-        TieredGraphEngine → yata-cypher / yata-gie (push-based)
+        R2 (Arrow IPC sorted COO segments) → DiskBlobCache/MmapBlobCache → CooStore
+        TieredGraphEngine → yata-cypher / yata-gie (sparse index binary search)
 
-Persistence: Arrow IPC WAL + per-label L1 Compaction
-  R2 = Source of Truth (per-label compacted segments: log/compacted/{pid}/label/{label}.arrow)
-  DiskBlobCache = Container ephemeral disk cache (page-in/out, LRU evict)
-  MmapBlobCache = zero-copy mmap (500M edges/Container)
-  CSR = In-memory graph topology (<1ms query)
+Storage: Sorted COO (Coordinate format) + Sparse Index
+  COO triples sorted by (label, src, dst) in Arrow IPC segments (~32MB each)
+  R2 = Source of Truth (per-label sorted segments: log/coo/{pid}/label/{label}/{range}.arrow)
+  Sparse index: per-label (every 256th src → segment offset) → O(log 256) traversal
+  L0 = unsorted append buffer (in-memory) → L1 = sorted segments (LSM compaction)
+  DiskBlobCache = Container ephemeral disk cache (segment-level LRU)
+  MmapBlobCache = zero-copy mmap (segment-level)
+
+Key properties (vs CSR):
+  Write: O(1) append (CSR was O(V) offsets rebuild per dirty label)
+  Snapshot: eliminated (sorted segments ARE persistent format, no commit() rebuild)
+  Page-in: (label, src_range) granular (CSR was full label)
+  Traversal: O(log 256 + degree) via sparse index (CSR was O(1) + O(degree))
 ```
 
 Deploy/config/ops details: `infra/cloudflare/container/yata/CLAUDE.md`
@@ -29,31 +37,33 @@ Deploy/config/ops details: `infra/cloudflare/container/yata/CLAUDE.md`
 ## Data Flow
 
 ```
-Write (append-only, NO page-in):
+Write (append-only, NO page-in, NO rebuild):
   App → PDS_RPC.createRecord(repo, collection, record)
     → Pipeline.send(): AT commit + MST update → ACK (~1ms, durable)
-    → YATA_RPC.mergeRecord(): WAL append + CSR merge (PK dedup in-memory only, NO R2 read)
+    → YATA_RPC.mergeRecord(): L0 buffer append (O(1)) + WAL ring append (PK dedup in-memory only, NO R2 read)
     → dirty_labels.insert(label)
 
   yata への直接 mutate は mergeRecord からのみ (app 直接禁止)
 
-Per-label L1 Compaction (cron 1min, dirty_labels gated, two-phase PUT):
-  trigger_snapshot():
+Per-label LSM Compaction (cron 1min, dirty_labels gated, two-phase PUT):
+  trigger_compaction():
     → wal_flush_segment(): WAL ring → Arrow IPC segment → R2 PUT (safe: empty entries guard)
     → drain_dirty_labels() → dirty set
     → dirty empty? → skip (zero R2 I/O)
-    → Phase 1: per dirty label: PK-dedup → Blake3 checksum → R2 PUT label/{label}.arrow (failed labels skipped)
-    → Phase 2: manifest v2 built from successfully uploaded labels only → R2 PUT (never references missing segments)
+    → Phase 1: per dirty label: L0 + existing L1 sorted segments → merge-sort → PK-dedup → Blake3 → R2 PUT (failed labels skipped)
+    → Phase 2: manifest v2 built from successfully uploaded labels only → R2 PUT
     → clean labels: untouched (zero R2 I/O)
+    → NO CSR rebuild, NO commit() — sorted segments are the persistent + query format
 
-Read (WAL cold start + per-label page-in + Blake3 verification):
+Read (cold start: per-label segment page-in + Blake3 verification):
   PDS_RPC.query / listRecords / getTimeline
     → YATA_RPC.cypher → TieredGraphEngine
     → ensure_labels(vertex_labels) → hot_initialized == false?
-      → wal_cold_start(): per-label compacted segments (mmap/R2) → Blake3 verify → WAL tail replay
-      → corrupt segment detected? → skip + error log (no panic, no corrupt data in CSR)
+      → cold_start(): per-label sorted COO segments (mmap/R2) → Blake3 verify → L0 tail replay
+      → sparse index build (every 256th src → offset)
+      → corrupt segment detected? → skip + error log (no panic)
       → hot_initialized = true
-    → CSR direct query (<1µs)
+    → sparse index binary search + segment scan (O(log 256 + degree))
 
 PDS Container (Rust) は不要 — 全て TS Worker + Pipeline + YATA_RPC。
 ```
@@ -80,9 +90,9 @@ env.YATA.stats()                        // → all partition CpmStats (K3a)
 |---|---|
 | `yata-core` | GlobalVid, LocalVid, PartitionId |
 | `yata-grin` | GRIN trait (Topology, Property, Schema, Scannable, Mutable) |
-| `yata-format` | **YataFragment format** (snapshot format, test/migration utility)。NbrUnit zero-copy CSR (25x faster neighbor traversal)。`csr_to_fragment()` (test-only)。**Arrow row-group chunk**: `split_record_batch` + byte-based chunking (32 MB default)。PropertyGraphSchema (typed vertex/edge labels + Arrow property columns) |
-| `yata-store` | MutableCsrStore (mutable in-memory CSR, GRIN traits), ArrowGraphStore, ArrowWalStore (mmap I/O utility for compacted WAL), DiskBlobCache/MmapBlobCache/MemoryBlobCache (BlobCache trait impls), PartitionStoreSet, GraphStoreEnum (Single/Partitioned/Arrow — 3 variant のみ、ArrowWalStore は utility で variant ではない) |
-| `yata-engine` | TieredGraphEngine, CpmStats (K3a), delta-apply mutation (K3c), **Arrow IPC WAL** (`arrow_wal.rs`: serialize/deserialize/auto-detect, default format), **Per-label L1 Compaction** (`compaction.rs`: PK-dedup per-label rewrite, CompactionManifest v2 per-label tracking, dirty_labels drain, v1→v2 auto-migration), cold start (per-label segment mmap → R2 GET → WAL tail replay), 3-tier blob fetch (`fetch_blob_cached`: disk → R2 → write-through), Frontier BFS, ShardedCoordinator, WAL Projection (ring buffer + segment flush + checkpoint + compaction)。Design E SecurityScope (`query_with_did` → CSR policy vertex lookup) |
+| `yata-format` | **YataFragment format** (snapshot format, test/migration utility)。NbrUnit zero-copy (CSR legacy, Phase 3 removal candidate)。**Arrow row-group chunk**: `split_record_batch` + byte-based chunking (32 MB default)。PropertyGraphSchema (typed vertex/edge labels + Arrow property columns)。**COO segment format**: sorted (label, src, dst) Arrow IPC segments |
+| `yata-store` | **CooStore** (sorted COO, L0 append buffer + L1 sorted segments, sparse index), MutableCsrStore (legacy CSR, Phase 3 removal), ArrowGraphStore, ArrowWalStore (mmap I/O utility for compacted WAL), DiskBlobCache/MmapBlobCache/MemoryBlobCache (BlobCache trait impls), PartitionStoreSet, GraphStoreEnum |
+| `yata-engine` | TieredGraphEngine, CpmStats (K3a), **LSM compaction** (`compaction.rs`: L0+L1 merge-sort, PK-dedup, CompactionManifest v2 per-label tracking, dirty_labels drain), **Arrow IPC WAL** (`arrow_wal.rs`: serialize/deserialize/auto-detect, default format), cold start (per-label sorted COO segment mmap → R2 GET → L0 tail replay), 3-tier blob fetch (`fetch_blob_cached`: disk → R2 → write-through), Frontier BFS, ShardedCoordinator, WAL Projection (ring buffer + segment flush + compaction)。Design E SecurityScope (`query_with_did` → policy vertex lookup) |
 | `yata-cypher` | Full Cypher parser + executor (incl. untyped edge traversal) |
 | `yata-gie` | GIE push-based executor, IR (Exchange/Receive/Gather), distributed planner |
 | `yata-s3` | R2 persistence (sync ureq+rustls S3 client, SigV4)。`trigger_snapshot()` → R2 PUT、page-in → R2 GET |
@@ -96,48 +106,47 @@ env.YATA.stats()                        // → all partition CpmStats (K3a)
 
 ## R2 Persistence `[PRODUCTION]` (verified 2026-03-29: 964v, 33 labels, 1.58 MB, full properties)
 
-R2 = source of truth。**Per-label compacted segments**: `log/compacted/{pid}/label/{label}.arrow` (Arrow IPC per label)。**Append-only write**: mergeRecord は page-in 不要 (in-memory CSR に append + WAL ring append + `dirty_labels.insert(label)`)。PK dedup は per-label compaction 時。**Dirty tracking**: `drain_dirty_labels()` で dirty set を取得し compaction 後にクリア。dirty empty = zero R2 I/O (skip)。**Per-label compaction `[PRODUCTION]`**: dirty labels のみ: existing per-label segment + new WAL entries → PK-dedup → per-label R2 PUT。Clean labels は untouched。CompactionManifest v2 (`label_segments: HashMap<String, LabelSegmentState>`)。v1 monolithic manifest からの auto-migration。**Blake3 checksum `[PRODUCTION]`**: `LabelSegmentState.blake3_hex` に segment hash 記録。cold start 時 `verify_blake3()` で検証、mismatch → skip + error log (corrupt data を CSR に入れない)。legacy segment (blake3_hex 空) はスキップ (backward compat)。**Two-phase PUT `[PRODUCTION]`**: Phase 1: per-label segment upload (失敗 label はスキップ)。Phase 2: 成功 label のみから manifest 構築 → PUT。manifest が未 upload segment を参照不可能。**3-tier page-in `[PRODUCTION]`**: `fetch_blob_cached()` — disk cache → R2 GET → write-through。Cold start: per-label segment mmap (~100µs/label) → R2 GET fallback → Blake3 verify。**Snapshot monitoring (K3d)**: `last_snapshot_serialize_ms` in CpmStats。
+R2 = source of truth。**Per-label sorted COO segments**: `log/coo/{pid}/label/{label}/{range}.arrow` (Arrow IPC, sorted by (label, src, dst))。**Append-only write**: mergeRecord は page-in 不要 (L0 buffer append + WAL ring append + `dirty_labels.insert(label)`)。PK dedup は LSM compaction 時。**Dirty tracking**: `drain_dirty_labels()` で dirty set を取得し compaction 後にクリア。dirty empty = zero R2 I/O (skip)。**LSM Compaction `[DESIGN]`**: L0 (unsorted append buffer) + L1 (existing sorted segments) → merge-sort → PK-dedup → per-label R2 PUT。Clean labels は untouched。CompactionManifest v2 (`label_segments: HashMap<String, LabelSegmentState>`)。**Blake3 checksum `[PRODUCTION]`**: `LabelSegmentState.blake3_hex` に segment hash 記録。cold start 時 `verify_blake3()` で検証、mismatch → skip + error log。**Two-phase PUT `[PRODUCTION]`**: Phase 1: per-label segment upload (失敗 label はスキップ)。Phase 2: 成功 label のみから manifest 構築 → PUT。**Segment-level page-in**: `fetch_blob_cached()` — disk cache → R2 GET → write-through。Cold start: per-label sorted segments mmap (~100µs/segment) → R2 GET fallback → Blake3 verify → sparse index build。**No snapshot serialize** — sorted segments ARE the persistent format (commit() rebuild 排除)。
 
 ## Concurrency Model (CRITICAL)
 
-**RwLock<GraphStoreEnum>**: read 並列 / write 排他。`Mutex` から `RwLock` に移行済み。
+**COO: Read-Write 並列化** — L0 buffer (write) と L1 sorted segments (read) は分離構造。CSR の commit() rebuild ロック不要。
 
 | 操作 | Lock | 並列性 |
 |---|---|---|
-| Read × Read | `hot.read()` | **concurrent** |
-| Read × Write | read wait | blocked (write waits for reads) |
-| Write × Write | `hot.write()` | sequential |
-| Read × Snapshot serialize | `hot.read()` | **concurrent** |
-| Write × Snapshot compaction | `hot.write()` | sequential (brief) |
+| Read × Read | immutable sorted segments | **concurrent** (lock-free) |
+| Read × Write | L0 buffer ≠ L1 segments | **concurrent** (分離構造) |
+| Write × Write | L0 buffer mutex (~ns) | sequential (brief) |
+| Read × Compaction | atomic segment swap | **concurrent** |
+| Compaction × Write | L0 continues appending | **concurrent** |
 
-**Cross-partition**: 各 partition = 独立 Container = 独立 RwLock → **partition 間は完全並列**。YataRPC が `hash(label) % N` で routing → 同一 label は同一 partition。異なる label への concurrent writes = zero contention。
+**Cross-partition**: 各 partition = 独立 Container → **partition 間は完全並列**。YataRPC が `hash(label) % N` で routing。
 
-**CF Container**: 1 vCPU + Workers RPC sequential → 実質 single-thread で contention なし。axum tokio multi-thread 時は RwLock で read 並列化。
-
-**Append-only write safety**: mergeRecord は page-in 不要 → write lock scope は merge_by_pk + commit のみ (~µs)。snapshot compaction が write lock を取るのは R2 既存データの CSR merge 時のみ (初回 1 回)。
+**COO write safety**: mergeRecord = L0 buffer append O(1) → mutex scope ~ns (CSR は commit() rebuild で ~µs–ms ロック保持だった)。Compaction は新 segment を atomic に swap → read は中断なし。
 
 **`hot_initialized` AtomicBool**: `Ordering::SeqCst` (全 load/store)。`Relaxed` は concurrent cold start 重複実行リスクがあったため昇格。
 
 **`loaded_labels` guard (CRITICAL)**: `ensure_labels()` は `enrich_label_from_r2()` 成功時のみ `loaded_labels` に追加。失敗時は追加しない → 次回 query で再試行。以前は失敗時も loaded 扱いで Container 再起動まで永久に空結果だった。
 
-## Arrow IPC Shannon Analysis
+## Shannon Analysis
 
-WAL + query storage schema の Shannon 情報効率比較: `docs/260329-yata-arrow-ipc-shannon-analysis.md`。結論: WAL=Edge List Arrow IPC + Query=CSR が Shannon 最適 (加重 71.8%)。NDJSON→Arrow IPC 移行で +9.3%。YataFragment 抽象は memmap2 直接置き換え候補。
+WAL + query storage schema の Shannon 情報効率比較。**Sorted COO = 82.5% vs CSR = 45.1%** (Write Amplification + Snapshot 軸追加後)。旧分析 (`docs/260329-yata-arrow-ipc-shannon-analysis.md`) は CSR の write-path 非効率を隠蔽 → COO 設計 (`docs/260329-yata-coo-sorted-design.md`) で修正。
 
-## Persistence Model — Arrow IPC WAL + Per-label L1 Compaction
+## Persistence Model — Sorted COO Segments + Arrow IPC WAL
 
-**Durability は Pipeline WAL が保証。** Pipeline → R2 JSON (10s flush) が WAL source of truth。
+**Durability は Pipeline WAL が保証。** Pipeline → R2 JSON (10s flush) が WAL source of truth。**Sorted COO segments が query format = persistent format** (別途 snapshot 不要)。
 
 | 層 | Format | Trigger | 用途 |
 |---|---|---|---|
 | **Pipeline WAL** | R2 JSON (`pipeline/wal/`) | `Pipeline.send()` 10s flush | source of truth (durable) |
 | **yata WAL segments** | Arrow IPC (`wal/segments/{pid}/`) | cron 10s `walFlushSegment` | Cold start replay |
-| **Per-label compacted segments** | Arrow IPC (`log/compacted/{pid}/label/{label}.arrow`) | `trigger_compaction` (dirty labels only) | PK-dedup recovery (P=1.0) |
-| **CompactionManifest v2** | JSON (`log/compacted/{pid}/manifest.json`) | `trigger_compaction` | Per-label state tracking |
+| **L0 buffer** | in-memory unsorted COO tuples | mergeRecord append | instant write, pending compaction |
+| **L1 sorted COO segments** | Arrow IPC (`log/coo/{pid}/label/{label}/{range}.arrow`) | LSM compaction (dirty labels only) | query + persistence (PK-dedup, P=1.0) |
+| **CompactionManifest v2** | JSON (`log/coo/{pid}/manifest.json`) | `trigger_compaction` | Per-label state tracking |
 
-**`trigger_snapshot()` = `wal_flush_segment` + `drain_dirty_labels` + per-label `trigger_compaction`。** Clean labels = zero R2 I/O。v1 monolithic manifest → v2 per-label auto-migration。
+**`trigger_compaction()` = `wal_flush_segment` + `drain_dirty_labels` + per-label LSM merge-sort。** L0 + existing L1 → merge-sort by (label, src, dst) → PK-dedup → R2 PUT。Clean labels = zero R2 I/O。**No commit() rebuild** — compaction 出力がそのまま query 用 sorted segments。
 
-**Cold start**: `ensure_labels` → `hot_initialized == false` → `wal_cold_start()` 自動実行。v2: per-label segment mmap (~100µs/label) → R2 GET fallback。v1: monolithic segment (backward compat)。WAL tail replay (segment registry from `head.json`)。Read replica は初 query で自動 cold start。
+**Cold start**: `ensure_labels` → `hot_initialized == false` → `cold_start()` 自動実行。Per-label sorted COO segments mmap (~100µs/segment) → R2 GET fallback → sparse index build。WAL tail replay → L0 buffer に append。Read replica は初 query で自動 cold start。
 
 ## Arrow IPC WAL + L1 Compaction `[PRODUCTION]` (verified 2026-03-29)
 
@@ -152,7 +161,8 @@ WAL + query storage schema の Shannon 情報効率比較: `docs/260329-yata-arr
 - **Replica transport**: `/xrpc/ai.gftd.yata.walTailArrow` (Arrow IPC body) + `/xrpc/ai.gftd.yata.walApplyArrow`。JSON endpoints 維持 (backward compat)
 - **Migration CLI**: `gftd yata migrate --from snapshot --to arrow-wal` (forward) / `--from arrow-wal --to snapshot` (rollback)
 - **Edge cache 除去**: PDS `cyCached` → `cy` 直接 (graph data は mutation-driven、edge cache は stale 原因)
-- **PDS `cyRetry` (CRITICAL)**: `cyCached` が `cyRetry` 経由で yata 呼出。空結果時に1回リトライ。Container cold start / 一時的 R2 label page-in 失敗に対する defense-in-depth
+- **PDS `cyRetry` (CRITICAL)**: `cyCached` が `cyRetry` 経由で yata 呼出。空結果時に1回リトライ (5s timeout)。Container cold start / 一時的 R2 label page-in 失敗に対する defense-in-depth
+- **Cron compaction (CRITICAL)**: YataRPC cron が毎 5 分 (minute % 5 == 2) に `compact()` 呼出。v1 monolithic → v2 per-label 自動 migration。v2 cold start は per-label R2 GET (~数 MB/label) で v1 (419 MB monolithic) より大幅高速
 
 | Path | Before | After |
 |---|---|---|
@@ -184,10 +194,10 @@ Production: PARTITION_COUNT=1, per-label Arrow IPC, full page-in (3-tier: disk�
 
 ### Key behaviors
 
-- **Query** (GIE, <1us): Cypher → parse → ensure_labels (selective page-in) → GIE transpile → CSR push-based execute. No MemoryGraph fallback (GIE transpile failure = error)
-- **Mutation** (~55ms with delta-apply, fallback ~500ms): MemoryGraph copy → mutate → delta-apply O(delta) for <50% change, full CSR rebuild fallback。merge_by_pk = prop_eq_index O(1)。Edge deletion = tombstone HashSet (O(1) lookup in neighbor iteration)。CpmStats: cypher_read/mutation/mergeRecord counts + mutation_avg_us + last_snapshot_serialize_ms
-- **Storage**: RAM (CSR <1us) → disk cache (~100us) → R2 source of truth (~3-5ms)
-- **Cold start**: **label-selective page-in** (topology + query-needed labels only)。3-tier blob fetch (disk → R2 → write-through)。後続 query で on-demand enrich (enrich_new_labels)
+- **Query** (sparse index, <10us): Cypher → parse → ensure_labels (segment page-in) → sparse index binary search → sorted segment scan。GIE push-based for multi-hop。No MemoryGraph fallback (failure = error)
+- **Mutation** (O(1) append, no rebuild): L0 buffer append + WAL ring append。merge_by_pk = prop_eq_index O(1)。Edge deletion = tombstone in L0 (compacted out in L1)。CpmStats: cypher_read/mutation/mergeRecord counts + mutation_avg_us。**No commit() rebuild** — CSR rebuild 排除
+- **Storage**: RAM (L0 buffer + sparse index) → disk cache (sorted segments ~100us) → R2 source of truth (~3-5ms)
+- **Cold start**: **segment-level page-in** (label × src_range 単位)。3-tier blob fetch (disk → R2 → write-through)。後続 query で on-demand segment load
 - **Chunk**: Arrow row-group 32 MB/chunk byte-based。1B vertices でも ~数十 chunks
 - **Partition fan-out**: 1x standard-1 = ~20M nodes (production)。4x standard-1 = ~100M (E2E verified)
 

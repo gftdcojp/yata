@@ -1813,6 +1813,21 @@ impl TieredGraphEngine {
             _ => None,
         }
     }
+
+    /// Phase 5: Execute a distributed plan fragment step on local CSR.
+    pub fn execute_fragment_step(
+        &self,
+        cypher: &str,
+        partition_id: u32,
+        partition_count: u32,
+        target_round: u32,
+        inbound: &std::collections::HashMap<u32, Vec<yata_gie::MaterializedRecord>>,
+    ) -> Result<yata_gie::ExchangePayload, String> {
+        self.ensure_hot();
+        let hot = self.hot.read().map_err(|e| format!("lock: {e}"))?;
+        let single = hot.as_single().ok_or("not single-partition store")?;
+        yata_gie::execute_step(cypher, single, partition_id, partition_count, target_round, inbound)
+    }
 }
 
 // Write-path standalone functions removed:

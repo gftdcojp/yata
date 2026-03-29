@@ -3305,6 +3305,7 @@ dependencies = [
 name = "yata-gie"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "yata-cypher",
@@ -3406,6 +3407,7 @@ dependencies = [
  "yata-core",
  "yata-engine",
  "yata-format",
+ "yata-gie",
  "yata-graph",
  "yata-grin",
  "yata-object",

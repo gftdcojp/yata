@@ -1,12 +1,19 @@
-//! Push-based distributed executor — code exists but NOT WIRED into production path.
-//! Each partition executes its plan fragment autonomously.
-//! Exchange operators serialize records for inter-partition data flow.
-//! Receive operators consume records from other partitions.
-//! NOTE: Hash partition routing is not wired into mutation flow. Single-partition only in practice.
+//! Push-based distributed executor with coordinator-mediated HTTP exchange.
+//!
+//! Phase 5: GIE Exchange/Receive/Gather wired for production multi-partition execution.
+//! CF Containers cannot communicate directly — the TS coordinator mediates all exchange.
+//!
+//! Execution model (stateless per-round):
+//!   Round 0: execute ops until first Exchange → yield outbound MaterializedRecords
+//!   Round N: replay ops 0..N with inbound data injected at Receive → yield or return final
+//!
+//! The coordinator orchestrates: collect outbound → route to targets → inject as inbound.
 
 use std::collections::HashMap;
 
-use crate::executor::{execute_op, eval_expr, Record};
+use serde::{Deserialize, Serialize};
+
+use crate::executor::{execute_op, eval_expr, MaterializedRecord, Record};
 use crate::ir::*;
 use yata_grin::PropValue;
 use yata_store::MutableCsrStore;
@@ -208,6 +215,144 @@ pub fn execute_fragment(
 /// Hash a routing key value to a partition ID.
 fn hash_to_partition(value: u64, partition_count: u32) -> u32 {
     (value % partition_count as u64) as u32
+}
+
+// ── Phase 5: Step executor for coordinator-mediated HTTP exchange ──
+
+/// Serializable exchange payload for HTTP transport between coordinator and containers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExchangePayload {
+    /// Target partition → materialized records
+    pub outbound: HashMap<u32, Vec<MaterializedRecord>>,
+    /// Final result rows (only when done=true)
+    pub results: Vec<Vec<(String, String)>>,
+    /// True if execution completed (no more exchange rounds)
+    pub done: bool,
+    /// Current exchange round (for coordinator tracking)
+    pub round: u32,
+}
+
+/// Execute a distributed plan fragment up to a specific exchange round.
+///
+/// - `target_round`: execute until this exchange round, then yield outbound data.
+///   If target_round >= total exchange rounds, execute to completion.
+/// - `inbound`: materialized records received from other partitions for each round < target_round.
+///
+/// Returns ExchangePayload with outbound data or final results.
+pub fn execute_step(
+    cypher: &str,
+    store: &MutableCsrStore,
+    partition_id: u32,
+    partition_count: u32,
+    target_round: u32,
+    inbound: &HashMap<u32, Vec<MaterializedRecord>>,
+) -> Result<ExchangePayload, String> {
+    // Parse and plan
+    let ast = yata_cypher::parse(cypher).map_err(|e| format!("parse error: {e}"))?;
+    let plan = crate::transpile::transpile(&ast).map_err(|e| format!("transpile error: {e}"))?;
+    let dist = crate::distributed_planner::plan_distributed(&plan, partition_count);
+
+    if partition_id as usize >= dist.fragments.len() {
+        return Ok(ExchangePayload { outbound: HashMap::new(), results: vec![], done: true, round: target_round });
+    }
+
+    let fragment = &dist.fragments[partition_id as usize];
+    let pid = partition_id;
+    let mut data: Vec<Record> = Vec::new();
+    let mut exchange_round = 0u32;
+
+    for op in &fragment.plan.ops {
+        match op {
+            LogicalOp::Exchange { routing_key, kind } => {
+                if exchange_round == target_round {
+                    // Yield: materialize records and return outbound data
+                    let mut outbound: HashMap<u32, Vec<MaterializedRecord>> = HashMap::new();
+                    match kind {
+                        ExchangeKind::HashShuffle => {
+                            for record in &data {
+                                let key_val = eval_routing_key(routing_key, record, store);
+                                let target_pid = hash_to_partition(key_val, partition_count);
+                                if target_pid != pid {
+                                    outbound.entry(target_pid).or_default()
+                                        .push(MaterializedRecord::from_record(record, store));
+                                }
+                            }
+                            // Keep local records
+                            data.retain(|r| {
+                                let key_val = eval_routing_key(routing_key, r, store);
+                                hash_to_partition(key_val, partition_count) == pid
+                            });
+                        }
+                        ExchangeKind::Broadcast => {
+                            let materialized: Vec<MaterializedRecord> = data.iter()
+                                .map(|r| MaterializedRecord::from_record(r, store))
+                                .collect();
+                            for target in 0..partition_count {
+                                if target != pid {
+                                    outbound.insert(target, materialized.clone());
+                                }
+                            }
+                        }
+                        ExchangeKind::Gather => {
+                            if pid != 0 {
+                                let materialized: Vec<MaterializedRecord> = data.iter()
+                                    .map(|r| MaterializedRecord::from_record(r, store))
+                                    .collect();
+                                outbound.insert(0, materialized);
+                                data.clear();
+                            }
+                        }
+                    }
+                    return Ok(ExchangePayload { outbound, results: vec![], done: false, round: exchange_round });
+                }
+                // Past round: apply same logic but don't yield (already handled in previous call)
+                match kind {
+                    ExchangeKind::HashShuffle => {
+                        data.retain(|r| {
+                            let key_val = eval_routing_key(routing_key, r, store);
+                            hash_to_partition(key_val, partition_count) == pid
+                        });
+                    }
+                    ExchangeKind::Gather => {
+                        if pid != 0 { data.clear(); }
+                    }
+                    ExchangeKind::Broadcast => {} // keep all
+                }
+                exchange_round += 1;
+            }
+            LogicalOp::Receive { .. } => {
+                // Inject inbound records for this round (from coordinator)
+                let recv_round = exchange_round.saturating_sub(1);
+                if let Some(materialized) = inbound.get(&recv_round) {
+                    for mr in materialized {
+                        if let Some(record) = mr.to_record(store) {
+                            data.push(record);
+                        }
+                    }
+                }
+            }
+            other => {
+                data = execute_op(other, data, store);
+            }
+        }
+    }
+
+    // Execution complete — format results
+    let results: Vec<Vec<(String, String)>> = data.iter().map(|record| {
+        record.values.iter().enumerate().map(|(i, v)| {
+            let col = format!("col_{i}");
+            let val = match v {
+                PropValue::Null => "null".to_string(),
+                PropValue::Bool(b) => b.to_string(),
+                PropValue::Int(n) => n.to_string(),
+                PropValue::Float(f) => f.to_string(),
+                PropValue::Str(s) => s.clone(),
+            };
+            (col, val)
+        }).collect()
+    }).collect();
+
+    Ok(ExchangePayload { outbound: HashMap::new(), results, done: true, round: exchange_round })
 }
 
 /// Evaluate routing key expression to a u64 for partition routing.

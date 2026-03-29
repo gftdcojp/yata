@@ -41,6 +41,20 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
         None
     }
 
+    /// Phase 5: Execute a distributed plan fragment step.
+    /// Returns exchange payload with outbound data or final results.
+    fn execute_fragment_step(
+        &self,
+        cypher: &str,
+        partition_id: u32,
+        partition_count: u32,
+        target_round: u32,
+        inbound: &std::collections::HashMap<u32, Vec<yata_gie::MaterializedRecord>>,
+    ) -> Result<yata_gie::ExchangePayload, String> {
+        let _ = (cypher, partition_id, partition_count, target_round, inbound);
+        Err("execute_fragment_step not implemented".into())
+    }
+
     // ── WAL Projection API ──
 
     /// Read WAL tail entries after a given sequence number.
@@ -132,6 +146,8 @@ pub fn router<G: GraphQueryExecutor>(state: YataRestState<G>) -> Router {
         .route("/xrpc/ai.gftd.yata.compact", post(compact_handler::<G>))
         .route("/xrpc/ai.gftd.yata.mergeRecordWal", post(merge_record_wal_handler::<G>))
         .route("/xrpc/ai.gftd.yata.stats", get(stats_handler::<G>))
+        // Phase 5: Distributed GIE fragment execution
+        .route("/xrpc/ai.gftd.yata.executeFragment", post(execute_fragment_handler::<G>))
         .with_state(state)
 }
 
@@ -210,6 +226,45 @@ async fn stats_handler<G: GraphQueryExecutor>(
     match state.graph.cpm_stats() {
         Some(stats) => (StatusCode::OK, Json(serde_json::to_value(stats).unwrap_or_default())),
         None => (StatusCode::OK, Json(serde_json::json!({"error": "stats not available"}))),
+    }
+}
+
+// ── Phase 5: Distributed GIE fragment execution ──
+
+#[derive(Deserialize)]
+struct ExecuteFragmentReq {
+    cypher: String,
+    partition_id: u32,
+    partition_count: u32,
+    #[serde(default)]
+    round: u32,
+    #[serde(default)]
+    inbound: std::collections::HashMap<u32, Vec<yata_gie::MaterializedRecord>>,
+}
+
+async fn execute_fragment_handler<G: GraphQueryExecutor>(
+    State(state): State<YataRestState<G>>,
+    headers: HeaderMap,
+    Json(req): Json<ExecuteFragmentReq>,
+) -> impl IntoResponse {
+    match authorize(&headers, &state) {
+        Ok(AuthResult::Internal) => {}
+        _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "internal only"}))),
+    };
+    let graph = state.graph.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        graph.execute_fragment_step(
+            &req.cypher,
+            req.partition_id,
+            req.partition_count,
+            req.round,
+            &req.inbound,
+        )
+    }).await;
+    match result {
+        Ok(Ok(payload)) => (StatusCode::OK, Json(serde_json::to_value(payload).unwrap_or_default())),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
     }
 }
 
@@ -686,6 +741,17 @@ impl GraphQueryExecutor for yata_engine::TieredGraphEngine {
 
     fn cpm_stats(&self) -> Option<yata_engine::engine::CpmStats> {
         Some(self.cpm_stats())
+    }
+
+    fn execute_fragment_step(
+        &self,
+        cypher: &str,
+        partition_id: u32,
+        partition_count: u32,
+        target_round: u32,
+        inbound: &std::collections::HashMap<u32, Vec<yata_gie::MaterializedRecord>>,
+    ) -> Result<yata_gie::ExchangePayload, String> {
+        self.execute_fragment_step(cypher, partition_id, partition_count, target_round, inbound)
     }
 }
 
