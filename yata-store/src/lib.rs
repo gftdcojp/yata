@@ -389,9 +389,25 @@ impl BTreeIndex {
         vertex_props_map: &[HashMap<String, PropValue>],
         vertex_alive: &[bool],
     ) {
-        // Rebuild for all registered (label, prop) keys
         let keys: Vec<(String, String)> = self.trees.keys().cloned().collect();
         for (label, prop) in keys {
+            self.rebuild_single(label_index, vertex_props_map, vertex_alive, &label, &prop);
+        }
+    }
+
+    /// Rebuild only dirty labels (zero-copy for clean labels).
+    fn rebuild_dirty(
+        &mut self,
+        label_index: &HashMap<String, Vec<u32>>,
+        vertex_props_map: &[HashMap<String, PropValue>],
+        vertex_alive: &[bool],
+        dirty: &HashSet<String>,
+    ) {
+        let keys: Vec<(String, String)> = self.trees.keys().cloned().collect();
+        for (label, prop) in keys {
+            if !dirty.is_empty() && !dirty.contains(&label) {
+                continue;
+            }
             self.rebuild_single(label_index, vertex_props_map, vertex_alive, &label, &prop);
         }
     }
@@ -1238,10 +1254,14 @@ impl MutableCsrStore {
         }
     }
 
-    /// Rebuild all registered property equality indexes.
+    /// Rebuild property equality indexes — dirty labels only.
     fn rebuild_prop_indexes(&mut self) {
+        let dirty = &self.dirty_vertex_labels;
         let keys: Vec<(String, String)> = self.prop_eq_index.keys().cloned().collect();
         for (label, prop) in keys {
+            if !dirty.is_empty() && !dirty.contains(&label) {
+                continue;
+            }
             self.rebuild_single_prop_index(&label, &prop);
         }
     }
@@ -1260,12 +1280,13 @@ impl MutableCsrStore {
             .insert((label.to_string(), prop_key.to_string()), idx);
     }
 
-    /// Rebuild B-tree range indexes for all registered (label, prop) pairs.
+    /// Rebuild B-tree range indexes — dirty labels only.
     fn rebuild_btree_indexes(&mut self) {
-        self.btree_index.rebuild(
+        self.btree_index.rebuild_dirty(
             &self.label_index,
             &self.vertex_props_map,
             &self.vertex_alive,
+            &self.dirty_vertex_labels,
         );
     }
 
@@ -1302,21 +1323,37 @@ impl MutableCsrStore {
         &self.btree_index
     }
 
-    /// Rebuild columnar property cache for all labels.
-    /// Creates dense Vec<Option<PropValue>> per (label, prop_key) for cache-friendly scan.
+    /// Rebuild columnar property cache — dirty labels only (zero-copy for clean labels).
     fn rebuild_columnar_cache(&mut self) {
-        self.columnar_cache.columns.clear();
+        let dirty = &self.dirty_vertex_labels;
         let n = self.vertex_count as usize;
 
-        for label in &self.known_vertex_labels {
-            // Collect all prop keys for this label
+        // Full rebuild only on first commit (dirty empty = no tracking yet)
+        if dirty.is_empty() {
+            self.columnar_cache.columns.clear();
+        }
+
+        let labels: Vec<String> = if dirty.is_empty() {
+            self.known_vertex_labels.clone()
+        } else {
+            dirty.iter().cloned().collect()
+        };
+
+        for label in &labels {
+            // Remove stale columns for this label
+            self.columnar_cache.columns.retain(|(l, _), _| l != label);
+
+            let vids = match self.label_index.get(label) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            // Collect prop keys from dirty vertices only
             let mut all_keys: HashSet<String> = HashSet::new();
-            if let Some(vids) = self.label_index.get(label) {
-                for &vid in vids {
-                    if let Some(props) = self.vertex_props_map.get(vid as usize) {
-                        for k in props.keys() {
-                            all_keys.insert(k.clone());
-                        }
+            for &vid in vids {
+                if let Some(props) = self.vertex_props_map.get(vid as usize) {
+                    for k in props.keys() {
+                        all_keys.insert(k.clone());
                     }
                 }
             }
@@ -1324,12 +1361,10 @@ impl MutableCsrStore {
             // Build dense column per key
             for key in all_keys {
                 let mut col = vec![None; n];
-                if let Some(vids) = self.label_index.get(label) {
-                    for &vid in vids {
-                        if let Some(props) = self.vertex_props_map.get(vid as usize) {
-                            if let Some(val) = props.get(&key) {
-                                col[vid as usize] = Some(val.clone());
-                            }
+                for &vid in vids {
+                    if let Some(props) = self.vertex_props_map.get(vid as usize) {
+                        if let Some(val) = props.get(&key) {
+                            col[vid as usize] = Some(val.clone());
                         }
                     }
                 }
@@ -1340,11 +1375,23 @@ impl MutableCsrStore {
         }
     }
 
-    /// Rebuild label bitmaps for all labels.
+    /// Rebuild label bitmaps — dirty labels only (zero-copy for clean labels).
     fn rebuild_label_bitmap(&mut self) {
-        self.label_bitmap.bitmaps.clear();
+        let dirty = &self.dirty_vertex_labels;
         let n = self.vertex_count as usize;
-        for label in &self.known_vertex_labels {
+
+        // Full rebuild only on first commit
+        if dirty.is_empty() {
+            self.label_bitmap.bitmaps.clear();
+        }
+
+        let labels: Vec<String> = if dirty.is_empty() {
+            self.known_vertex_labels.clone()
+        } else {
+            dirty.iter().cloned().collect()
+        };
+
+        for label in &labels {
             let mut bitmap = vec![false; n];
             if let Some(vids) = self.label_index.get(label) {
                 for &vid in vids {

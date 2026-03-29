@@ -6,14 +6,13 @@
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Trait abstracting the graph query interface needed by the REST API.
 pub trait GraphQueryExecutor: Send + Sync + 'static {
@@ -30,7 +29,7 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
         &self,
         cypher: &str,
         params: &[(String, String)],
-        did: &str,
+        _did: &str,
     ) -> Result<Vec<Vec<(String, String)>>, String> {
         // Default: fall back to public query (no RLS)
         self.query(cypher, params, None)

@@ -3,7 +3,6 @@
 //! - Query routing (CSR hot-path)
 //! - Query result cache (LRU + TTL + generation invalidation)
 //! - Delta write-back (mutation tracking + CSR rebuild)
-//! - RLS filtering (org_id scoping)
 //! - Vineyard page-in / page-out (lazy label loading)
 
 pub mod cache;
@@ -14,7 +13,6 @@ pub mod frontier;
 pub mod loader;
 pub mod partition_query;
 pub mod partition_router;
-pub mod rls;
 pub mod router;
 pub mod sharded_coordinator;
 pub mod snapshot;

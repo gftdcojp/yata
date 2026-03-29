@@ -13,7 +13,6 @@ use yata_store::vineyard::{
 use crate::cache::{QueryCache, cache_key};
 use crate::config::TieredEngineConfig;
 use crate::loader;
-use crate::rls;
 use crate::router;
 
 /// CPM metrics: CP5 mutation frequency + read/write ratio + CP4 snapshot monitoring.
@@ -39,91 +38,6 @@ static ENGINE_RT: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::Lazy
         .build()
         .expect("yata-engine tokio runtime")
 });
-
-/// Build a full RlsScope from org_id + _rls_* Cypher params.
-/// This bridges the REST layer's param injection to the engine's scoped RLS filter.
-fn build_rls_scope_from_params(org_id: &str, params: &[(String, String)]) -> rls::RlsScope {
-    let get = |key: &str| -> Option<String> {
-        params.iter().find(|(k, _)| k == key).map(|(_, v)| {
-            v.trim_matches('"').to_string()
-        })
-    };
-
-    // org_id filtering is skipped when org_id is empty or when SecurityFilter (GIE path) handles governance.
-    // "pds" magic value is prohibited. Empty org_id = no org_id filter (public/anon).
-    let is_system_scope = org_id.is_empty() || org_id == "anon";
-
-    let clearance = get("_rls_clearance").and_then(|s| {
-        match s.as_str() {
-            "public" => Some(rls::DataSensitivity::Public),
-            "internal" => Some(rls::DataSensitivity::Internal),
-            "confidential" => Some(rls::DataSensitivity::Confidential),
-            "restricted" => Some(rls::DataSensitivity::Restricted),
-            _ => None,
-        }
-    });
-
-    let consent_grants = get("_rls_consent_grants")
-        .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(&s).ok())
-        .map(|grants| {
-            grants.iter().filter_map(|g| {
-                Some(rls::ConsentGrant {
-                    grantor_did: g.get("grantor_did")?.as_str()?.to_string(),
-                    grantee_did: g.get("grantee_did")?.as_str().unwrap_or("").to_string(),
-                    resource_ids: g.get("resource_ids")
-                        .and_then(|v| v.as_array())
-                        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                        .unwrap_or_default(),
-                    max_sensitivity: match g.get("max_sensitivity").and_then(|v| v.as_str()).unwrap_or("public") {
-                        "internal" => rls::DataSensitivity::Internal,
-                        "confidential" => rls::DataSensitivity::Confidential,
-                        "restricted" => rls::DataSensitivity::Restricted,
-                        _ => rls::DataSensitivity::Public,
-                    },
-                    delegatable: g.get("delegatable").and_then(|v| v.as_bool()).unwrap_or(false),
-                })
-            }).collect()
-        })
-        .unwrap_or_default();
-
-    rls::RlsScope {
-        org_id: org_id.to_string(),
-        user_did: get("_rls_user_did"),
-        actor_did: get("_rls_actor_did"),
-        clearance,
-        consent_grants,
-        skip_org_filter: is_system_scope,
-    }
-}
-
-/// Convert RlsScope → GIE SecurityScope for predicate pushdown.
-fn build_gie_security_scope(rls: &rls::RlsScope) -> yata_gie::ir::SecurityScope {
-    if rls.skip_org_filter && rls.clearance.is_none() {
-        return yata_gie::ir::SecurityScope { bypass: true, ..Default::default() };
-    }
-
-    let max_sensitivity_ord = match &rls.clearance {
-        Some(rls::DataSensitivity::Restricted) => 3,
-        Some(rls::DataSensitivity::Confidential) => 2,
-        Some(rls::DataSensitivity::Internal) => 1,
-        _ => 0, // public only
-    };
-
-    let collection_scopes = Vec::new();
-
-    // Consent: hash grantor DIDs for O(1) lookup during CSR traversal
-    let allowed_owner_hashes: Vec<u32> = rls.consent_grants
-        .iter()
-        .map(|g| fnv1a_32(g.grantor_did.as_bytes()))
-        .collect();
-
-    yata_gie::ir::SecurityScope {
-        max_sensitivity_ord,
-        collection_scopes,
-        allowed_owner_hashes,
-        bypass: rls.skip_org_filter && max_sensitivity_ord >= 3,
-    }
-}
 
 /// FNV-1a 32-bit hash (fast, non-cryptographic — for owner_hash property matching).
 fn fnv1a_32(data: &[u8]) -> u32 {
@@ -195,26 +109,6 @@ pub struct MutationContext {
     pub user_did: String,
     /// DID-based actor identity (federation-ready).
     pub actor_did: String,
-}
-
-impl MutationContext {
-    /// Build an RlsScope from this context.
-    pub fn to_rls_scope(&self) -> rls::RlsScope {
-        rls::RlsScope {
-            org_id: self.org_id.clone(),
-            user_did: if self.user_did.is_empty() {
-                None
-            } else {
-                Some(self.user_did.clone())
-            },
-            actor_did: if self.actor_did.is_empty() {
-                None
-            } else {
-                Some(self.actor_did.clone())
-            },
-            ..Default::default()
-        }
-    }
 }
 
 /// Graph engine: MutableCSR in-memory + WAL Projection (R2 segments + checkpoints).
@@ -470,7 +364,6 @@ impl TieredGraphEngine {
             self.ensure_labels(&[]);
         }
 
-        let rls_owned = rls_org_id.map(String::from);
 
         self.block_on(async {
             self.ensure_hot();
@@ -481,15 +374,6 @@ impl TieredGraphEngine {
             } else {
                 return Err("failed to acquire CSR lock".to_string());
             };
-
-            // Apply RLS once.
-            if let Some(ref org_id) = rls_owned {
-                if !ctx.user_did.is_empty() || !ctx.actor_did.is_empty() {
-                    rls::apply_rls_filter_scoped(&mut g.0, &ctx.to_rls_scope());
-                } else {
-                    rls::apply_rls_filter(&mut g.0, org_id);
-                }
-            }
 
             // Track initial state once.
             let initial_vids: HashSet<String> = g.0.nodes().iter().map(|n| n.id.clone()).collect();
@@ -565,8 +449,7 @@ impl TieredGraphEngine {
         })
     }
 
-    /// Query with full RLS scope (org_id + user_did + actor_did).
-    /// Uses RlsScope-based filtering for per-entity graph partitioning.
+    /// Query with scoped mutation context (org_id + user_did + actor_did).
     pub fn query_with_scoped_context(
         &self,
         cypher: &str,
@@ -649,28 +532,12 @@ impl TieredGraphEngine {
             self.ensure_labels(&vl_refs);
 
             // GIE path: Cypher → IR Plan → execute directly on CSR (zero MemoryGraph copy).
-            // RLS via SecurityFilter predicate pushdown. No MemoryGraph fallback.
+            // Design E: SecurityScope is compiled from CSR policy vertices via query_with_did().
+            // This path (query_inner) is Internal-only (no SecurityFilter needed).
             if let Ok(csr) = self.hot.read() {
                 if let Some(single_csr) = csr.as_single() {
                     if let Ok(ast) = yata_cypher::parse(cypher) {
-                        // Build SecurityScope from RLS params (if authenticated).
-                        // GIE SecurityFilter uses property-based governance (sensitivity_ord, owner_hash).
-                        // If _rls_clearance param is present → new governance model → use GIE SecurityFilter.
-                        // Otherwise → old org_id model → error (migrate to SecurityFilter).
-                        let has_clearance = params.iter().any(|(k, _)| k == "_rls_clearance");
-
-                        let plan_result = if rls_org_id.is_some() && has_clearance {
-                            let rls = build_rls_scope_from_params(rls_org_id.unwrap(), params);
-                            let security_scope = build_gie_security_scope(&rls);
-                            yata_gie::transpile::transpile_secured(&ast, security_scope)
-                        } else if rls_org_id.is_none() {
-                            yata_gie::transpile::transpile(&ast)
-                        } else {
-                            // old org_id RLS → fall through to MemoryGraph path
-                            Err(yata_gie::transpile::TranspileError::UnsupportedClause(
-                                "old org_id RLS → MemoryGraph fallback".into(),
-                            ))
-                        };
+                        let plan_result = yata_gie::transpile::transpile(&ast);
 
                         if let Ok(plan) = plan_result {
                             let records = yata_gie::executor::execute(&plan, single_csr);
@@ -696,7 +563,6 @@ impl TieredGraphEngine {
         } else {
             self.ensure_labels(&[]);
         }
-        let rls_owned = rls_org_id.map(String::from);
 
         self.block_on(async {
             self.ensure_hot();
@@ -705,11 +571,6 @@ impl TieredGraphEngine {
             } else {
                 return Err("failed to acquire CSR lock".to_string());
             };
-
-            if let Some(ref org_id) = rls_owned {
-                let scope = build_rls_scope_from_params(org_id, params);
-                rls::apply_rls_filter_scoped(&mut g.0, &scope);
-            }
 
             // Lightweight mutation tracking: only track IDs (O(n) ID clones, no format! serialization)
             let before_vids: HashSet<String> =
@@ -1815,6 +1676,9 @@ mod tests {
 
     #[test]
     fn test_rls() {
+        // Design E: query_inner is Internal-only (no SecurityFilter).
+        // Parameter-based RLS removed — all nodes visible on internal path.
+        // Security filtering is via query_with_did() → CSR policy vertex lookup.
         let dir = tempfile::tempdir().unwrap();
         let engine = make_engine(&dir);
         run_query(
@@ -1843,9 +1707,10 @@ mod tests {
             .iter()
             .flat_map(|r| r.iter().find(|(c, _)| c == "name").map(|(_, v)| v.as_str()))
             .collect();
+        // Internal path: all nodes visible (no RLS filtering)
         assert!(names.contains(&"\"A\""));
         assert!(names.contains(&"\"System\""));
-        assert!(!names.contains(&"\"B\""));
+        assert!(names.contains(&"\"B\""));
     }
 
     #[test]
@@ -2289,7 +2154,8 @@ mod tests {
 
     #[test]
     fn test_rls_read_filters_by_org() {
-        // RLS on reads: only see own org + system nodes
+        // Design E: query_inner is Internal-only — all nodes visible.
+        // Parameter-based RLS removed. Security via query_with_did().
         let dir = tempfile::tempdir().unwrap();
         let e = make_engine(&dir);
         run_query(
@@ -2306,7 +2172,7 @@ mod tests {
             None,
         )
         .unwrap();
-        run_query(&e, "CREATE (n:Item {name: 'C'})", &[], None).unwrap(); // no org_id = system
+        run_query(&e, "CREATE (n:Item {name: 'C'})", &[], None).unwrap(); // no org_id
         let rows = run_query(
             &e,
             "MATCH (n:Item) RETURN n.name AS name",
@@ -2316,13 +2182,15 @@ mod tests {
         .unwrap();
         assert_eq!(
             rows.len(),
-            2,
-            "RLS read should return org_1 node + system node (no org_id)"
+            3,
+            "Internal path: all Item nodes visible (no RLS filtering)"
         );
         let has_a = rows.iter().any(|r| r.iter().any(|(_, v)| v.contains("A")));
+        let has_b = rows.iter().any(|r| r.iter().any(|(_, v)| v.contains("B")));
         let has_c = rows.iter().any(|r| r.iter().any(|(_, v)| v.contains("C")));
-        assert!(has_a, "Should see org_1 node A");
-        assert!(has_c, "Should see system node C (no org_id)");
+        assert!(has_a, "Should see node A");
+        assert!(has_b, "Should see node B");
+        assert!(has_c, "Should see node C");
     }
 
     // ── RETURN n via GIE path ───────────────────────────────────────
@@ -3124,37 +2992,6 @@ mod tests {
         );
     }
 
-    // ── MutationContext ──────────────────────────────────────────────
-
-    #[test]
-    fn test_mutation_context_to_rls_scope() {
-        let ctx = MutationContext {
-            app_id: "test-app".into(),
-            org_id: "org-1".into(),
-            user_id: "u1".into(),
-            actor_id: "a1".into(),
-            user_did: "did:key:alice".into(),
-            actor_did: "did:key:bot1".into(),
-        };
-        let scope = ctx.to_rls_scope();
-        assert_eq!(scope.org_id, "org-1");
-        assert_eq!(scope.user_did, Some("did:key:alice".into()));
-        assert_eq!(scope.actor_did, Some("did:key:bot1".into()));
-    }
-
-    #[test]
-    fn test_mutation_context_empty_dids_are_none() {
-        let ctx = MutationContext {
-            org_id: "org-1".into(),
-            user_did: String::new(),
-            actor_did: String::new(),
-            ..Default::default()
-        };
-        let scope = ctx.to_rls_scope();
-        assert_eq!(scope.user_did, None);
-        assert_eq!(scope.actor_did, None);
-    }
-
     // ── fnv1a_32 hash ────────────────────────────────────────────────
 
     #[test]
@@ -3175,89 +3012,6 @@ mod tests {
     fn test_fnv1a_32_empty() {
         let h = fnv1a_32(b"");
         assert_eq!(h, 0x811c_9dc5, "empty input should return FNV offset basis");
-    }
-
-    // ── build_rls_scope_from_params ──────────────────────────────────
-
-    #[test]
-    fn test_build_rls_scope_basic() {
-        let scope = build_rls_scope_from_params("org-1", &[]);
-        assert_eq!(scope.org_id, "org-1");
-        assert!(!scope.skip_org_filter);
-        assert!(scope.clearance.is_none());
-        assert!(scope.consent_grants.is_empty());
-    }
-
-    #[test]
-    fn test_build_rls_scope_system_scope_empty() {
-        let scope = build_rls_scope_from_params("", &[]);
-        assert!(scope.skip_org_filter, "empty org_id should skip org filter");
-    }
-
-    #[test]
-    fn test_build_rls_scope_system_scope_anon() {
-        let scope = build_rls_scope_from_params("anon", &[]);
-        assert!(scope.skip_org_filter, "anon org_id should skip org filter");
-    }
-
-    #[test]
-    fn test_build_rls_scope_with_clearance() {
-        let params = vec![("_rls_clearance".into(), "\"confidential\"".into())];
-        let scope = build_rls_scope_from_params("org-1", &params);
-        assert_eq!(scope.clearance, Some(rls::DataSensitivity::Confidential));
-    }
-
-    #[test]
-    fn test_build_rls_scope_with_user_did() {
-        let params = vec![("_rls_user_did".into(), "\"did:key:alice\"".into())];
-        let scope = build_rls_scope_from_params("org-1", &params);
-        assert_eq!(scope.user_did, Some("did:key:alice".into()));
-    }
-
-    // ── build_gie_security_scope ──────────────────────────────────────
-
-    #[test]
-    fn test_gie_security_scope_bypass_for_system() {
-        let rls = rls::RlsScope {
-            skip_org_filter: true,
-            clearance: None,
-            ..Default::default()
-        };
-        let scope = build_gie_security_scope(&rls);
-        assert!(scope.bypass);
-    }
-
-    #[test]
-    fn test_gie_security_scope_sensitivity_ord() {
-        let rls = rls::RlsScope {
-            org_id: "org-1".into(),
-            clearance: Some(rls::DataSensitivity::Confidential),
-            ..Default::default()
-        };
-        let scope = build_gie_security_scope(&rls);
-        assert_eq!(scope.max_sensitivity_ord, 2);
-        assert!(!scope.bypass);
-    }
-
-    #[test]
-    fn test_gie_security_scope_consent_hashes() {
-        let rls = rls::RlsScope {
-            org_id: "org-1".into(),
-            consent_grants: vec![rls::ConsentGrant {
-                grantor_did: "did:web:org2".into(),
-                grantee_did: "did:web:me".into(),
-                resource_ids: vec!["*".into()],
-                max_sensitivity: rls::DataSensitivity::Public,
-                delegatable: false,
-            }],
-            ..Default::default()
-        };
-        let scope = build_gie_security_scope(&rls);
-        assert_eq!(scope.allowed_owner_hashes.len(), 1);
-        assert_eq!(
-            scope.allowed_owner_hashes[0],
-            fnv1a_32(b"did:web:org2")
-        );
     }
 
     // ── merge_record readable via Cypher ──────────────────────────────
