@@ -218,30 +218,9 @@ fn parse_props_json(json: &str) -> HashMap<String, PropValue> {
         .collect()
 }
 
-// ── Mutable trait (read-only store — panics on mutation) ──
-
-impl Mutable for ArrowWalStore {
-    fn add_vertex(&mut self, _label: &str, _props: &[(&str, PropValue)]) -> u32 {
-        panic!("ArrowWalStore is read-only")
-    }
-    fn add_edge(&mut self, _src: u32, _dst: u32, _label: &str, _props: &[(&str, PropValue)]) -> u32 {
-        panic!("ArrowWalStore is read-only")
-    }
-    fn set_vertex_prop(&mut self, _vid: u32, _key: &str, _value: PropValue) {
-        panic!("ArrowWalStore is read-only")
-    }
-    fn delete_vertex(&mut self, _vid: u32) {
-        panic!("ArrowWalStore is read-only")
-    }
-    fn delete_edge(&mut self, _edge_id: u32) {
-        panic!("ArrowWalStore is read-only")
-    }
-    fn commit(&mut self) -> u64 {
-        0
-    }
-}
-
 // ── GRIN trait implementations (read-only, vertex-only) ──
+// These enable direct querying of the store without wal_apply,
+// though the primary use is as a loading utility for cold start.
 
 impl Topology for ArrowWalStore {
     fn vertex_count(&self) -> usize {

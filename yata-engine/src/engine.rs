@@ -1237,6 +1237,49 @@ impl TieredGraphEngine {
 
     /// Apply WAL entries to the CSR (incremental merge). Read Container only.
     /// Each entry is applied as merge_by_pk (upsert) or delete_by_pk (delete).
+    /// Apply vertex data from an ArrowWalStore (mmap'd compacted segment) to the CSR.
+    /// Uses GRIN Property trait to read vertex data without intermediate WalEntry allocation.
+    fn apply_arrow_wal_store(&self, store: &yata_store::ArrowWalStore) -> Result<u64, String> {
+        use yata_grin::{Property, Scannable, Schema};
+        if store.is_empty() {
+            return Ok(0);
+        }
+        let mut applied = 0u64;
+        if let Ok(mut hot) = self.hot.write() {
+            if let Some(single) = hot.as_single_mut() {
+                for vid in store.scan_all_vertices() {
+                    let labels = Property::vertex_labels(store, vid);
+                    let label = labels.first().map(|s| s.as_str()).unwrap_or("_default");
+                    let all_props = store.vertex_all_props(vid);
+                    let props: Vec<(&str, yata_grin::PropValue)> = all_props
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.clone()))
+                        .collect();
+                    // Use "rkey" as PK key (WAL convention)
+                    if let Some(yata_grin::PropValue::Str(pk_val)) = all_props.get("rkey") {
+                        let pk = yata_grin::PropValue::Str(pk_val.clone());
+                        single.merge_by_pk(label, "rkey", &pk, &props);
+                    } else {
+                        // Fallback: use find_vid_by_pk from the store
+                        single.add_vertex(label, &props);
+                    }
+                    applied += 1;
+                }
+                single.commit();
+                if let Ok(mut ll) = self.loaded_labels.lock() {
+                    for label in Schema::vertex_labels(store) {
+                        ll.insert(label);
+                    }
+                }
+                self.hot_initialized.store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Ok(mut c) = self.cache.lock() {
+                    c.invalidate();
+                }
+            }
+        }
+        Ok(applied)
+    }
+
     pub fn wal_apply(&self, entries: &[crate::wal::WalEntry]) -> Result<u64, String> {
         if entries.is_empty() {
             return Ok(0);
@@ -1536,42 +1579,81 @@ impl TieredGraphEngine {
         };
 
         let checkpoint_seq = if let Some(ref manifest) = compaction_manifest {
-            // L1 path: load compacted segment → wal_apply
+            // L1 path: mmap-first cold start (Phase 4)
+            // Priority: disk cache (mmap, ~100µs) → R2 GET (~3-5ms) → legacy fallback
             tracing::info!(
                 compacted_seq = manifest.compacted_seq,
                 entries = manifest.entry_count,
                 labels = manifest.labels.len(),
-                "cold start: loading L1 compacted segment"
+                "cold start: L1 compacted segment"
             );
 
-            match s3.get_sync(&manifest.compacted_segment_key) {
-                Ok(Some(data)) => {
-                    let entries = crate::arrow_wal::deserialize_segment_auto(
-                        &manifest.compacted_segment_key,
-                        &data,
-                    );
-                    if !entries.is_empty() {
-                        self.wal_apply(&entries)?;
-                        tracing::info!(
-                            applied = entries.len(),
-                            "cold start: L1 compacted segment applied"
+            let segment_filename = manifest.compacted_segment_key
+                .rsplit('/').next().unwrap_or("compacted.arrow");
+
+            // Try disk cache first (mmap, zero R2 fetch)
+            let disk_path = std::env::var("YATA_VINEYARD_DIR").ok().map(|d| {
+                format!("{d}/log/compacted/{pid}/{segment_filename}")
+            });
+
+            let loaded = if let Some(ref path) = disk_path {
+                if std::path::Path::new(path).exists() {
+                    // Phase 4: mmap reattach — O(1) open + O(N_labels) index build
+                    match yata_store::ArrowWalStore::from_file(std::path::Path::new(path)) {
+                        Ok(store) => {
+                            tracing::info!(
+                                path, vertices = store.len(),
+                                "cold start: mmap'd from disk cache (zero R2 fetch)"
+                            );
+                            // Apply to CSR via GRIN traits (vertex data only)
+                            self.apply_arrow_wal_store(&store)?;
+                            true
+                        }
+                        Err(e) => {
+                            tracing::warn!(path, error = %e, "disk cache mmap failed, trying R2");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !loaded {
+                // R2 GET fallback
+                match s3.get_sync(&manifest.compacted_segment_key) {
+                    Ok(Some(data)) => {
+                        let entries = crate::arrow_wal::deserialize_segment_auto(
+                            &manifest.compacted_segment_key,
+                            &data,
                         );
+                        if !entries.is_empty() {
+                            self.wal_apply(&entries)?;
+                            tracing::info!(
+                                applied = entries.len(),
+                                "cold start: L1 compacted segment applied from R2"
+                            );
+                        }
+                        // Write to disk cache for next mmap reattach
+                        if let Some(ref path) = disk_path {
+                            if let Some(parent) = std::path::Path::new(path).parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            let _ = std::fs::write(path, &data);
+                            tracing::debug!(path, "wrote compacted segment to disk cache");
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::warn!(key = %manifest.compacted_segment_key, "compacted segment not found, falling back to legacy");
+                        self.restore_from_r2();
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to load compacted segment, falling back to legacy");
+                        self.restore_from_r2();
                     }
                 }
-                Ok(None) => {
-                    tracing::warn!(key = %manifest.compacted_segment_key, "compacted segment not found, falling back to legacy");
-                    self.restore_from_r2();
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to load compacted segment, falling back to legacy");
-                    self.restore_from_r2();
-                }
-            }
-
-            // Also write to disk cache for next restart
-            if let Ok(vineyard_dir) = std::env::var("YATA_VINEYARD_DIR") {
-                let compact_dir = format!("{vineyard_dir}/log/compacted/{pid}");
-                let _ = std::fs::create_dir_all(&compact_dir);
             }
 
             manifest.compacted_seq
