@@ -26,15 +26,8 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
 
     fn rebuild_from_r2(&self);
 
-    fn force_snapshot_flush(&self);
-
     fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
         Err("trigger_snapshot not implemented".to_string())
-    }
-
-    /// Export snapshot blobs as a list of (key, bytes) pairs for external R2 upload.
-    fn export_snapshot_blobs(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
-        Err("export_snapshot_blobs not implemented".to_string())
     }
 
     // ── WAL Projection API ──
@@ -330,57 +323,6 @@ async fn rebuild_from_snapshot<G: GraphQueryExecutor>(
     }
 }
 
-/// POST /xrpc/ai.gftd.yata.mergeRecord — Merge a record into CSR by label + PK.
-/// Used by YataRPC for label-routed writes (hash(label) % N → this partition).
-/// Rejected with 405 on read-only containers (YATA_READONLY=true).
-async fn merge_record_handler<G: GraphQueryExecutor>(
-    State(state): State<YataRestState<G>>,
-    headers: HeaderMap,
-    Json(req): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    if state.readonly {
-        return (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"error": "read-only container: mergeRecord rejected"})));
-    }
-    let (_, _) = match authorize(&headers, &state) {
-        Ok(a) => a,
-        Err(s) => return (s, Json(serde_json::json!({"error": "unauthorized"}))),
-    };
-
-    let label = req.get("label").and_then(|v| v.as_str()).unwrap_or("");
-    let pk_key = req.get("pk_key").and_then(|v| v.as_str()).unwrap_or("rkey");
-    let pk_value = req.get("pk_value").and_then(|v| v.as_str()).unwrap_or("");
-    let props_val = req.get("props").cloned().unwrap_or(serde_json::Value::Object(Default::default()));
-
-    if label.is_empty() || pk_value.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "label and pk_value required"})));
-    }
-
-    // Convert JSON props to Cypher MERGE statement
-    let mut set_clauses = Vec::new();
-    if let Some(obj) = props_val.as_object() {
-        for (k, v) in obj {
-            let val_str = match v {
-                serde_json::Value::String(s) => format!("'{}'", s.replace('\'', "\\'")),
-                serde_json::Value::Number(n) => n.to_string(),
-                serde_json::Value::Bool(b) => b.to_string(),
-                _ => format!("'{}'", v),
-            };
-            set_clauses.push(format!("n.{k} = {val_str}"));
-        }
-    }
-
-    let cypher = if set_clauses.is_empty() {
-        format!("MERGE (n:{label} {{{pk_key}: '{pk_value}'}})")
-    } else {
-        format!("MERGE (n:{label} {{{pk_key}: '{pk_value}'}}) SET {}", set_clauses.join(", "))
-    };
-
-    match state.graph.query(&cypher, &[], None) {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true, "label": label, "pk": pk_value}))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
-    }
-}
-
 /// POST /xrpc/ai.gftd.yata.triggerSnapshot — Trigger snapshot: CSR → ArrowFragment → R2.
 /// Rejected with 405 on read-only containers (YATA_READONLY=true).
 async fn trigger_snapshot_handler<G: GraphQueryExecutor>(
@@ -395,55 +337,8 @@ async fn trigger_snapshot_handler<G: GraphQueryExecutor>(
     }
 }
 
-/// POST /xrpc/ai.gftd.yata.exportSnapshot — Export snapshot blobs for TS Worker R2 upload.
-/// Returns JSON: { blobs: [{key, data_b64}], meta_json, vertices, edges }
-/// Rejected with 405 on read-only containers (YATA_READONLY=true).
-async fn export_snapshot_handler<G: GraphQueryExecutor>(
-    State(state): State<YataRestState<G>>,
-) -> impl IntoResponse {
-    if state.readonly {
-        return (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"error": "read-only container: exportSnapshot rejected"})));
-    }
-    use base64::Engine as _;
-    let graph = state.graph.clone();
-    let result = tokio::task::spawn_blocking(move || graph.export_snapshot_blobs()).await;
-
-    match result {
-        Ok(Ok(blobs)) => {
-            let mut meta_json = String::new();
-            let mut blob_entries = Vec::new();
-
-            for (key, data) in &blobs {
-                if key.ends_with("meta.json") {
-                    meta_json = String::from_utf8_lossy(data).to_string();
-                }
-                blob_entries.push(serde_json::json!({
-                    "key": key,
-                    "data_b64": base64::engine::general_purpose::STANDARD.encode(data),
-                }));
-            }
-
-            let blob_count = blob_entries.len();
-            (StatusCode::OK, Json(serde_json::json!({
-                "blobs": blob_entries,
-                "meta_json": meta_json,
-                "vertices": blob_count,
-                "edges": 0,
-            })))
-        }
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e})),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("spawn_blocking failed: {e}")})),
-        ),
-    }
-}
-
-// Legacy snapshot import/export/diag endpoints removed.
-// ArrowFragment format: snapshot → R2 PUT (trigger_snapshot), page-in → R2 GET (ensure_labels).
+// Legacy endpoints removed: exportSnapshot, mergeRecord (Cypher MERGE).
+// WAL Projection: mergeRecordWal + walApply + walCheckpoint.
 
 // ── WAL Projection handlers ────────────────────────────────────────────
 
@@ -614,16 +509,8 @@ impl GraphQueryExecutor for yata_engine::TieredGraphEngine {
         self.restore_from_r2();
     }
 
-    fn force_snapshot_flush(&self) {
-        let _ = self.trigger_snapshot_force();
-    }
-
     fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
         self.trigger_snapshot()
-    }
-
-    fn export_snapshot_blobs(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
-        self.export_snapshot_blobs()
     }
 
     // ── WAL Projection ──
@@ -701,14 +588,8 @@ mod tests {
 
         fn rebuild_from_r2(&self) {}
 
-        fn force_snapshot_flush(&self) {}
-
         fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
             self.engine.trigger_snapshot()
-        }
-
-        fn export_snapshot_blobs(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
-            self.engine.export_snapshot_blobs()
         }
 
         fn wal_tail(&self, after_seq: u64, limit: usize) -> Result<Vec<yata_engine::wal::WalEntry>, String> {

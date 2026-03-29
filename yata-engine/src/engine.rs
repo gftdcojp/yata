@@ -123,6 +123,29 @@ fn fnv1a_32(data: &[u8]) -> u32 {
     hash
 }
 
+/// Convert PropValue slice to JSON map (for WAL entry serialization).
+fn props_to_json(props: &[(&str, yata_grin::PropValue)]) -> serde_json::Map<String, serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    for (k, v) in props {
+        let jv = match v {
+            yata_grin::PropValue::Str(s) => serde_json::Value::String(s.clone()),
+            yata_grin::PropValue::Int(n) => serde_json::Value::Number((*n).into()),
+            yata_grin::PropValue::Float(f) => serde_json::json!(*f),
+            yata_grin::PropValue::Bool(b) => serde_json::Value::Bool(*b),
+            yata_grin::PropValue::Null => serde_json::Value::Null,
+        };
+        m.insert(k.to_string(), jv);
+    }
+    m
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// Mutation context: metadata auto-injected into every mutated node.
 #[derive(Debug, Clone, Default)]
 pub struct MutationContext {
@@ -273,17 +296,9 @@ impl TieredGraphEngine {
         let s3_prefix = std::env::var("YATA_S3_PREFIX").unwrap_or_default();
         let s3_client = Arc::new(Mutex::new(None));
 
-        // WAL Projection mode: MutableCsrStore required (GIE query path needs as_single()).
-        // ArrowGraphStore is read-only (page-in only), merge_by_pk writes are invisible to GIE.
-        let use_csr = config.persistence_mode == crate::config::PersistenceMode::WalProjection
-            || std::env::var("YATA_USE_CSR").unwrap_or_default() == "true";
-        let hot_store = if use_csr {
-            tracing::info!("using MutableCsrStore (WAL Projection / YATA_USE_CSR)");
-            yata_store::GraphStoreEnum::new(partition_count, hot_partition_id)
-        } else {
-            tracing::info!("using ArrowGraphStore (Vineyard-native)");
-            yata_store::GraphStoreEnum::new_arrow(hot_partition_id)
-        };
+        // WAL Projection: MutableCsrStore (GIE query path needs as_single()).
+        let hot_store = yata_store::GraphStoreEnum::new(partition_count, hot_partition_id);
+        tracing::info!("using MutableCsrStore (WAL Projection)");
         let wal_ring_capacity = config.wal_ring_capacity;
         Self {
             config,
@@ -1019,53 +1034,20 @@ impl TieredGraphEngine {
             dl.insert(label.to_string());
         }
 
-        // WAL append (WalProjection mode)
-        let wal_entry = if self.config.persistence_mode == crate::config::PersistenceMode::WalProjection {
-            if let Ok(mut wal) = self.wal.lock() {
-                let seq = wal.next_seq();
-                let mut json_props = serde_json::Map::new();
-                for (k, v) in props {
-                    let jv = match v {
-                        yata_grin::PropValue::Str(s) => serde_json::Value::String(s.clone()),
-                        yata_grin::PropValue::Int(n) => serde_json::Value::Number((*n).into()),
-                        yata_grin::PropValue::Float(f) => serde_json::json!(*f),
-                        yata_grin::PropValue::Bool(b) => serde_json::Value::Bool(*b),
-                        yata_grin::PropValue::Null => serde_json::Value::Null,
-                    };
-                    json_props.insert(k.to_string(), jv);
-                }
-                let entry = crate::wal::WalEntry {
-                    seq,
-                    op: crate::wal::WalOp::Upsert,
-                    label: label.to_string(),
-                    pk_key: pk_key.to_string(),
-                    pk_value: pk_value.to_string(),
-                    props: json_props,
-                    timestamp_ms: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                };
-                wal.append(entry.clone());
-                Some(entry)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let _ = wal_entry; // entry is returned via wal_last_entry() if needed
+        // WAL append
+        if let Ok(mut wal) = self.wal.lock() {
+            let seq = wal.next_seq();
+            let json_props = props_to_json(props);
+            let entry = crate::wal::WalEntry {
+                seq, op: crate::wal::WalOp::Upsert,
+                label: label.to_string(), pk_key: pk_key.to_string(),
+                pk_value: pk_value.to_string(), props: json_props,
+                timestamp_ms: now_ms(),
+            };
+            wal.append(entry);
+        }
 
         if let Ok(mut hot) = self.hot.write() {
-            if let Some(arrow) = hot.as_arrow_mut() {
-                let vid = arrow.merge_by_pk(label, pk_key, pk_value, props);
-                arrow.commit();
-                if let Ok(mut ll) = self.loaded_labels.lock() {
-                    ll.insert(label.to_string());
-                }
-                self.pending_writes.fetch_add(1, Ordering::Relaxed);
-                return Ok(vid);
-            }
             if let Some(single) = hot.as_single_mut() {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
                 let vid = single.merge_by_pk(label, pk_key, &pk, props);
@@ -1127,15 +1109,6 @@ impl TieredGraphEngine {
         }
 
         if let Ok(mut hot) = self.hot.write() {
-            if let Some(arrow) = hot.as_arrow_mut() {
-                let vid = arrow.merge_by_pk(label, pk_key, pk_value, props);
-                arrow.commit();
-                if let Ok(mut ll) = self.loaded_labels.lock() {
-                    ll.insert(label.to_string());
-                }
-                self.pending_writes.fetch_add(1, Ordering::Relaxed);
-                return Ok((vid, wal_entry));
-            }
             if let Some(single) = hot.as_single_mut() {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
                 let vid = single.merge_by_pk(label, pk_key, &pk, props);
@@ -1165,30 +1138,18 @@ impl TieredGraphEngine {
         }
 
         // WAL append (Delete)
-        if self.config.persistence_mode == crate::config::PersistenceMode::WalProjection {
-            if let Ok(mut wal) = self.wal.lock() {
-                let seq = wal.next_seq();
-                let entry = crate::wal::WalEntry {
-                    seq,
-                    op: crate::wal::WalOp::Delete,
-                    label: label.to_string(),
-                    pk_key: pk_key.to_string(),
-                    pk_value: pk_value.to_string(),
-                    props: serde_json::Map::new(),
-                    timestamp_ms: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                };
-                wal.append(entry);
-            }
+        if let Ok(mut wal) = self.wal.lock() {
+            let seq = wal.next_seq();
+            let entry = crate::wal::WalEntry {
+                seq, op: crate::wal::WalOp::Delete,
+                label: label.to_string(), pk_key: pk_key.to_string(),
+                pk_value: pk_value.to_string(), props: serde_json::Map::new(),
+                timestamp_ms: now_ms(),
+            };
+            wal.append(entry);
         }
 
         if let Ok(mut hot) = self.hot.write() {
-            if let Some(arrow) = hot.as_arrow_mut() {
-                let deleted = arrow.delete_by_pk(label, pk_key, pk_value);
-                return Ok(deleted);
-            }
             if let Some(single) = hot.as_single_mut() {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
                 let deleted = single.delete_by_pk(label, pk_key, &pk);
@@ -1233,10 +1194,6 @@ impl TieredGraphEngine {
         };
 
         if let Ok(mut hot) = self.hot.write() {
-            if let Some(arrow) = hot.as_arrow_mut() {
-                let deleted = arrow.delete_by_pk(label, pk_key, pk_value);
-                return Ok((deleted, wal_entry));
-            }
             if let Some(single) = hot.as_single_mut() {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
                 let deleted = single.delete_by_pk(label, pk_key, &pk);
@@ -1247,10 +1204,8 @@ impl TieredGraphEngine {
         Err("failed to acquire hot store lock".into())
     }
 
-    /// Trigger R2 snapshot with compaction: page-in existing R2 → merge with in-memory → upload.
-    ///
-    /// Append-only writes don't page-in, so in-memory CSR may only have new records.
-    /// Snapshot compacts: R2 existing + in-memory new → full ArrowFragment → R2 PUT.
+    /// Trigger R2 checkpoint: serialize CSR → ArrowFragment → R2 PUT.
+    /// WAL Projection: CSR is authoritative (no R2 compaction).
     pub fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
         self.trigger_snapshot_inner(false)
     }
@@ -1281,43 +1236,7 @@ impl TieredGraphEngine {
             .ok_or_else(|| "S3 client not configured".to_string())?;
         let prefix = &self.s3_prefix;
 
-        // Compaction: ALWAYS merge R2 existing data into in-memory CSR before snapshot.
-        // WAL Projection: SKIP compaction — CSR is authoritative (built from WAL).
-        // Snapshot mode: merge R2 existing data to prevent vertex loss.
-        if self.config.persistence_mode != crate::config::PersistenceMode::WalProjection {
-            if let Ok(existing) = crate::loader::page_in_from_r2(
-                &s3, prefix, self.config.hot_partition_id,
-            ) {
-                let existing_vc = existing.vertex_count();
-                if existing_vc > 0 {
-                    if let Ok(mut hot) = self.hot.write() {
-                        if let Some(single) = hot.as_single_mut() {
-                            use yata_grin::{Scannable, Property, Schema as GrinSchema};
-                            let mut merged = 0u64;
-                            for label in GrinSchema::vertex_labels(&existing) {
-                                for vid in Scannable::scan_vertices_by_label(&existing, &label) {
-                                    let props: Vec<(String, yata_grin::PropValue)> = existing
-                                        .vertex_prop_keys(&label)
-                                        .iter()
-                                        .filter_map(|k| existing.vertex_prop(vid, k).map(|v| (k.clone(), v)))
-                                        .collect();
-                                    let props_ref: Vec<(&str, yata_grin::PropValue)> =
-                                        props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-                                    if let Some(pk_val) = props.iter().find(|(k, _)| k == "rkey").map(|(_, v)| v.clone()) {
-                                        single.merge_by_pk(&label, "rkey", &pk_val, &props_ref);
-                                    } else {
-                                        single.add_vertex(&label, &props_ref);
-                                    }
-                                    merged += 1;
-                                }
-                            }
-                            single.commit();
-                            tracing::info!(existing_vertices = existing_vc, merged, "compacted R2 data into CSR");
-                        }
-                    }
-                }
-            }
-        }
+        // WAL Projection: no R2 compaction. CSR is authoritative (built from WAL).
         self.hot_initialized.store(true, Ordering::Relaxed);
 
         // Serialize CSR → ArrowFragment → MemoryBlobStore
@@ -1428,116 +1347,6 @@ impl TieredGraphEngine {
     }
 
     /// Export snapshot blobs for external upload (TS Worker → R2).
-    /// Returns Vec<(key, bytes)> for all ArrowFragment blobs + meta.json.
-    /// Does NOT upload to S3/R2 — caller handles persistence.
-    pub fn export_snapshot_blobs(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
-        // Compaction: ALWAYS merge R2 existing data into CSR before export (same as trigger_snapshot)
-        {
-            if let Some(s3) = self.get_s3_client() {
-                if let Ok(existing) = crate::loader::page_in_from_r2(
-                    &s3, &self.s3_prefix, self.config.hot_partition_id,
-                ) {
-                    let existing_vc = existing.vertex_count();
-                    if existing_vc > 0 {
-                        if let Ok(mut hot) = self.hot.write() {
-                            if let Some(single) = hot.as_single_mut() {
-                                use yata_grin::{Scannable, Property, Schema as GrinSchema};
-                                let mut merged = 0u64;
-                                for label in GrinSchema::vertex_labels(&existing) {
-                                    for vid in Scannable::scan_vertices_by_label(&existing, &label) {
-                                        let props: Vec<(String, yata_grin::PropValue)> = existing
-                                            .vertex_prop_keys(&label)
-                                            .iter()
-                                            .filter_map(|k| existing.vertex_prop(vid, k).map(|v| (k.clone(), v)))
-                                            .collect();
-                                        let props_ref: Vec<(&str, yata_grin::PropValue)> =
-                                            props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-                                        if let Some(pk_val) = props.iter().find(|(k, _)| k == "rkey").map(|(_, v)| v.clone()) {
-                                            single.merge_by_pk(&label, "rkey", &pk_val, &props_ref);
-                                        } else {
-                                            single.add_vertex(&label, &props_ref);
-                                        }
-                                        merged += 1;
-                                    }
-                                }
-                                single.commit();
-                                tracing::info!(existing_vertices = existing_vc, merged, "compacted R2 data into CSR for export");
-                            }
-                        }
-                    }
-                }
-            }
-            self.hot_initialized.store(true, Ordering::Relaxed);
-        }
-
-        // Serialize CSR → ArrowFragment → MemoryBlobStore
-        let (v_count, e_count, blob_store, meta) = if let Ok(csr) = self.hot.read() {
-            let store = csr.as_single()
-                .ok_or_else(|| "no CSR store available".to_string())?;
-            let pid = store.partition_id_raw().get();
-            let frag = yata_vineyard::convert::csr_to_fragment(store, pid);
-            let vc = frag.ivnums.iter().sum::<u64>();
-            let ec = frag.edge_num();
-            let bs = yata_vineyard::blob::MemoryBlobStore::new();
-            let m = frag.serialize(&bs);
-            (vc, ec, bs, m)
-        } else {
-            return Err("failed to acquire CSR lock".into());
-        };
-
-        if v_count == 0 && e_count == 0 {
-            tracing::info!("export_snapshot_blobs: CSR is empty, returning empty");
-            return Ok(Vec::new());
-        }
-
-        let prefix = &self.s3_prefix;
-        let mut result = Vec::new();
-
-        // Collect all ArrowFragment blobs
-        for name in meta.blobs.keys() {
-            if let Some(data) = BlobStore::get(&blob_store, name) {
-                let full_key = format!("{prefix}snap/fragment/{name}");
-                result.push((full_key, data.to_vec()));
-            }
-        }
-
-        // Add meta.json
-        let meta_json = serde_json::to_vec(&meta).unwrap_or_default();
-        let meta_key = format!("{prefix}snap/fragment/meta.json");
-        result.push((meta_key, meta_json));
-
-        // Also write blobs to YATA_VINEYARD_DIR on disk (fallback/cache for Container restarts)
-        if let Ok(vineyard_dir) = std::env::var("YATA_VINEYARD_DIR") {
-            let snap_dir = format!("{vineyard_dir}/snap/fragment");
-            if let Err(e) = std::fs::create_dir_all(&snap_dir) {
-                tracing::warn!(error = %e, "failed to create vineyard snap dir");
-            } else {
-                for (key, data) in &result {
-                    // Extract filename from full key (last segment)
-                    let filename = key.rsplit('/').next().unwrap_or(key);
-                    let path = format!("{snap_dir}/{filename}");
-                    if let Err(e) = std::fs::write(&path, data) {
-                        tracing::warn!(path, error = %e, "failed to write snapshot blob to disk");
-                    }
-                }
-                tracing::info!(snap_dir, blobs = result.len(), "snapshot blobs written to disk cache");
-            }
-        }
-
-        // Clear dirty flag, dirty labels, pending writes, and update last snapshot count
-        self.dirty.store(false, Ordering::Relaxed);
-        self.pending_writes.store(0, Ordering::Relaxed);
-        if let Ok(mut dl) = self.dirty_labels.lock() {
-            dl.clear();
-        }
-        if let Ok(mut last) = self.last_snapshot_count.lock() {
-            *last = (v_count, e_count);
-        }
-
-        tracing::info!(vertices = v_count, edges = e_count, blobs = result.len(), "export_snapshot_blobs complete");
-        Ok(result)
-    }
-
     // ── WAL Projection API ──────────────────────────────────────────────
 
     /// Read WAL entries after `after_seq`, up to `limit`.
@@ -1611,45 +1420,6 @@ impl TieredGraphEngine {
                 // Mark HOT as initialized (read container is now live)
                 self.hot_initialized.store(true, Ordering::Relaxed);
                 // Invalidate query cache
-                if let Ok(mut c) = self.cache.lock() {
-                    c.invalidate();
-                }
-            } else if let Some(arrow) = hot.as_arrow_mut() {
-                for entry in entries {
-                    match entry.op {
-                        crate::wal::WalOp::Upsert => {
-                            let props: Vec<(&str, yata_grin::PropValue)> = entry.props.iter()
-                                .map(|(k, v)| {
-                                    let pv = match v {
-                                        serde_json::Value::String(s) => yata_grin::PropValue::Str(s.clone()),
-                                        serde_json::Value::Number(n) => {
-                                            if let Some(i) = n.as_i64() {
-                                                yata_grin::PropValue::Int(i)
-                                            } else {
-                                                yata_grin::PropValue::Float(n.as_f64().unwrap_or(0.0))
-                                            }
-                                        }
-                                        serde_json::Value::Bool(b) => yata_grin::PropValue::Bool(*b),
-                                        _ => yata_grin::PropValue::Str(v.to_string()),
-                                    };
-                                    (k.as_str(), pv)
-                                })
-                                .collect();
-                            arrow.merge_by_pk(&entry.label, &entry.pk_key, &entry.pk_value, &props);
-                        }
-                        crate::wal::WalOp::Delete => {
-                            arrow.delete_by_pk(&entry.label, &entry.pk_key, &entry.pk_value);
-                        }
-                    }
-                    applied += 1;
-                }
-                arrow.commit();
-                if let Ok(mut ll) = self.loaded_labels.lock() {
-                    for entry in entries {
-                        ll.insert(entry.label.clone());
-                    }
-                }
-                self.hot_initialized.store(true, Ordering::Relaxed);
                 if let Ok(mut c) = self.cache.lock() {
                     c.invalidate();
                 }
