@@ -223,6 +223,11 @@ pub struct TieredGraphEngine {
     wal_last_flushed_seq: Arc<AtomicU64>,
     /// SecurityScope cache: DID → (SecurityScope, compiled_at). Design E.
     security_scope_cache: Arc<Mutex<HashMap<String, (yata_gie::ir::SecurityScope, std::time::Instant)>>>,
+    // CPM metrics: CP5 mutation frequency measurement
+    cypher_read_count: Arc<AtomicU64>,
+    cypher_mutation_count: Arc<AtomicU64>,
+    cypher_mutation_us_total: Arc<AtomicU64>,
+    merge_record_count: Arc<AtomicU64>,
 }
 
 impl TieredGraphEngine {
@@ -315,6 +320,10 @@ impl TieredGraphEngine {
             wal: Arc::new(Mutex::new(crate::wal::WalRingBuffer::new(wal_ring_capacity))),
             wal_last_flushed_seq: Arc::new(AtomicU64::new(0)),
             security_scope_cache: Arc::new(Mutex::new(HashMap::new())),
+            cypher_read_count: Arc::new(AtomicU64::new(0)),
+            cypher_mutation_count: Arc::new(AtomicU64::new(0)),
+            cypher_mutation_us_total: Arc::new(AtomicU64::new(0)),
+            merge_record_count: Arc::new(AtomicU64::new(0)),
         }
         // No startup restore — labels are lazy-loaded from R2 on first query (page-in).
         // Write path: Pipeline.send() + mergeRecord() (PDS Worker).
@@ -599,7 +608,11 @@ impl TieredGraphEngine {
         let is_mutation = router::is_cypher_mutation(cypher);
         if is_mutation {
             self.dirty.store(true, Ordering::Relaxed);
+            self.cypher_mutation_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.cypher_read_count.fetch_add(1, Ordering::Relaxed);
         }
+        let query_start = std::time::Instant::now();
 
         // Cache lookup (reads only)
         if !is_mutation {
