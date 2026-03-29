@@ -1,16 +1,16 @@
-//! Edge Vineyard: Cloudflare-compatible Vineyard abstraction.
+//! BlobCache: tiered blob storage abstraction.
 //!
-//! Provides the same metadata-blob separation as Vineyard, but backed by
-//! R2 (blobs) + DO SQLite (metadata) instead of shared memory.
+//! Provides metadata-blob separation backed by R2 (blobs) + in-process
+//! HashMap (metadata), with optional disk and mmap tiers.
 //!
 //! ## Design
 //!
-//! Vineyard stores immutable "objects" identified by ObjectID:
+//! Immutable "objects" identified by ObjectID:
 //! - **Blob**: raw bytes (Arrow IPC, CSR topology, vector index)
 //! - **Metadata**: JSON-like tree describing the object's schema/type
 //!
-//! Edge Vineyard maps this to:
-//! - Blob → R2 object (key = `vineyard/{object_id}`)
+//! Storage mapping:
+//! - Blob → R2 object or local file
 //! - Metadata → in-process HashMap (synced to DO SQLite for persistence)
 //! - Local cache → LRU Vec<u8> cache for hot blobs
 //!
@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-/// Vineyard object ID (same as Vineyard's uint64 ObjectID).
+/// Object ID (uint64).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ObjectId(pub u64);
 
@@ -59,7 +59,7 @@ pub enum BlobType {
     Raw,
 }
 
-/// Object metadata (Vineyard-compatible tree structure).
+/// Object metadata (tree structure).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ObjectMeta {
     pub id: ObjectId,
@@ -70,7 +70,7 @@ pub struct ObjectMeta {
     pub partition_id: u32,
     /// Size of the blob in bytes.
     pub size_bytes: u64,
-    /// R2 key for the blob (Edge Vineyard only).
+    /// R2 key for the blob.
     pub r2_key: String,
     /// Arbitrary metadata fields.
     pub fields: HashMap<String, String>,
@@ -78,8 +78,8 @@ pub struct ObjectMeta {
     pub created_at: i64,
 }
 
-/// Vineyard store trait — implemented by both Edge (CF) and Native (Linux).
-pub trait VineyardStore: Send + Sync {
+/// Blob cache trait — implemented by memory, disk, and mmap backends.
+pub trait BlobCache: Send + Sync {
     /// Get object metadata by ID.
     fn get_meta(&self, id: ObjectId) -> Option<ObjectMeta>;
 
@@ -112,11 +112,11 @@ pub trait VineyardStore: Send + Sync {
     }
 }
 
-// ── Edge Vineyard (Cloudflare) ──────────────────────────────────────
+// ── Memory Blob Cache (Cloudflare) ─────────────────────────────────
 
-/// In-process Edge Vineyard store. Blobs are cached in memory as `Bytes`.
+/// In-process blob cache. Blobs are cached in memory as `Bytes`.
 /// Metadata is in a HashMap. Both can be synced to DO SQLite / R2 externally.
-pub struct EdgeVineyard {
+pub struct MemoryBlobCache {
     meta: Mutex<HashMap<ObjectId, ObjectMeta>>,
     blobs: Mutex<HashMap<ObjectId, bytes::Bytes>>,
     next_id: std::sync::atomic::AtomicU64,
@@ -124,8 +124,8 @@ pub struct EdgeVineyard {
     budget_bytes: u64,
 }
 
-impl EdgeVineyard {
-    /// Create a new Edge Vineyard with optional memory budget (MB).
+impl MemoryBlobCache {
+    /// Create a new in-memory blob cache with optional memory budget (MB).
     pub fn new(budget_mb: u64) -> Self {
         Self {
             meta: Mutex::new(HashMap::new()),
@@ -206,7 +206,7 @@ impl EdgeVineyard {
     }
 }
 
-impl VineyardStore for EdgeVineyard {
+impl BlobCache for MemoryBlobCache {
     fn get_meta(&self, id: ObjectId) -> Option<ObjectMeta> {
         self.meta.lock().unwrap().get(&id).cloned()
     }
@@ -253,19 +253,13 @@ impl VineyardStore for EdgeVineyard {
     }
 }
 
-// ── Disk Vineyard (Container, GraphScope-compatible) ────────────────
+// ── Disk Blob Cache (Container) ─────────────────────────────────────
 
-/// Disk-backed Vineyard store for CF Container (8GB disk).
+/// Disk-backed blob cache for CF Container (8GB disk).
 /// Blobs stored as files: `{base_dir}/blobs/{object_id}`.
 /// Metadata stored as JSON: `{base_dir}/meta/{object_id}.json`.
-/// Page-in: file → mmap (or read to Bytes). Page-out: drop from memory.
-///
-/// GraphScope equivalent:
-///   Vineyard shm blob → DiskVineyard file blob
-///   Vineyard metadata → DiskVineyard JSON metadata
-///   mmap page-in → file read / mmap
-///   mmap page-out → LRU eviction (drop Bytes ref)
-pub struct DiskVineyard {
+/// Page-in: file → read to Bytes. Page-out: drop from memory (LRU eviction).
+pub struct DiskBlobCache {
     base_dir: std::path::PathBuf,
     meta_cache: Mutex<HashMap<ObjectId, ObjectMeta>>,
     blob_cache: Mutex<HashMap<ObjectId, bytes::Bytes>>,
@@ -273,7 +267,7 @@ pub struct DiskVineyard {
     budget_bytes: u64,
 }
 
-impl DiskVineyard {
+impl DiskBlobCache {
     pub fn new(base_dir: impl Into<std::path::PathBuf>, budget_mb: u64) -> std::io::Result<Self> {
         let base_dir = base_dir.into();
         std::fs::create_dir_all(base_dir.join("blobs"))?;
@@ -409,7 +403,7 @@ impl DiskVineyard {
     }
 }
 
-impl VineyardStore for DiskVineyard {
+impl BlobCache for DiskBlobCache {
     fn get_meta(&self, id: ObjectId) -> Option<ObjectMeta> {
         // Memory cache
         if let Some(m) = self.meta_cache.lock().unwrap().get(&id) {
@@ -470,28 +464,27 @@ impl VineyardStore for DiskVineyard {
     }
 }
 
-// ── Mmap Vineyard (Out-of-Core, trillion-scale) ─────────────────────
+// ── Mmap Blob Cache (Out-of-Core, trillion-scale) ───────────────────
 
-/// Mmap-backed Vineyard store — zero-copy access to Arrow IPC blobs via OS page cache.
-/// GraphScope Vineyard parity: mmap replaces shared memory, OS page-in/out replaces Vineyard's page management.
-/// Capacity: 8GB disk = ~500M edges (vs DiskVineyard's 4GB RAM limit).
+/// Mmap-backed blob cache — zero-copy access to Arrow IPC blobs via OS page cache.
+/// Capacity: 8GB disk = ~500M edges (vs DiskBlobCache's 4GB RAM limit).
 ///
-/// Key difference from DiskVineyard:
-///   DiskVineyard: `page_in()` reads entire file into `Bytes` (RAM copy) → LRU eviction by dropping `Bytes`
-///   MmapVineyard: `page_in()` creates `Mmap` handle → OS manages 4KB page granularity → no explicit RAM management
-pub struct MmapVineyard {
+/// Key difference from DiskBlobCache:
+///   DiskBlobCache: `page_in()` reads entire file into `Bytes` (RAM copy) → LRU eviction by dropping `Bytes`
+///   MmapBlobCache: `page_in()` creates `Mmap` handle → OS manages 4KB page granularity → no explicit RAM management
+pub struct MmapBlobCache {
     base_dir: std::path::PathBuf,
     /// mmap handles keyed by ObjectId — OS manages page-in/out at 4KB granularity.
     mmaps: Mutex<HashMap<ObjectId, memmap2::Mmap>>,
-    /// Metadata cache (same layout as DiskVineyard).
+    /// Metadata cache.
     meta_cache: Mutex<HashMap<ObjectId, ObjectMeta>>,
     next_id: std::sync::atomic::AtomicU64,
     /// Total mapped bytes (for stats/monitoring).
     mapped_bytes: std::sync::atomic::AtomicU64,
 }
 
-impl MmapVineyard {
-    /// Create a new MmapVineyard at the given directory.
+impl MmapBlobCache {
+    /// Create a new mmap blob cache at the given directory.
     /// Scans existing metadata files to resume from prior state.
     pub fn new(base_dir: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
         let base_dir = base_dir.into();
@@ -540,7 +533,7 @@ impl MmapVineyard {
     }
 
     /// Page-in: create mmap handle for the blob file. OS manages actual page faults.
-    /// Unlike DiskVineyard, this does NOT copy the file into RAM — the OS page cache handles it.
+    /// Unlike DiskBlobCache, does NOT copy the file into RAM — the OS page cache handles it.
     pub fn page_in(&self, id: ObjectId) -> bool {
         let mut mmaps = self.mmaps.lock().unwrap();
         if mmaps.contains_key(&id) {
@@ -614,7 +607,7 @@ impl MmapVineyard {
     }
 }
 
-impl VineyardStore for MmapVineyard {
+impl BlobCache for MmapBlobCache {
     fn get_meta(&self, id: ObjectId) -> Option<ObjectMeta> {
         if let Some(m) = self.meta_cache.lock().unwrap().get(&id) {
             return Some(m.clone());
@@ -694,13 +687,12 @@ impl VineyardStore for MmapVineyard {
     }
 }
 
-// ── Vineyard-backed graph fragment ──────────────────────────────────
+// ── Graph fragment ──────────────────────────────────────────────────
 
-/// A graph fragment stored in Vineyard objects (Arrow IPC blobs).
-/// Equivalent to Vineyard's ArrowFragment.
+/// A graph fragment stored as Arrow IPC blobs in a BlobCache.
 pub struct GraphFragment {
-    /// Vineyard store backing this fragment.
-    store: Arc<dyn VineyardStore>,
+    /// Blob cache backing this fragment.
+    store: Arc<dyn BlobCache>,
     /// Vertex group objects by label.
     vertex_objects: HashMap<String, ObjectId>,
     /// Edge group objects by label.
@@ -712,7 +704,7 @@ pub struct GraphFragment {
 }
 
 impl GraphFragment {
-    pub fn new(store: Arc<dyn VineyardStore>, partition_id: u32) -> Self {
+    pub fn new(store: Arc<dyn BlobCache>, partition_id: u32) -> Self {
         Self {
             store,
             vertex_objects: HashMap::new(),
@@ -823,7 +815,7 @@ impl GraphFragment {
     }
 
     /// Reconstruct a fragment from a persisted manifest.
-    pub fn from_manifest(store: Arc<dyn VineyardStore>, manifest: &FragmentManifest) -> Self {
+    pub fn from_manifest(store: Arc<dyn BlobCache>, manifest: &FragmentManifest) -> Self {
         Self {
             store,
             vertex_objects: manifest.vertex_labels.clone(),
@@ -843,16 +835,16 @@ impl GraphFragment {
         &self.edge_objects
     }
 
-    /// Underlying Vineyard store.
-    pub fn store(&self) -> &Arc<dyn VineyardStore> {
+    /// Underlying blob cache.
+    pub fn store(&self) -> &Arc<dyn BlobCache> {
         &self.store
     }
 }
 
 // ── Fragment manifest ───────────────────────────────────────────────
 
-/// Serializable manifest for a graph fragment stored in Vineyard.
-/// Maps label names → Vineyard ObjectIds so the fragment can be
+/// Serializable manifest for a graph fragment.
+/// Maps label names → ObjectIds so the fragment can be
 /// reconstructed without re-scanning the store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentManifest {
@@ -893,7 +885,7 @@ mod tests {
 
     #[test]
     fn test_edge_vineyard_put_get() {
-        let store = EdgeVineyard::new(0);
+        let store = MemoryBlobCache::new(0);
         let data = bytes::Bytes::from_static(b"arrow-ipc-data-here");
         let meta = make_meta("Person", BlobType::ArrowVertexGroup);
 
@@ -910,7 +902,7 @@ mod tests {
 
     #[test]
     fn test_edge_vineyard_list() {
-        let store = EdgeVineyard::new(0);
+        let store = MemoryBlobCache::new(0);
         store.put(
             make_meta("Person", BlobType::ArrowVertexGroup),
             bytes::Bytes::from_static(b"a"),
@@ -936,7 +928,7 @@ mod tests {
 
     #[test]
     fn test_edge_vineyard_delete() {
-        let store = EdgeVineyard::new(0);
+        let store = MemoryBlobCache::new(0);
         let id = store.put(
             make_meta("X", BlobType::Raw),
             bytes::Bytes::from_static(b"data"),
@@ -948,7 +940,7 @@ mod tests {
 
     #[test]
     fn test_edge_vineyard_budget_eviction() {
-        let store = EdgeVineyard::new(1); // 1MB budget
+        let store = MemoryBlobCache::new(1); // 1MB budget
         // Put 2MB of data — should evict oldest
         let big = bytes::Bytes::from(vec![0u8; 600_000]); // 600KB
         let id1 = store.put(make_meta("A", BlobType::Raw), big.clone());
@@ -964,7 +956,7 @@ mod tests {
 
     #[test]
     fn test_graph_fragment() {
-        let store = Arc::new(EdgeVineyard::new(0));
+        let store = Arc::new(MemoryBlobCache::new(0));
 
         let v_id = store.put(
             make_meta("Person", BlobType::ArrowVertexGroup),
@@ -994,7 +986,7 @@ mod tests {
 
     #[test]
     fn test_export_import_meta() {
-        let store = EdgeVineyard::new(0);
+        let store = MemoryBlobCache::new(0);
         store.put(
             make_meta("A", BlobType::Raw),
             bytes::Bytes::from_static(b"a"),
@@ -1007,7 +999,7 @@ mod tests {
         let exported = store.export_meta();
         assert_eq!(exported.len(), 2);
 
-        let store2 = EdgeVineyard::new(0);
+        let store2 = MemoryBlobCache::new(0);
         store2.import_meta(exported);
         assert_eq!(store2.list(None).len(), 2);
     }
@@ -1018,12 +1010,12 @@ mod tests {
         assert_eq!(format!("{}", id), "o00000000000000ff");
     }
 
-    // ── DiskVineyard tests ──
+    // ── DiskBlobCache tests ──
 
     #[test]
     fn test_disk_vineyard_put_get() {
         let dir = tempfile::tempdir().unwrap();
-        let store = DiskVineyard::new(dir.path(), 0).unwrap();
+        let store = DiskBlobCache::new(dir.path(), 0).unwrap();
         let data = bytes::Bytes::from_static(b"disk-arrow-ipc");
         let meta = make_meta("Person", BlobType::ArrowVertexGroup);
 
@@ -1047,7 +1039,7 @@ mod tests {
     #[test]
     fn test_disk_vineyard_page_in_out() {
         let dir = tempfile::tempdir().unwrap();
-        let store = DiskVineyard::new(dir.path(), 1).unwrap(); // 1MB budget
+        let store = DiskBlobCache::new(dir.path(), 1).unwrap(); // 1MB budget
         let big = bytes::Bytes::from(vec![42u8; 500_000]); // 500KB
 
         let id1 = store.put(make_meta("A", BlobType::Raw), big.clone());
@@ -1068,14 +1060,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id;
         {
-            let store = DiskVineyard::new(dir.path(), 0).unwrap();
+            let store = DiskBlobCache::new(dir.path(), 0).unwrap();
             id = store.put(
                 make_meta("X", BlobType::Raw),
                 bytes::Bytes::from_static(b"persist"),
             );
         }
         // Reopen
-        let store2 = DiskVineyard::new(dir.path(), 0).unwrap();
+        let store2 = DiskBlobCache::new(dir.path(), 0).unwrap();
         store2.load_all_meta();
         let meta = store2.get_meta(id).unwrap();
         assert_eq!(meta.label, "X");
@@ -1086,7 +1078,7 @@ mod tests {
     #[test]
     fn test_disk_vineyard_fragment() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(DiskVineyard::new(dir.path(), 0).unwrap());
+        let store = Arc::new(DiskBlobCache::new(dir.path(), 0).unwrap());
 
         let v_id = store.put(
             make_meta("Person", BlobType::ArrowVertexGroup),
@@ -1112,7 +1104,7 @@ mod tests {
     #[test]
     fn test_disk_vineyard_disk_bytes() {
         let dir = tempfile::tempdir().unwrap();
-        let store = DiskVineyard::new(dir.path(), 0).unwrap();
+        let store = DiskBlobCache::new(dir.path(), 0).unwrap();
         store.put(
             make_meta("A", BlobType::Raw),
             bytes::Bytes::from(vec![0u8; 1000]),
@@ -1135,12 +1127,12 @@ mod tests {
         assert_eq!(slice.len(), 4);
     }
 
-    // ── MmapVineyard tests ──
+    // ── MmapBlobCache tests ──
 
     #[test]
     fn test_mmap_put_get() {
         let dir = tempfile::tempdir().unwrap();
-        let store = MmapVineyard::new(dir.path()).unwrap();
+        let store = MmapBlobCache::new(dir.path()).unwrap();
         let data = bytes::Bytes::from_static(b"mmap-arrow-ipc-data");
         let meta = make_meta("Person", BlobType::ArrowVertexGroup);
 
@@ -1158,7 +1150,7 @@ mod tests {
     #[test]
     fn test_mmap_page_in_out() {
         let dir = tempfile::tempdir().unwrap();
-        let store = MmapVineyard::new(dir.path()).unwrap();
+        let store = MmapBlobCache::new(dir.path()).unwrap();
         let data = bytes::Bytes::from(vec![42u8; 4096]);
 
         let id = store.put(make_meta("A", BlobType::Raw), data.clone());
@@ -1178,7 +1170,7 @@ mod tests {
     #[test]
     fn test_mmap_list() {
         let dir = tempfile::tempdir().unwrap();
-        let store = MmapVineyard::new(dir.path()).unwrap();
+        let store = MmapBlobCache::new(dir.path()).unwrap();
         store.put(
             make_meta("Person", BlobType::ArrowVertexGroup),
             bytes::Bytes::from_static(b"a"),
@@ -1205,7 +1197,7 @@ mod tests {
     #[test]
     fn test_mmap_delete() {
         let dir = tempfile::tempdir().unwrap();
-        let store = MmapVineyard::new(dir.path()).unwrap();
+        let store = MmapBlobCache::new(dir.path()).unwrap();
         let id = store.put(
             make_meta("X", BlobType::Raw),
             bytes::Bytes::from_static(b"data"),
@@ -1221,7 +1213,7 @@ mod tests {
     #[test]
     fn test_mmap_zero_copy_tracking() {
         let dir = tempfile::tempdir().unwrap();
-        let store = MmapVineyard::new(dir.path()).unwrap();
+        let store = MmapBlobCache::new(dir.path()).unwrap();
 
         let data1 = bytes::Bytes::from(vec![0u8; 1000]);
         let data2 = bytes::Bytes::from(vec![0u8; 2000]);
@@ -1243,7 +1235,7 @@ mod tests {
     #[test]
     fn test_mmap_large_blob() {
         let dir = tempfile::tempdir().unwrap();
-        let store = MmapVineyard::new(dir.path()).unwrap();
+        let store = MmapBlobCache::new(dir.path()).unwrap();
         let big = bytes::Bytes::from(vec![0xABu8; 1_000_000]); // 1MB
 
         let id = store.put(make_meta("Large", BlobType::Raw), big.clone());
@@ -1261,7 +1253,7 @@ mod tests {
         let id1;
         let id2;
         {
-            let store = MmapVineyard::new(dir.path()).unwrap();
+            let store = MmapBlobCache::new(dir.path()).unwrap();
             id1 = store.put(
                 make_meta("A", BlobType::Raw),
                 bytes::Bytes::from_static(b"persist-a"),
@@ -1272,7 +1264,7 @@ mod tests {
             );
         }
         // Reopen at same directory — blobs should still be on disk.
-        let store2 = MmapVineyard::new(dir.path()).unwrap();
+        let store2 = MmapBlobCache::new(dir.path()).unwrap();
         store2.load_all_meta();
 
         let meta1 = store2.get_meta(id1).unwrap();

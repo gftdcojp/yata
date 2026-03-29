@@ -6,8 +6,8 @@ use yata_cypher::Graph;
 use yata_graph::{GraphStore, QueryableGraph};
 use yata_grin::{Mutable, Predicate, PropValue, Property, Scannable, Topology};
 use yata_format::BlobStore;
-use yata_store::vineyard::{
-    DiskVineyard, EdgeVineyard, FragmentManifest, MmapVineyard, VineyardStore,
+use yata_store::blob_cache::{
+    DiskBlobCache, MemoryBlobCache, FragmentManifest, MmapBlobCache, BlobCache,
 };
 
 use crate::cache::{QueryCache, cache_key};
@@ -108,7 +108,7 @@ pub struct TieredGraphEngine {
     cache: Arc<Mutex<QueryCache>>,
     hot_initialized: Arc<AtomicBool>,
     loaded_labels: Arc<Mutex<HashSet<String>>>,
-    vineyard: Arc<dyn VineyardStore>,
+    blob_cache: Arc<dyn BlobCache>,
     s3_client: Arc<Mutex<Option<Arc<yata_s3::s3::S3Client>>>>,
     s3_prefix: String,
     dirty_labels: Arc<Mutex<HashSet<String>>>,
@@ -145,50 +145,50 @@ impl TieredGraphEngine {
         if partition_count > 1 {
             tracing::info!(partition_count, "partitioned graph store enabled");
         }
-        let vineyard_budget_mb = config.vineyard_budget_mb;
+        let blob_cache_budget_mb = config.blob_cache_budget_mb;
         let vineyard_dir = std::env::var("YATA_VINEYARD_DIR").ok();
         let use_mmap = std::env::var("YATA_MMAP_VINEYARD").unwrap_or_default() == "true";
-        let vineyard: Arc<dyn VineyardStore> = if use_mmap {
+        let blob_cache: Arc<dyn BlobCache> = if use_mmap {
             if let Some(ref dir) = vineyard_dir {
-                match MmapVineyard::new(dir) {
+                match MmapBlobCache::new(dir) {
                     Ok(mv) => {
                         let meta_count = mv.load_all_meta();
                         tracing::info!(
                             dir,
                             meta_count,
-                            "MmapVineyard initialized (zero-copy OS page cache)"
+                            "MmapBlobCache initialized (zero-copy OS page cache)"
                         );
                         Arc::new(mv)
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "MmapVineyard init failed, falling back to EdgeVineyard");
-                        Arc::new(EdgeVineyard::new(vineyard_budget_mb))
+                        tracing::warn!(error = %e, "MmapBlobCache init failed, falling back to MemoryBlobCache");
+                        Arc::new(MemoryBlobCache::new(blob_cache_budget_mb))
                     }
                 }
             } else {
-                tracing::warn!("YATA_MMAP_VINEYARD=true but YATA_VINEYARD_DIR not set, falling back to EdgeVineyard");
-                Arc::new(EdgeVineyard::new(vineyard_budget_mb))
+                tracing::warn!("YATA_MMAP_VINEYARD=true but YATA_VINEYARD_DIR not set, falling back to MemoryBlobCache");
+                Arc::new(MemoryBlobCache::new(blob_cache_budget_mb))
             }
         } else if let Some(ref dir) = vineyard_dir {
-            match DiskVineyard::new(dir, vineyard_budget_mb) {
+            match DiskBlobCache::new(dir, blob_cache_budget_mb) {
                 Ok(dv) => {
                     let meta_count = dv.load_all_meta();
                     tracing::info!(
                         dir,
-                        vineyard_budget_mb,
+                        blob_cache_budget_mb,
                         meta_count,
-                        "DiskVineyard initialized (Container disk)"
+                        "DiskBlobCache initialized (Container disk)"
                     );
                     Arc::new(dv)
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "DiskVineyard init failed, falling back to EdgeVineyard");
-                    Arc::new(EdgeVineyard::new(vineyard_budget_mb))
+                    tracing::warn!(error = %e, "DiskBlobCache init failed, falling back to MemoryBlobCache");
+                    Arc::new(MemoryBlobCache::new(blob_cache_budget_mb))
                 }
             }
         } else {
-            tracing::info!(vineyard_budget_mb, "EdgeVineyard initialized (in-memory)");
-            Arc::new(EdgeVineyard::new(vineyard_budget_mb))
+            tracing::info!(blob_cache_budget_mb, "MemoryBlobCache initialized (in-memory)");
+            Arc::new(MemoryBlobCache::new(blob_cache_budget_mb))
         };
 
         // ── S3/R2 client for read (page-in from R2, lazy init) ──
@@ -206,7 +206,7 @@ impl TieredGraphEngine {
             cache: Arc::new(Mutex::new(cache)),
             hot_initialized: Arc::new(AtomicBool::new(false)),
             loaded_labels: Arc::new(Mutex::new(HashSet::new())),
-            vineyard,
+            blob_cache,
             s3_client,
             s3_prefix,
             dirty_labels: Arc::new(Mutex::new(HashSet::new())),
@@ -1364,12 +1364,25 @@ impl TieredGraphEngine {
         s3.put_sync(&key, bytes::Bytes::from(data.clone()))
             .map_err(|e| format!("R2 WAL segment upload failed: {e}"))?;
 
-        // Update head pointer
+        // Update head pointer + segment registry (avoids R2 list_sync)
         let head_key = format!("{prefix}wal/meta/{pid}/head.json");
+        // Read existing segment list from head, append new segment
+        let mut segment_keys: Vec<String> = match s3.get_sync(&head_key) {
+            Ok(Some(data)) => {
+                serde_json::from_slice::<serde_json::Value>(&data)
+                    .ok()
+                    .and_then(|v| v.get("segments").cloned())
+                    .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        segment_keys.push(key.clone());
         let head_json = serde_json::json!({
             "partition_id": pid,
             "head_seq": seq_end,
             "entry_count": entries.len(),
+            "segments": segment_keys,
             "updated_at_ms": std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1450,21 +1463,19 @@ impl TieredGraphEngine {
             _ => 0,
         };
 
-        // List WAL segments in R2
-        let segment_prefix = format!("{prefix}wal/segments/{pid}/");
-        let segment_objects = match s3.list_sync(&segment_prefix) {
-            Ok(objects) => {
-                tracing::info!(prefix = %segment_prefix, count = objects.len(), "compaction: listed WAL segments");
-                objects
-            }
-            Err(e) => {
-                tracing::error!(prefix = %segment_prefix, error = %e, "compaction: R2 list failed");
-                return Err(format!("R2 list failed for {segment_prefix}: {e}"));
-            }
+        // Segment registry from head.json (avoids R2 S3 ListObjectsV2 signing issue)
+        let head_key = format!("{prefix}wal/meta/{pid}/head.json");
+        let segment_keys: Vec<String> = match s3.get_sync(&head_key) {
+            Ok(Some(data)) => serde_json::from_slice::<serde_json::Value>(&data)
+                .ok()
+                .and_then(|v| v.get("segments").cloned())
+                .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+                .unwrap_or_default(),
+            _ => Vec::new(),
         };
 
-        if segment_objects.is_empty() {
-            tracing::info!(prefix = %segment_prefix, "compaction: no WAL segments found");
+        if segment_keys.is_empty() {
+            tracing::info!("compaction: no segments in registry");
             return Ok(crate::compaction::CompactionResult {
                 data: bytes::Bytes::new(),
                 min_seq: 0,
@@ -1474,11 +1485,9 @@ impl TieredGraphEngine {
                 labels: Vec::new(),
             });
         }
+        tracing::info!(count = segment_keys.len(), "compaction: segments in registry");
 
-        // Load existing compacted segment (if any) + all new WAL segments
         let mut segment_data: Vec<(String, bytes::Bytes)> = Vec::new();
-
-        // Include existing compacted segment as input for re-compaction
         if existing_compacted_seq > 0 {
             let compacted_key = crate::compaction::compacted_segment_r2_key(prefix, pid, existing_compacted_seq);
             if let Ok(Some(data)) = s3.get_sync(&compacted_key) {
@@ -1486,9 +1495,7 @@ impl TieredGraphEngine {
             }
         }
 
-        // Load WAL segments (only those after the existing compacted_seq)
-        for obj in &segment_objects {
-            let key = &obj.key;
+        for key in &segment_keys {
             if let Some(filename) = key.rsplit('/').next() {
                 let stripped = filename.strip_suffix(".ndjson")
                     .or_else(|| filename.strip_suffix(".arrow"));
@@ -1496,7 +1503,6 @@ impl TieredGraphEngine {
                     let parts: Vec<&str> = stripped.split('-').collect();
                     if parts.len() == 2 {
                         if let Ok(seg_end) = parts[1].parse::<u64>() {
-                            // Skip segments fully covered by existing compaction
                             if seg_end <= existing_compacted_seq {
                                 continue;
                             }

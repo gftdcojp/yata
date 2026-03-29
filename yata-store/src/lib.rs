@@ -14,16 +14,22 @@ pub mod graph_store_enum;
 pub mod mirror;
 pub mod partition;
 pub mod partitioned;
-pub mod vineyard;
+pub mod blob_cache;
 pub use arrow_store::ArrowGraphStore;
 pub use arrow_wal_store::ArrowWalStore;
 pub use graph_store_enum::{GraphStoreEnum, MemoryBudget};
 pub use mirror::{MirrorEdge, MirrorRegistry, MirrorVertex};
 pub use partitioned::PartitionedGraphStore;
-pub use vineyard::{
-    BlobType, DiskVineyard, EdgeVineyard, FragmentManifest, GraphFragment, MmapVineyard, ObjectId,
-    ObjectMeta, VineyardStore,
+pub use blob_cache::{
+    BlobType, DiskBlobCache, MemoryBlobCache, FragmentManifest, GraphFragment, MmapBlobCache, ObjectId,
+    ObjectMeta, BlobCache,
 };
+
+/// Backward-compat aliases.
+pub type VineyardStore = dyn BlobCache;
+pub type EdgeVineyard = MemoryBlobCache;
+pub type DiskVineyard = DiskBlobCache;
+pub type MmapVineyard = MmapBlobCache;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
