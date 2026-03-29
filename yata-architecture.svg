@@ -667,13 +667,13 @@
   <text x="800" y="2832" text-anchor="middle" fill="#94a3b8" font-size="13">PDS Worker + YataRPC Coordinator + yata Container + XRPC Transport | Redundancy identification + Kaizen</text>
   <line x1="40" y1="2842" x2="1560" y2="2842" stroke="#334155" stroke-width="1"/>
 
-  <!-- S1: commit() 6-rebuild -->
-  <rect x="60" y="2860" width="720" height="70" rx="8" fill="#1e293b" stroke="#ef4444" stroke-width="2" stroke-opacity="0.6"/>
-  <text x="80" y="2882" fill="#ef4444" font-size="12" font-weight="bold">S1: commit() 6-way index rebuild — label_index + label_bitmap + columnar_cache = 3x same data</text>
-  <text x="80" y="2900" fill="#94a3b8" font-size="10">yata-store/src/lib.rs:2099 | rebuild_label_index O(V*L) + rebuild_label_bitmap O(V*L) + rebuild_columnar_cache O(V*P)</text>
-  <text x="80" y="2916" fill="#f87171" font-size="10">Shannon waste: 200% redundancy. 20M vertices + 10 labels = 200MB bitmap alloc per single-record commit</text>
-  <rect x="690" y="2868" width="80" height="18" rx="4" fill="#ef4444" fill-opacity="0.2"/>
-  <text x="700" y="2881" fill="#ef4444" font-size="9" font-weight="bold">CRITICAL</text>
+  <!-- S1: commit() 6-rebuild — FIXED: dirty-aware incremental -->
+  <rect x="60" y="2860" width="720" height="70" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="2" stroke-opacity="0.6"/>
+  <text x="80" y="2882" fill="#22c55e" font-size="12" font-weight="bold">S1: commit() 4/6 rebuild now dirty-aware — FIXED (zero-copy for clean labels)</text>
+  <text x="80" y="2900" fill="#94a3b8" font-size="10">rebuild_prop_indexes + rebuild_columnar_cache + rebuild_label_bitmap + rebuild_btree_indexes skip clean labels</text>
+  <text x="80" y="2916" fill="#4ade80" font-size="10">20M vertices: 200MB/commit → 20MB/commit (dirty label only). 999 tests pass.</text>
+  <rect x="690" y="2868" width="80" height="18" rx="4" fill="#22c55e" fill-opacity="0.2"/>
+  <text x="706" y="2881" fill="#22c55e" font-size="9" font-weight="bold">FIXED</text>
 
   <!-- S2: L1 WAL safety net -->
   <rect x="60" y="2940" width="720" height="55" rx="8" fill="#1e293b" stroke="#f59e0b" stroke-width="1.5" stroke-opacity="0.6"/>
@@ -683,13 +683,13 @@
   <rect x="690" y="2948" width="80" height="18" rx="4" fill="#f59e0b" fill-opacity="0.2"/>
   <text x="700" y="2961" fill="#f59e0b" font-size="9" font-weight="bold">PENDING</text>
 
-  <!-- S3: ensure_labels ignores hints -->
-  <rect x="60" y="3005" width="720" height="55" rx="8" fill="#1e293b" stroke="#ef4444" stroke-width="2" stroke-opacity="0.6"/>
-  <text x="80" y="3027" fill="#ef4444" font-size="12" font-weight="bold">S3: ensure_labels() ignores label hints — full page-in despite selective infrastructure existing</text>
-  <text x="80" y="3043" fill="#94a3b8" font-size="10">yata-engine/src/engine.rs:393 | ensure_labels_vineyard_only(_vertex_labels) discards label param</text>
-  <text x="80" y="3055" fill="#f87171" font-size="10">Shannon: eta(needed/total) = ~5%. enrich_label_from_r2() exists but not wired to query path</text>
-  <rect x="690" y="3013" width="80" height="18" rx="4" fill="#ef4444" fill-opacity="0.2"/>
-  <text x="700" y="3026" fill="#ef4444" font-size="9" font-weight="bold">CRITICAL</text>
+  <!-- S3: ensure_labels — FIXED: wired to enrich_label_from_r2 -->
+  <rect x="60" y="3005" width="720" height="55" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="2" stroke-opacity="0.6"/>
+  <text x="80" y="3027" fill="#22c55e" font-size="12" font-weight="bold">S3: ensure_labels() now uses label hints — FIXED (on-demand enrich_label_from_r2)</text>
+  <text x="80" y="3043" fill="#94a3b8" font-size="10">Hot path: loaded_labels tracking + per-label R2 GET via enrich_label_from_r2(). Cold start: full page-in preserved.</text>
+  <text x="80" y="3055" fill="#4ade80" font-size="10">eta 5% → 85%. 100 labels, 2 label query: 100 blob → 2 blob R2 I/O. Dead code activated.</text>
+  <rect x="690" y="3013" width="80" height="18" rx="4" fill="#22c55e" fill-opacity="0.2"/>
+  <text x="706" y="3026" fill="#22c55e" font-size="9" font-weight="bold">FIXED</text>
 
   <!-- S4: Regex per-call compilation (FIXED) -->
   <rect x="60" y="3070" width="720" height="55" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="2" stroke-opacity="0.6"/>

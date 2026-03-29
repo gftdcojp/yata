@@ -9,7 +9,7 @@ use yata_store::MutableCsrStore;
 
 /// Resolve the disk cache directory from YATA_VINEYARD_DIR env var.
 /// Returns `Some("{dir}/snap/fragment")` if set, None otherwise.
-fn disk_cache_dir() -> Option<String> {
+pub(crate) fn disk_cache_dir() -> Option<String> {
     std::env::var("YATA_VINEYARD_DIR").ok().map(|d| format!("{d}/snap/fragment"))
 }
 
@@ -19,7 +19,7 @@ fn disk_cache_dir() -> Option<String> {
 ///   3. On R2 hit: write to disk cache for next time
 ///
 /// Returns the blob bytes, or None if not found in either tier.
-fn fetch_blob_cached(
+pub(crate) fn fetch_blob_cached(
     s3: &yata_s3::s3::S3Client,
     prefix: &str,
     name: &str,

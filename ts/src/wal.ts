@@ -70,8 +70,6 @@ export async function sendWalAndProject(
   extraMergeProps?: Record<string, string>
 ): Promise<{ rev: string; mergeError?: string }> {
   const walRecord = buildWalRecord(repo, collection, rkey, action, json);
-  await walStream.send([walRecord]);
-
   const label = collectionToLabel(collection);
   let mergeError: string | undefined;
 
@@ -89,38 +87,44 @@ export async function sendWalAndProject(
     }
   };
 
-  try {
-    await Promise.race([
-      doMerge(),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("mergeRecord timeout (30s)")), 30000)
-      ),
-    ]);
-  } catch (e1) {
-    mergeError = e1 instanceof Error ? e1.message : String(e1);
-    if (!mergeError.includes("timeout")) {
-      try {
-        await new Promise((r) => setTimeout(r, 500));
-        await Promise.race([
-          doMerge(),
-          new Promise((_, reject) =>
-            setTimeout(
-              () => reject(new Error("mergeRecord retry timeout (15s)")),
-              15000
-            )
-          ),
-        ]);
-        mergeError = undefined;
-      } catch (e2) {
-        mergeError = e2 instanceof Error ? e2.message : String(e2);
+  const doMergeWithRetry = async () => {
+    try {
+      await Promise.race([
+        doMerge(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("mergeRecord timeout (30s)")), 30000)
+        ),
+      ]);
+    } catch (e1) {
+      mergeError = e1 instanceof Error ? e1.message : String(e1);
+      if (!mergeError.includes("timeout")) {
+        try {
+          await new Promise((r) => setTimeout(r, 500));
+          await Promise.race([
+            doMerge(),
+            new Promise((_, reject) =>
+              setTimeout(
+                () => reject(new Error("mergeRecord retry timeout (15s)")),
+                15000
+              )
+            ),
+          ]);
+          mergeError = undefined;
+        } catch (e2) {
+          mergeError = e2 instanceof Error ? e2.message : String(e2);
+        }
+      }
+      if (mergeError) {
+        console.error(
+          `[sendWalAndProject] mergeRecord FAILED (${label}/${rkey}): ${mergeError} — WAL is durable, wal-replay will recover`
+        );
       }
     }
-    if (mergeError) {
-      console.error(
-        `[sendWalAndProject] mergeRecord FAILED (${label}/${rkey}): ${mergeError} — WAL is durable, wal-replay will recover`
-      );
-    }
-  }
+  };
+
+  // Pipeline (durable) + mergeRecord (projection) are independent — run in parallel.
+  // Pipeline.send resolve = durable. mergeRecord failure is recoverable via wal-replay.
+  await Promise.all([walStream.send([walRecord]), doMergeWithRetry()]);
 
   return { rev: walRecord.rev, mergeError };
 }

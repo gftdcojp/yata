@@ -1256,7 +1256,7 @@ impl MutableCsrStore {
 
     /// Rebuild property equality indexes — dirty labels only.
     fn rebuild_prop_indexes(&mut self) {
-        let dirty = &self.dirty_vertex_labels;
+        let dirty: HashSet<String> = self.dirty_vertex_labels.clone();
         let keys: Vec<(String, String)> = self.prop_eq_index.keys().cloned().collect();
         for (label, prop) in keys {
             if !dirty.is_empty() && !dirty.contains(&label) {
@@ -1282,11 +1282,12 @@ impl MutableCsrStore {
 
     /// Rebuild B-tree range indexes — dirty labels only.
     fn rebuild_btree_indexes(&mut self) {
+        let dirty: HashSet<String> = self.dirty_vertex_labels.clone();
         self.btree_index.rebuild_dirty(
             &self.label_index,
             &self.vertex_props_map,
             &self.vertex_alive,
-            &self.dirty_vertex_labels,
+            &dirty,
         );
     }
 
@@ -1325,7 +1326,7 @@ impl MutableCsrStore {
 
     /// Rebuild columnar property cache — dirty labels only (zero-copy for clean labels).
     fn rebuild_columnar_cache(&mut self) {
-        let dirty = &self.dirty_vertex_labels;
+        let dirty: HashSet<String> = self.dirty_vertex_labels.clone();
         let n = self.vertex_count as usize;
 
         // Full rebuild only on first commit (dirty empty = no tracking yet)
@@ -1377,7 +1378,7 @@ impl MutableCsrStore {
 
     /// Rebuild label bitmaps — dirty labels only (zero-copy for clean labels).
     fn rebuild_label_bitmap(&mut self) {
-        let dirty = &self.dirty_vertex_labels;
+        let dirty: HashSet<String> = self.dirty_vertex_labels.clone();
         let n = self.vertex_count as usize;
 
         // Full rebuild only on first commit

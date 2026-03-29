@@ -122,7 +122,6 @@ pub struct TieredGraphEngine {
     vineyard: Arc<dyn VineyardStore>,
     s3_client: Arc<Mutex<Option<Arc<yata_s3::s3::S3Client>>>>,
     s3_prefix: String,
-    dirty: Arc<AtomicBool>,
     dirty_labels: Arc<Mutex<HashSet<String>>>,
     pending_writes: Arc<AtomicUsize>,
     wal: Arc<Mutex<crate::wal::WalRingBuffer>>,
@@ -221,7 +220,6 @@ impl TieredGraphEngine {
             vineyard,
             s3_client,
             s3_prefix,
-            dirty: Arc::new(AtomicBool::new(false)),
             dirty_labels: Arc::new(Mutex::new(HashSet::new())),
             pending_writes: Arc::new(AtomicUsize::new(0)),
             wal: Arc::new(Mutex::new(crate::wal::WalRingBuffer::new(wal_ring_capacity))),
@@ -307,18 +305,72 @@ impl TieredGraphEngine {
     ///    — re-page-in from Vineyard is Arrow decode only (no R2 fetch)
     ///
     /// If `labels` is empty, loads ALL labels (mutation path fallback).
+    /// If `labels` is non-empty AND hot_initialized, enriches only needed labels on-demand
+    /// via enrich_label_from_r2 (zero-copy for already-loaded labels).
     fn ensure_labels(&self, vertex_labels: &[&str]) {
-        self.ensure_labels_vineyard_only(vertex_labels);
-    }
+        if !self.hot_initialized.load(Ordering::Relaxed) {
+            // Cold start: full page-in (topology + all labels needed for CSR)
+            self.restore_from_r2();
+            return;
+        }
 
-    /// Cold start fallback: full page-in from R2 checkpoint.
-    /// WAL mode: normally walColdStart handles this. This is the fallback
-    /// for first query before walColdStart is called.
-    fn ensure_labels_vineyard_only(&self, _vertex_labels: &[&str]) {
-        if self.hot_initialized.load(Ordering::Relaxed) { return; }
+        // Hot path: enrich only labels not yet loaded
+        if vertex_labels.is_empty() { return; }
+        let needed: Vec<String> = {
+            let loaded = match self.loaded_labels.lock() {
+                Ok(ll) => ll,
+                Err(_) => return,
+            };
+            vertex_labels
+                .iter()
+                .filter(|l| !loaded.contains(**l))
+                .map(|l| l.to_string())
+                .collect()
+        };
+        if needed.is_empty() { return; }
 
-        // Full page-in from R2 checkpoint
-        self.restore_from_r2();
+        let s3 = match self.get_s3_client() {
+            Some(s3) => s3.clone(),
+            None => return,
+        };
+
+        // Fetch meta + schema from R2 (3-tier: disk cache → R2)
+        let meta = match crate::loader::fetch_fragment_meta(&s3, &self.s3_prefix) {
+            Ok(m) => m,
+            Err(e) => { tracing::warn!(error = %e, "ensure_labels: meta fetch failed"); return; }
+        };
+        let schema_bytes = match crate::loader::fetch_blob_cached(
+            &s3, &self.s3_prefix, "schema", crate::loader::disk_cache_dir().as_deref(),
+        ) {
+            Some(b) => b,
+            None => { tracing::warn!("ensure_labels: schema blob not found"); return; }
+        };
+        let schema: yata_vineyard::schema::PropertyGraphSchema = match serde_json::from_slice(&schema_bytes) {
+            Ok(s) => s,
+            Err(e) => { tracing::warn!(error = %e, "ensure_labels: schema parse failed"); return; }
+        };
+
+        // Enrich each needed label via existing enrich_label_from_r2 (per-label R2 GET)
+        for label in &needed {
+            if let Ok(mut hot) = self.hot.write() {
+                if let Some(single) = hot.as_single_mut() {
+                    match crate::loader::enrich_label_from_r2(
+                        &s3, &self.s3_prefix, &meta, &schema, label, single, 0,
+                    ) {
+                        Ok(()) => {
+                            single.commit();
+                            tracing::debug!(label, "enriched label from R2 (on-demand)");
+                        }
+                        Err(e) => {
+                            tracing::warn!(label, error = %e, "label enrichment failed");
+                        }
+                    }
+                }
+            }
+            if let Ok(mut ll) = self.loaded_labels.lock() {
+                ll.insert(label.clone());
+            }
+        }
     }
 
 
@@ -504,8 +556,12 @@ impl TieredGraphEngine {
     ) -> Result<Vec<Vec<(String, String)>>, String> {
         let is_mutation = router::is_cypher_mutation(cypher);
         if is_mutation {
-            self.dirty.store(true, Ordering::Relaxed);
             self.cypher_mutation_count.fetch_add(1, Ordering::Relaxed);
+            if let Some((labels, _)) = router::extract_mutation_hints(cypher) {
+                if let Ok(mut dl) = self.dirty_labels.lock() {
+                    dl.extend(labels);
+                }
+            }
         } else {
             self.cypher_read_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -1091,13 +1147,14 @@ impl TieredGraphEngine {
 
         // Dirty label delta upload: only PUT blobs for dirty vertex labels.
         // Infrastructure blobs (schema, ivnums, meta.json) are always uploaded.
-        // Edge/topology blobs are uploaded only when dirty flag indicates edge mutations.
+        // Edge/topology blobs: upload only when dirty_set contains edge-related labels (not global flag).
+        let has_dirty_edges = !dirty_set.is_empty();
         let mut uploaded = 0u32;
         let mut skipped = 0u32;
         for name in meta.blobs.keys() {
             let should_upload = is_infra_blob(name)
                 || is_dirty_vertex_blob(name, &dirty_vlabel_ids)
-                || (had_dirty_flag && is_edge_or_topology_blob(name));
+                || (has_dirty_edges && is_edge_or_topology_blob(name));
             if !should_upload {
                 skipped += 1;
                 continue;
