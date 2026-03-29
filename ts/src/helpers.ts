@@ -7,11 +7,10 @@
  */
 
 import type { MergeProps } from "./types.js";
-import { toBase64, fnv1a32 } from "@gftd/xrpc/encode";
+import { toBase64, fnv1a32 } from "@gftd/xrpc";
 
 // Re-export from @gftd/xrpc (Single Source of Truth — Shannon: no local copies)
-export { collectionToLabel, expandCollection } from "@gftd/xrpc/nsid";
-export { generateTid, toBase64, fnv1a32, cl } from "@gftd/xrpc/encode";
+export { collectionToLabel, expandCollection, generateTid, toBase64, fnv1a32, cl } from "@gftd/xrpc";
 
 // ── Cypher escaping ──
 
