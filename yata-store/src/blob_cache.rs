@@ -848,9 +848,9 @@ impl GraphFragment {
 /// reconstructed without re-scanning the store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentManifest {
-    /// Vertex label → Vineyard ObjectId (Arrow IPC blob).
+    /// Vertex label → ObjectId (Arrow IPC blob).
     pub vertex_labels: HashMap<String, ObjectId>,
-    /// Edge label → Vineyard ObjectId (Arrow IPC blob).
+    /// Edge label → ObjectId (Arrow IPC blob).
     pub edge_labels: HashMap<String, ObjectId>,
     /// CSR topology blob (optional).
     pub csr_object: Option<ObjectId>,
@@ -884,7 +884,7 @@ mod tests {
     }
 
     #[test]
-    fn test_edge_vineyard_put_get() {
+    fn test_memory_blob_cache_put_get() {
         let store = MemoryBlobCache::new(0);
         let data = bytes::Bytes::from_static(b"arrow-ipc-data-here");
         let meta = make_meta("Person", BlobType::ArrowVertexGroup);
@@ -901,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn test_edge_vineyard_list() {
+    fn test_memory_blob_cache_list() {
         let store = MemoryBlobCache::new(0);
         store.put(
             make_meta("Person", BlobType::ArrowVertexGroup),
@@ -927,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn test_edge_vineyard_delete() {
+    fn test_memory_blob_cache_delete() {
         let store = MemoryBlobCache::new(0);
         let id = store.put(
             make_meta("X", BlobType::Raw),
@@ -939,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn test_edge_vineyard_budget_eviction() {
+    fn test_memory_blob_cache_budget_eviction() {
         let store = MemoryBlobCache::new(1); // 1MB budget
         // Put 2MB of data — should evict oldest
         let big = bytes::Bytes::from(vec![0u8; 600_000]); // 600KB
@@ -1010,10 +1010,10 @@ mod tests {
         assert_eq!(format!("{}", id), "o00000000000000ff");
     }
 
-    // ── DiskBlobCache tests ──
+    // ── DiskBlobCache tests ───────────────────────────────────────
 
     #[test]
-    fn test_disk_vineyard_put_get() {
+    fn test_disk_blob_cache_put_get() {
         let dir = tempfile::tempdir().unwrap();
         let store = DiskBlobCache::new(dir.path(), 0).unwrap();
         let data = bytes::Bytes::from_static(b"disk-arrow-ipc");
@@ -1037,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn test_disk_vineyard_page_in_out() {
+    fn test_disk_blob_cache_page_in_out() {
         let dir = tempfile::tempdir().unwrap();
         let store = DiskBlobCache::new(dir.path(), 1).unwrap(); // 1MB budget
         let big = bytes::Bytes::from(vec![42u8; 500_000]); // 500KB
@@ -1056,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn test_disk_vineyard_persist_across_reopen() {
+    fn test_disk_blob_cache_persist_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let id;
         {
@@ -1076,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn test_disk_vineyard_fragment() {
+    fn test_disk_blob_cache_fragment() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DiskBlobCache::new(dir.path(), 0).unwrap());
 
@@ -1102,7 +1102,7 @@ mod tests {
     }
 
     #[test]
-    fn test_disk_vineyard_disk_bytes() {
+    fn test_disk_blob_cache_disk_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let store = DiskBlobCache::new(dir.path(), 0).unwrap();
         store.put(
@@ -1127,7 +1127,7 @@ mod tests {
         assert_eq!(slice.len(), 4);
     }
 
-    // ── MmapBlobCache tests ──
+    // ── MmapBlobCache tests ───────────────────────────────────────
 
     #[test]
     fn test_mmap_put_get() {

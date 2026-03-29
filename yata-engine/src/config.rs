@@ -35,7 +35,7 @@ pub struct TieredEngineConfig {
     pub lazy_label_max_loaded: usize,
     pub hot_partition_id: PartitionId,
     pub partition_count: u32,
-    pub vineyard_budget_mb: u64,
+    pub blob_cache_budget_mb: u64,
     /// WAL ring buffer capacity (entries). Write Container only.
     pub wal_ring_capacity: usize,
     /// WAL segment max bytes before R2 flush.
@@ -86,7 +86,7 @@ impl Default for TieredEngineConfig {
                 .map(PartitionId::from).unwrap_or_else(|| PartitionId::from(0)),
             partition_count: std::env::var("YATA_PARTITION_COUNT")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(1),
-            vineyard_budget_mb: std::env::var("YATA_VINEYARD_BUDGET_MB")
+            blob_cache_budget_mb: std::env::var("YATA_VINEYARD_BUDGET_MB")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(256),
             wal_ring_capacity: std::env::var("YATA_WAL_RING_CAPACITY")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(100_000),

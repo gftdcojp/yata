@@ -1,6 +1,6 @@
 # packages/rust/yata
 
-yata — Rust Cypher graph engine. `[PRODUCTION]` Container (CSR + DiskVineyard/MmapVineyard) × 1 partition. Workers RPC coordinator. GraphScope parity 21/25 (14 PRODUCTION + 7 IMPLEMENTED)。Vineyard + GIE push-based + Design E SecurityScope (CSR policy vertex lookup, parameter-based RLS 除去済み) + Arrow row-group chunk + label-selective page-in + edge property lookup + edge tombstone deletion + dirty label tracking + batch commit threshold + adaptive √N fan-out + CpmStats observability + cypherBatch + delta-apply mutation (CP5)。
+yata — Rust Cypher graph engine. `[PRODUCTION]` Container (CSR + DiskBlobCache/MmapBlobCache) × 1 partition. Workers RPC coordinator. GraphScope parity 21/25 (14 PRODUCTION + 7 IMPLEMENTED)。Vineyard + GIE push-based + Design E SecurityScope (CSR policy vertex lookup, parameter-based RLS 除去済み) + Arrow row-group chunk + label-selective page-in + edge property lookup + edge tombstone deletion + dirty label tracking + batch commit threshold + adaptive √N fan-out + CpmStats observability + cypherBatch + delta-apply mutation (CP5)。
 
 ## Architecture (CRITICAL)
 
@@ -13,13 +13,13 @@ Read model: yata Container (pure read)
   Workers RPC (YataRPC) → hierarchical coordinator (√N fan-out)
     → N × Container (Rust, standard-1, 4GB RAM, 8GB disk)
       Each Container:
-        R2 (Arrow IPC) → DiskVineyard/MmapVineyard → MutableCsrStore (<1ms)
+        R2 (Arrow IPC) → DiskBlobCache/MmapBlobCache → MutableCsrStore (<1ms)
         TieredGraphEngine → yata-cypher / yata-gie (push-based)
         No WAL. No FUSE. No background upload.
 
 R2 = Source of Truth (ArrowFragment per-label per-partition: snap/fragment/meta.json + snap/fragment/{blob_name})
-DiskVineyard = Container ephemeral disk cache (page-in/out, LRU evict)
-MmapVineyard = zero-copy mmap (500M edges/Container)
+DiskBlobCache = Container ephemeral disk cache (page-in/out, LRU evict)
+MmapBlobCache = zero-copy mmap (500M edges/Container)
 CSR = In-memory graph topology (<1ms query)
 ```
 
@@ -80,9 +80,9 @@ env.YATA.stats()                        // → all partition CpmStats (K3a)
 |---|---|
 | `yata-core` | GlobalVid, LocalVid, PartitionId |
 | `yata-grin` | GRIN trait (Topology, Property, Schema, Scannable, Mutable) |
-| `yata-vineyard` | **ArrowFragment format** (canonical snapshot/persistence format)。NbrUnit zero-copy CSR (25x faster neighbor traversal)。`csr_to_fragment()` (CSR→ArrowFragment) + `ArrowFragment::serialize/deserialize` (BlobStore↔R2)。**Arrow row-group chunk**: `split_record_batch` + byte-based chunking (32 MB default, `estimate_bytes_per_row`)。PropertyGraphSchema (typed vertex/edge labels + Arrow property columns) |
-| `yata-store` | MutableCsrStore (mutable in-memory CSR, GRIN traits), ArrowGraphStore, DiskVineyard/MmapVineyard/EdgeVineyard (blob cache), PartitionStoreSet, GraphStoreEnum |
-| `yata-engine` | TieredGraphEngine, CpmStats (K3a), delta-apply mutation (K3c, ~5ms vs 400ms full rebuild), ArrowFragment snapshot (dirty label delta + force checkpoint), 2-phase cold start (`page_in_topology_from_r2` + on-demand `enrich_label_from_r2`), 3-tier blob fetch (`fetch_blob_cached`: disk → R2 → write-through), Frontier BFS, ShardedCoordinator, WAL Projection (ring buffer + segment flush + checkpoint)。parameter-based RLS 除去済み (rls.rs deleted) → Design E SecurityScope (`query_with_did` → CSR policy vertex lookup) |
+| `yata-format` | **ArrowFragment format** (canonical snapshot/persistence format)。NbrUnit zero-copy CSR (25x faster neighbor traversal)。`csr_to_fragment()` (CSR→ArrowFragment) + `ArrowFragment::serialize/deserialize` (BlobStore↔R2)。**Arrow row-group chunk**: `split_record_batch` + byte-based chunking (32 MB default, `estimate_bytes_per_row`)。PropertyGraphSchema (typed vertex/edge labels + Arrow property columns) |
+| `yata-store` | MutableCsrStore (mutable in-memory CSR, GRIN traits), ArrowGraphStore, ArrowWalStore (mmap I/O utility for compacted WAL), DiskBlobCache/MmapBlobCache/EdgeVineyard (blob cache), PartitionStoreSet, GraphStoreEnum (Single/Partitioned/Arrow — 3 variant のみ、ArrowWalStore は utility で variant ではない) |
+| `yata-engine` | TieredGraphEngine, CpmStats (K3a), delta-apply mutation (K3c), ArrowFragment snapshot (dirty label delta + force checkpoint), **Arrow IPC WAL** (`arrow_wal.rs`: serialize/deserialize/auto-detect, default format), **L1 Compaction** (`compaction.rs`: PK-dedup log rewrite, CompactionManifest, segment registry via head.json), 2-phase cold start (L1 compacted segment mmap-first → legacy ArrowFragment fallback), 3-tier blob fetch (`fetch_blob_cached`: disk → R2 → write-through), Frontier BFS, ShardedCoordinator, WAL Projection (ring buffer + segment flush + checkpoint + compaction)。Design E SecurityScope (`query_with_did` → CSR policy vertex lookup) |
 | `yata-cypher` | Full Cypher parser + executor (incl. untyped edge traversal) |
 | `yata-gie` | GIE push-based executor, IR (Exchange/Receive/Gather), distributed planner |
 | `yata-s3` | R2 persistence (sync ureq+rustls S3 client, SigV4)。`trigger_snapshot()` → R2 PUT、page-in → R2 GET |
@@ -115,6 +115,10 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
 **CF Container**: 1 vCPU + Workers RPC sequential → 実質 single-thread で contention なし。axum tokio multi-thread 時は RwLock で read 並列化。
 
 **Append-only write safety**: mergeRecord は page-in 不要 → write lock scope は merge_by_pk + commit のみ (~µs)。snapshot compaction が write lock を取るのは R2 既存データの CSR merge 時のみ (初回 1 回)。
+
+## Arrow IPC Shannon Analysis
+
+WAL + query storage schema の Shannon 情報効率比較: `docs/260329-yata-arrow-ipc-shannon-analysis.md`。結論: WAL=Edge List Arrow IPC + Query=CSR が Shannon 最適 (加重 71.8%)。NDJSON→Arrow IPC 移行で +9.3%。Vineyard 抽象は memmap2 直接置き換え候補。
 
 ## Snapshot Model — Dirty Label Delta `[IMPLEMENTED]`
 
@@ -165,7 +169,7 @@ Production: PARTITION_COUNT=1, per-label Arrow IPC, full page-in (3-tier: disk�
 | Env var | Default | Purpose |
 |---|---|---|
 | `YATA_S3_*` | (empty) | R2 endpoint/bucket/key/secret/prefix |
-| `YATA_MMAP_VINEYARD` | `false` | Enable MmapVineyard (zero-copy) |
+| `YATA_MMAP_VINEYARD` | `false` | Enable MmapBlobCache (zero-copy) |
 | `YATA_DIRECT_FAN_OUT_LIMIT` | `8` | Below this, direct fan-out; above, hierarchical √N `[IMPLEMENTED]` (companion Worker adaptive routing) |
 | `YATA_BATCH_COMMIT_THRESHOLD` | `10` | R2 snapshot skipped if pending_writes < threshold `[IMPLEMENTED]` (engine.rs pending_writes gate) |
 | `YATA_CHUNK_TARGET_BYTES` | `33554432` (32 MB) | Arrow row-group chunk target byte size per blob。R2/S3 最適 8-64 MB |
