@@ -1,0 +1,224 @@
+# CI: yata coverage + load test (WAL Projection + MinIO)
+#
+# Usage:
+#   # Coverage (unit + e2e, llvm-cov HTML report)
+#   ./scripts/ci-coverage.sh
+#
+#   # Load test (WAL write + read propagation + point read + 2-hop)
+#   docker compose -f docker-compose.ci.yml up -d --build
+#   ./scripts/ci-loadtest.sh
+#
+#   # Teardown
+#   docker compose -f docker-compose.ci.yml down -v
+
+services:
+  # ── S3-compatible storage ──
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb local/yata --ignore-existing &&
+        echo 'Bucket yata created'
+      "
+
+  # ── Write Container (WAL Projection) ──
+  yata-write:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "8083:8081"
+      - "9090:9090"
+    environment:
+      RUST_LOG: info,yata_engine=debug,yata_s3=debug
+      YATA_S3_ENDPOINT: http://minio:9000
+      YATA_S3_BUCKET: yata
+      YATA_S3_ACCESS_KEY_ID: minioadmin
+      YATA_S3_SECRET_ACCESS_KEY: minioadmin
+      YATA_S3_REGION: us-east-1
+      YATA_S3_PREFIX: "yata/"
+      YATA_DATA_DIR: /data/yata
+      YATA_REST_PORT: "8081"
+      YATA_METRICS_PORT: "9090"
+      YATA_API_SECRET: test-token
+      YATA_VINEYARD_BUDGET_MB: "256"
+      YATA_MMAP_VINEYARD: "false"
+      YATA_PARTITION_COUNT: "1"
+      YATA_HOT_PARTITION_ID: "0"
+      YATA_PERSISTENCE_MODE: wal_projection
+      YATA_WAL_RING_CAPACITY: "100000"
+      YATA_WAL_SEGMENT_MAX_BYTES: "1048576"
+      YATA_WAL_SEGMENT_MAX_AGE_SECS: "10"
+      YATA_WAL_CHECKPOINT_INTERVAL_SECS: "60"
+      YATA_WAL_FORMAT: arrow
+      PERFORMER_ID: yata-write
+      YATA_ORG_ID: test-org
+    volumes:
+      - yata-write-data:/data/yata
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8081/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Read Replica 0 ──
+  yata-read-0:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "8090:8081"
+    environment:
+      RUST_LOG: info,yata_engine=debug
+      YATA_S3_ENDPOINT: http://minio:9000
+      YATA_S3_BUCKET: yata
+      YATA_S3_ACCESS_KEY_ID: minioadmin
+      YATA_S3_SECRET_ACCESS_KEY: minioadmin
+      YATA_S3_REGION: us-east-1
+      YATA_S3_PREFIX: "yata/"
+      YATA_DATA_DIR: /data/yata
+      YATA_REST_PORT: "8081"
+      YATA_API_SECRET: test-token
+      YATA_VINEYARD_BUDGET_MB: "256"
+      YATA_HOT_PARTITION_ID: "0"
+      YATA_PERSISTENCE_MODE: wal_projection
+      YATA_READONLY: "true"
+      YATA_WAL_FORMAT: arrow
+      PERFORMER_ID: yata-read-0
+      YATA_ORG_ID: test-org
+    volumes:
+      - yata-read-0-data:/data/yata
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8081/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Read Replica 1 ──
+  yata-read-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "8091:8081"
+    environment:
+      RUST_LOG: info,yata_engine=debug
+      YATA_S3_ENDPOINT: http://minio:9000
+      YATA_S3_BUCKET: yata
+      YATA_S3_ACCESS_KEY_ID: minioadmin
+      YATA_S3_SECRET_ACCESS_KEY: minioadmin
+      YATA_S3_REGION: us-east-1
+      YATA_S3_PREFIX: "yata/"
+      YATA_DATA_DIR: /data/yata
+      YATA_REST_PORT: "8081"
+      YATA_API_SECRET: test-token
+      YATA_VINEYARD_BUDGET_MB: "256"
+      YATA_HOT_PARTITION_ID: "0"
+      YATA_PERSISTENCE_MODE: wal_projection
+      YATA_READONLY: "true"
+      YATA_WAL_FORMAT: arrow
+      PERFORMER_ID: yata-read-1
+      YATA_ORG_ID: test-org
+    volumes:
+      - yata-read-1-data:/data/yata
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8081/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Coverage Runner (cargo-llvm-cov) ──
+  # Builds instrumented binary, runs unit + e2e tests, outputs coverage report.
+  # Usage: docker compose -f docker-compose.ci.yml run --rm coverage
+  coverage:
+    build:
+      context: .
+      dockerfile: Dockerfile.coverage
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      RUST_LOG: info
+      YATA_S3_ENDPOINT: http://minio:9000
+      YATA_S3_BUCKET: yata
+      YATA_S3_ACCESS_KEY_ID: minioadmin
+      YATA_S3_SECRET_ACCESS_KEY: minioadmin
+      YATA_S3_REGION: us-east-1
+      YATA_S3_PREFIX: "yata/coverage/"
+      YATA_DATA_DIR: /tmp/yata-cov
+      YATA_REST_PORT: "18081"
+      YATA_API_SECRET: test-token
+      YATA_VINEYARD_BUDGET_MB: "128"
+      YATA_MMAP_VINEYARD: "false"
+      YATA_PARTITION_COUNT: "1"
+      YATA_HOT_PARTITION_ID: "0"
+      YATA_WAL_FORMAT: arrow
+      PERFORMER_ID: yata-cov
+      YATA_ORG_ID: test-org
+    volumes:
+      - coverage-output:/coverage
+    profiles:
+      - coverage
+
+  # ── Load Test Runner ──
+  # Runs load test against yata-write + yata-read-{0,1}.
+  # Usage: docker compose -f docker-compose.ci.yml run --rm loadtest
+  loadtest:
+    image: debian:bookworm-slim
+    depends_on:
+      yata-write:
+        condition: service_healthy
+      yata-read-0:
+        condition: service_healthy
+      yata-read-1:
+        condition: service_healthy
+    environment:
+      WRITE_URL: http://yata-write:8081
+      READ0_URL: http://yata-read-0:8081
+      READ1_URL: http://yata-read-1:8081
+      NUM_WRITES: "1000"
+      NUM_READS: "500"
+      NUM_PARALLEL: "10"
+    entrypoint: >
+      /bin/sh -c "
+        apt-get update -qq && apt-get install -y -qq curl python3 > /dev/null 2>&1 &&
+        /loadtest/ci-loadtest.sh
+      "
+    volumes:
+      - ./scripts:/loadtest:ro
+    profiles:
+      - loadtest
+
+volumes:
+  yata-write-data:
+  yata-read-0-data:
+  yata-read-1-data:
+  coverage-output:

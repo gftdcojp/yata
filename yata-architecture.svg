@@ -74,7 +74,7 @@
 
   <!-- Title -->
   <text x="800" y="40" text-anchor="middle" fill="#f8fafc" font-size="22" font-weight="bold">yata — Rust Cypher Graph Engine Architecture</text>
-  <text x="800" y="62" text-anchor="middle" fill="#94a3b8" font-size="13">14 crates | 1,068 tests | CSR + ArrowFragment + R2 | Critical Path + Full-Stack Shannon + Kaizen + Security Architecture</text>
+  <text x="800" y="62" text-anchor="middle" fill="#94a3b8" font-size="13">14 crates | 1,068 tests | CSR + YataFragment + R2 | Critical Path + Full-Stack Shannon + Kaizen + Security Architecture</text>
 
   <!-- ==================== LAYER 0 ==================== -->
   <text x="40" y="105" fill="#64748b" font-size="10" font-weight="bold">LAYER 0 — Zero Dependencies (Foundation)</text>
@@ -118,11 +118,11 @@
   <text x="420" y="362" fill="#94a3b8" font-size="10">Blake3 hash directory layout</text>
   <text x="420" y="377" fill="#475569" font-size="9">deps: core, async-trait, ciborium</text>
 
-  <!-- yata-vineyard (CHANGED) -->
+  <!-- yata-format -->
   <rect x="740" y="290" width="340" height="100" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="2"/>
-  <text x="760" y="313" fill="#22c55e" font-size="13" font-weight="bold">yata-vineyard</text>
+  <text x="760" y="313" fill="#22c55e" font-size="13" font-weight="bold">yata-format</text>
   <text x="960" y="313" fill="#64748b" font-size="9">~1,500 LOC</text>
-  <text x="760" y="332" fill="#94a3b8" font-size="10">ArrowFragment (canonical snapshot format)</text>
+  <text x="760" y="332" fill="#94a3b8" font-size="10">YataFragment (canonical snapshot format)</text>
   <text x="760" y="347" fill="#94a3b8" font-size="10">NbrUnit64 (packed CSR, 25x faster)</text>
   <text x="760" y="362" fill="#4ade80" font-size="10">csr_to_fragment_selective() [NEW]</text>
   <text x="760" y="377" fill="#475569" font-size="9">deps: core, grin, arrow, bytes</text>
@@ -149,9 +149,9 @@
   <text x="420" y="468" fill="#e2e8f0" font-size="13" font-weight="bold">yata-store</text>
   <text x="620" y="468" fill="#64748b" font-size="9">~2,000 LOC</text>
   <text x="420" y="487" fill="#94a3b8" font-size="10">MutableCsrStore (in-memory, GRIN impl)</text>
-  <text x="420" y="502" fill="#94a3b8" font-size="10">DiskVineyard/MmapVineyard (LRU cache)</text>
+  <text x="420" y="502" fill="#94a3b8" font-size="10">DiskBlobCache/MmapBlobCache (LRU cache)</text>
   <text x="420" y="517" fill="#94a3b8" font-size="10">GraphStoreEnum dispatch, PartitionedStore</text>
-  <text x="420" y="532" fill="#475569" font-size="9">deps: grin, cypher, vineyard, core, memmap2</text>
+  <text x="420" y="532" fill="#475569" font-size="9">deps: grin, cypher, format, core, memmap2</text>
 
   <rect x="780" y="445" width="300" height="100" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
   <text x="800" y="468" fill="#e2e8f0" font-size="13" font-weight="bold">yata-graph</text>
@@ -186,7 +186,7 @@
   <text x="440" y="657" fill="#94a3b8" font-size="10">RwLock&lt;GraphStoreEnum&gt;, QueryCache</text>
   <text x="440" y="672" fill="#4ade80" font-size="10">Dirty label delta snapshot [FIXED]</text>
   <text x="440" y="687" fill="#4ade80" font-size="10">is_dirty_vertex_blob / is_infra_blob [NEW]</text>
-  <text x="440" y="702" fill="#475569" font-size="9">deps: core,grin,store,cypher,gie,graph,s3,vineyard</text>
+  <text x="440" y="702" fill="#475569" font-size="9">deps: core,grin,store,cypher,gie,graph,s3,format</text>
 
   <rect x="860" y="600" width="300" height="55" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
   <text x="880" y="623" fill="#e2e8f0" font-size="13" font-weight="bold">yata-vex</text>
@@ -253,13 +253,13 @@
   <text x="590" y="1050" fill="#fcd34d" font-size="14" font-weight="bold">WARM (Disk Cache)</text>
   <text x="810" y="1050" fill="#f59e0b" font-size="11">~100us</text>
   <rect x="590" y="1065" width="140" height="45" rx="6" fill="#1e293b" stroke="#f59e0b" stroke-width="1" stroke-opacity="0.4"/>
-  <text x="605" y="1085" fill="#e2e8f0" font-size="11">DiskVineyard</text>
+  <text x="605" y="1085" fill="#e2e8f0" font-size="11">DiskBlobCache</text>
   <text x="605" y="1100" fill="#94a3b8" font-size="9">LRU evict cache</text>
   <rect x="750" y="1065" width="140" height="45" rx="6" fill="#1e293b" stroke="#f59e0b" stroke-width="1" stroke-opacity="0.4"/>
-  <text x="765" y="1085" fill="#e2e8f0" font-size="11">MmapVineyard</text>
+  <text x="765" y="1085" fill="#e2e8f0" font-size="11">MmapBlobCache</text>
   <text x="765" y="1100" fill="#94a3b8" font-size="9">zero-copy mmap</text>
   <rect x="590" y="1120" width="300" height="45" rx="6" fill="#1e293b" stroke="#f59e0b" stroke-width="1" stroke-opacity="0.4"/>
-  <text x="605" y="1140" fill="#e2e8f0" font-size="11">ArrowFragment blobs (per-label IPC)</text>
+  <text x="605" y="1140" fill="#e2e8f0" font-size="11">YataFragment blobs (per-label IPC)</text>
   <text x="605" y="1155" fill="#94a3b8" font-size="9">8GB ephemeral, write-through from R2</text>
 
   <!-- COLD -->
@@ -671,7 +671,7 @@
 
   <!-- S2: L1 WAL safety net -->
   <rect x="60" y="2940" width="720" height="55" rx="8" fill="#1e293b" stroke="#f59e0b" stroke-width="1.5" stroke-opacity="0.6"/>
-  <text x="80" y="2962" fill="#f59e0b" font-size="12" font-weight="bold">S2: L1 yata WAL safety net — redundant with L0 Pipeline WAL (exactly-once, durable)</text>
+  <text x="80" y="2962" fill="#22c55e" font-size="12" font-weight="bold">S2: L1 Arrow IPC WAL — unified format (zero-copy mmap, segment registry, L1 compaction)</text>
   <text x="80" y="2978" fill="#94a3b8" font-size="10">container/yata/src/index.ts:7 | walFlushSegment cron 10s + pushWalToReplicas fire-and-forget</text>
   <text x="80" y="2990" fill="#fbbf24" font-size="10">Shannon: L0 Pipeline.send() = source of truth. L1 = safety net while Pipeline Beta. Post-GA: delete L1</text>
   <rect x="690" y="2948" width="80" height="18" rx="4" fill="#f59e0b" fill-opacity="0.2"/>
@@ -897,11 +897,11 @@
   <!-- Branch from YataRPC to Write Container + Read Replicas -->
   <line x1="520" y1="3952" x2="520" y2="3972" stroke="#60a5fa" stroke-width="1" marker-end="url(#arrow)"/>
 
-  <!-- L1 WAL (redundant) -->
-  <rect x="420" y="3974" width="200" height="50" rx="6" fill="#1e293b" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="4,3"/>
-  <text x="440" y="3994" fill="#f59e0b" font-size="10" font-weight="bold">L1 yata WAL ring</text>
-  <text x="440" y="4010" fill="#fbbf24" font-size="9">R2 NDJSON (10s cron)</text>
-  <text x="440" y="4020" fill="#f59e0b" font-size="7">REDUNDANT post-Pipeline-GA (S2)</text>
+  <!-- L1 Arrow IPC WAL (Shannon-optimal) -->
+  <rect x="420" y="3974" width="200" height="50" rx="6" fill="#1e293b" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="440" y="3994" fill="#22c55e" font-size="10" font-weight="bold">L1 Arrow IPC WAL</text>
+  <text x="440" y="4010" fill="#86efac" font-size="9">R2 Arrow IPC (10s flush)</text>
+  <text x="440" y="4020" fill="#22c55e" font-size="7">ZERO-COPY MMAP + SEGMENT REGISTRY</text>
 
   <!-- Write Container -->
   <line x1="520" y1="4024" x2="520" y2="4044" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
@@ -912,32 +912,32 @@
   <!-- L2 Checkpoint -->
   <line x1="620" y1="4071" x2="680" y2="4071" stroke="#3b82f6" stroke-width="1" marker-end="url(#arrow)"/>
   <rect x="682" y="4046" width="200" height="50" rx="6" fill="#1e293b" stroke="#3b82f6" stroke-width="1.5"/>
-  <text x="702" y="4066" fill="#3b82f6" font-size="10" font-weight="bold">L2 Checkpoint</text>
-  <text x="702" y="4082" fill="#94a3b8" font-size="9">R2 ArrowFragment (5min)</text>
-  <text x="702" y="4092" fill="#3b82f6" font-size="7">COLD START RECOVERY</text>
+  <text x="702" y="4066" fill="#3b82f6" font-size="10" font-weight="bold">L1 Compaction + L2 Checkpoint</text>
+  <text x="702" y="4082" fill="#94a3b8" font-size="9">PK-dedup Arrow IPC (compact) / YataFragment (legacy)</text>
+  <text x="702" y="4092" fill="#3b82f6" font-size="7">MMAP-FIRST COLD START (disk ~100µs → R2 fallback)</text>
 
   <!-- Read Replicas -->
   <line x1="620" y1="3990" x2="750" y2="3990" stroke="#4b5563" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arrow)"/>
   <rect x="752" y="3970" width="200" height="45" rx="6" fill="#1e293b" stroke="#a855f7" stroke-width="1"/>
   <text x="772" y="3990" fill="#a855f7" font-size="10" font-weight="bold">Read Replicas x N</text>
-  <text x="772" y="4005" fill="#94a3b8" font-size="9">walApply (fire-and-forget, S7)</text>
+  <text x="772" y="4005" fill="#94a3b8" font-size="9">walApplyArrow (Arrow IPC binary, zero JSON)</text>
 
   <!-- Annotations -->
   <rect x="960" y="3800" width="310" height="120" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
   <text x="980" y="3822" fill="#e2e8f0" font-size="11" font-weight="bold">Data Persistence Count</text>
   <text x="980" y="3842" fill="#22c55e" font-size="10">L0 Pipeline WAL — required (truth)</text>
-  <text x="980" y="3860" fill="#f59e0b" font-size="10">L1 yata WAL — removable (S2)</text>
-  <text x="980" y="3878" fill="#3b82f6" font-size="10">L2 Checkpoint — required (cold start)</text>
+  <text x="980" y="3860" fill="#22c55e" font-size="10">L1 Arrow IPC WAL — unified format (mmap-ready)</text>
+  <text x="980" y="3878" fill="#3b82f6" font-size="10">L1 Compaction — PK-dedup (P=1.0 recovery)</text>
   <text x="980" y="3896" fill="#dc2626" font-size="10">CSR in-memory — required (query)</text>
-  <text x="980" y="3910" fill="#94a3b8" font-size="9">Total: 4 copies. Optimal: 3 (remove L1)</text>
+  <text x="980" y="3910" fill="#94a3b8" font-size="9">Shannon R=0.15 (WAL+compaction unified Arrow IPC)</text>
 
   <!-- Shannon η summary at bottom -->
   <rect x="960" y="3940" width="310" height="90" rx="6" fill="#1e293b" stroke="#22c55e" stroke-width="1"/>
-  <text x="980" y="3962" fill="#22c55e" font-size="11" font-weight="bold">Shannon Efficiency (ACHIEVED)</text>
-  <text x="980" y="3982" fill="#4ade80" font-size="10">eta(write): ~50% (K5: Promise.all parallel)</text>
-  <text x="980" y="4000" fill="#94a3b8" font-size="10">was: ~33% (3 serial copies)</text>
-  <text x="980" y="4018" fill="#4ade80" font-size="10">eta(cold): ~85% (K2: label-selective)</text>
-  <text x="980" y="4036" fill="#94a3b8" font-size="10">was: ~5% (full page-in all labels)</text>
+  <text x="980" y="3962" fill="#22c55e" font-size="11" font-weight="bold">Shannon Efficiency (Phase 0-5)</text>
+  <text x="980" y="3982" fill="#4ade80" font-size="10">write: PropValue→Vec (0 JSON, was JSON→Map)</text>
+  <text x="980" y="4000" fill="#4ade80" font-size="10">WAL: Arrow IPC (mmap-ready, was NDJSON text)</text>
+  <text x="980" y="4018" fill="#4ade80" font-size="10">cold: mmap ~100µs (was R2 GET ~5ms)</text>
+  <text x="980" y="4036" fill="#4ade80" font-size="10">recovery: P=1.0 (compacted+tail, was P=0.7)</text>
 
   <!-- ================================================================ -->
   <!-- FALLBACK PATH MAP -->
@@ -1534,7 +1534,7 @@
   <text x="590" y="7411" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="bold">yata-grin</text>
   <text x="590" y="7425" text-anchor="middle" fill="#64748b" font-size="8">⊥₂  313 LOC</text>
 
-  <!-- Layer 1: arrow, object, vineyard -->
+  <!-- Layer 1: arrow, object, format -->
   <rect x="140" y="7310" width="110" height="32" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
   <text x="195" y="7331" text-anchor="middle" fill="#e2e8f0" font-size="10">yata-arrow</text>
   <text x="195" y="7343" text-anchor="middle" fill="#64748b" font-size="8">639 LOC</text>
@@ -1546,7 +1546,7 @@
   <line x1="365" y1="7342" x2="410" y2="7390" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
 
   <rect x="500" y="7310" width="120" height="32" rx="6" fill="#1e293b" stroke="#22c55e" stroke-width="2"/>
-  <text x="560" y="7331" text-anchor="middle" fill="#22c55e" font-size="10">yata-vineyard</text>
+  <text x="560" y="7331" text-anchor="middle" fill="#22c55e" font-size="10">yata-format</text>
   <text x="560" y="7343" text-anchor="middle" fill="#64748b" font-size="8">2,046 LOC</text>
   <line x1="540" y1="7342" x2="410" y2="7390" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
   <line x1="560" y1="7342" x2="590" y2="7390" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
@@ -1627,7 +1627,7 @@
   <rect x="750" y="7270" width="380" height="90" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="1" stroke-opacity="0.5"/>
   <text x="770" y="7295" fill="#22c55e" font-size="12" font-weight="bold">After Merge: 11 crates (Shannon-optimal)</text>
   <text x="770" y="7315" fill="#94a3b8" font-size="10">⊥: core, grin (zero deps, pure types+traits)</text>
-  <text x="770" y="7335" fill="#94a3b8" font-size="10">Interior: arrow, vineyard, cypher, store, gie, s3+obj, engine+graph+vex</text>
+  <text x="770" y="7335" fill="#94a3b8" font-size="10">Interior: arrow, format, cypher, store, gie, s3+obj, engine+graph+vex</text>
   <text x="770" y="7350" fill="#94a3b8" font-size="10">⊤: server, bench (consumers only, no dependents)</text>
 
   <!-- Semilattice property annotation -->
