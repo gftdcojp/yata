@@ -24,12 +24,6 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
         rls_org_id: Option<&str>,
     ) -> Result<Vec<Vec<(String, String)>>, String>;
 
-    fn rebuild_from_r2(&self);
-
-    fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
-        Err("trigger_snapshot not implemented".to_string())
-    }
-
     // ── WAL Projection API ──
 
     /// Read WAL tail entries after a given sequence number.
@@ -100,8 +94,6 @@ pub fn router<G: GraphQueryExecutor>(state: YataRestState<G>) -> Router {
         .route("/readyz", get(health))
         // XRPC — primary API (Workers RPC only)
         .route("/xrpc/ai.gftd.yata.cypher", post(xrpc_cypher::<G>))
-        .route("/xrpc/ai.gftd.yata.triggerSnapshot", post(trigger_snapshot_handler::<G>))
-        .route("/internal/snapshot/rebuild", post(rebuild_from_snapshot::<G>))
         // WAL Projection API
         .route("/xrpc/ai.gftd.yata.walTail", post(wal_tail_handler::<G>))
         .route("/xrpc/ai.gftd.yata.walApply", post(wal_apply_handler::<G>))
@@ -298,46 +290,7 @@ async fn xrpc_cypher<G: GraphQueryExecutor>(
 //
 // These endpoints allow the MagatamaContainer DO (TypeScript) to proxy
 // snapshot data between R2 and the Container's Vineyard store.
-// The Container itself doesn't need S3 HTTP access — the DO handles R2 I/O.
-
-
-/// POST /internal/snapshot/rebuild — Rebuild CSR from R2 ArrowFragment.
-async fn rebuild_from_snapshot<G: GraphQueryExecutor>(
-    State(state): State<YataRestState<G>>,
-) -> impl IntoResponse {
-    let graph = state.graph.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        graph.rebuild_from_r2();
-    })
-    .await;
-
-    match result {
-        Ok(()) => {
-            tracing::info!("CSR rebuilt from R2 ArrowFragment");
-            (StatusCode::OK, Json(serde_json::json!({"ok": true})))
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("rebuild failed: {e}")})),
-        ),
-    }
-}
-
-/// POST /xrpc/ai.gftd.yata.triggerSnapshot — Trigger snapshot: CSR → ArrowFragment → R2.
-/// Rejected with 405 on read-only containers (YATA_READONLY=true).
-async fn trigger_snapshot_handler<G: GraphQueryExecutor>(
-    State(state): State<YataRestState<G>>,
-) -> impl IntoResponse {
-    if state.readonly {
-        return (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"error": "read-only container: triggerSnapshot rejected"})));
-    }
-    match state.graph.trigger_snapshot() {
-        Ok((v, e)) => (StatusCode::OK, Json(serde_json::json!({"vertices": v, "edges": e}))),
-        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": err}))),
-    }
-}
-
-// Legacy endpoints removed: exportSnapshot, mergeRecord (Cypher MERGE).
+// Legacy endpoints removed: triggerSnapshot, rebuild, exportSnapshot, mergeRecord (Cypher MERGE).
 // WAL Projection: mergeRecordWal + walApply + walCheckpoint.
 
 // ── WAL Projection handlers ────────────────────────────────────────────
@@ -505,14 +458,6 @@ impl GraphQueryExecutor for yata_engine::TieredGraphEngine {
         self.query(cypher, params, rls_org_id)
     }
 
-    fn rebuild_from_r2(&self) {
-        self.restore_from_r2();
-    }
-
-    fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
-        self.trigger_snapshot()
-    }
-
     // ── WAL Projection ──
 
     fn wal_tail(&self, after_seq: u64, limit: usize) -> Result<Vec<yata_engine::wal::WalEntry>, String> {
@@ -584,12 +529,6 @@ mod tests {
             rls_org_id: Option<&str>,
         ) -> Result<Vec<Vec<(String, String)>>, String> {
             self.engine.query(cypher, params, rls_org_id)
-        }
-
-        fn rebuild_from_r2(&self) {}
-
-        fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
-            self.engine.trigger_snapshot()
         }
 
         fn wal_tail(&self, after_seq: u64, limit: usize) -> Result<Vec<yata_engine::wal::WalEntry>, String> {

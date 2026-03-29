@@ -179,50 +179,21 @@ impl MutationContext {
     }
 }
 
-/// Graph engine: HOT (MutableCSR in-memory) + Snapshot (R2 persistent).
-///
-/// Integrates: query routing, cache, RLS, snapshot persistence, vector search passthrough.
+/// Graph engine: MutableCSR in-memory + WAL Projection (R2 segments + checkpoints).
 pub struct TieredGraphEngine {
     config: TieredEngineConfig,
-    /// HOT tier: in-memory CSR store. RwLock for concurrent reads, exclusive writes.
     hot: Arc<RwLock<yata_store::GraphStoreEnum>>,
-    /// GraphStore — vector search (yata-vex) only. NOT graph persistence.
     warm: GraphStore,
-    /// Query result cache.
     cache: Arc<Mutex<QueryCache>>,
-    /// Whether the HOT tier has been initialized.
     hot_initialized: Arc<AtomicBool>,
-    /// Labels already loaded into HOT CSR.
     loaded_labels: Arc<Mutex<HashSet<String>>>,
-    /// Vineyard blob store: DiskVineyard (Container disk) or EdgeVineyard (in-memory fallback).
     vineyard: Arc<dyn VineyardStore>,
-    /// Last known fragment manifest (from snapshot or restore).
-    fragment_manifest: Arc<Mutex<Option<FragmentManifest>>>,
-    /// S3/R2 client for R2 read (page-in). Lazy-initialized on first use.
     s3_client: Arc<Mutex<Option<Arc<yata_s3::s3::S3Client>>>>,
-    /// S3 key prefix for R2 read (e.g. "yata/").
     s3_prefix: String,
-    /// Dirty flag: set to true on any write (merge/delete). Cleared after snapshot.
-    /// Prevents redundant R2 uploads when no mutations occurred.
     dirty: Arc<AtomicBool>,
-    /// Per-label dirty tracking: labels mutated since last snapshot.
-    /// Enables future delta PUT (only dirty labels serialized).
     dirty_labels: Arc<Mutex<HashSet<String>>>,
-    /// Last snapshot vertex+edge count. Used to detect partial page-in corruption.
-    last_snapshot_count: Arc<Mutex<(u64, u64)>>,
-    /// Cached fragment meta from R2 (for incremental label enrichment).
-    cached_meta: Arc<Mutex<Option<yata_vineyard::blob::ObjectMeta>>>,
-    /// Cached schema from R2 (for label-id lookup during enrichment).
-    cached_schema: Arc<Mutex<Option<yata_vineyard::schema::PropertyGraphSchema>>>,
-    /// Per-label VID offset (label → first VID). Computed once during initial page-in.
-    label_vid_offsets: Arc<Mutex<HashMap<String, u32>>>,
-    /// Pending write count since last snapshot. Used with batch_commit_threshold
-    /// to avoid triggering snapshots on every single write.
     pending_writes: Arc<AtomicUsize>,
-    /// WAL ring buffer for Kafka-style projection (WalProjection mode).
-    /// Write Container: merge_record appends here. Read replicas consume via wal_tail.
     wal: Arc<Mutex<crate::wal::WalRingBuffer>>,
-    /// Last WAL seq flushed to R2 segment.
     wal_last_flushed_seq: Arc<AtomicU64>,
 }
 
@@ -308,15 +279,10 @@ impl TieredGraphEngine {
             hot_initialized: Arc::new(AtomicBool::new(false)),
             loaded_labels: Arc::new(Mutex::new(HashSet::new())),
             vineyard,
-            fragment_manifest: Arc::new(Mutex::new(None)),
             s3_client,
             s3_prefix,
             dirty: Arc::new(AtomicBool::new(false)),
             dirty_labels: Arc::new(Mutex::new(HashSet::new())),
-            last_snapshot_count: Arc::new(Mutex::new((0, 0))),
-            cached_meta: Arc::new(Mutex::new(None)),
-            cached_schema: Arc::new(Mutex::new(None)),
-            label_vid_offsets: Arc::new(Mutex::new(HashMap::new())),
             pending_writes: Arc::new(AtomicUsize::new(0)),
             wal: Arc::new(Mutex::new(crate::wal::WalRingBuffer::new(wal_ring_capacity))),
             wal_last_flushed_seq: Arc::new(AtomicU64::new(0)),
@@ -399,196 +365,14 @@ impl TieredGraphEngine {
         self.ensure_labels_vineyard_only(vertex_labels);
     }
 
-    /// Full page-in from R2 ArrowFragment snapshot (3-tier: disk cache → R2).
-    ///
-    /// Cold start: full page-in of ALL labels with properties.
-    ///   Topology-only (stubs) page-in was attempted but caused property-loss
-    ///   because PDS queries often lack label hints (unlabeled MATCH patterns).
-    ///   Full page-in is the only safe cold start strategy.
-    ///
-    /// After cold start (hot_initialized=true):
-    ///   New labels created via mergeRecord are immediately available (in-memory).
-    ///   The 3-tier blob fetch (disk → R2) accelerates cold start (~100µs vs ~3-5ms per blob).
-    fn ensure_labels_vineyard_only(&self, vertex_labels: &[&str]) {
-        // Phase 1: Initial cold start — selective page-in (topology + needed labels only)
-        if !self.hot_initialized.load(Ordering::Relaxed) {
-            let s3 = match self.get_s3_client() {
-                Some(s3) => s3.clone(),
-                None => return,
-            };
+    /// Cold start fallback: full page-in from R2 checkpoint.
+    /// WAL mode: normally walColdStart handles this. This is the fallback
+    /// for first query before walColdStart is called.
+    fn ensure_labels_vineyard_only(&self, _vertex_labels: &[&str]) {
+        if self.hot_initialized.load(Ordering::Relaxed) { return; }
 
-            // Build needed label set from query hints (empty = topology-only bootstrap)
-            let needed: std::collections::HashSet<String> = vertex_labels.iter()
-                .map(|l| l.to_string())
-                .collect();
-
-            let page_in_result = if needed.is_empty() {
-                // No label hints — use topology-only page-in (fastest cold start)
-                crate::loader::page_in_topology_from_r2(&s3, &self.s3_prefix, self.config.hot_partition_id)
-                    .map(|(store, meta, schema, offsets)| {
-                        // Cache meta/schema/offsets for incremental enrichment
-                        if let Ok(mut cm) = self.cached_meta.lock() { *cm = Some(meta); }
-                        if let Ok(mut cs) = self.cached_schema.lock() { *cs = Some(schema); }
-                        if let Ok(mut lo) = self.label_vid_offsets.lock() { *lo = offsets; }
-                        (store, std::collections::HashSet::<String>::new())
-                    })
-            } else {
-                // Label hints available — selective page-in (topology + needed labels)
-                crate::loader::page_in_selective_from_r2(&s3, &self.s3_prefix, self.config.hot_partition_id, &needed)
-                    .map(|(store, meta, schema, loaded)| {
-                        // Cache meta/schema for incremental enrichment
-                        let mut offsets = std::collections::HashMap::new();
-                        let mut offset = 0u32;
-                        for entry in &schema.vertex_entries {
-                            offsets.insert(entry.label.clone(), offset);
-                            let count = yata_grin::Scannable::scan_vertices_by_label(&store, &entry.label).len();
-                            offset += count as u32;
-                        }
-                        if let Ok(mut cm) = self.cached_meta.lock() { *cm = Some(meta); }
-                        if let Ok(mut cs) = self.cached_schema.lock() { *cs = Some(schema); }
-                        if let Ok(mut lo) = self.label_vid_offsets.lock() { *lo = offsets; }
-                        (store, loaded)
-                    })
-            };
-
-            match page_in_result {
-                Ok((store, loaded_labels)) => {
-                    let vc = yata_grin::Topology::vertex_count(&store);
-                    let ec = yata_grin::Topology::edge_count(&store);
-                    if vc == 0 && ec == 0 {
-                        tracing::debug!("R2 page-in: empty fragment");
-                        self.hot_initialized.store(true, Ordering::Relaxed);
-                        return;
-                    }
-                    if let Ok(mut last) = self.last_snapshot_count.lock() {
-                        *last = (vc as u64, ec as u64);
-                    }
-                    if let Ok(mut ll) = self.loaded_labels.lock() {
-                        for label in &loaded_labels {
-                            ll.insert(label.clone());
-                        }
-                    }
-                    if let Ok(mut hot) = self.hot.write() {
-                        if let Some(existing) = hot.as_single_mut() {
-                            let existing_vc = yata_grin::Topology::vertex_count(existing);
-                            if existing_vc > 0 {
-                                use yata_grin::{Scannable, Property, Schema as GrinSchema};
-                                for label in GrinSchema::vertex_labels(&store) {
-                                    for vid in Scannable::scan_vertices_by_label(&store, &label) {
-                                        let props: Vec<(String, yata_grin::PropValue)> = store
-                                            .vertex_prop_keys(&label)
-                                            .iter()
-                                            .filter_map(|k| store.vertex_prop(vid, k).map(|v| (k.clone(), v)))
-                                            .collect();
-                                        let props_ref: Vec<(&str, yata_grin::PropValue)> =
-                                            props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-                                        if let Some(pk_val) = props.iter().find(|(k, _)| k == "rkey").map(|(_, v)| v.clone()) {
-                                            existing.merge_by_pk(&label, "rkey", &pk_val, &props_ref);
-                                        } else {
-                                            existing.add_vertex(&label, &props_ref);
-                                        }
-                                    }
-                                }
-                                existing.commit();
-                                tracing::info!(r2_vertices = vc, existing_vc, loaded = loaded_labels.len(), "selective merge into existing CSR");
-                            } else {
-                                *hot = yata_store::GraphStoreEnum::Single(store);
-                                tracing::info!(vertices = vc, edges = ec, loaded = loaded_labels.len(), "selective page-in complete (3-tier: disk→R2)");
-                            }
-                        } else {
-                            *hot = yata_store::GraphStoreEnum::Single(store);
-                            tracing::info!(vertices = vc, edges = ec, loaded = loaded_labels.len(), "selective page-in complete (3-tier: disk→R2)");
-                        }
-                        // WAL replay: recover records written after last snapshot
-                        if let Some(single) = hot.as_single_mut() {
-                            if let Some(s3_for_wal) = self.get_s3_client() {
-                                match crate::loader::replay_wal_from_r2(&s3_for_wal, single, 0) {
-                                    Ok(n) if n > 0 => {
-                                        single.commit();
-                                        tracing::info!(replayed = n, "WAL replay into CSR complete");
-                                    }
-                                    Ok(_) => {}
-                                    Err(e) => tracing::warn!("WAL replay failed (non-fatal): {e}"),
-                                }
-                            }
-                        }
-                        self.hot_initialized.store(true, Ordering::Relaxed);
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("R2 page-in failed (may not exist yet): {e}");
-                    self.hot_initialized.store(true, Ordering::Relaxed);
-                }
-            }
-            return;
-        }
-
-        // Phase 2: Incremental enrichment — load new labels on demand
-        if !vertex_labels.is_empty() {
-            self.enrich_new_labels(vertex_labels);
-        }
-    }
-
-    /// Incrementally enrich stub vertices with properties for new labels.
-    fn enrich_new_labels(&self, vertex_labels: &[&str]) {
-        let new_labels: Vec<String> = if let Ok(ll) = self.loaded_labels.lock() {
-            vertex_labels.iter()
-                .filter(|l| !ll.contains(**l))
-                .map(|l| l.to_string())
-                .collect()
-        } else { return; };
-
-        if new_labels.is_empty() { return; }
-
-        let s3 = match self.get_s3_client() {
-            Some(s3) => s3,
-            None => return,
-        };
-
-        let meta = if let Ok(cm) = self.cached_meta.lock() {
-            cm.clone()
-        } else { None };
-        let schema = if let Ok(cs) = self.cached_schema.lock() {
-            cs.clone()
-        } else { None };
-        let offsets = if let Ok(lo) = self.label_vid_offsets.lock() {
-            lo.clone()
-        } else { HashMap::new() };
-
-        let (meta, schema) = match (meta, schema) {
-            (Some(m), Some(s)) => (m, s),
-            _ => return, // No cached meta — can't enrich incrementally
-        };
-
-        // Write lock for property updates
-        if let Ok(mut hot) = self.hot.write() {
-            if let Some(single) = hot.as_single_mut() {
-                for label in &new_labels {
-                    let vid_offset = offsets.get(label).copied().unwrap_or(0);
-                    if let Err(e) = crate::loader::enrich_label_from_r2(
-                        &s3, &self.s3_prefix, &meta, &schema, label, single, vid_offset,
-                    ) {
-                        tracing::warn!(label, error = %e, "failed to enrich label");
-                        continue;
-                    }
-                    single.commit();
-                }
-            }
-        }
-
-        // Mark labels as loaded
-        if let Ok(mut ll) = self.loaded_labels.lock() {
-            for label in &new_labels {
-                ll.insert(label.clone());
-            }
-        }
-
-        // Invalidate cache
-        if let Ok(mut c) = self.cache.lock() {
-            c.invalidate();
-        }
-
-        tracing::info!(labels = ?new_labels, "incremental label enrichment complete");
+        // Full page-in from R2 checkpoint
+        self.restore_from_r2();
     }
 
 
@@ -1260,18 +1044,7 @@ impl TieredGraphEngine {
             return Ok((0, 0));
         }
 
-        // Guard: never overwrite a larger R2 snapshot with a smaller one (partial page-in protection).
-        // If page-in loaded 1000 records but only 5 new writes came in, CSR has 5 → don't destroy 1000.
-        if let Ok(last) = self.last_snapshot_count.lock() {
-            let (last_v, last_e) = *last;
-            if last_v > 0 && v_count < last_v / 2 {
-                tracing::warn!(
-                    current_v = v_count, last_v, current_e = e_count, last_e,
-                    "snapshot skipped: CSR has fewer vertices than last snapshot (partial page-in?)"
-                );
-                return Ok((0, 0));
-            }
-        }
+        // WAL mode: CSR is authoritative. No partial page-in guard needed.
 
         // Upload ArrowFragment blobs to R2 (name-based, no CAS)
         let mut uploaded = 0u32;
@@ -1338,11 +1111,8 @@ impl TieredGraphEngine {
         if let Ok(mut dl) = self.dirty_labels.lock() {
             dl.clear();
         }
-        if let Ok(mut last) = self.last_snapshot_count.lock() {
-            *last = (v_count, e_count);
-        }
 
-        tracing::info!(vertices = v_count, edges = e_count, blobs = uploaded, "R2 ArrowFragment snapshot triggered");
+        tracing::info!(vertices = v_count, edges = e_count, blobs = uploaded, "R2 checkpoint written");
         Ok((v_count, e_count))
     }
 
