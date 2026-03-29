@@ -74,7 +74,7 @@
 
   <!-- Title -->
   <text x="800" y="40" text-anchor="middle" fill="#f8fafc" font-size="22" font-weight="bold">yata — Rust Cypher Graph Engine Architecture</text>
-  <text x="800" y="62" text-anchor="middle" fill="#94a3b8" font-size="13">11 crates | 1,068 tests | CSR + ArrowFragment + R2 | Critical Path + Full-Stack Shannon + Kaizen + Security Architecture</text>
+  <text x="800" y="62" text-anchor="middle" fill="#94a3b8" font-size="13">14 crates | 1,068 tests | CSR + ArrowFragment + R2 | Critical Path + Full-Stack Shannon + Kaizen + Security Architecture</text>
 
   <!-- ==================== LAYER 0 ==================== -->
   <text x="40" y="105" fill="#64748b" font-size="10" font-weight="bold">LAYER 0 — Zero Dependencies (Foundation)</text>
@@ -450,7 +450,7 @@
   <text x="1120" y="1957" fill="#22c55e" font-size="10">changed crate</text>
   <rect x="1270" y="1945" width="50" height="14" rx="4" fill="none" stroke="#60a5fa" stroke-width="2"/>
   <text x="1330" y="1957" fill="#60a5fa" font-size="10">entry point</text>
-  <text x="120" y="1985" fill="#475569" font-size="10">12 crates | ~22,000 LOC | 1,068 tests pass | Edition 2024 | Apache-2.0 | cargo zigbuild x86_64-unknown-linux-gnu</text>
+  <text x="120" y="1985" fill="#475569" font-size="10">14 crates | ~44,500 LOC | 1,068 tests pass | Edition 2024 | Apache-2.0 | cargo zigbuild x86_64-unknown-linux-gnu</text>
 
   <!-- ================================================================ -->
   <!-- CRITICAL PATH ANALYSIS (5 paths with bottleneck identification) -->
@@ -1517,5 +1517,121 @@
   <text x="120" y="6918" fill="#a855f7" font-size="12" font-weight="bold">Security Design Invariants</text>
   <text x="120" y="6935" fill="#94a3b8" font-size="10">1. DID = canonical identity (no ephemeral IDs, no Clerk orgs)  2. ES256 &gt; HS256 for service-to-service  3. yata CSR = SecurityScope source of truth</text>
   <text x="120" y="6948" fill="#94a3b8" font-size="10">4. SecurityFilter is O(1) (no MemoryGraph fallback)  5. Partition ≠ security boundary  6. Consent via owner_hash (FNV-1a O(1))  7. AT Protocol faithful (Session+ServiceAuth JWT)</text>
+
+  <!-- ================================================================ -->
+  <!-- SYSTEM OF SYSTEMS — SEMILATTICE -->
+  <!-- ================================================================ -->
+  <text x="800" y="7040" text-anchor="middle" fill="#f8fafc" font-size="22" font-weight="bold">System of Systems — Crate Semilattice</text>
+  <text x="800" y="7062" text-anchor="middle" fill="#94a3b8" font-size="11">Hasse diagram: edge = direct dependency (transitive omitted). Meet-semilattice: ⊥ = yata-core ∧ yata-grin. Shannon: each crate = unique information, no redundant node.</text>
+  <line x1="40" y1="7070" x2="1560" y2="7070" stroke="#334155" stroke-width="1"/>
+
+  <!-- ⊥ (bottom / join of all) = yata-core, yata-grin -->
+  <rect x="350" y="7390" width="120" height="32" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="410" y="7411" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="bold">yata-core</text>
+  <text x="410" y="7425" text-anchor="middle" fill="#64748b" font-size="8">⊥₁  1,085 LOC</text>
+
+  <rect x="530" y="7390" width="120" height="32" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="590" y="7411" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="bold">yata-grin</text>
+  <text x="590" y="7425" text-anchor="middle" fill="#64748b" font-size="8">⊥₂  313 LOC</text>
+
+  <!-- Layer 1: arrow, object, vineyard -->
+  <rect x="140" y="7310" width="110" height="32" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="195" y="7331" text-anchor="middle" fill="#e2e8f0" font-size="10">yata-arrow</text>
+  <text x="195" y="7343" text-anchor="middle" fill="#64748b" font-size="8">639 LOC</text>
+  <line x1="195" y1="7342" x2="410" y2="7390" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+
+  <rect x="310" y="7310" width="110" height="32" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="365" y="7331" text-anchor="middle" fill="#e2e8f0" font-size="10">yata-object</text>
+  <text x="365" y="7343" text-anchor="middle" fill="#f59e0b" font-size="8">⚠ 800 LOC</text>
+  <line x1="365" y1="7342" x2="410" y2="7390" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+
+  <rect x="500" y="7310" width="120" height="32" rx="6" fill="#1e293b" stroke="#22c55e" stroke-width="2"/>
+  <text x="560" y="7331" text-anchor="middle" fill="#22c55e" font-size="10">yata-vineyard</text>
+  <text x="560" y="7343" text-anchor="middle" fill="#64748b" font-size="8">2,046 LOC</text>
+  <line x1="540" y1="7342" x2="410" y2="7390" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="560" y1="7342" x2="590" y2="7390" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="540" y1="7342" x2="195" y2="7342" stroke="#334155" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+
+  <!-- Layer 2: cypher, store, graph -->
+  <rect x="80" y="7230" width="120" height="32" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="140" y="7251" text-anchor="middle" fill="#e2e8f0" font-size="10">yata-cypher</text>
+  <text x="140" y="7263" text-anchor="middle" fill="#64748b" font-size="8">10,475 LOC</text>
+  <line x1="140" y1="7262" x2="410" y2="7390" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+
+  <rect x="230" y="7230" width="120" height="32" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="290" y="7251" text-anchor="middle" fill="#e2e8f0" font-size="10">yata-store</text>
+  <text x="290" y="7263" text-anchor="middle" fill="#64748b" font-size="8">8,863 LOC</text>
+  <line x1="270" y1="7262" x2="195" y2="7310" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="290" y1="7262" x2="560" y2="7310" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="290" y1="7262" x2="590" y2="7390" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+
+  <rect x="400" y="7230" width="120" height="32" rx="6" fill="#1e293b" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <text x="460" y="7251" text-anchor="middle" fill="#f59e0b" font-size="10">yata-graph</text>
+  <text x="460" y="7263" text-anchor="middle" fill="#f59e0b" font-size="8">⚠ 800 LOC</text>
+  <line x1="440" y1="7262" x2="140" y2="7262" stroke="#334155" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+  <line x1="460" y1="7262" x2="195" y2="7310" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+
+  <!-- Layer 3: gie, engine, vex, s3 -->
+  <rect x="80" y="7150" width="110" height="32" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="135" y="7171" text-anchor="middle" fill="#e2e8f0" font-size="10">yata-gie</text>
+  <text x="135" y="7183" text-anchor="middle" fill="#64748b" font-size="8">1,500 LOC</text>
+  <line x1="135" y1="7182" x2="290" y2="7230" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="135" y1="7182" x2="140" y2="7230" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="135" y1="7182" x2="590" y2="7390" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+
+  <rect x="240" y="7150" width="140" height="32" rx="6" fill="#1e293b" stroke="#22c55e" stroke-width="2"/>
+  <text x="310" y="7171" text-anchor="middle" fill="#22c55e" font-size="10" font-weight="bold">yata-engine</text>
+  <text x="310" y="7183" text-anchor="middle" fill="#64748b" font-size="8">3,000 LOC (MAIN)</text>
+  <line x1="280" y1="7182" x2="135" y2="7182" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="290" y1="7182" x2="290" y2="7230" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="310" y1="7182" x2="460" y2="7230" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="310" y1="7182" x2="140" y2="7230" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="330" y1="7182" x2="560" y2="7310" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+
+  <rect x="430" y="7150" width="110" height="32" rx="6" fill="#1e293b" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <text x="485" y="7171" text-anchor="middle" fill="#f59e0b" font-size="10">yata-vex</text>
+  <text x="485" y="7183" text-anchor="middle" fill="#f59e0b" font-size="8">⚠ 1,500 LOC</text>
+  <line x1="485" y1="7182" x2="195" y2="7310" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+
+  <rect x="580" y="7150" width="110" height="32" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="635" y="7171" text-anchor="middle" fill="#e2e8f0" font-size="10">yata-s3</text>
+  <text x="635" y="7183" text-anchor="middle" fill="#64748b" font-size="8">500 LOC</text>
+  <line x1="635" y1="7182" x2="410" y2="7390" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+
+  <!-- Layer 4: server (⊤ top / meet of all) -->
+  <rect x="260" y="7090" width="160" height="32" rx="6" fill="#1e293b" stroke="#60a5fa" stroke-width="2"/>
+  <text x="340" y="7111" text-anchor="middle" fill="#60a5fa" font-size="11" font-weight="bold">yata-server</text>
+  <text x="340" y="7123" text-anchor="middle" fill="#64748b" font-size="8">⊤  1,000+ LOC</text>
+  <line x1="300" y1="7122" x2="135" y2="7150" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="320" y1="7122" x2="310" y2="7150" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="360" y1="7122" x2="635" y2="7150" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="350" y1="7122" x2="460" y2="7230" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+
+  <!-- Layer 5: bench (not in lattice, leaf) -->
+  <rect x="470" y="7090" width="110" height="32" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <text x="525" y="7111" text-anchor="middle" fill="#64748b" font-size="10">yata-bench</text>
+  <text x="525" y="7123" text-anchor="middle" fill="#475569" font-size="8">dev-only</text>
+  <line x1="500" y1="7122" x2="310" y2="7150" stroke="#1e293b" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arrow)"/>
+
+  <!-- Shannon redundancy annotations -->
+  <rect x="750" y="7100" width="380" height="145" rx="8" fill="#1e293b" stroke="#f59e0b" stroke-width="1" stroke-opacity="0.5"/>
+  <text x="770" y="7125" fill="#fcd34d" font-size="12" font-weight="bold">Shannon Redundancy Candidates (⚠)</text>
+  <text x="770" y="7145" fill="#f59e0b" font-size="10">yata-graph → merge into yata-engine</text>
+  <text x="770" y="7160" fill="#94a3b8" font-size="9">GraphStore wraps MemoryGraph; engine-specific, 2 consumers</text>
+  <text x="770" y="7180" fill="#f59e0b" font-size="10">yata-vex → merge into yata-engine</text>
+  <text x="770" y="7195" fill="#94a3b8" font-size="9">IVF_PQ + DiskANN; single consumer (yata-graph only)</text>
+  <text x="770" y="7215" fill="#f59e0b" font-size="10">yata-object → merge into yata-s3</text>
+  <text x="770" y="7230" fill="#94a3b8" font-size="9">LocalObjectStore (CAS+MDAG); 2 consumers (s3, server)</text>
+
+  <!-- Optimal lattice after merge -->
+  <rect x="750" y="7270" width="380" height="90" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="1" stroke-opacity="0.5"/>
+  <text x="770" y="7295" fill="#22c55e" font-size="12" font-weight="bold">After Merge: 11 crates (Shannon-optimal)</text>
+  <text x="770" y="7315" fill="#94a3b8" font-size="10">⊥: core, grin (zero deps, pure types+traits)</text>
+  <text x="770" y="7335" fill="#94a3b8" font-size="10">Interior: arrow, vineyard, cypher, store, gie, s3+obj, engine+graph+vex</text>
+  <text x="770" y="7350" fill="#94a3b8" font-size="10">⊤: server, bench (consumers only, no dependents)</text>
+
+  <!-- Semilattice property annotation -->
+  <text x="800" y="7440" text-anchor="middle" fill="#475569" font-size="10">Meet-semilattice: ∀ a,b ∈ Crates, a ∧ b = greatest common dependency. Acyclic (Cargo enforces). Unique ⊥ = {core, grin}. Unique ⊤ = {server}.</text>
+  <text x="800" y="7458" text-anchor="middle" fill="#475569" font-size="10">Shannon criterion: each node contributes unique information (H &gt; 0). ⚠ nodes have H ≈ 0 (single-consumer wrapper = entropy redundancy). Merge restores H &gt; 0.</text>
 
 </svg>
