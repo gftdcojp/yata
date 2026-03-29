@@ -3233,16 +3233,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "yata-client"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "yata-arrow",
- "yata-core",
-]
-
-[[package]]
 name = "yata-core"
 version = "0.1.0"
 dependencies = [
@@ -3396,7 +3386,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "yata-arrow",
- "yata-client",
  "yata-core",
  "yata-engine",
  "yata-graph",

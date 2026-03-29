@@ -250,6 +250,22 @@ impl TieredGraphEngine {
         }
     }
 
+    /// Mark a single label as dirty (snapshot will include it).
+    fn mark_label_dirty(&self, label: &str) {
+        match self.dirty_labels.lock() {
+            Ok(mut dl) => { dl.insert(label.to_string()); }
+            Err(e) => tracing::error!("dirty_labels poisoned (label={label}): {e}"),
+        }
+    }
+
+    /// Mark multiple labels as dirty (from Cypher mutation hints).
+    fn mark_labels_dirty(&self, labels: impl IntoIterator<Item = String>) {
+        match self.dirty_labels.lock() {
+            Ok(mut dl) => { dl.extend(labels); }
+            Err(e) => tracing::error!("dirty_labels poisoned: {e}"),
+        }
+    }
+
     /// Get or lazily initialize the S3 client. Returns None if not configured.
     fn get_s3_client(&self) -> Option<Arc<yata_s3::s3::S3Client>> {
         if let Ok(guard) = self.s3_client.lock() {
@@ -558,9 +574,7 @@ impl TieredGraphEngine {
         if is_mutation {
             self.cypher_mutation_count.fetch_add(1, Ordering::Relaxed);
             if let Some((labels, _)) = router::extract_mutation_hints(cypher) {
-                if let Ok(mut dl) = self.dirty_labels.lock() {
-                    dl.extend(labels);
-                }
+                self.mark_labels_dirty(labels);
             }
         } else {
             self.cypher_read_count.fetch_add(1, Ordering::Relaxed);
@@ -854,9 +868,7 @@ impl TieredGraphEngine {
         props: &[(&str, yata_grin::PropValue)],
     ) -> Result<u32, String> {
         self.merge_record_count.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut dl) = self.dirty_labels.lock() {
-            dl.insert(label.to_string());
-        }
+        self.mark_label_dirty(label);
         self.invalidate_security_cache_if_policy(label, props);
 
         // WAL append
@@ -928,9 +940,7 @@ impl TieredGraphEngine {
             None
         };
 
-        if let Ok(mut dl) = self.dirty_labels.lock() {
-            dl.insert(label.to_string());
-        }
+        self.mark_label_dirty(label);
         self.invalidate_security_cache_if_policy(label, props);
 
         if let Ok(mut hot) = self.hot.write() {
@@ -957,9 +967,7 @@ impl TieredGraphEngine {
         pk_value: &str,
     ) -> Result<bool, String> {
         self.ensure_labels(&[label]);
-        if let Ok(mut dl) = self.dirty_labels.lock() {
-            dl.insert(label.to_string());
-        }
+        self.mark_label_dirty(label);
 
         // WAL append (Delete)
         if let Ok(mut wal) = self.wal.lock() {
@@ -992,10 +1000,7 @@ impl TieredGraphEngine {
         pk_value: &str,
     ) -> Result<(bool, Option<crate::wal::WalEntry>), String> {
         self.ensure_labels(&[label]);
-        self.dirty.store(true, Ordering::Relaxed);
-        if let Ok(mut dl) = self.dirty_labels.lock() {
-            dl.insert(label.to_string());
-        }
+        self.mark_label_dirty(label);
 
         let wal_entry = if let Ok(mut wal) = self.wal.lock() {
             let seq = wal.next_seq();
@@ -1069,15 +1074,15 @@ impl TieredGraphEngine {
 
     fn trigger_snapshot_inner(&self, force: bool) -> Result<(u64, u64), String> {
         // Drain dirty_labels atomically — snapshot owns this set from here.
-        let dirty_set: HashSet<String> = if let Ok(mut dl) = self.dirty_labels.lock() {
-            dl.drain().collect()
-        } else {
-            HashSet::new()
+        let dirty_set: HashSet<String> = match self.dirty_labels.lock() {
+            Ok(mut dl) => dl.drain().collect(),
+            Err(e) => {
+                tracing::error!("dirty_labels poisoned in snapshot: {e}");
+                HashSet::new()
+            }
         };
-        let had_dirty_flag = self.dirty.load(Ordering::Relaxed);
-
         // Skip if no mutations since last snapshot
-        if !had_dirty_flag && dirty_set.is_empty() {
+        if dirty_set.is_empty() {
             return Ok((0, 0));
         }
 
@@ -1085,9 +1090,7 @@ impl TieredGraphEngine {
         let pending = self.pending_writes.load(Ordering::Relaxed);
         if pending < self.config.batch_commit_threshold as usize && !force {
             // Put dirty labels back — they weren't consumed
-            if let Ok(mut dl) = self.dirty_labels.lock() {
-                dl.extend(dirty_set);
-            }
+            self.mark_labels_dirty(dirty_set);
             return Ok((0, 0));
         }
 
@@ -1144,14 +1147,13 @@ impl TieredGraphEngine {
 
         // Dirty label delta upload: only PUT blobs for dirty vertex labels.
         // Infrastructure blobs (schema, ivnums, meta.json) are always uploaded.
-        // Edge/topology blobs: upload only when dirty_set contains edge-related labels (not global flag).
-        let has_dirty_edges = !dirty_set.is_empty();
+        // Edge/topology blobs: always uploaded (dirty_set is non-empty at this point).
         let mut uploaded = 0u32;
         let mut skipped = 0u32;
         for name in meta.blobs.keys() {
             let should_upload = is_infra_blob(name)
                 || is_dirty_vertex_blob(name, &dirty_vlabel_ids)
-                || (has_dirty_edges && is_edge_or_topology_blob(name));
+                || is_edge_or_topology_blob(name);
             if !should_upload {
                 skipped += 1;
                 continue;
@@ -1182,7 +1184,7 @@ impl TieredGraphEngine {
                 for name in meta.blobs.keys() {
                     let should_write = is_infra_blob(name)
                         || is_dirty_vertex_blob(name, &dirty_vlabel_ids)
-                        || (had_dirty_flag && is_edge_or_topology_blob(name));
+                        || is_edge_or_topology_blob(name);
                     if !should_write { continue; }
                     if let Some(data) = BlobStore::get(&blob_store, name) {
                         let path = format!("{snap_dir}/{name}");
@@ -1216,8 +1218,7 @@ impl TieredGraphEngine {
             tracing::error!(error = %e, "R2 snapshot manifest upload failed");
         }
 
-        // Clear dirty flag and pending writes (dirty_labels already drained above)
-        self.dirty.store(false, Ordering::Relaxed);
+        // Clear pending writes (dirty_labels already drained above)
         self.pending_writes.store(0, Ordering::Relaxed);
 
         tracing::info!(
@@ -1599,7 +1600,9 @@ impl TieredGraphEngine {
     ) -> Result<Vec<Vec<(String, String)>>, String> {
         let is_mutation = router::is_cypher_mutation(cypher);
         if is_mutation {
-            self.dirty.store(true, Ordering::Relaxed);
+            if let Some((labels, _)) = router::extract_mutation_hints(cypher) {
+                self.mark_labels_dirty(labels);
+            }
         }
 
         // Cache lookup (reads only, scope-aware key)
@@ -2963,20 +2966,20 @@ mod tests {
         assert!(csr.vertex_count() >= 1, "should have at least 1 vertex after re-merge");
     }
 
-    // ── dirty flag tracking ────────────────────────────────────────
+    // ── dirty_labels tracking ────────────────────────────────────────
 
     #[test]
-    fn test_dirty_flag_initially_false() {
+    fn test_dirty_labels_initially_empty() {
         let dir = tempfile::tempdir().unwrap();
         let e = make_engine(&dir);
         assert!(
-            !e.dirty.load(Ordering::Relaxed),
-            "dirty flag should start false"
+            e.dirty_labels.lock().unwrap().is_empty(),
+            "dirty_labels should start empty"
         );
     }
 
     #[test]
-    fn test_dirty_flag_set_after_merge_record() {
+    fn test_dirty_labels_set_after_merge_record() {
         let dir = tempfile::tempdir().unwrap();
         let e = make_engine(&dir);
         e.merge_record(
@@ -2986,43 +2989,45 @@ mod tests {
             &[("rkey", PropValue::Str("d1".into()))],
         )
         .unwrap();
+        let dl = e.dirty_labels.lock().unwrap();
         assert!(
-            e.dirty.load(Ordering::Relaxed),
-            "dirty flag should be true after merge_record"
+            dl.contains("D"),
+            "dirty_labels should contain 'D' after merge_record"
         );
     }
 
     #[test]
-    fn test_dirty_flag_set_after_delete_record() {
+    fn test_dirty_labels_set_after_delete_record() {
         let dir = tempfile::tempdir().unwrap();
         let e = make_engine(&dir);
         e.delete_record("D", "rkey", "nonexistent").unwrap();
+        let dl = e.dirty_labels.lock().unwrap();
         assert!(
-            e.dirty.load(Ordering::Relaxed),
-            "dirty flag should be true after delete_record (even if nothing deleted)"
+            dl.contains("D"),
+            "dirty_labels should contain 'D' after delete_record"
         );
     }
 
     #[test]
-    fn test_dirty_flag_set_after_cypher_mutation() {
+    fn test_dirty_labels_set_after_cypher_mutation() {
         let dir = tempfile::tempdir().unwrap();
         let e = make_engine(&dir);
         run_query(&e, "CREATE (n:Dirty {k: 'v'})", &[], None).unwrap();
+        let dl = e.dirty_labels.lock().unwrap();
         assert!(
-            e.dirty.load(Ordering::Relaxed),
-            "dirty flag should be true after CREATE"
+            dl.contains("Dirty"),
+            "dirty_labels should contain 'Dirty' after CREATE"
         );
     }
 
     #[test]
-    fn test_dirty_flag_not_set_by_read() {
+    fn test_dirty_labels_not_set_by_read() {
         let dir = tempfile::tempdir().unwrap();
         let e = make_engine(&dir);
-        // Read on empty graph
         let _ = run_query(&e, "MATCH (n) RETURN n", &[], None);
         assert!(
-            !e.dirty.load(Ordering::Relaxed),
-            "dirty flag should remain false after read-only query"
+            e.dirty_labels.lock().unwrap().is_empty(),
+            "dirty_labels should remain empty after read-only query"
         );
     }
 

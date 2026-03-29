@@ -18,7 +18,7 @@ Arrow-native graph database and event store with Raft consensus.
 │  yata-bolt (Bolt v4)                                        │
 ├─────────────────────────────────────────────────────────────┤
 │                   Layer 4: Server                            │
-│  yata-server  yata-client                                   │
+│  yata-server                                                │
 ├─────────────────────────────────────────────────────────────┤
 │                   Layer 3: Engine                            │
 │  yata-engine  yata-gie  yata-vex  yata-s3                   │
@@ -53,7 +53,6 @@ Arrow-native graph database and event store with Raft consensus.
 | **yata-engine** | TieredGraphEngine — ArrowFragment snapshot/page-in, partition routing |
 | **yata-s3** | S3/R2 adapter (sync ureq+rustls, SigV4) |
 | **yata-vex** | Vector index (IVF_PQ + DiskANN) |
-| **yata-client** | Async client API |
 | **yata-server** | XRPC API server (Cypher, mergeRecord, triggerSnapshot) |
 | **yata-bench** | Benchmarks + trillion-scale test |
 | **yata-engine** | Tiered HTAP engine: HOT (CSR) + MDAG CAS persistence |

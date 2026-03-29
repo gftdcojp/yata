@@ -2,7 +2,7 @@ use bytes::Bytes;
 use std::sync::Arc;
 use yata_core::ObjectMeta;
 use yata_core::OcelEventDraft;
-use yata_server::{Broker, BrokerBackend, BrokerConfig};
+use yata_server::{Broker, BrokerConfig};
 
 async fn test_broker(dir: &tempfile::TempDir) -> Arc<Broker> {
     let config = BrokerConfig {
@@ -73,10 +73,10 @@ async fn test_broker_ocel_event_graph() {
 async fn test_client_object_store() {
     let dir = tempfile::tempdir().unwrap();
     let broker = test_broker(&dir).await;
-    let client = BrokerBackend::new(broker).into_client();
 
     let data = Bytes::from(b"binary payload data".to_vec());
-    let manifest = client
+    let manifest = broker
+        .objects
         .put_object(
             data.clone(),
             ObjectMeta {
@@ -88,7 +88,7 @@ async fn test_client_object_store() {
         .await
         .unwrap();
 
-    let retrieved = client.get_object(&manifest.object_id).await.unwrap();
+    let retrieved = broker.objects.get_object(&manifest.object_id).await.unwrap();
     assert_eq!(retrieved, data);
 }
 

@@ -14,7 +14,6 @@ COPY yata-arrow/Cargo.toml      yata-arrow/Cargo.toml
 COPY yata-object/Cargo.toml     yata-object/Cargo.toml
 COPY yata-s3/Cargo.toml         yata-s3/Cargo.toml
 COPY yata-server/Cargo.toml     yata-server/Cargo.toml
-COPY yata-client/Cargo.toml     yata-client/Cargo.toml
 COPY yata-bench/Cargo.toml      yata-bench/Cargo.toml
 COPY yata-store/Cargo.toml      yata-store/Cargo.toml
 COPY yata-cypher/Cargo.toml     yata-cypher/Cargo.toml
@@ -26,7 +25,7 @@ COPY yata-vex/Cargo.toml        yata-vex/Cargo.toml
 COPY yata-vineyard/Cargo.toml   yata-vineyard/Cargo.toml
 
 # Stub src for dep caching
-RUN for d in yata-core yata-arrow yata-object yata-s3 yata-client \
+RUN for d in yata-core yata-arrow yata-object yata-s3 \
              yata-store yata-cypher yata-grin yata-graph yata-engine \
              yata-gie yata-vex yata-vineyard; do \
       mkdir -p $d/src && echo '' > $d/src/lib.rs; \

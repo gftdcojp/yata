@@ -17,7 +17,6 @@ path = "src/lib.rs"
 yata-core.workspace = true
 yata-arrow.workspace = true
 yata-object.workspace = true
-yata-client.workspace = true
 yata-graph.workspace = true
 yata-s3.workspace = true
 yata-store.workspace = true

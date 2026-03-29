@@ -20,7 +20,6 @@ members = [
     "yata-s3",
     # Layer 4: protocol
     "yata-server",
-    "yata-client",
     # Layer 5: dev
     "yata-bench",
 ]
@@ -55,7 +54,6 @@ yata-engine = { path = "yata-engine" }
 yata-gie = { path = "yata-gie" }
 yata-vex = { path = "yata-vex" }
 yata-server = { path = "yata-server" }
-yata-client = { path = "yata-client" }
 yata-arrow = { path = "yata-arrow" }
 yata-vineyard = { path = "yata-vineyard" }
 metrics = "0.24"

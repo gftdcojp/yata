@@ -27,7 +27,6 @@ COPY yata-object/Cargo.toml     yata-object/Cargo.toml
 COPY yata-ocel/Cargo.toml       yata-ocel/Cargo.toml
 COPY yata-s3/Cargo.toml         yata-s3/Cargo.toml
 COPY yata-server/Cargo.toml     yata-server/Cargo.toml
-COPY yata-client/Cargo.toml     yata-client/Cargo.toml
 COPY yata-cli/Cargo.toml        yata-cli/Cargo.toml
 COPY yata-cbor/Cargo.toml       yata-cbor/Cargo.toml
 COPY yata-cas/Cargo.toml        yata-cas/Cargo.toml
@@ -37,7 +36,7 @@ COPY yata-bench/Cargo.toml      yata-bench/Cargo.toml
 
 # Stub src/ for each crate so Cargo can resolve the dependency graph
 RUN for d in yata-core yata-arrow yata-log yata-object yata-ocel \
-             yata-s3 yata-server yata-client yata-cli yata-cbor \
+             yata-s3 yata-server yata-cli yata-cbor \
              yata-cas yata-at yata-signal yata-cypher; do \
       mkdir -p $d/src && echo '' > $d/src/lib.rs; \
     done && \

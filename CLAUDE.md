@@ -1,6 +1,6 @@
 # packages/rust/yata
 
-yata — Rust Cypher graph engine. `[PRODUCTION]` Container (CSR + DiskVineyard/MmapVineyard) × 1 partition. Workers RPC coordinator. GraphScope parity 21/25 (14 PRODUCTION + 7 IMPLEMENTED)。Vineyard + GIE push-based + SecurityFilter RLS + Arrow row-group chunk + label-selective page-in + edge property lookup + edge tombstone deletion + dirty label tracking + batch commit threshold + adaptive √N fan-out。
+yata — Rust Cypher graph engine. `[PRODUCTION]` Container (CSR + DiskVineyard/MmapVineyard) × 1 partition. Workers RPC coordinator. GraphScope parity 21/25 (14 PRODUCTION + 7 IMPLEMENTED)。Vineyard + GIE push-based + Design E SecurityScope (CSR policy vertex lookup, parameter-based RLS 除去済み) + Arrow row-group chunk + label-selective page-in + edge property lookup + edge tombstone deletion + dirty label tracking + batch commit threshold + adaptive √N fan-out + CpmStats observability + cypherBatch + delta-apply mutation (CP5)。
 
 ## Architecture (CRITICAL)
 
@@ -65,12 +65,13 @@ PDS Container (Rust) は不要 — 全て TS Worker + Pipeline + YATA_RPC。
 // Transport: Workers RPC only
 // Container XRPC: /xrpc/ai.gftd.yata.cypher (unified read+write)
 
-env.YATA.cypher(cypher, appId)   // unified Cypher path → /xrpc/ai.gftd.yata.cypher
-env.YATA.query(cypher, appId)    // read-only alias
-env.YATA.mutate(cypher, appId)   // CREATE → random partition, DELETE → broadcast
-env.YATA.health()                // → partition-0 Container
-env.YATA.ping()                  // "pong" (no wake)
-env.YATA.stats()                 // → all partition stats
+env.YATA.cypher(cypher, appId)          // unified Cypher path → /xrpc/ai.gftd.yata.cypher
+env.YATA.cypherBatch(stmts[], appId)    // N statements in 1 HTTP round-trip (K3b)
+env.YATA.query(cypher, appId)           // read-only alias → read replicas
+env.YATA.mutate(cypher, appId)          // CREATE → random partition, DELETE → broadcast
+env.YATA.health()                       // → partition-0 Container
+env.YATA.ping()                         // "pong" (no wake)
+env.YATA.stats()                        // → all partition CpmStats (K3a)
 ```
 
 ## Crate Roles (CRITICAL)
@@ -81,7 +82,7 @@ env.YATA.stats()                 // → all partition stats
 | `yata-grin` | GRIN trait (Topology, Property, Schema, Scannable, Mutable) |
 | `yata-vineyard` | **ArrowFragment format** (canonical snapshot/persistence format)。NbrUnit zero-copy CSR (25x faster neighbor traversal)。`csr_to_fragment()` (CSR→ArrowFragment) + `ArrowFragment::serialize/deserialize` (BlobStore↔R2)。**Arrow row-group chunk**: `split_record_batch` + byte-based chunking (32 MB default, `estimate_bytes_per_row`)。PropertyGraphSchema (typed vertex/edge labels + Arrow property columns) |
 | `yata-store` | MutableCsrStore (mutable in-memory CSR, GRIN traits), ArrowGraphStore, DiskVineyard/MmapVineyard/EdgeVineyard (blob cache), PartitionStoreSet, GraphStoreEnum |
-| `yata-engine` | TieredGraphEngine, ArrowFragment snapshot (trigger_snapshot → R2 + disk), 2-phase cold start (`page_in_topology_from_r2` + on-demand `enrich_label_from_r2`), 3-tier blob fetch (`fetch_blob_cached`: disk → R2 → write-through), Frontier BFS, ShardedCoordinator |
+| `yata-engine` | TieredGraphEngine, CpmStats (K3a), delta-apply mutation (K3c, ~5ms vs 400ms full rebuild), ArrowFragment snapshot (dirty label delta + force checkpoint), 2-phase cold start (`page_in_topology_from_r2` + on-demand `enrich_label_from_r2`), 3-tier blob fetch (`fetch_blob_cached`: disk → R2 → write-through), Frontier BFS, ShardedCoordinator, WAL Projection (ring buffer + segment flush + checkpoint)。parameter-based RLS 除去済み (rls.rs deleted) → Design E SecurityScope (`query_with_did` → CSR policy vertex lookup) |
 | `yata-cypher` | Full Cypher parser + executor (incl. untyped edge traversal) |
 | `yata-gie` | GIE push-based executor, IR (Exchange/Receive/Gather), distributed planner |
 | `yata-s3` | R2 persistence (sync ureq+rustls S3 client, SigV4)。`trigger_snapshot()` → R2 PUT、page-in → R2 GET |
@@ -91,11 +92,11 @@ env.YATA.stats()                 // → all partition stats
 
 ## GraphScope Parity
 
-`gftd symbol-graph --package yata` で component status を確認。854 tests。
+`gftd symbol-graph --package yata` で component status を確認。1,068 tests (1,000 unit + 68 e2e)。
 
-## R2 Persistence `[PRODUCTION]`
+## R2 Persistence `[PRODUCTION]` (verified 2026-03-29: 964v, 33 labels, 1.58 MB, full properties)
 
-R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in-memory CSR に append のみ)。PK dedup は in-memory 内のみ。R2 既存データとの dedup は snapshot compaction 時。**Dirty tracking**: dirty flag が true の時のみ snapshot upload。**Snapshot compaction**: R2 既存 + in-memory pending → merge by PK → ArrowFragment → R2 PUT。**Partial page-in protection**: `last_snapshot_count` で上書き防止。**Name-based blob** (CAS 除去): `snap/fragment/{name}` で直接 PUT/GET。Blake3 hash 不要。**3-tier page-in `[PRODUCTION]`**: `fetch_blob_cached()` — disk cache (`YATA_VINEYARD_DIR/snap/fragment/`) → R2 GET → write-through to disk。Cold start: full page-in (ALL labels, ALL properties)。warm disk: ~100µs/blob (R2 skip)。`trigger_snapshot` が disk + R2 両方に書くため disk cache は常に warm。**Arrow row-group chunk `[IMPLEMENTED]`**: 大きい vertex/edge table は byte-based で自動分割 (default 32 MB/chunk)。`estimate_bytes_per_row()` が Arrow buffer size から行単価を推定 → `target_bytes / bytes_per_row` で chunk row 数算出 (clamp [1K, 10M])。R2 key: `vertex_table_{i}_chunk_{j}` / meta field: `vertex_table_{i}_chunks`。Old single-blob format は deserialize 時に自動検出 (backward compat)。1B vertices でも ~数十 chunks (S3/R2 10億ファイル問題回避)。
+R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in-memory CSR に append のみ)。PK dedup は in-memory 内のみ。R2 既存データとの dedup は snapshot compaction 時。**Dirty tracking**: dirty flag が true の時のみ snapshot upload。**Snapshot compaction**: R2 既存 + in-memory pending → merge by PK → ArrowFragment → R2 PUT。**Partial page-in protection**: `last_snapshot_count` で上書き防止。**Name-based blob** (CAS 除去): `snap/fragment/{name}` で直接 PUT/GET。Blake3 hash 不要。**3-tier page-in `[PRODUCTION]`**: `fetch_blob_cached()` — disk cache (`YATA_VINEYARD_DIR/snap/fragment/`) → R2 GET → write-through to disk。Cold start: full page-in (ALL labels, ALL properties)。warm disk: ~100µs/blob (R2 skip)。`trigger_snapshot` が disk + R2 両方に書くため disk cache は常に warm。**Arrow row-group chunk `[IMPLEMENTED]`**: 大きい vertex/edge table は byte-based で自動分割 (default 32 MB/chunk)。`estimate_bytes_per_row()` が Arrow buffer size から行単価を推定 → `target_bytes / bytes_per_row` で chunk row 数算出 (clamp [1K, 10M])。R2 key: `vertex_table_{i}_chunk_{j}` / meta field: `vertex_table_{i}_chunks`。Old single-blob format は deserialize 時に自動検出 (backward compat)。1B vertices でも ~数十 chunks (S3/R2 10億ファイル問題回避)。**Snapshot monitoring (K3d)**: `last_snapshot_serialize_ms` in CpmStats。vertex >100K or serialize >100ms で auto-warn。
 
 ## Concurrency Model (CRITICAL)
 
@@ -148,12 +149,12 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
 
 ## Scale Strategy
 
-Production: PARTITION_COUNT=1, per-label Arrow IPC, full page-in (3-tier: disk→R2), GIE SecurityFilter (RLS)。854 tests。
+Production: PARTITION_COUNT=1, per-label Arrow IPC, full page-in (3-tier: disk→R2), Design E SecurityScope (CSR policy vertex lookup)。1,068 tests。
 
 ### Key behaviors
 
 - **Query** (GIE, <1us): Cypher → parse → ensure_labels (selective page-in) → GIE transpile → CSR push-based execute. No MemoryGraph fallback (GIE transpile failure = error)
-- **Mutation** (~500ms): MemoryGraph copy → mutate → CSR rebuild。merge_by_pk = prop_eq_index O(1)。Edge deletion = tombstone HashSet (O(1) lookup in neighbor iteration)
+- **Mutation** (~55ms with delta-apply, fallback ~500ms): MemoryGraph copy → mutate → delta-apply O(delta) for <50% change, full CSR rebuild fallback。merge_by_pk = prop_eq_index O(1)。Edge deletion = tombstone HashSet (O(1) lookup in neighbor iteration)。CpmStats: cypher_read/mutation/mergeRecord counts + mutation_avg_us + last_snapshot_serialize_ms
 - **Storage**: RAM (CSR <1us) → disk cache (~100us) → R2 source of truth (~3-5ms)
 - **Cold start**: **label-selective page-in** (topology + query-needed labels only)。3-tier blob fetch (disk → R2 → write-through)。後続 query で on-demand enrich (enrich_new_labels)
 - **Chunk**: Arrow row-group 32 MB/chunk byte-based。1B vertices でも ~数十 chunks
@@ -172,7 +173,7 @@ Production: PARTITION_COUNT=1, per-label Arrow IPC, full page-in (3-tier: disk�
 
 ## Test Coverage
 
-854 Rust unit tests, 0 failures. E2E: 8 tests (docker-compose + MinIO, 2-partition). 6-node distributed: 6 tests (10K records, label routing, cold put/pull). Phase 3 load test: 8 tests (chunk snapshot, 2-hop traversal, label-selective reads, mixed load). ArrowFragment snapshot roundtrip verified.
+1,000 Rust unit tests + 68 e2e, 0 failures. E2E: 8 tests (docker-compose + MinIO, 2-partition). 6-node distributed: 6 tests (10K records, label routing, cold put/pull). Phase 3 load test: 8 tests (chunk snapshot, 2-hop traversal, label-selective reads, mixed load). ArrowFragment snapshot roundtrip verified. R2 persistence verified (2026-03-29): 964 vertices, 33 labels, 1.58 MB snapshot, full property columns (rkey/collection/repo/value_b64/owner_hash/updated_at/_app_id/_org_id).
 
 ## Benchmark (measured, release build, 10K records)
 
