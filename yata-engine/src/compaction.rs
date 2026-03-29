@@ -1,18 +1,17 @@
 //! L1 Compaction — Kafka-style PK-dedup log rewrite.
 //!
 //! Reads WAL segments (Arrow IPC or NDJSON), deduplicates entries by (label, pk_value)
-//! keeping only the latest seq per key, outputs a compacted Arrow IPC segment.
+//! keeping only the latest seq per key, outputs per-label compacted Arrow IPC segments.
 //!
-//! This replaces ArrowFragment snapshot as the persistence mechanism:
-//! - Snapshot = serialize entire CSR → ArrowFragment blobs (O(state_size), OOM risk)
-//! - Compaction = merge WAL segments → dedup → single Arrow IPC file (O(WAL_size), streaming)
+//! Per-label compaction: only dirty labels are re-compacted on each cycle.
+//! Clean labels retain their existing compacted segment (zero R2 I/O).
 //!
-//! The compacted segment uses the same Arrow IPC File format as WAL segments,
+//! The compacted segments use the same Arrow IPC File format as WAL segments,
 //! enabling uniform mmap-based zero-copy reads (Phase 3 MmapCsrView).
 //!
 //! Compaction is idempotent: compacting an already-compacted segment produces the same output.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 use yata_grin::PropValue;
@@ -115,6 +114,86 @@ pub fn compact_segments(segments: &[(&str, &[u8])]) -> Result<CompactionResult, 
     })
 }
 
+/// Partition WAL entries by label, then compact each label independently.
+/// Returns a map of label → compacted entries.
+pub fn compact_entries_by_label(batches: &[&[WalEntry]]) -> HashMap<String, Vec<WalEntry>> {
+    // Group by label first
+    let mut by_label: HashMap<String, Vec<&WalEntry>> = HashMap::new();
+    for batch in batches {
+        for entry in *batch {
+            by_label.entry(entry.label.clone()).or_default().push(entry);
+        }
+    }
+
+    let mut result: HashMap<String, Vec<WalEntry>> = HashMap::new();
+    for (label, entries) in by_label {
+        // PK-dedup within this label
+        let mut latest: HashMap<(&str, &str), &WalEntry> = HashMap::new();
+        for entry in &entries {
+            match latest.get(&(entry.pk_key.as_str(), entry.pk_value.as_str())) {
+                Some(existing) if existing.seq >= entry.seq => {}
+                _ => { latest.insert((entry.pk_key.as_str(), entry.pk_value.as_str()), entry); }
+            }
+        }
+        // Remove tombstones
+        let mut compacted: Vec<WalEntry> = latest.into_values()
+            .filter(|e| e.op != WalOp::Delete)
+            .cloned()
+            .collect();
+        compacted.sort_by_key(|e| e.seq);
+        if !compacted.is_empty() {
+            result.insert(label, compacted);
+        }
+    }
+    result
+}
+
+/// Per-label compaction result for a single label.
+#[derive(Debug, Clone)]
+pub struct LabelCompactionResult {
+    pub label: String,
+    pub data: Bytes,
+    pub max_seq: u64,
+    pub entry_count: usize,
+}
+
+/// Compact WAL segments per-label. Only processes entries for the given dirty labels.
+/// Returns per-label compacted Arrow IPC segments.
+pub fn compact_segments_by_label(
+    segments: &[(&str, &[u8])],
+    dirty_labels: &HashSet<String>,
+) -> Result<Vec<LabelCompactionResult>, String> {
+    // Parse all segments
+    let mut all_entries: Vec<Vec<WalEntry>> = Vec::with_capacity(segments.len());
+    for (key, data) in segments {
+        let entries = crate::arrow_wal::deserialize_segment_auto(key, data);
+        all_entries.push(entries);
+    }
+
+    // Flatten and filter to dirty labels only
+    let dirty_entries: Vec<WalEntry> = all_entries.into_iter()
+        .flatten()
+        .filter(|e| dirty_labels.contains(&e.label))
+        .collect();
+
+    if dirty_entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let refs = vec![dirty_entries.as_slice()];
+    let by_label = compact_entries_by_label(&refs);
+
+    let mut results = Vec::with_capacity(by_label.len());
+    for (label, entries) in by_label {
+        let max_seq = entries.iter().map(|e| e.seq).max().unwrap_or(0);
+        let entry_count = entries.len();
+        let data = crate::arrow_wal::serialize_segment_arrow(&entries)?;
+        results.push(LabelCompactionResult { label, data, max_seq, entry_count });
+    }
+    results.sort_by(|a, b| a.label.cmp(&b.label));
+    Ok(results)
+}
+
 /// Result of a compaction operation.
 #[derive(Debug, Clone)]
 pub struct CompactionResult {
@@ -132,30 +211,45 @@ pub struct CompactionResult {
     pub labels: Vec<String>,
 }
 
-/// Manifest for compacted state in R2.
+/// V2 manifest with per-label compacted segments.
+/// Backward-compatible: v1 fields retained, v2 adds `label_segments`.
 ///
 /// R2 key: `{prefix}log/compacted/{partition_id}/manifest.json`
-///
-/// The manifest tracks the compacted segment and the WAL seq range it covers.
-/// Cold start: load compacted segment → replay WAL segments after compacted_seq.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompactionManifest {
     /// Partition ID.
     pub partition_id: u32,
-    /// Version for forward compat.
+    /// Version for forward compat. v1 = monolithic, v2 = per-label.
     pub version: u32,
-    /// R2 key of the compacted segment (Arrow IPC).
+    /// R2 key of the compacted segment (v1 monolithic, empty in v2).
+    #[serde(default)]
     pub compacted_segment_key: String,
     /// Maximum WAL seq included in the compacted segment.
     /// WAL replay starts from compacted_seq + 1.
     pub compacted_seq: u64,
-    /// Number of entries in the compacted segment.
+    /// Number of entries in the compacted segment (v1) or total across all labels (v2).
     pub entry_count: usize,
     /// Sorted list of labels present in the compacted segment.
     pub labels: Vec<String>,
     /// Timestamp of compaction (millis since epoch).
     pub created_at_ms: u64,
-    /// Size of compacted segment in bytes.
+    /// Size of compacted segment in bytes (v1) or total across all labels (v2).
+    pub segment_bytes: usize,
+    /// Per-label compacted segment state (v2). Empty in v1.
+    #[serde(default)]
+    pub label_segments: HashMap<String, LabelSegmentState>,
+}
+
+/// Per-label compacted segment metadata.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LabelSegmentState {
+    /// R2 key of the per-label compacted segment.
+    pub key: String,
+    /// Max WAL seq included in this label's compacted segment.
+    pub max_seq: u64,
+    /// Number of entries.
+    pub entry_count: usize,
+    /// Segment size in bytes.
     pub segment_bytes: usize,
 }
 
@@ -164,7 +258,7 @@ pub fn manifest_r2_key(prefix: &str, partition_id: u32) -> String {
     format!("{prefix}log/compacted/{partition_id}/manifest.json")
 }
 
-/// Build R2 key for a compacted segment.
+/// Build R2 key for a compacted segment (v1 monolithic).
 pub fn compacted_segment_r2_key(
     prefix: &str,
     partition_id: u32,
@@ -175,6 +269,11 @@ pub fn compacted_segment_r2_key(
     )
 }
 
+/// Build R2 key for a per-label compacted segment (v2).
+pub fn label_compacted_r2_key(prefix: &str, partition_id: u32, label: &str) -> String {
+    format!("{prefix}log/compacted/{partition_id}/label/{label}.arrow")
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -182,7 +281,7 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Build a CompactionManifest from a CompactionResult.
+/// Build a CompactionManifest from a CompactionResult (v1 compat).
 pub fn build_manifest(
     partition_id: u32,
     prefix: &str,
@@ -197,6 +296,50 @@ pub fn build_manifest(
         labels: result.labels.clone(),
         created_at_ms: now_ms(),
         segment_bytes: result.data.len(),
+        label_segments: HashMap::new(),
+    }
+}
+
+/// Build a v2 CompactionManifest from per-label results.
+pub fn build_manifest_v2(
+    partition_id: u32,
+    prefix: &str,
+    global_max_seq: u64,
+    label_results: &[LabelCompactionResult],
+    existing: &HashMap<String, LabelSegmentState>,
+) -> CompactionManifest {
+    let mut label_segments = existing.clone();
+    let mut total_entries = 0usize;
+    let mut total_bytes = 0usize;
+
+    for lr in label_results {
+        let key = label_compacted_r2_key(prefix, partition_id, &lr.label);
+        label_segments.insert(lr.label.clone(), LabelSegmentState {
+            key,
+            max_seq: lr.max_seq,
+            entry_count: lr.entry_count,
+            segment_bytes: lr.data.len(),
+        });
+    }
+
+    let mut all_labels: Vec<String> = label_segments.keys().cloned().collect();
+    all_labels.sort();
+
+    for state in label_segments.values() {
+        total_entries += state.entry_count;
+        total_bytes += state.segment_bytes;
+    }
+
+    CompactionManifest {
+        partition_id,
+        version: 2,
+        compacted_segment_key: String::new(),
+        compacted_seq: global_max_seq,
+        entry_count: total_entries,
+        labels: all_labels,
+        created_at_ms: now_ms(),
+        segment_bytes: total_bytes,
+        label_segments,
     }
 }
 
@@ -431,10 +574,134 @@ mod tests {
             labels: vec!["Post".to_string()],
             created_at_ms: 1234567890,
             segment_bytes: 4096,
+            label_segments: HashMap::new(),
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let parsed: CompactionManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.compacted_seq, 100);
         assert_eq!(parsed.entry_count, 50);
+        assert!(parsed.label_segments.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_v1_deserialize_compat() {
+        // v1 JSON without label_segments field — should deserialize with default
+        let json = r#"{"partition_id":0,"version":1,"compacted_segment_key":"k","compacted_seq":50,"entry_count":10,"labels":["Post"],"created_at_ms":0,"segment_bytes":100}"#;
+        let parsed: CompactionManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.version, 1);
+        assert!(parsed.label_segments.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_v2_serde_roundtrip() {
+        let mut label_segments = HashMap::new();
+        label_segments.insert("Post".to_string(), LabelSegmentState {
+            key: "log/compacted/0/label/Post.arrow".to_string(),
+            max_seq: 100,
+            entry_count: 30,
+            segment_bytes: 2048,
+        });
+        let manifest = CompactionManifest {
+            partition_id: 0,
+            version: 2,
+            compacted_segment_key: String::new(),
+            compacted_seq: 100,
+            entry_count: 30,
+            labels: vec!["Post".to_string()],
+            created_at_ms: 1234567890,
+            segment_bytes: 2048,
+            label_segments,
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let parsed: CompactionManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.version, 2);
+        assert_eq!(parsed.label_segments.len(), 1);
+        assert_eq!(parsed.label_segments["Post"].entry_count, 30);
+    }
+
+    #[test]
+    fn test_compact_entries_by_label() {
+        let batch = vec![
+            make(1, "Post", "pk_1", WalOp::Upsert, "v1"),
+            make(2, "Like", "pk_2", WalOp::Upsert, "v1"),
+            make(3, "Post", "pk_1", WalOp::Upsert, "v2"),
+            make(4, "Follow", "pk_3", WalOp::Upsert, "v1"),
+            make_delete(5, "Like", "pk_2"),
+        ];
+        let result = compact_entries_by_label(&[&batch]);
+        assert_eq!(result.len(), 2, "Like should be removed by delete");
+        assert!(result.contains_key("Post"));
+        assert!(result.contains_key("Follow"));
+        assert!(!result.contains_key("Like"));
+        assert_eq!(result["Post"].len(), 1);
+        assert_eq!(result["Post"][0].seq, 3);
+    }
+
+    #[test]
+    fn test_compact_segments_by_label_filters_dirty() {
+        let entries = vec![
+            make(1, "Post", "pk_1", WalOp::Upsert, "v1"),
+            make(2, "Like", "pk_2", WalOp::Upsert, "v1"),
+            make(3, "Follow", "pk_3", WalOp::Upsert, "v1"),
+        ];
+        let seg = crate::arrow_wal::serialize_segment_arrow(&entries).unwrap();
+
+        let dirty: HashSet<String> = ["Post".to_string()].into_iter().collect();
+        let results = compact_segments_by_label(&[("seg.arrow", &seg)], &dirty).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].label, "Post");
+        assert_eq!(results[0].entry_count, 1);
+    }
+
+    #[test]
+    fn test_label_compacted_r2_key() {
+        assert_eq!(
+            label_compacted_r2_key("yata/", 0, "Post"),
+            "yata/log/compacted/0/label/Post.arrow"
+        );
+    }
+
+    #[test]
+    fn test_build_manifest_v2() {
+        let results = vec![
+            LabelCompactionResult {
+                label: "Post".to_string(),
+                data: Bytes::from(vec![1, 2]),
+                max_seq: 10,
+                entry_count: 5,
+            },
+        ];
+        let existing = HashMap::new();
+        let manifest = build_manifest_v2(0, "yata/", 10, &results, &existing);
+        assert_eq!(manifest.version, 2);
+        assert!(manifest.compacted_segment_key.is_empty());
+        assert_eq!(manifest.label_segments.len(), 1);
+        assert_eq!(manifest.label_segments["Post"].entry_count, 5);
+        assert_eq!(manifest.entry_count, 5);
+        assert_eq!(manifest.segment_bytes, 2);
+    }
+
+    #[test]
+    fn test_build_manifest_v2_merges_existing() {
+        let mut existing = HashMap::new();
+        existing.insert("Like".to_string(), LabelSegmentState {
+            key: "yata/log/compacted/0/label/Like.arrow".to_string(),
+            max_seq: 5,
+            entry_count: 3,
+            segment_bytes: 100,
+        });
+        let results = vec![
+            LabelCompactionResult {
+                label: "Post".to_string(),
+                data: Bytes::from(vec![1, 2]),
+                max_seq: 10,
+                entry_count: 5,
+            },
+        ];
+        let manifest = build_manifest_v2(0, "yata/", 10, &results, &existing);
+        assert_eq!(manifest.label_segments.len(), 2);
+        assert_eq!(manifest.labels, vec!["Like", "Post"]);
+        assert_eq!(manifest.entry_count, 8); // 3 + 5
     }
 }

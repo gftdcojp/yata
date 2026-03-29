@@ -1042,8 +1042,8 @@ impl TieredGraphEngine {
         }
     }
 
-    /// Trigger persistence: flush WAL + L1 compaction.
-    /// Legacy ArrowFragment snapshot path removed — all persistence is Arrow IPC WAL.
+    /// Trigger persistence: flush WAL + per-label L1 compaction (dirty labels only).
+    /// Clean labels incur zero R2 I/O.
     pub fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
         let _ = self.wal_flush_segment();
         let result = self.trigger_compaction()?;
@@ -1055,8 +1055,16 @@ impl TieredGraphEngine {
         self.trigger_snapshot()
     }
 
-    // trigger_snapshot_inner removed — legacy ArrowFragment snapshot path eliminated.
-    // All persistence is Arrow IPC WAL + L1 compaction (trigger_compaction).
+    /// Drain dirty_labels and return the set. After drain, dirty_labels is empty.
+    fn drain_dirty_labels(&self) -> std::collections::HashSet<String> {
+        match self.dirty_labels.lock() {
+            Ok(mut dl) => dl.drain().collect(),
+            Err(e) => {
+                tracing::error!("dirty_labels poisoned on drain: {e}");
+                std::collections::HashSet::new()
+            }
+        }
+    }
 
     /// Export snapshot blobs for external upload (TS Worker → R2).
     // ── WAL Projection API ──────────────────────────────────────────────
@@ -1244,7 +1252,7 @@ impl TieredGraphEngine {
         Ok((seq_start, seq_end, data.len()))
     }
 
-    /// Checkpoint: flush WAL + L1 compaction. Legacy ArrowFragment path removed.
+    /// Checkpoint: flush WAL + per-label L1 compaction.
     pub fn wal_checkpoint(&self) -> Result<(u64, u64), String> {
         let _ = self.wal_flush_segment();
         let result = self.trigger_compaction()?;
@@ -1269,19 +1277,18 @@ impl TieredGraphEngine {
         // First flush pending WAL entries to R2
         let _ = self.wal_flush_segment();
 
-        // Read existing compaction manifest (if any) to know where to start
-        let manifest_key = crate::compaction::manifest_r2_key(prefix, pid);
-        let existing_compacted_seq = match s3.get_sync(&manifest_key) {
-            Ok(Some(data)) => {
-                serde_json::from_slice::<crate::compaction::CompactionManifest>(&data)
-                    .ok()
-                    .map(|m| m.compacted_seq)
-                    .unwrap_or(0)
-            }
-            _ => 0,
-        };
+        // Drain dirty_labels — only these labels need re-compaction
+        let dirty = self.drain_dirty_labels();
 
-        // Segment registry from head.json (avoids R2 S3 ListObjectsV2 signing issue)
+        // Read existing compaction manifest
+        let manifest_key = crate::compaction::manifest_r2_key(prefix, pid);
+        let existing_manifest: Option<crate::compaction::CompactionManifest> = match s3.get_sync(&manifest_key) {
+            Ok(Some(data)) => serde_json::from_slice(&data).ok(),
+            _ => None,
+        };
+        let existing_compacted_seq = existing_manifest.as_ref().map(|m| m.compacted_seq).unwrap_or(0);
+
+        // Segment registry from head.json
         let head_key = format!("{prefix}wal/meta/{pid}/head.json");
         let segment_keys: Vec<String> = match s3.get_sync(&head_key) {
             Ok(Some(data)) => serde_json::from_slice::<serde_json::Value>(&data)
@@ -1292,8 +1299,8 @@ impl TieredGraphEngine {
             _ => Vec::new(),
         };
 
-        if segment_keys.is_empty() {
-            tracing::info!("compaction: no segments in registry");
+        if segment_keys.is_empty() && dirty.is_empty() {
+            tracing::debug!("compaction: no segments and no dirty labels");
             return Ok(crate::compaction::CompactionResult {
                 data: bytes::Bytes::new(),
                 min_seq: 0,
@@ -1303,16 +1310,10 @@ impl TieredGraphEngine {
                 labels: Vec::new(),
             });
         }
-        tracing::info!(count = segment_keys.len(), "compaction: segments in registry");
 
-        let mut segment_data: Vec<(String, bytes::Bytes)> = Vec::new();
-        if existing_compacted_seq > 0 {
-            let compacted_key = crate::compaction::compacted_segment_r2_key(prefix, pid, existing_compacted_seq);
-            if let Ok(Some(data)) = s3.get_sync(&compacted_key) {
-                segment_data.push((compacted_key, data));
-            }
-        }
-
+        // Collect new WAL segments (after existing compacted_seq)
+        let mut new_segment_data: Vec<(String, bytes::Bytes)> = Vec::new();
+        let mut global_max_seq = existing_compacted_seq;
         for key in &segment_keys {
             if let Some(filename) = key.rsplit('/').next() {
                 let stripped = filename.strip_suffix(".ndjson")
@@ -1321,11 +1322,12 @@ impl TieredGraphEngine {
                     let parts: Vec<&str> = stripped.split('-').collect();
                     if parts.len() == 2 {
                         if let Ok(seg_end) = parts[1].parse::<u64>() {
+                            global_max_seq = global_max_seq.max(seg_end);
                             if seg_end <= existing_compacted_seq {
                                 continue;
                             }
                             if let Ok(Some(data)) = s3.get_sync(key) {
-                                segment_data.push((key.clone(), data));
+                                new_segment_data.push((key.clone(), data));
                             }
                         }
                     }
@@ -1333,7 +1335,47 @@ impl TieredGraphEngine {
             }
         }
 
-        if segment_data.is_empty() {
+        // v2 per-label compaction: for each dirty label, merge existing per-label
+        // compacted segment + new WAL entries → per-label compacted segment.
+        let existing_label_segments = existing_manifest.as_ref()
+            .map(|m| &m.label_segments)
+            .cloned()
+            .unwrap_or_default();
+
+        // Build segment refs for per-label compaction
+        let mut all_segment_refs: Vec<(String, bytes::Bytes)> = Vec::new();
+
+        // Include existing per-label compacted segments for dirty labels
+        for label in &dirty {
+            if let Some(state) = existing_label_segments.get(label) {
+                if let Ok(Some(data)) = s3.get_sync(&state.key) {
+                    all_segment_refs.push((state.key.clone(), data));
+                }
+            }
+        }
+
+        // Include new WAL segments (will be filtered to dirty labels by compact_segments_by_label)
+        all_segment_refs.extend(new_segment_data);
+
+        // If v1 monolithic compacted segment exists (migration), include it
+        if existing_manifest.as_ref().map_or(false, |m| m.version == 1 && !m.compacted_segment_key.is_empty()) {
+            let v1_key = &existing_manifest.as_ref().unwrap().compacted_segment_key;
+            if let Ok(Some(data)) = s3.get_sync(v1_key) {
+                all_segment_refs.push((v1_key.clone(), data));
+            }
+            // v1 migration: treat all labels as dirty
+            let v1_labels = existing_manifest.as_ref().unwrap().labels.clone();
+            if let Ok(mut dl) = self.dirty_labels.lock() {
+                dl.extend(v1_labels);
+            }
+            // Re-drain to include v1 labels
+            let extra = self.drain_dirty_labels();
+            // Use union of original dirty + v1 labels
+            let dirty = dirty.union(&extra).cloned().collect::<std::collections::HashSet<String>>();
+            return self.do_per_label_compaction(s3, prefix, pid, &manifest_key, &all_segment_refs, &dirty, &existing_label_segments, global_max_seq);
+        }
+
+        if all_segment_refs.is_empty() && dirty.is_empty() {
             tracing::debug!("compaction: no new segments to compact");
             return Ok(crate::compaction::CompactionResult {
                 data: bytes::Bytes::new(),
@@ -1345,51 +1387,74 @@ impl TieredGraphEngine {
             });
         }
 
-        // Build references for compact_segments
-        let refs: Vec<(&str, &[u8])> = segment_data.iter()
+        self.do_per_label_compaction(s3, prefix, pid, &manifest_key, &all_segment_refs, &dirty, &existing_label_segments, global_max_seq)
+    }
+
+    /// Execute per-label compaction: compact only dirty labels, upload per-label segments + manifest.
+    fn do_per_label_compaction(
+        &self,
+        s3: std::sync::Arc<yata_s3::s3::S3Client>,
+        prefix: &str,
+        pid: u32,
+        manifest_key: &str,
+        segment_refs: &[(String, bytes::Bytes)],
+        dirty: &std::collections::HashSet<String>,
+        existing_label_segments: &std::collections::HashMap<String, crate::compaction::LabelSegmentState>,
+        global_max_seq: u64,
+    ) -> Result<crate::compaction::CompactionResult, String> {
+        let refs: Vec<(&str, &[u8])> = segment_refs.iter()
             .map(|(k, d)| (k.as_str(), d.as_ref()))
             .collect();
 
-        let result = crate::compaction::compact_segments(&refs)?;
+        let label_results = crate::compaction::compact_segments_by_label(&refs, dirty)?;
 
-        if result.data.is_empty() {
-            tracing::info!("compaction: all entries were tombstoned, nothing to write");
-            return Ok(result);
+        let mut total_output = 0usize;
+        let mut total_bytes = 0usize;
+        let vineyard_dir = std::env::var("YATA_VINEYARD_DIR").ok();
+
+        // Upload per-label compacted segments
+        for lr in &label_results {
+            let r2_key = crate::compaction::label_compacted_r2_key(prefix, pid, &lr.label);
+            s3.put_sync(&r2_key, lr.data.clone())
+                .map_err(|e| format!("R2 per-label compacted segment upload failed ({}): {e}", lr.label))?;
+
+            // Disk cache for mmap on restart
+            if let Some(ref dir) = vineyard_dir {
+                let label_dir = format!("{dir}/log/compacted/{pid}/label");
+                let _ = std::fs::create_dir_all(&label_dir);
+                let _ = std::fs::write(format!("{label_dir}/{}.arrow", lr.label), &lr.data);
+            }
+
+            total_output += lr.entry_count;
+            total_bytes += lr.data.len();
         }
 
-        // Upload compacted segment
-        let compacted_key = crate::compaction::compacted_segment_r2_key(prefix, pid, result.max_seq);
-        s3.put_sync(&compacted_key, result.data.clone())
-            .map_err(|e| format!("R2 compacted segment upload failed: {e}"))?;
-
-        // Write to disk cache too (for fast mmap on restart)
-        if let Ok(vineyard_dir) = std::env::var("YATA_VINEYARD_DIR") {
-            let compact_dir = format!("{vineyard_dir}/log/compacted/{pid}");
-            let _ = std::fs::create_dir_all(&compact_dir);
-            let filename = compacted_key.rsplit('/').next().unwrap_or("compacted.arrow");
-            let path = format!("{compact_dir}/{filename}");
-            let _ = std::fs::write(&path, &result.data);
-        }
-
-        // Upload manifest
-        let manifest = crate::compaction::build_manifest(pid, prefix, &result);
+        // Build v2 manifest
+        let manifest = crate::compaction::build_manifest_v2(pid, prefix, global_max_seq, &label_results, existing_label_segments);
         let manifest_json = serde_json::to_vec(&manifest).unwrap_or_default();
-        s3.put_sync(&manifest_key, bytes::Bytes::from(manifest_json))
+        s3.put_sync(manifest_key, bytes::Bytes::from(manifest_json))
             .map_err(|e| format!("R2 compaction manifest upload failed: {e}"))?;
 
-        // Old compacted segment left in R2 (overwritten on next compaction cycle).
-        // R2 lifecycle rules can clean up stale compacted_* files if needed.
+        let dirty_count = label_results.len();
+        let all_labels: Vec<String> = manifest.labels.clone();
 
         tracing::info!(
-            input_entries = result.input_entries,
-            output_entries = result.output_entries,
-            labels = result.labels.len(),
-            compacted_seq = result.max_seq,
-            bytes = result.data.len(),
-            "L1 compaction complete"
+            dirty_labels = dirty_count,
+            total_labels = all_labels.len(),
+            output_entries = total_output,
+            global_max_seq,
+            bytes = total_bytes,
+            "per-label L1 compaction complete"
         );
 
-        Ok(result)
+        Ok(crate::compaction::CompactionResult {
+            data: bytes::Bytes::new(), // v2: no monolithic blob
+            min_seq: 0,
+            max_seq: global_max_seq,
+            input_entries: 0,
+            output_entries: total_output,
+            labels: all_labels,
+        })
     }
 
     /// Cold start: L1 compacted segment (mmap disk → R2 GET) + WAL tail replay.
@@ -1400,24 +1465,66 @@ impl TieredGraphEngine {
         let prefix = &self.s3_prefix;
         let pid = self.config.hot_partition_id.get();
 
-        // Load compacted segment (mmap disk cache → R2 GET)
+        // Load compacted segment(s) (mmap disk cache → R2 GET)
         let manifest_key = crate::compaction::manifest_r2_key(prefix, pid);
         let checkpoint_seq = match s3.get_sync(&manifest_key) {
             Ok(Some(data)) => {
                 match serde_json::from_slice::<crate::compaction::CompactionManifest>(&data) {
+                    Ok(manifest) if manifest.version >= 2 && !manifest.label_segments.is_empty() => {
+                        // v2: load per-label compacted segments
+                        tracing::info!(
+                            compacted_seq = manifest.compacted_seq,
+                            labels = manifest.label_segments.len(),
+                            entries = manifest.entry_count,
+                            "cold start: loading per-label compacted segments (v2)"
+                        );
+                        let vineyard_dir = std::env::var("YATA_VINEYARD_DIR").ok();
+                        for (label, state) in &manifest.label_segments {
+                            let disk_path = vineyard_dir.as_ref()
+                                .map(|d| format!("{d}/log/compacted/{pid}/label/{label}.arrow"));
+
+                            let loaded = disk_path.as_ref().map_or(false, |path| {
+                                if !std::path::Path::new(path).exists() { return false; }
+                                match yata_store::ArrowWalStore::from_file(std::path::Path::new(path)) {
+                                    Ok(store) => {
+                                        tracing::info!(label, path, vertices = store.len(), "cold start: mmap label from disk");
+                                        self.apply_arrow_wal_store(&store).is_ok()
+                                    }
+                                    Err(_) => false,
+                                }
+                            });
+
+                            if !loaded {
+                                if let Ok(Some(data)) = s3.get_sync(&state.key) {
+                                    let entries = crate::arrow_wal::deserialize_segment_auto(&state.key, &data);
+                                    if !entries.is_empty() {
+                                        let _ = self.wal_apply(&entries);
+                                        tracing::info!(label, applied = entries.len(), "cold start: label segment from R2");
+                                    }
+                                    if let Some(ref path) = disk_path {
+                                        if let Some(parent) = std::path::Path::new(path).parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        let _ = std::fs::write(path, &data);
+                                    }
+                                }
+                            }
+                        }
+                        manifest.compacted_seq
+                    }
                     Ok(manifest) => {
+                        // v1: monolithic compacted segment
                         tracing::info!(
                             compacted_seq = manifest.compacted_seq,
                             entries = manifest.entry_count,
                             labels = manifest.labels.len(),
-                            "cold start: loading compacted segment"
+                            "cold start: loading compacted segment (v1)"
                         );
                         let filename = manifest.compacted_segment_key
                             .rsplit('/').next().unwrap_or("compacted.arrow");
                         let disk_path = std::env::var("YATA_VINEYARD_DIR").ok()
                             .map(|d| format!("{d}/log/compacted/{pid}/{filename}"));
 
-                        // Try disk cache mmap first
                         let loaded = disk_path.as_ref().map_or(false, |path| {
                             if !std::path::Path::new(path).exists() { return false; }
                             match yata_store::ArrowWalStore::from_file(std::path::Path::new(path)) {
@@ -1430,7 +1537,6 @@ impl TieredGraphEngine {
                         });
 
                         if !loaded {
-                            // R2 GET
                             if let Ok(Some(data)) = s3.get_sync(&manifest.compacted_segment_key) {
                                 let entries = crate::arrow_wal::deserialize_segment_auto(
                                     &manifest.compacted_segment_key, &data,
@@ -1439,7 +1545,6 @@ impl TieredGraphEngine {
                                     let _ = self.wal_apply(&entries);
                                     tracing::info!(applied = entries.len(), "cold start: compacted segment from R2");
                                 }
-                                // Cache to disk for next mmap
                                 if let Some(ref path) = disk_path {
                                     if let Some(parent) = std::path::Path::new(path).parent() {
                                         let _ = std::fs::create_dir_all(parent);

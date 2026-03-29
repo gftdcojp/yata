@@ -74,7 +74,7 @@
 
   <!-- Title -->
   <text x="800" y="40" text-anchor="middle" fill="#f8fafc" font-size="22" font-weight="bold">yata — Rust Cypher Graph Engine Architecture</text>
-  <text x="800" y="62" text-anchor="middle" fill="#94a3b8" font-size="13">14 crates | 1,068 tests | CSR + YataFragment + R2 | Critical Path + Full-Stack Shannon + Kaizen + Security Architecture</text>
+  <text x="800" y="62" text-anchor="middle" fill="#94a3b8" font-size="13">14 crates | 985+ tests | CSR + Arrow IPC WAL + Per-label Compaction + R2 | Critical Path + Shannon + Kaizen + Security</text>
 
   <!-- ==================== LAYER 0 ==================== -->
   <text x="40" y="105" fill="#64748b" font-size="10" font-weight="bold">LAYER 0 — Zero Dependencies (Foundation)</text>
@@ -124,7 +124,7 @@
   <text x="960" y="313" fill="#64748b" font-size="9">~1,500 LOC</text>
   <text x="760" y="332" fill="#94a3b8" font-size="10">YataFragment (canonical snapshot format)</text>
   <text x="760" y="347" fill="#94a3b8" font-size="10">NbrUnit64 (packed CSR, 25x faster)</text>
-  <text x="760" y="362" fill="#4ade80" font-size="10">csr_to_fragment_selective() [NEW]</text>
+  <text x="760" y="362" fill="#94a3b8" font-size="10">csr_to_fragment() (test/migration only)</text>
   <text x="760" y="377" fill="#475569" font-size="9">deps: core, grin, arrow, bytes</text>
 
   <!-- Layer 0->1 arrows -->
@@ -184,8 +184,8 @@
   <text x="680" y="623" fill="#64748b" font-size="9">~3,000 LOC</text>
   <text x="440" y="642" fill="#94a3b8" font-size="10">TieredGraphEngine (HOT/Warm/Cold)</text>
   <text x="440" y="657" fill="#94a3b8" font-size="10">RwLock&lt;GraphStoreEnum&gt;, QueryCache</text>
-  <text x="440" y="672" fill="#4ade80" font-size="10">Dirty label delta snapshot [FIXED]</text>
-  <text x="440" y="687" fill="#4ade80" font-size="10">is_dirty_vertex_blob / is_infra_blob [NEW]</text>
+  <text x="440" y="672" fill="#4ade80" font-size="10">Per-label delta compaction [PRODUCTION]</text>
+  <text x="440" y="687" fill="#4ade80" font-size="10">drain_dirty_labels / manifest v2 [NEW]</text>
   <text x="440" y="702" fill="#475569" font-size="9">deps: core,grin,store,cypher,gie,graph,s3,format</text>
 
   <rect x="860" y="600" width="300" height="55" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
@@ -259,7 +259,7 @@
   <text x="765" y="1085" fill="#e2e8f0" font-size="11">MmapBlobCache</text>
   <text x="765" y="1100" fill="#94a3b8" font-size="9">zero-copy mmap</text>
   <rect x="590" y="1120" width="300" height="45" rx="6" fill="#1e293b" stroke="#f59e0b" stroke-width="1" stroke-opacity="0.4"/>
-  <text x="605" y="1140" fill="#e2e8f0" font-size="11">YataFragment blobs (per-label IPC)</text>
+  <text x="605" y="1140" fill="#e2e8f0" font-size="11">Per-label compacted segments (Arrow IPC)</text>
   <text x="605" y="1155" fill="#94a3b8" font-size="9">8GB ephemeral, write-through from R2</text>
 
   <!-- COLD -->
@@ -267,11 +267,11 @@
   <text x="980" y="1050" fill="#93c5fd" font-size="14" font-weight="bold">COLD (R2 Source of Truth)</text>
   <text x="1200" y="1050" fill="#3b82f6" font-size="11">~3-5ms</text>
   <rect x="980" y="1065" width="280" height="45" rx="6" fill="#1e293b" stroke="#3b82f6" stroke-width="1" stroke-opacity="0.4"/>
-  <text x="995" y="1085" fill="#e2e8f0" font-size="11">snap/fragment/meta.json</text>
-  <text x="995" y="1100" fill="#94a3b8" font-size="9">schema + blob manifest</text>
+  <text x="995" y="1085" fill="#e2e8f0" font-size="11">log/compacted/{pid}/manifest.json</text>
+  <text x="995" y="1100" fill="#94a3b8" font-size="9">v2 per-label state tracking</text>
   <rect x="980" y="1120" width="280" height="45" rx="6" fill="#1e293b" stroke="#3b82f6" stroke-width="1" stroke-opacity="0.4"/>
-  <text x="995" y="1140" fill="#e2e8f0" font-size="11">vertex_table_N / edge_table_N</text>
-  <text x="995" y="1155" fill="#94a3b8" font-size="9">Arrow IPC, 32MB chunks, SigV4</text>
+  <text x="995" y="1140" fill="#e2e8f0" font-size="11">label/{label}.arrow (per-label)</text>
+  <text x="995" y="1155" fill="#94a3b8" font-size="9">Arrow IPC, PK-dedup, SigV4</text>
 
   <line x1="520" y1="1110" x2="568" y2="1110" stroke="#f59e0b" stroke-width="2" marker-end="url(#arrowAmber)"/>
   <text x="525" y="1103" fill="#f59e0b" font-size="8">page-in</text>
@@ -282,10 +282,10 @@
   <!-- DELTA SNAPSHOT WRITE PATH -->
   <!-- ======================================================== -->
   <rect x="60" y="1220" width="1220" height="100" rx="10" fill="url(#fixedGrad)" stroke="#22c55e" stroke-width="2" filter="url(#greenGlow)"/>
-  <text x="80" y="1245" fill="#22c55e" font-size="14" font-weight="bold">Write Path — Dirty Label Delta Snapshot [IMPLEMENTED]</text>
-  <text x="80" y="1267" fill="#e2e8f0" font-size="11">1. App -> PDS_RPC.createRecord -> Pipeline.send() (durable) -> YATA_RPC.mergeRecord() -> dirty_labels.insert(label)</text>
-  <text x="80" y="1287" fill="#e2e8f0" font-size="11">2. Snapshot cron: dirty_labels.drain() -> csr_to_fragment_selective(dirty_set) -> selective R2 PUT (dirty blobs only)</text>
-  <text x="80" y="1307" fill="#4ade80" font-size="11">3. is_infra_blob (always) | is_dirty_vertex_blob (dirty only) | is_edge_or_topology_blob (if edges changed)</text>
+  <text x="80" y="1245" fill="#22c55e" font-size="14" font-weight="bold">Write Path — Per-label Delta Compaction [PRODUCTION]</text>
+  <text x="80" y="1267" fill="#e2e8f0" font-size="11">1. App -> PDS_RPC.createRecord -> Pipeline.send() (durable) -> YATA_RPC.mergeRecord() -> WAL append + dirty_labels.insert(label)</text>
+  <text x="80" y="1287" fill="#e2e8f0" font-size="11">2. Compaction cron: wal_flush_segment() -> drain_dirty_labels() -> per dirty label: PK-dedup -> R2 PUT label/{label}.arrow</text>
+  <text x="80" y="1307" fill="#4ade80" font-size="11">3. Clean labels = zero R2 I/O | Manifest v2 per-label tracking | v1 monolithic auto-migration</text>
 
   <!-- ======================================================== -->
   <!-- SHANNON BEFORE vs AFTER -->
@@ -295,16 +295,16 @@
 
   <!-- BEFORE -->
   <rect x="60" y="1395" width="710" height="260" rx="10" fill="#1e293b" stroke="#ef4444" stroke-width="1.5" stroke-opacity="0.4"/>
-  <text x="80" y="1420" fill="#ef4444" font-size="14" font-weight="bold">BEFORE (Full Compaction)</text>
-  <line x1="78" y1="1416" x2="310" y2="1416" stroke="#ef4444" stroke-width="1.5" stroke-opacity="0.4"/>
+  <text x="80" y="1420" fill="#ef4444" font-size="14" font-weight="bold">BEFORE (Monolithic Compaction)</text>
+  <line x1="78" y1="1416" x2="370" y2="1416" stroke="#ef4444" stroke-width="1.5" stroke-opacity="0.4"/>
 
   <rect x="80" y="1435" width="670" height="45" rx="6" fill="#1a0505" stroke="#7f1d1d" stroke-width="1" stroke-opacity="0.4"/>
-  <text x="95" y="1453" fill="#fca5a5" font-size="11" font-opacity="0.6">P2: trigger_snapshot() serialized ALL labels, uploaded ALL blobs to R2</text>
-  <text x="95" y="1470" fill="#94a3b8" font-size="9" font-opacity="0.6">O(N) network per snapshot. eta = 0.01% (N=1M, delta=100)</text>
+  <text x="95" y="1453" fill="#fca5a5" font-size="11" font-opacity="0.6">P2: trigger_compaction() read ALL segments + full compacted segment → re-compact ALL</text>
+  <text x="95" y="1470" fill="#94a3b8" font-size="9" font-opacity="0.6">O(total_entries) per cycle. dirty_labels tracked but never drained (leak)</text>
 
   <rect x="80" y="1488" width="670" height="45" rx="6" fill="#1a0505" stroke="#7f1d1d" stroke-width="1" stroke-opacity="0.4"/>
-  <text x="95" y="1506" fill="#fca5a5" font-size="11" font-opacity="0.6">P9: csr_to_fragment() extracted properties for ALL vertex labels</text>
-  <text x="95" y="1523" fill="#94a3b8" font-size="9" font-opacity="0.6">O(V_total x P) CPU per snapshot even when only 1 label was dirty</text>
+  <text x="95" y="1506" fill="#fca5a5" font-size="11" font-opacity="0.6">P9: monolithic compacted segment grew unbounded with total state</text>
+  <text x="95" y="1523" fill="#94a3b8" font-size="9" font-opacity="0.6">1 label change → re-read + re-write entire compacted segment (all labels)</text>
 
   <rect x="80" y="1541" width="670" height="35" rx="6" fill="#1a0a00" stroke="#78350f" stroke-width="1" stroke-opacity="0.3"/>
   <text x="95" y="1564" fill="#fcd34d" font-size="10" font-opacity="0.5">P4: Cold start full page-in (already mitigated: label-selective + topology-only)</text>
@@ -317,16 +317,16 @@
 
   <!-- AFTER -->
   <rect x="810" y="1395" width="470" height="260" rx="10" fill="#1e293b" stroke="#22c55e" stroke-width="2" filter="url(#greenGlow)"/>
-  <text x="830" y="1420" fill="#22c55e" font-size="14" font-weight="bold">AFTER (Delta Snapshot)</text>
+  <text x="830" y="1420" fill="#22c55e" font-size="14" font-weight="bold">AFTER (Per-label Delta Compaction)</text>
 
   <rect x="830" y="1435" width="430" height="55" rx="6" fill="#052e16" stroke="#166534" stroke-width="1"/>
-  <text x="845" y="1453" fill="#4ade80" font-size="11" font-weight="bold">P2 FIXED: selective R2 PUT</text>
-  <text x="845" y="1470" fill="#86efac" font-size="10">is_dirty_vertex_blob(): vertex_table_{i}* only</text>
-  <text x="845" y="1483" fill="#86efac" font-size="10">is_infra_blob(): schema + ivnums always</text>
+  <text x="845" y="1453" fill="#4ade80" font-size="11" font-weight="bold">P2 FIXED: per-label R2 PUT</text>
+  <text x="845" y="1470" fill="#86efac" font-size="10">drain_dirty_labels() → per dirty label only</text>
+  <text x="845" y="1483" fill="#86efac" font-size="10">log/compacted/{pid}/label/{label}.arrow</text>
 
   <rect x="830" y="1498" width="430" height="42" rx="6" fill="#052e16" stroke="#166534" stroke-width="1"/>
-  <text x="845" y="1516" fill="#4ade80" font-size="11" font-weight="bold">P9 FIXED: csr_to_fragment_selective()</text>
-  <text x="845" y="1533" fill="#86efac" font-size="10">Clean labels = empty table (skip O(V x P))</text>
+  <text x="845" y="1516" fill="#4ade80" font-size="11" font-weight="bold">P9 FIXED: per-label WAL compaction</text>
+  <text x="845" y="1533" fill="#86efac" font-size="10">Clean labels = zero R2 I/O (no read, no write)</text>
 
   <rect x="830" y="1548" width="430" height="30" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
   <text x="845" y="1568" fill="#94a3b8" font-size="10">P4: Already PRODUCTION (selective page-in)</text>
@@ -351,23 +351,23 @@
 
   <rect x="100" y="1756" width="1400" height="28" rx="0" fill="#1e293b"/>
   <text x="140" y="1775" fill="#fcd34d" font-size="11" font-weight="bold">NETWORK (R2 PUT)</text>
-  <text x="360" y="1775" fill="#f87171" font-size="10">O(N) all blobs per snapshot</text>
-  <text x="680" y="1775" fill="#4ade80" font-size="10">O(delta) dirty vertex blobs only</text>
-  <text x="1020" y="1775" fill="#22c55e" font-size="11" font-weight="bold">eta: 0.01% -> 85%</text>
+  <text x="360" y="1775" fill="#f87171" font-size="10">O(total_entries) full re-compact per cycle</text>
+  <text x="680" y="1775" fill="#4ade80" font-size="10">O(dirty_entries) per-label delta only</text>
+  <text x="1020" y="1775" fill="#22c55e" font-size="11" font-weight="bold">33 labels, 1 dirty = 3%</text>
   <text x="1340" y="1775" fill="#22c55e" font-size="11" font-weight="bold">FIXED</text>
 
   <rect x="100" y="1786" width="1400" height="28" rx="0" fill="#1a2332"/>
-  <text x="140" y="1805" fill="#67e8f9" font-size="11" font-weight="bold">CPU (serialize)</text>
-  <text x="360" y="1805" fill="#f87171" font-size="10">O(V x P) all labels property scan</text>
-  <text x="680" y="1805" fill="#4ade80" font-size="10">O(V_dirty x P) dirty labels only</text>
+  <text x="140" y="1805" fill="#67e8f9" font-size="11" font-weight="bold">CPU (compact)</text>
+  <text x="360" y="1805" fill="#f87171" font-size="10">O(total) read + dedup all segments</text>
+  <text x="680" y="1805" fill="#4ade80" font-size="10">O(dirty) filter + dedup dirty labels only</text>
   <text x="1020" y="1805" fill="#22c55e" font-size="11" font-weight="bold">O(N) -> O(delta)</text>
   <text x="1340" y="1805" fill="#22c55e" font-size="11" font-weight="bold">FIXED</text>
 
   <rect x="100" y="1816" width="1400" height="28" rx="0" fill="#1e293b"/>
   <text x="140" y="1835" fill="#d8b4fe" font-size="11" font-weight="bold">DISK (cache write)</text>
-  <text x="360" y="1835" fill="#f87171" font-size="10">ALL blobs written to disk</text>
-  <text x="680" y="1835" fill="#4ade80" font-size="10">Dirty blobs only written</text>
-  <text x="1020" y="1835" fill="#22c55e" font-size="11" font-weight="bold">Same selective logic</text>
+  <text x="360" y="1835" fill="#f87171" font-size="10">Full compacted segment to disk</text>
+  <text x="680" y="1835" fill="#4ade80" font-size="10">Per-label segments to disk (dirty only)</text>
+  <text x="1020" y="1835" fill="#22c55e" font-size="11" font-weight="bold">Per-label selective</text>
   <text x="1340" y="1835" fill="#22c55e" font-size="11" font-weight="bold">FIXED</text>
 
   <rect x="100" y="1846" width="1400" height="28" rx="0" fill="#1a2332"/>
@@ -549,29 +549,28 @@
   <text x="910" y="2361" fill="#94a3b8" font-size="8">Coordinator = 96%</text>
 
   <!-- CP4: Snapshot -->
-  <text x="60" y="2394" fill="#06b6d4" font-size="13" font-weight="bold">CP4: Snapshot Path (Total ~15ms@10K, ~150s@10M projected)</text>
+  <text x="60" y="2394" fill="#22c55e" font-size="13" font-weight="bold">CP4: Compaction Path (Per-label delta — O(dirty) not O(total))</text>
   <rect x="60" y="2406" width="100" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
   <text x="72" y="2424" fill="#e2e8f0" font-size="9">cron 1min</text>
   <line x1="160" y1="2424" x2="180" y2="2424" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
-  <rect x="182" y="2406" width="110" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
-  <text x="194" y="2424" fill="#e2e8f0" font-size="9">dirty_labels empty?</text>
-  <text x="194" y="2436" fill="#64748b" font-size="7">0us (drain)</text>
-  <line x1="292" y1="2424" x2="312" y2="2424" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
-  <rect x="314" y="2402" width="200" height="44" rx="5" fill="url(#criticalGrad)" stroke="#ef4444" stroke-width="2" filter="url(#criticalGlow)"/>
-  <text x="330" y="2421" fill="#fca5a5" font-size="10" font-weight="bold">csr_to_fragment()</text>
-  <text x="330" y="2434" fill="#f87171" font-size="9">~10ms@10K O(V+E)</text>
-  <text x="330" y="2444" fill="#ef4444" font-size="7">BOTTLENECK (1 vCPU)</text>
-  <line x1="514" y1="2424" x2="534" y2="2424" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arrowRed)"/>
-  <rect x="536" y="2406" width="170" height="36" rx="5" fill="#1a0a00" stroke="#f59e0b" stroke-width="1.5"/>
-  <text x="548" y="2424" fill="#fcd34d" font-size="9">R2 PUT (full)</text>
-  <text x="548" y="2436" fill="#f59e0b" font-size="7">~3-5ms, O(N) even 1 label</text>
+  <rect x="182" y="2406" width="130" height="36" rx="5" fill="#052e16" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="194" y="2424" fill="#4ade80" font-size="9">drain_dirty_labels()</text>
+  <text x="194" y="2436" fill="#22c55e" font-size="7">0us (drain → skip if empty)</text>
+  <line x1="312" y1="2424" x2="332" y2="2424" stroke="#22c55e" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+  <rect x="334" y="2406" width="180" height="36" rx="5" fill="#052e16" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="350" y="2421" fill="#4ade80" font-size="10" font-weight="bold">per-label PK-dedup</text>
+  <text x="350" y="2434" fill="#22c55e" font-size="9">O(dirty_entries) only</text>
+  <line x1="514" y1="2424" x2="534" y2="2424" stroke="#22c55e" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+  <rect x="536" y="2406" width="170" height="36" rx="5" fill="#052e16" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="548" y="2424" fill="#4ade80" font-size="9">R2 PUT (dirty labels)</text>
+  <text x="548" y="2436" fill="#22c55e" font-size="7">label/{label}.arrow per dirty</text>
   <line x1="706" y1="2424" x2="726" y2="2424" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
   <rect x="728" y="2406" width="120" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
-  <text x="740" y="2424" fill="#e2e8f0" font-size="9">pending_writes=0</text>
+  <text x="740" y="2424" fill="#e2e8f0" font-size="9">manifest v2 PUT</text>
   <rect x="60" y="2450" width="788" height="5" rx="2" fill="#1e293b"/>
-  <rect x="314" y="2450" width="200" height="5" rx="2" fill="#ef4444" fill-opacity="0.6"/>
-  <rect x="536" y="2450" width="80" height="5" rx="2" fill="#f59e0b" fill-opacity="0.4"/>
-  <text x="860" y="2455" fill="#94a3b8" font-size="8">Serialize = 67%</text>
+  <rect x="334" y="2450" width="180" height="5" rx="2" fill="#22c55e" fill-opacity="0.4"/>
+  <rect x="536" y="2450" width="80" height="5" rx="2" fill="#22c55e" fill-opacity="0.3"/>
+  <text x="860" y="2455" fill="#22c55e" font-size="8">FIXED: O(dirty) not O(total)</text>
 
   <!-- CP5: Mutation (OPTIMIZED — incremental delta-apply) -->
   <text x="60" y="2486" fill="#a855f7" font-size="13" font-weight="bold">CP5: Mutation Path (Total ~500ms → ~55ms with delta-apply)</text>
@@ -638,12 +637,12 @@
 
   <rect x="100" y="2704" width="1400" height="24" fill="#1e293b"/>
   <text x="130" y="2721" fill="#f59e0b" font-size="11" font-weight="bold">4</text>
-  <text x="170" y="2721" fill="#fcd34d" font-size="9">CP4 Snapshot</text>
-  <text x="350" y="2721" fill="#fbbf24" font-size="9">csr_to_fragment() serialize + monitoring</text>
-  <text x="620" y="2721" fill="#fbbf24" font-size="9">10ms@10K</text>
-  <text x="730" y="2721" fill="#f59e0b" font-size="9" font-weight="bold">67%</text>
-  <text x="800" y="2721" fill="#94a3b8" font-size="9">100K threshold auto-warn. Stats: last_snapshot_serialize_ms</text>
-  <text x="1100" y="2721" fill="#22c55e" font-size="9">MONITORED (parallel at 100K+)</text>
+  <text x="170" y="2721" fill="#86efac" font-size="9">CP4 Compaction</text>
+  <text x="350" y="2721" fill="#4ade80" font-size="9">per-label delta compaction (dirty only)</text>
+  <text x="620" y="2721" fill="#4ade80" font-size="9">O(dirty)</text>
+  <text x="730" y="2721" fill="#22c55e" font-size="9" font-weight="bold">FIXED</text>
+  <text x="800" y="2721" fill="#94a3b8" font-size="9">drain_dirty_labels → per-label PK-dedup → label/{label}.arrow</text>
+  <text x="1100" y="2721" fill="#22c55e" font-size="9" font-weight="bold">PRODUCTION</text>
 
   <rect x="100" y="2730" width="1400" height="24" fill="#1a2332"/>
   <text x="130" y="2747" fill="#22c55e" font-size="11" font-weight="bold">5</text>
@@ -1015,15 +1014,15 @@
   <text x="75" y="4616" fill="#fca5a5" font-size="9" font-weight="bold">FB3c: Snapshot corrupt gftd wal-replay (~10-30s/1M)</text>
 
   <!-- FB4: Snapshot -->
-  <text x="450" y="4440" fill="#a855f7" font-size="13" font-weight="bold">FB4: Snapshot Path</text>
+  <text x="450" y="4440" fill="#a855f7" font-size="13" font-weight="bold">FB4: Compaction Path</text>
   <rect x="450" y="4453" width="190" height="34" rx="5" fill="#1e293b" stroke="#22c55e" stroke-width="1.5"/>
-  <text x="465" y="4468" fill="#22c55e" font-size="9" font-weight="bold">csr_to_fragment_selective</text>
-  <text x="465" y="4481" fill="#64748b" font-size="7">dirty labels ~10ms@10K</text>
+  <text x="465" y="4468" fill="#22c55e" font-size="9" font-weight="bold">per-label PK-dedup</text>
+  <text x="465" y="4481" fill="#64748b" font-size="7">dirty labels O(delta)</text>
   <line x1="640" y1="4470" x2="665" y2="4470" stroke="#22c55e" stroke-width="2" marker-end="url(#arrowGreen)"/>
   <rect x="667" y="4453" width="120" height="34" rx="5" fill="#1e293b" stroke="#22c55e" stroke-width="1.5"/>
-  <text x="680" y="4468" fill="#22c55e" font-size="9" font-weight="bold">R2 PUT delta</text>
-  <text x="680" y="4481" fill="#64748b" font-size="7">~3-5ms</text>
-  <text x="800" y="4470" fill="#22c55e" font-size="8">~15ms</text>
+  <text x="680" y="4468" fill="#22c55e" font-size="9" font-weight="bold">R2 PUT /label/</text>
+  <text x="680" y="4481" fill="#64748b" font-size="7">per-label only</text>
+  <text x="800" y="4470" fill="#22c55e" font-size="8">O(dirty)</text>
   <line x1="545" y1="4487" x2="545" y2="4503" stroke="#f59e0b" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arrowAmber)"/>
   <rect x="450" y="4505" width="260" height="30" rx="5" fill="#1a0a00" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="3,2"/>
   <text x="465" y="4524" fill="#fcd34d" font-size="9" font-weight="bold">FB4a: pending &lt; threshold defer</text>
