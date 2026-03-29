@@ -266,6 +266,16 @@ impl TieredGraphEngine {
         }
     }
 
+    /// Fallback: when mutation hints cannot extract specific labels, mark all loaded labels dirty.
+    fn mark_all_loaded_labels_dirty(&self) {
+        let labels: Vec<String> = self.loaded_labels.lock()
+            .map(|ll| ll.iter().cloned().collect())
+            .unwrap_or_default();
+        if !labels.is_empty() {
+            self.mark_labels_dirty(labels);
+        }
+    }
+
     /// Get or lazily initialize the S3 client. Returns None if not configured.
     fn get_s3_client(&self) -> Option<Arc<yata_s3::s3::S3Client>> {
         if let Ok(guard) = self.s3_client.lock() {
@@ -571,14 +581,19 @@ impl TieredGraphEngine {
         mutation_ctx: Option<&MutationContext>,
     ) -> Result<Vec<Vec<(String, String)>>, String> {
         let is_mutation = router::is_cypher_mutation(cypher);
-        if is_mutation {
+        let mutation_hints = if is_mutation {
             self.cypher_mutation_count.fetch_add(1, Ordering::Relaxed);
-            if let Some((labels, _)) = router::extract_mutation_hints(cypher) {
-                self.mark_labels_dirty(labels);
+            let hints = router::extract_mutation_hints(cypher);
+            if let Some((ref labels, _)) = hints {
+                self.mark_labels_dirty(labels.iter().cloned());
+            } else {
+                self.mark_all_loaded_labels_dirty();
             }
+            hints
         } else {
             self.cypher_read_count.fetch_add(1, Ordering::Relaxed);
-        }
+            None
+        };
         let query_start = std::time::Instant::now();
 
         // Cache lookup (reads only)
@@ -625,9 +640,8 @@ impl TieredGraphEngine {
             }
         }
 
-        // Mutation path: load only labels referenced in Cypher (targeted).
-        // Falls back to load-all only when AST extraction finds no labels.
-        if let Some((vlabels, _elabels)) = router::extract_mutation_hints(cypher) {
+        // Mutation path: reuse cached hints to avoid double-parsing
+        if let Some((ref vlabels, _)) = mutation_hints {
             let vl_refs: Vec<&str> = vlabels.iter().map(|s| s.as_str()).collect();
             self.ensure_labels(&vl_refs);
         } else {
@@ -1145,61 +1159,55 @@ impl TieredGraphEngine {
             return Ok((0, 0));
         }
 
-        // Dirty label delta upload: only PUT blobs for dirty vertex labels.
-        // Infrastructure blobs (schema, ivnums, meta.json) are always uploaded.
-        // Edge/topology blobs: always uploaded (dirty_set is non-empty at this point).
+        // Dirty label delta upload + disk cache in single pass.
+        // Infrastructure blobs (schema, ivnums) are always persisted.
+        // Edge/topology blobs: always persisted (dirty_set is non-empty at this point).
+        // Clean vertex blobs are skipped.
+        let meta_json = serde_json::to_vec(&meta).unwrap_or_default();
+        let snap_dir = std::env::var("YATA_VINEYARD_DIR").ok().map(|d| {
+            let sd = format!("{d}/snap/fragment");
+            if let Err(e) = std::fs::create_dir_all(&sd) {
+                tracing::warn!(error = %e, "failed to create vineyard snap dir for disk cache");
+            }
+            sd
+        });
         let mut uploaded = 0u32;
         let mut skipped = 0u32;
         for name in meta.blobs.keys() {
-            let should_upload = is_infra_blob(name)
+            let dominated = is_infra_blob(name)
                 || is_dirty_vertex_blob(name, &dirty_vlabel_ids)
                 || is_edge_or_topology_blob(name);
-            if !should_upload {
+            if !dominated {
                 skipped += 1;
                 continue;
             }
             if let Some(data) = BlobStore::get(&blob_store, name) {
                 let full_key = format!("{prefix}snap/fragment/{name}");
-                if let Err(e) = s3.put_sync(&full_key, data) {
+                if let Err(e) = s3.put_sync(&full_key, data.clone()) {
                     tracing::error!(name, error = %e, "R2 ArrowFragment blob upload failed");
                 } else {
                     uploaded += 1;
+                }
+                if let Some(ref sd) = snap_dir {
+                    let path = format!("{sd}/{name}");
+                    if let Err(e) = std::fs::write(&path, &data[..]) {
+                        tracing::warn!(path, error = %e, "failed to write blob to disk cache");
+                    }
                 }
             }
         }
 
         // Upload fragment meta (ObjectMeta JSON) — always, reflects full CSR state
-        let meta_json = serde_json::to_vec(&meta).unwrap_or_default();
         let meta_key = format!("{prefix}snap/fragment/meta.json");
         if let Err(e) = s3.put_sync(&meta_key, bytes::Bytes::from(meta_json.clone())) {
             tracing::error!(error = %e, "R2 fragment meta upload failed");
         }
-
-        // Write dirty blobs to YATA_VINEYARD_DIR on disk (same selective logic)
-        if let Ok(vineyard_dir) = std::env::var("YATA_VINEYARD_DIR") {
-            let snap_dir = format!("{vineyard_dir}/snap/fragment");
-            if let Err(e) = std::fs::create_dir_all(&snap_dir) {
-                tracing::warn!(error = %e, "failed to create vineyard snap dir for disk cache");
-            } else {
-                for name in meta.blobs.keys() {
-                    let should_write = is_infra_blob(name)
-                        || is_dirty_vertex_blob(name, &dirty_vlabel_ids)
-                        || is_edge_or_topology_blob(name);
-                    if !should_write { continue; }
-                    if let Some(data) = BlobStore::get(&blob_store, name) {
-                        let path = format!("{snap_dir}/{name}");
-                        if let Err(e) = std::fs::write(&path, &data[..]) {
-                            tracing::warn!(path, error = %e, "failed to write blob to disk cache");
-                        }
-                    }
-                }
-                // Write meta.json to disk — always
-                let meta_path = format!("{snap_dir}/meta.json");
-                if let Err(e) = std::fs::write(&meta_path, &meta_json) {
-                    tracing::warn!(error = %e, "failed to write meta.json to disk cache");
-                }
-                tracing::debug!(snap_dir, "delta snapshot blobs written to disk cache");
+        if let Some(ref sd) = snap_dir {
+            let meta_path = format!("{sd}/meta.json");
+            if let Err(e) = std::fs::write(&meta_path, &meta_json) {
+                tracing::warn!(error = %e, "failed to write meta.json to disk cache");
             }
+            tracing::debug!(snap_dir = %sd, "delta snapshot blobs written to disk cache");
         }
 
         // Upload manifest (backward-compat for existing page-in path)
@@ -1602,6 +1610,8 @@ impl TieredGraphEngine {
         if is_mutation {
             if let Some((labels, _)) = router::extract_mutation_hints(cypher) {
                 self.mark_labels_dirty(labels);
+            } else {
+                self.mark_all_loaded_labels_dirty();
             }
         }
 
