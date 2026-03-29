@@ -74,7 +74,7 @@
 
   <!-- Title -->
   <text x="800" y="40" text-anchor="middle" fill="#f8fafc" font-size="22" font-weight="bold">yata — Rust Cypher Graph Engine Architecture</text>
-  <text x="800" y="62" text-anchor="middle" fill="#94a3b8" font-size="13">14 crates | 1,060+ tests | CSR + Arrow IPC WAL + Per-label Compaction + Blake3 + Two-phase PUT + R2 | Critical Path + Shannon + Kaizen + Security</text>
+  <text x="800" y="62" text-anchor="middle" fill="#94a3b8" font-size="13">14 crates | 1,060+ tests | Sorted COO + Arrow IPC WAL + Per-label Compaction + Blake3 + Two-phase PUT + R2 | Critical Path + Shannon + Kaizen + Security</text>
 
   <!-- ==================== CRITICAL ISSUES (2026-03-29) ==================== -->
   <g transform="translate(40, 80)">
@@ -84,9 +84,9 @@
     <!-- Issue 1: Cold Start Blind Spot -->
     <rect x="20" y="40" width="470" height="120" rx="6" fill="#1e1e2e" stroke="#ef4444" stroke-width="1" opacity="0.9"/>
     <text x="35" y="60" fill="#ef4444" font-size="11" font-weight="bold">P0: Cold Start Blind Spot (12-52s)</text>
-    <text x="35" y="78" fill="#94a3b8" font-size="10">Deploy new image → Container restart → CSR lost</text>
+    <text x="35" y="78" fill="#94a3b8" font-size="10">Deploy new image → Container restart → in-memory lost</text>
     <text x="35" y="93" fill="#94a3b8" font-size="10">→ R2 page-in 12-52s → ALL queries return empty</text>
-    <text x="35" y="108" fill="#94a3b8" font-size="10">Read replicas: cron 5min cold start (gap)</text>
+    <text x="35" y="108" fill="#94a3b8" font-size="10">Read replicas: on-demand cold start (first query)</text>
     <text x="35" y="123" fill="#94a3b8" font-size="10">Write partition: on-demand page-in (slow)</text>
     <text x="35" y="143" fill="#f59e0b" font-size="10" font-weight="bold">Fix: edge cache restored + write fallback</text>
 
@@ -94,7 +94,7 @@
     <rect x="510" y="40" width="470" height="120" rx="6" fill="#1e1e2e" stroke="#f59e0b" stroke-width="1" opacity="0.9"/>
     <text x="525" y="60" fill="#f59e0b" font-size="11" font-weight="bold">P1: Read Replicas Empty After Deploy</text>
     <text x="525" y="78" fill="#94a3b8" font-size="10">WAL push = fire-and-forget (no ack, no retry)</text>
-    <text x="525" y="93" fill="#94a3b8" font-size="10">Cold start = cron 5min (not on first query)</text>
+    <text x="525" y="93" fill="#94a3b8" font-size="10">Cold start = on-demand (first query triggers page-in)</text>
     <text x="525" y="108" fill="#94a3b8" font-size="10">Empty response = HTTP 200 (no error signal)</text>
     <text x="525" y="123" fill="#94a3b8" font-size="10">PDS cannot distinguish empty vs no-data</text>
     <text x="525" y="143" fill="#f59e0b" font-size="10" font-weight="bold">Fix: fetchStubFast 8s → write fallback</text>
@@ -111,10 +111,10 @@
     <!-- Architecture Comparison -->
     <rect x="20" y="170" width="1450" height="95" rx="6" fill="#1e1e2e" stroke="#3b82f6" stroke-width="1" opacity="0.8"/>
     <text x="35" y="190" fill="#3b82f6" font-size="11" font-weight="bold">Architecture Stability Comparison (Shannon η)</text>
-    <text x="35" y="210" fill="#94a3b8" font-size="10">A: Current (CSR+WAL+edge cache)  η=71.8%  Avail=95%   Cold=12-52s   Cost=$3/mo</text>
+    <text x="35" y="210" fill="#94a3b8" font-size="10">A: Current (COO+WAL+size-compact) η=71.8%  Avail=95%   Cold=12-52s   Cost=$3/mo</text>
     <text x="35" y="225" fill="#94a3b8" font-size="10">B: R2 Direct Query (no Container) η=58.2%  Avail=99.9% Cold=0s       Cost=$0.50/mo</text>
     <text x="35" y="240" fill="#94a3b8" font-size="10">C: Warm Standby (blue-green)      η=71.8%  Avail=99.5% Cold=0s       Cost=$6/mo</text>
-    <text x="35" y="255" fill="#22c55e" font-size="10" font-weight="bold">D: Hybrid R2+CSR (recommended)    η=68.4%  Avail=99.9% Cold=0s       Cost=$3/mo  ← R2 scan fallback when CSR cold</text>
+    <text x="35" y="255" fill="#22c55e" font-size="10" font-weight="bold">D: Hybrid R2+COO (recommended)    η=68.4%  Avail=99.9% Cold=0s       Cost=$3/mo  ← R2 scan fallback when COO cold</text>
     <text x="770" y="210" fill="#94a3b8" font-size="10">E: Pipeline Materialized View     η=75.1%  Avail=99.9% Cold=0s       Cost=$0.50/mo (Pipeline GA required)</text>
   </g>
 
@@ -167,9 +167,9 @@
   <rect x="740" y="290" width="340" height="100" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="2"/>
   <text x="760" y="313" fill="#22c55e" font-size="13" font-weight="bold">yata-format</text>
   <text x="960" y="313" fill="#64748b" font-size="9">~1,500 LOC</text>
-  <text x="760" y="332" fill="#94a3b8" font-size="10">YataFragment (canonical snapshot format)</text>
-  <text x="760" y="347" fill="#94a3b8" font-size="10">NbrUnit64 (packed CSR, 25x faster)</text>
-  <text x="760" y="362" fill="#94a3b8" font-size="10">csr_to_fragment() (test/migration only)</text>
+  <text x="760" y="332" fill="#94a3b8" font-size="10">YataFragment (legacy snapshot, COO segments replace)</text>
+  <text x="760" y="347" fill="#94a3b8" font-size="10">NbrUnit64 (packed CSR, legacy Phase 3 removal)</text>
+  <text x="760" y="362" fill="#94a3b8" font-size="10">COO segment format (sorted Arrow IPC)</text>
   <text x="760" y="377" fill="#475569" font-size="9">deps: core, grin, arrow, bytes</text>
 
   <!-- Layer 0->1 arrows -->
@@ -186,14 +186,14 @@
   <text x="80" y="468" fill="#e2e8f0" font-size="13" font-weight="bold">yata-cypher</text>
   <text x="250" y="468" fill="#64748b" font-size="9">~500 LOC</text>
   <text x="80" y="487" fill="#94a3b8" font-size="10">Full Cypher parser (regex lexing)</text>
-  <text x="80" y="502" fill="#94a3b8" font-size="10">CSR-based executor</text>
+  <text x="80" y="502" fill="#94a3b8" font-size="10">Push-based executor</text>
   <text x="80" y="517" fill="#94a3b8" font-size="10">Graph trait, Value, NodeRef, RelRef</text>
   <text x="80" y="532" fill="#475569" font-size="9">deps: serde_json, indexmap, regex</text>
 
   <rect x="400" y="445" width="340" height="100" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
   <text x="420" y="468" fill="#e2e8f0" font-size="13" font-weight="bold">yata-store</text>
   <text x="620" y="468" fill="#64748b" font-size="9">~2,000 LOC</text>
-  <text x="420" y="487" fill="#94a3b8" font-size="10">MutableCsrStore (in-memory, GRIN impl)</text>
+  <text x="420" y="487" fill="#94a3b8" font-size="10">Sorted COO Store (in-memory, GRIN impl)</text>
   <text x="420" y="502" fill="#94a3b8" font-size="10">DiskBlobCache/MmapBlobCache (LRU cache)</text>
   <text x="420" y="517" fill="#94a3b8" font-size="10">GraphStoreEnum dispatch, PartitionedStore</text>
   <text x="420" y="532" fill="#475569" font-size="9">deps: grin, cypher, format, core, memmap2</text>
@@ -278,10 +278,10 @@
 
   <!-- HOT -->
   <rect x="60" y="1025" width="460" height="165" rx="10" fill="url(#hotGrad)" stroke="#dc2626" stroke-width="1.5" stroke-opacity="0.5"/>
-  <text x="80" y="1050" fill="#fca5a5" font-size="14" font-weight="bold">HOT (CSR In-Memory)</text>
+  <text x="80" y="1050" fill="#fca5a5" font-size="14" font-weight="bold">HOT (Sorted COO In-Memory)</text>
   <text x="360" y="1050" fill="#dc2626" font-size="11">&lt;1us query</text>
   <rect x="80" y="1065" width="200" height="45" rx="6" fill="#1e293b" stroke="#dc2626" stroke-width="1" stroke-opacity="0.4"/>
-  <text x="95" y="1085" fill="#e2e8f0" font-size="11">MutableCsrStore</text>
+  <text x="95" y="1085" fill="#e2e8f0" font-size="11">CooStore + L0 buffer</text>
   <text x="95" y="1100" fill="#94a3b8" font-size="9">RwLock&lt;GraphStoreEnum&gt;</text>
   <rect x="300" y="1065" width="200" height="45" rx="6" fill="#1e293b" stroke="#dc2626" stroke-width="1" stroke-opacity="0.4"/>
   <text x="315" y="1085" fill="#e2e8f0" font-size="11">QueryCache (LRU+TTL)</text>
@@ -291,7 +291,7 @@
   <text x="95" y="1155" fill="#94a3b8" font-size="9">Cypher -> IR -> push records</text>
   <rect x="300" y="1120" width="200" height="45" rx="6" fill="#1e293b" stroke="#dc2626" stroke-width="1" stroke-opacity="0.4"/>
   <text x="315" y="1140" fill="#e2e8f0" font-size="11">SecurityScope (Design E)</text>
-  <text x="315" y="1155" fill="#94a3b8" font-size="9">CSR policy vertex lookup</text>
+  <text x="315" y="1155" fill="#94a3b8" font-size="9">COO policy vertex lookup</text>
 
   <!-- WARM -->
   <rect x="570" y="1025" width="340" height="165" rx="10" fill="url(#warmGrad)" stroke="#f59e0b" stroke-width="1.5" stroke-opacity="0.5"/>
@@ -324,12 +324,12 @@
   <text x="915" y="1103" fill="#3b82f6" font-size="8">fetch</text>
 
   <!-- ======================================================== -->
-  <!-- DELTA SNAPSHOT WRITE PATH -->
+  <!-- WRITE PATH (L0 APPEND + SIZE-BASED COMPACTION) -->
   <!-- ======================================================== -->
   <rect x="60" y="1220" width="1220" height="100" rx="10" fill="url(#fixedGrad)" stroke="#22c55e" stroke-width="2" filter="url(#greenGlow)"/>
   <text x="80" y="1245" fill="#22c55e" font-size="14" font-weight="bold">Write Path — Per-label Delta Compaction [PRODUCTION]</text>
   <text x="80" y="1267" fill="#e2e8f0" font-size="11">1. App -> PDS_RPC.createRecord -> Pipeline.send() (durable) -> YATA_RPC.mergeRecord() -> WAL append + dirty_labels.insert(label)</text>
-  <text x="80" y="1287" fill="#e2e8f0" font-size="11">2. Compaction cron: wal_flush_segment() (safe guard) -> drain_dirty_labels() -> Phase 1: per-label PK-dedup + Blake3 -> R2 PUT (skip failed)</text>
+  <text x="80" y="1287" fill="#e2e8f0" font-size="11">2. Size-based compaction: L0 >= 10K → wal_flush_segment() → drain_dirty_labels() → Phase 1: per-label PK-dedup + Blake3 → R2 PUT (skip failed)</text>
   <text x="80" y="1307" fill="#4ade80" font-size="11">3. Phase 2: manifest v2 from success only -> R2 PUT | Clean labels = zero R2 I/O | Cold start Blake3 verify | v1 auto-migration (safe)</text>
 
   <!-- ======================================================== -->
@@ -358,7 +358,7 @@
   <text x="95" y="1607" fill="#67e8f9" font-size="10" font-opacity="0.5">P5: Coordinator 2ms fan-out overhead (mitigated: adaptive sqrt(N))</text>
 
   <rect x="80" y="1627" width="670" height="20" rx="6" fill="#0f0520" stroke="#581c87" stroke-width="1" stroke-opacity="0.2"/>
-  <text x="95" y="1642" fill="#d8b4fe" font-size="9" font-opacity="0.4">P6: Dual persistence — Pipeline WAL + R2 snapshot (by design, cold start &lt;5s)</text>
+  <text x="95" y="1642" fill="#d8b4fe" font-size="9" font-opacity="0.4">P6: Dual persistence — Pipeline WAL + R2 sorted COO (by design, cold start &lt;5s)</text>
 
   <!-- AFTER -->
   <rect x="810" y="1395" width="470" height="260" rx="10" fill="#1e293b" stroke="#22c55e" stroke-width="2" filter="url(#greenGlow)"/>
@@ -385,7 +385,7 @@
   <!-- ======================================================== -->
   <!-- EFFICIENCY TABLE -->
   <!-- ======================================================== -->
-  <text x="800" y="1710" text-anchor="middle" fill="#f8fafc" font-size="16" font-weight="bold">Shannon Efficiency (N=1M vertices, delta=100 per snapshot)</text>
+  <text x="800" y="1710" text-anchor="middle" fill="#f8fafc" font-size="16" font-weight="bold">Shannon Efficiency (N=1M vertices, delta=100 per compaction)</text>
 
   <rect x="100" y="1725" width="1400" height="28" rx="4" fill="#334155"/>
   <text x="140" y="1744" fill="#e2e8f0" font-size="11" font-weight="bold">Dimension</text>
@@ -417,16 +417,16 @@
 
   <rect x="100" y="1846" width="1400" height="28" rx="0" fill="#1a2332"/>
   <text x="140" y="1865" fill="#fca5a5" font-size="11">MEMORY (4GB)</text>
-  <text x="360" y="1865" fill="#94a3b8" font-size="10">CSR primary store (~20M nodes)</text>
-  <text x="680" y="1865" fill="#94a3b8" font-size="10">Unchanged (CSR = the design)</text>
+  <text x="360" y="1865" fill="#94a3b8" font-size="10">Sorted COO primary store (~20M nodes)</text>
+  <text x="680" y="1865" fill="#94a3b8" font-size="10">Unchanged (Sorted COO = the design)</text>
   <text x="1020" y="1865" fill="#94a3b8" font-size="10">QueryCache bounded (256/30s)</text>
   <text x="1340" y="1865" fill="#94a3b8" font-size="10">by design</text>
 
   <rect x="100" y="1876" width="1400" height="28" rx="0" fill="#1e293b"/>
   <text x="140" y="1895" fill="#94a3b8" font-size="11">PERSISTENCE</text>
-  <text x="360" y="1895" fill="#94a3b8" font-size="10">Pipeline WAL + R2 snapshot</text>
+  <text x="360" y="1895" fill="#94a3b8" font-size="10">Pipeline WAL + R2 sorted COO</text>
   <text x="680" y="1895" fill="#94a3b8" font-size="10">Delta PUT reduces R2 I/O cost</text>
-  <text x="1020" y="1895" fill="#94a3b8" font-size="10">cold start &lt;5s requires checkpoint</text>
+  <text x="1020" y="1895" fill="#94a3b8" font-size="10">cold start &lt;5s from sorted COO segments</text>
   <text x="1340" y="1895" fill="#94a3b8" font-size="10">by design</text>
 
   <!-- ======================================================== -->
@@ -521,7 +521,7 @@
   <line x1="559" y1="2148" x2="589" y2="2148" stroke="#22c55e" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
   <rect x="591" y="2130" width="160" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
   <text x="604" y="2148" fill="#e2e8f0" font-size="9">YATA mergeRecord</text>
-  <text x="604" y="2160" fill="#64748b" font-size="7">~500us (CSR append)</text>
+  <text x="604" y="2160" fill="#64748b" font-size="7">~500us (L0 append)</text>
   <line x1="751" y1="2148" x2="781" y2="2148" stroke="#22c55e" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
   <rect x="783" y="2130" width="100" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
   <text x="796" y="2148" fill="#e2e8f0" font-size="9">dirty_labels.insert</text>
@@ -551,7 +551,7 @@
   <text x="505" y="2258" fill="#ef4444" font-size="7">BOTTLENECK #2</text>
   <line x1="666" y1="2238" x2="686" y2="2238" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
   <rect x="688" y="2220" width="100" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
-  <text x="700" y="2238" fill="#e2e8f0" font-size="9">CSR Build</text>
+  <text x="700" y="2238" fill="#e2e8f0" font-size="9">L0 Merge</text>
   <text x="700" y="2250" fill="#64748b" font-size="7">~50ms</text>
   <line x1="788" y1="2238" x2="808" y2="2238" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
   <rect x="810" y="2220" width="110" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
@@ -581,7 +581,7 @@
   <line x1="504" y1="2330" x2="524" y2="2330" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
   <rect x="526" y="2312" width="120" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
   <text x="538" y="2330" fill="#e2e8f0" font-size="9">GIE Execute</text>
-  <text x="538" y="2342" fill="#64748b" font-size="7">&lt;1us (CSR)</text>
+  <text x="538" y="2342" fill="#64748b" font-size="7">&lt;10us (sparse index)</text>
   <line x1="646" y1="2330" x2="666" y2="2330" stroke="#22c55e" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
   <rect x="668" y="2312" width="120" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
   <text x="680" y="2330" fill="#e2e8f0" font-size="9">mergeResults</text>
@@ -593,10 +593,10 @@
   <rect x="294" y="2356" width="210" height="5" rx="2" fill="#ef4444" fill-opacity="0.6"/>
   <text x="910" y="2361" fill="#94a3b8" font-size="8">Coordinator = 96%</text>
 
-  <!-- CP4: Snapshot -->
+  <!-- CP4: Compaction -->
   <text x="60" y="2394" fill="#22c55e" font-size="13" font-weight="bold">CP4: Compaction Path (Per-label delta — O(dirty) not O(total))</text>
   <rect x="60" y="2406" width="100" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
-  <text x="72" y="2424" fill="#e2e8f0" font-size="9">cron 1min</text>
+  <text x="72" y="2424" fill="#e2e8f0" font-size="9">size-based</text>
   <line x1="160" y1="2424" x2="180" y2="2424" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
   <rect x="182" y="2406" width="130" height="36" rx="5" fill="#052e16" stroke="#22c55e" stroke-width="1.5"/>
   <text x="194" y="2424" fill="#4ade80" font-size="9">drain_dirty_labels()</text>
@@ -668,7 +668,7 @@
   <rect x="100" y="2652" width="1400" height="24" fill="#0a1a0a"/>
   <text x="130" y="2669" fill="#22c55e" font-size="11" font-weight="bold">2</text>
   <text x="170" y="2669" fill="#86efac" font-size="9">CP5 Mutation</text>
-  <text x="350" y="2669" fill="#22c55e" font-size="9">Delta-Apply O(delta) [was CSR Rebuild O(V+E)]</text>
+  <text x="350" y="2669" fill="#22c55e" font-size="9">L1 Compaction O(delta) [was CSR Rebuild O(V+E)]</text>
   <text x="620" y="2669" fill="#22c55e" font-size="9">~5ms [was 400ms]</text>
   <text x="730" y="2669" fill="#22c55e" font-size="9" font-weight="bold">9%</text>
   <text x="800" y="2669" fill="#94a3b8" font-size="9">Incremental delta for small mutations. Full rebuild fallback for delta&gt;50%</text>
@@ -719,7 +719,7 @@
   <!-- S2: L1 WAL safety net -->
   <rect x="60" y="2940" width="720" height="55" rx="8" fill="#1e293b" stroke="#f59e0b" stroke-width="1.5" stroke-opacity="0.6"/>
   <text x="80" y="2962" fill="#22c55e" font-size="12" font-weight="bold">S2: L1 Arrow IPC WAL — unified format (zero-copy mmap, segment registry, L1 compaction)</text>
-  <text x="80" y="2978" fill="#94a3b8" font-size="10">container/yata/src/index.ts:7 | walFlushSegment cron 10s + pushWalToReplicas fire-and-forget</text>
+  <text x="80" y="2978" fill="#94a3b8" font-size="10">container/yata/src/index.ts | walFlushSegment cron (durability) + pushWalToReplicas fire-and-forget</text>
   <text x="80" y="2990" fill="#fbbf24" font-size="10">Shannon: L0 Pipeline.send() = source of truth. L1 = safety net while Pipeline Beta. Post-GA: delete L1</text>
   <rect x="690" y="2948" width="80" height="18" rx="4" fill="#f59e0b" fill-opacity="0.2"/>
   <text x="700" y="2961" fill="#f59e0b" font-size="9" font-weight="bold">PENDING</text>
@@ -750,7 +750,7 @@
   <rect x="800" y="2860" width="480" height="70" rx="8" fill="#1e293b" stroke="#06b6d4" stroke-width="1.5" stroke-opacity="0.6"/>
   <text x="820" y="2882" fill="#06b6d4" font-size="12" font-weight="bold">S6: Container HTTP overhead (structural)</text>
   <text x="820" y="2900" fill="#94a3b8" font-size="10">CF Container = gVisor sandbox. Workers RPC zero-copy impossible.</text>
-  <text x="820" y="2916" fill="#67e8f9" font-size="10">HTTP ~1-5ms per hop. Design: CSR &lt;1us absorbs. Not fixable.</text>
+  <text x="820" y="2916" fill="#67e8f9" font-size="10">HTTP ~1-5ms per hop. Design: sparse index &lt;10us absorbs. Not fixable.</text>
 
   <rect x="800" y="2940" width="480" height="55" rx="8" fill="#1e293b" stroke="#06b6d4" stroke-width="1.5" stroke-opacity="0.6"/>
   <text x="820" y="2962" fill="#06b6d4" font-size="12" font-weight="bold">S7: pushWalToReplicas fire-and-forget (silent loss)</text>
@@ -822,8 +822,8 @@
   <text x="140" y="3395" fill="#22c55e" font-size="11" font-weight="bold">K3a</text>
   <text x="200" y="3395" fill="#86efac" font-size="9">CPM</text>
   <text x="250" y="3395" fill="#94a3b8" font-size="9">yata-engine CpmStats</text>
-  <text x="460" y="3395" fill="#94a3b8" font-size="9">Atomic counters: cypher_read/mutation/mergeRecord + mutation_avg_us + snapshot_serialize_ms. /xrpc/ai.gftd.yata.stats</text>
-  <text x="820" y="3395" fill="#22c55e" font-size="9">Production mutation_ratio → incremental CSR ROI</text>
+  <text x="460" y="3395" fill="#94a3b8" font-size="9">Atomic counters: cypher_read/mutation/mergeRecord + mutation_avg_us + last_compaction_ms. /xrpc/ai.gftd.yata.stats</text>
+  <text x="820" y="3395" fill="#22c55e" font-size="9">Production mutation_ratio → compaction frequency ROI</text>
   <text x="1100" y="3395" fill="#94a3b8" font-size="9">done</text>
   <text x="1200" y="3395" fill="#22c55e" font-size="9" font-weight="bold">IMPLEMENTED</text>
 
@@ -837,22 +837,22 @@
   <text x="1100" y="3423" fill="#94a3b8" font-size="9">done</text>
   <text x="1200" y="3423" fill="#22c55e" font-size="9" font-weight="bold">IMPLEMENTED</text>
 
-  <!-- K3c: Incremental CSR Delta-Apply (NEW) -->
+  <!-- K3c: Size-based L1 Compaction -->
   <rect x="100" y="3433" width="1400" height="26" fill="#0a1a0a"/>
   <text x="140" y="3451" fill="#22c55e" font-size="11" font-weight="bold">K3c</text>
   <text x="200" y="3451" fill="#86efac" font-size="9">CP5</text>
-  <text x="250" y="3451" fill="#94a3b8" font-size="9">Incremental CSR delta-apply</text>
-  <text x="460" y="3451" fill="#94a3b8" font-size="9">Cypher mutation: delta&lt;50% → add/delete vertices+edges on existing CSR O(delta). Fallback: full rebuild O(V+E)</text>
+  <text x="250" y="3451" fill="#94a3b8" font-size="9">Size-based L1 compaction</text>
+  <text x="460" y="3451" fill="#94a3b8" font-size="9">L0 pending_writes >= 10K → trigger_compaction() → per-label LSM merge-sort → PK-dedup → R2 PUT. No cron.</text>
   <text x="820" y="3451" fill="#22c55e" font-size="9">400ms → ~5ms for typical mutations (1000x)</text>
   <text x="1100" y="3451" fill="#94a3b8" font-size="9">done</text>
   <text x="1200" y="3451" fill="#22c55e" font-size="9" font-weight="bold">IMPLEMENTED</text>
 
-  <!-- K3d: Snapshot Monitoring (NEW) -->
+  <!-- K3d: Compaction Monitoring -->
   <rect x="100" y="3461" width="1400" height="26" fill="#0a1a0a"/>
   <text x="140" y="3479" fill="#22c55e" font-size="11" font-weight="bold">K3d</text>
   <text x="200" y="3479" fill="#86efac" font-size="9">CP4</text>
-  <text x="250" y="3479" fill="#94a3b8" font-size="9">Snapshot serialize monitoring</text>
-  <text x="460" y="3479" fill="#94a3b8" font-size="9">last_snapshot_serialize_ms in CpmStats. Auto-warn at vertex&gt;100K or serialize&gt;100ms with projected latency</text>
+  <text x="250" y="3479" fill="#94a3b8" font-size="9">Compaction latency monitoring</text>
+  <text x="460" y="3479" fill="#94a3b8" font-size="9">last_compaction_ms in CpmStats. Auto-warn at vertex&gt;100K or compaction&gt;100ms with projected latency</text>
   <text x="820" y="3479" fill="#22c55e" font-size="9">Early detection → parallel serialize when needed</text>
   <text x="1100" y="3479" fill="#94a3b8" font-size="9">done</text>
   <text x="1200" y="3479" fill="#22c55e" font-size="9" font-weight="bold">IMPLEMENTED</text>
@@ -862,7 +862,7 @@
   <text x="140" y="3507" fill="#f59e0b" font-size="11" font-weight="bold">K4</text>
   <text x="200" y="3507" fill="#fcd34d" font-size="9">S2</text>
   <text x="250" y="3507" fill="#94a3b8" font-size="9">L1 WAL safety net</text>
-  <text x="460" y="3507" fill="#94a3b8" font-size="9">Delete walFlushSegment cron + pushWalToReplicas once Pipeline exits Beta</text>
+  <text x="460" y="3507" fill="#94a3b8" font-size="9">WAL flush cron retained (durability). Compaction is size-based (no cron).</text>
   <text x="820" y="3507" fill="#f59e0b" font-size="9">-$1.60/mo R2 ops, -10% write latency</text>
   <text x="1100" y="3507" fill="#94a3b8" font-size="9">1 day</text>
   <text x="1200" y="3507" fill="#f59e0b" font-size="9">POST-GA</text>
@@ -903,7 +903,7 @@
   <text x="120" y="3662" fill="#94a3b8" font-size="10">CP2 (Cold) FIXED (S3/K2): ensure_labels now uses label hints → enrich_label_from_r2 per-label R2 GET. Hot path: loaded_labels skip. eta 5% → 85%.</text>
   <text x="120" y="3678" fill="#94a3b8" font-size="10">CP5 (Mutation) FIXED (S1/K1): commit() 4/6 rebuild dirty-aware. rebuild_columnar_cache/label_bitmap/prop_indexes/btree skip clean labels. 200MB → 20MB.</text>
   <text x="120" y="3694" fill="#94a3b8" font-size="10">CP1 (Write) FIXED (S5/K5): Pipeline.send + mergeRecord now Promise.all (parallel). Write latency ~40ms → ~25ms. mergeRecord failure still recoverable via WAL.</text>
-  <text x="120" y="3710" fill="#94a3b8" font-size="10">R7 (Snapshot) FIXED: dirty AtomicBool removed. dirty_labels is SSoT. Edge/topology blobs always uploaded when dirty_set non-empty.</text>
+  <text x="120" y="3710" fill="#94a3b8" font-size="10">R7 (Compaction) FIXED: dirty AtomicBool removed. dirty_labels is SSoT. Per-label segments uploaded when dirty_set non-empty.</text>
 
   <!-- Full-Stack Data Flow Diagram -->
   <text x="800" y="3770" text-anchor="middle" fill="#f8fafc" font-size="18" font-weight="bold">Full-Stack Write Path — Shannon Redundancy Visualization</text>
@@ -953,7 +953,7 @@
   <!-- Write Container -->
   <line x1="520" y1="4024" x2="520" y2="4044" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
   <rect x="420" y="4046" width="200" height="50" rx="6" fill="#1e293b" stroke="#dc2626" stroke-width="1.5"/>
-  <text x="440" y="4066" fill="#dc2626" font-size="10" font-weight="bold">Write Container CSR</text>
+  <text x="440" y="4066" fill="#dc2626" font-size="10" font-weight="bold">Write Container COO</text>
   <text x="440" y="4082" fill="#94a3b8" font-size="9">delta-apply + CPM stats (K3a-K3d)</text>
 
   <!-- L2 Checkpoint -->
@@ -975,7 +975,7 @@
   <text x="980" y="3842" fill="#22c55e" font-size="10">L0 Pipeline WAL — required (truth)</text>
   <text x="980" y="3860" fill="#22c55e" font-size="10">L1 Arrow IPC WAL — unified format (mmap-ready)</text>
   <text x="980" y="3878" fill="#3b82f6" font-size="10">L1 Compaction — PK-dedup (P=1.0 recovery)</text>
-  <text x="980" y="3896" fill="#dc2626" font-size="10">CSR in-memory — required (query)</text>
+  <text x="980" y="3896" fill="#dc2626" font-size="10">COO in-memory — required (query)</text>
   <text x="980" y="3910" fill="#94a3b8" font-size="9">Shannon R=0.15 (WAL+compaction unified Arrow IPC)</text>
 
   <!-- Shannon η summary at bottom -->
@@ -1006,7 +1006,7 @@
   <line x1="372" y1="4237" x2="397" y2="4237" stroke="#22c55e" stroke-width="2" marker-end="url(#arrowGreen)"/>
   <rect x="399" y="4220" width="155" height="34" rx="5" fill="#1e293b" stroke="#22c55e" stroke-width="1.5"/>
   <text x="412" y="4235" fill="#22c55e" font-size="9" font-weight="bold">mergeRecord()</text>
-  <text x="412" y="4248" fill="#64748b" font-size="7">~500us CSR append</text>
+  <text x="412" y="4248" fill="#64748b" font-size="7">~500us L0 append</text>
   <line x1="554" y1="4237" x2="579" y2="4237" stroke="#22c55e" stroke-width="2" marker-end="url(#arrowGreen)"/>
   <rect x="581" y="4223" width="55" height="28" rx="5" fill="#22c55e" fill-opacity="0.12" stroke="#22c55e" stroke-width="1"/>
   <text x="593" y="4242" fill="#22c55e" font-size="9">OK</text>
@@ -1018,7 +1018,7 @@
   <line x1="504" y1="4308" x2="504" y2="4324" stroke="#ef4444" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arrowRed)"/>
   <rect x="399" y="4326" width="260" height="36" rx="5" fill="#1a0505" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="3,2"/>
   <text x="412" y="4341" fill="#fca5a5" font-size="9" font-weight="bold">FB1b: _mergeError + console.error</text>
-  <text x="412" y="4354" fill="#ef4444" font-size="7">CSR stale. Pipeline WAL durable. Recovery: gftd wal-replay</text>
+  <text x="412" y="4354" fill="#ef4444" font-size="7">L0 lost. Pipeline WAL durable. Recovery: gftd wal-replay</text>
   <rect x="217" y="4188" width="290" height="22" rx="5" fill="#1a0505" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="3,2"/>
   <text x="230" y="4204" fill="#fca5a5" font-size="8" font-weight="bold">FB1c: Pipeline reject = NOT durable. Client must retry.</text>
   <line x1="294" y1="4220" x2="294" y2="4210" stroke="#ef4444" stroke-width="1" stroke-dasharray="3,2"/>
@@ -1035,11 +1035,11 @@
   <line x1="860" y1="4254" x2="860" y2="4272" stroke="#f59e0b" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arrowAmber)"/>
   <rect x="800" y="4274" width="200" height="34" rx="5" fill="#1a0a00" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="3,2"/>
   <text x="815" y="4289" fill="#fcd34d" font-size="9" font-weight="bold">FB2a: Cache MISS</text>
-  <text x="815" y="4302" fill="#f59e0b" font-size="7">YataRPC Container CSR ~170ms</text>
+  <text x="815" y="4302" fill="#f59e0b" font-size="7">YataRPC Container COO ~170ms</text>
   <line x1="900" y1="4308" x2="900" y2="4324" stroke="#ef4444" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arrowRed)"/>
   <rect x="800" y="4326" width="270" height="36" rx="5" fill="#1a0505" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="3,2"/>
   <text x="815" y="4341" fill="#fca5a5" font-size="9" font-weight="bold">FB2b: Container asleep ~2.8s</text>
-  <text x="815" y="4354" fill="#ef4444" font-size="7">Wake 1.5s + R2 page-in 1.2s + CSR 50ms</text>
+  <text x="815" y="4354" fill="#ef4444" font-size="7">Wake 1.5s + R2 page-in 1.2s + sparse index 50ms</text>
   <line x1="935" y1="4362" x2="935" y2="4376" stroke="#ef4444" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arrowRed)"/>
   <rect x="800" y="4378" width="300" height="28" rx="5" fill="#1a0505" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="3,2"/>
   <text x="815" y="4397" fill="#fca5a5" font-size="9" font-weight="bold">FB2c: Crash fetchStub retry 1x (2s) ~5s</text>
@@ -1061,9 +1061,9 @@
   <text x="75" y="4570" fill="#fca5a5" font-size="9" font-weight="bold">FB3b: R2 empty hot_initialized=true (safe)</text>
   <line x1="195" y1="4581" x2="195" y2="4595" stroke="#ef4444" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arrowRed)"/>
   <rect x="60" y="4597" width="310" height="28" rx="5" fill="#1a0505" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="3,2"/>
-  <text x="75" y="4616" fill="#fca5a5" font-size="9" font-weight="bold">FB3c: Snapshot corrupt gftd wal-replay (~10-30s/1M)</text>
+  <text x="75" y="4616" fill="#fca5a5" font-size="9" font-weight="bold">FB3c: Segment corrupt gftd wal-replay (~10-30s/1M)</text>
 
-  <!-- FB4: Snapshot -->
+  <!-- FB4: Compaction -->
   <text x="450" y="4440" fill="#a855f7" font-size="13" font-weight="bold">FB4: Compaction Path</text>
   <rect x="450" y="4453" width="190" height="34" rx="5" fill="#1e293b" stroke="#22c55e" stroke-width="1.5"/>
   <text x="465" y="4468" fill="#22c55e" font-size="9" font-weight="bold">per-label PK-dedup</text>
@@ -1080,7 +1080,7 @@
   <rect x="450" y="4551" width="290" height="30" rx="5" fill="#1a0505" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="3,2"/>
   <text x="465" y="4570" fill="#fca5a5" font-size="9" font-weight="bold">FB4b: v=0,e=0 skip PUT (empty guard)</text>
   <rect x="450" y="4597" width="290" height="28" rx="5" fill="#1a0505" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="3,2"/>
-  <text x="465" y="4616" fill="#fca5a5" font-size="9" font-weight="bold">FB4c: R2 PUT error next cron. WAL backup.</text>
+  <text x="465" y="4616" fill="#fca5a5" font-size="9" font-weight="bold">FB4c: R2 PUT error next compaction. WAL backup.</text>
 
   <!-- FB5: WAL Replica -->
   <text x="900" y="4440" fill="#a855f7" font-size="13" font-weight="bold">FB5: WAL Replica</text>
@@ -1096,7 +1096,7 @@
   <text x="915" y="4524" fill="#fcd34d" font-size="9" font-weight="bold">FB5a: Push fail stale replica (silent)</text>
   <line x1="1035" y1="4535" x2="1035" y2="4549" stroke="#ef4444" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arrowRed)"/>
   <rect x="900" y="4551" width="330" height="30" rx="5" fill="#1a0505" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="3,2"/>
-  <text x="915" y="4570" fill="#fca5a5" font-size="9" font-weight="bold">FB5b: Restart walColdStart checkpoint+replay ~2-5s</text>
+  <text x="915" y="4570" fill="#fca5a5" font-size="9" font-weight="bold">FB5b: Restart coldStart segments+replay ~2-5s</text>
 
   <!-- FB6: XRPC Transport -->
   <text x="900" y="4610" fill="#06b6d4" font-size="13" font-weight="bold">FB6: XRPC Transport</text>
@@ -1137,15 +1137,15 @@
   <text x="220" y="4853" fill="#94a3b8" font-size="9">Disk ~100us</text>
   <text x="400" y="4853" fill="#f59e0b" font-size="9">R2 GET ~3-5ms</text>
   <text x="650" y="4853" fill="#ef4444" font-size="9">R2 empty hot_init=true</text>
-  <text x="950" y="4853" fill="#ef4444" font-size="9">Snapshot corrupt</text>
+  <text x="950" y="4853" fill="#ef4444" font-size="9">Segment corrupt</text>
   <text x="1250" y="4853" fill="#94a3b8" font-size="9">gftd wal-replay</text>
   <rect x="100" y="4861" width="1400" height="22" fill="#1a2332"/>
-  <text x="120" y="4877" fill="#a855f7" font-size="9">FB4 Snapshot</text>
+  <text x="120" y="4877" fill="#a855f7" font-size="9">FB4 Compaction</text>
   <text x="220" y="4877" fill="#94a3b8" font-size="9">Delta PUT ~15ms</text>
   <text x="400" y="4877" fill="#f59e0b" font-size="9">Below threshold defer</text>
   <text x="650" y="4877" fill="#ef4444" font-size="9">Empty guard skip</text>
   <text x="950" y="4877" fill="#ef4444" font-size="9">R2 PUT fail</text>
-  <text x="1250" y="4877" fill="#94a3b8" font-size="9">Next cron retry</text>
+  <text x="1250" y="4877" fill="#94a3b8" font-size="9">Next write triggers retry</text>
   <rect x="100" y="4885" width="1400" height="22" fill="#1e293b"/>
   <text x="120" y="4901" fill="#a855f7" font-size="9">FB5 Replica</text>
   <text x="220" y="4901" fill="#94a3b8" font-size="9">WAL push ~1-5ms</text>
@@ -1164,7 +1164,7 @@
   <!-- Design invariant -->
   <rect x="100" y="4950" width="1400" height="50" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="1" stroke-opacity="0.4"/>
   <text x="120" y="4972" fill="#22c55e" font-size="12" font-weight="bold">Design Invariant</text>
-  <text x="120" y="4988" fill="#94a3b8" font-size="10">Pipeline.send() resolve = durable. All other state (CSR, snapshots, replicas) is ephemeral, rebuildable from Pipeline WAL. gftd wal-replay = universal recovery.</text>
+  <text x="120" y="4988" fill="#94a3b8" font-size="10">Pipeline.send() resolve = durable. All other state (L0 buffer, sorted segments, replicas) is ephemeral, rebuildable from Pipeline WAL. gftd wal-replay = universal recovery.</text>
 
   <!-- Combined legend -->
   <rect x="100" y="5015" width="1400" height="50" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1"/>
@@ -1204,7 +1204,7 @@
   <rect x="60" y="5268" width="460" height="65" rx="8" fill="url(#securityGrad)" stroke="#a855f7" stroke-width="1.5"/>
   <text x="80" y="5288" fill="#c4b5fd" font-size="12" font-weight="bold">L2: ES256 Service Auth JWT (DID-signed P-256 ECDSA)</text>
   <text x="80" y="5305" fill="#94a3b8" font-size="10">aud: did:web:pds.gftd.ai | exp ±30s clock skew</text>
-  <text x="80" y="5322" fill="#d8b4fe" font-size="9">ring::signature P-256 verify | DID Document pubkey from CSR</text>
+  <text x="80" y="5322" fill="#d8b4fe" font-size="9">ring::signature P-256 verify | DID Document pubkey from COO</text>
 
   <!-- Layer 3: Passkey -->
   <rect x="60" y="5341" width="460" height="55" rx="8" fill="url(#securityGrad)" stroke="#a855f7" stroke-width="1.5"/>
@@ -1226,7 +1226,7 @@
   <text x="565" y="5374" fill="#64748b" font-size="8">HS256 access(2h) + refresh(90d)</text>
 
   <!-- ==================== SECURITY SCOPE ==================== -->
-  <text x="800" y="5180" fill="#a855f7" font-size="14" font-weight="bold">SecurityScope (Compiled from CSR Policy Vertices)</text>
+  <text x="800" y="5180" fill="#a855f7" font-size="14" font-weight="bold">SecurityScope (Compiled from COO Policy Vertices)</text>
 
   <rect x="800" y="5195" width="480" height="140" rx="8" fill="#1e293b" stroke="#a855f7" stroke-width="2" filter="url(#securityGlow)"/>
   <text x="820" y="5218" fill="#c4b5fd" font-size="12" font-weight="bold">SecurityScope { }</text>
@@ -1235,7 +1235,7 @@
   <text x="835" y="5274" fill="#fcd34d" font-size="10">allowed_owner_hashes: Vec&lt;u32&gt;  // FNV-1a(grantor DID)</text>
   <text x="835" y="5292" fill="#d8b4fe" font-size="10">bypass: bool              // internal system all-access</text>
   <text x="820" y="5316" fill="#475569" font-size="9">Cache: 5min TTL, invalidated on ClearanceAssignment/ConsentGrant mutation</text>
-  <text x="820" y="5330" fill="#475569" font-size="9">Source: CSR :ClearanceAssignment + :RBACAssignment + :ConsentGrant vertices</text>
+  <text x="820" y="5330" fill="#475569" font-size="9">Source: COO :ClearanceAssignment + :RBACAssignment + :ConsentGrant vertices</text>
 
   <!-- ==================== GIE SECURITY FILTER ==================== -->
   <text x="60" y="5430" fill="#ef4444" font-size="14" font-weight="bold">GIE SecurityFilter — Inline O(1) per Vertex (No MemoryGraph Fallback)</text>
@@ -1362,7 +1362,7 @@
 
   <!-- Policy graph vertices -->
   <rect x="1020" y="5855" width="260" height="110" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
-  <text x="1040" y="5878" fill="#e2e8f0" font-size="12" font-weight="bold">CSR Policy Vertices</text>
+  <text x="1040" y="5878" fill="#e2e8f0" font-size="12" font-weight="bold">COO Policy Vertices</text>
   <text x="1040" y="5898" fill="#fca5a5" font-size="10">:ClearanceAssignment</text>
   <text x="1055" y="5912" fill="#94a3b8" font-size="9">{did, max_sensitivity_ord}</text>
   <text x="1040" y="5930" fill="#93c5fd" font-size="10">:RBACAssignment</text>
@@ -1393,14 +1393,14 @@
   <rect x="440" y="6055" width="190" height="60" rx="6" fill="url(#securityGrad)" stroke="#a855f7" stroke-width="2"/>
   <text x="458" y="6075" fill="#c4b5fd" font-size="10" font-weight="bold">verify_es256_jwt()</text>
   <text x="458" y="6090" fill="#d8b4fe" font-size="9">P-256 ECDSA via ring</text>
-  <text x="458" y="6103" fill="#d8b4fe" font-size="9">resolve_pubkey(DID) → CSR</text>
+  <text x="458" y="6103" fill="#d8b4fe" font-size="9">resolve_pubkey(DID) → COO</text>
 
   <line x1="630" y1="6085" x2="658" y2="6085" stroke="#a855f7" stroke-width="1.5" marker-end="url(#arrowPurple)"/>
 
   <!-- Step 4: compile scope -->
   <rect x="660" y="6055" width="220" height="60" rx="6" fill="url(#securityGrad)" stroke="#a855f7" stroke-width="2" filter="url(#securityGlow)"/>
   <text x="678" y="6075" fill="#c4b5fd" font-size="10" font-weight="bold">compile_security_scope(did)</text>
-  <text x="678" y="6090" fill="#d8b4fe" font-size="9">CSR: Clearance + RBAC + Consent</text>
+  <text x="678" y="6090" fill="#d8b4fe" font-size="9">COO: Clearance + RBAC + Consent</text>
   <text x="678" y="6103" fill="#d8b4fe" font-size="9">→ SecurityScope (cached 5min)</text>
 
   <line x1="880" y1="6085" x2="908" y2="6085" stroke="#a855f7" stroke-width="1.5" marker-end="url(#arrowPurple)"/>
@@ -1455,7 +1455,7 @@
 
   <rect x="600" y="6215" width="680" height="22" fill="#1e293b"/>
   <text x="620" y="6231" fill="#fca5a5" font-size="9">Compromised JWT</text>
-  <text x="900" y="6231" fill="#94a3b8" font-size="9">ES256 P-256 sig verify + DID pubkey from CSR + exp ±30s</text>
+  <text x="900" y="6231" fill="#94a3b8" font-size="9">ES256 P-256 sig verify + DID pubkey from COO + exp ±30s</text>
 
   <rect x="600" y="6239" width="680" height="22" fill="#1a2332"/>
   <text x="620" y="6255" fill="#fca5a5" font-size="9">Replayed Service Auth</text>
@@ -1557,14 +1557,14 @@
 
   <!-- DID Document resolution -->
   <rect x="60" y="6820" width="1080" height="55" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1"/>
-  <text x="80" y="6842" fill="#e2e8f0" font-size="11" font-weight="bold">DID Document Resolution (CSR-native, no HTTPS fallback for internal DIDs)</text>
+  <text x="80" y="6842" fill="#e2e8f0" font-size="11" font-weight="bold">DID Document Resolution (COO-native, no HTTPS fallback for internal DIDs)</text>
   <text x="80" y="6860" fill="#94a3b8" font-size="10">:DIDDocument {did, controller_did, public_key_multibase, performer_type, key_custody_tier, created_at, updated_at}</text>
-  <text x="80" y="6870" fill="#475569" font-size="9">resolve_did_pubkey(did) → CSR query → z-prefixed base58btc → decompress P-256 (33B→65B) → ring::UnparsedPublicKey</text>
+  <text x="80" y="6870" fill="#475569" font-size="9">resolve_did_pubkey(did) → COO query → z-prefixed base58btc → decompress P-256 (33B→65B) → ring::UnparsedPublicKey</text>
 
   <!-- Final design invariant -->
   <rect x="100" y="6895" width="1400" height="55" rx="8" fill="#1e293b" stroke="#a855f7" stroke-width="1.5" stroke-opacity="0.5"/>
   <text x="120" y="6918" fill="#a855f7" font-size="12" font-weight="bold">Security Design Invariants</text>
-  <text x="120" y="6935" fill="#94a3b8" font-size="10">1. DID = canonical identity (no ephemeral IDs, no Clerk orgs)  2. ES256 &gt; HS256 for service-to-service  3. yata CSR = SecurityScope source of truth</text>
+  <text x="120" y="6935" fill="#94a3b8" font-size="10">1. DID = canonical identity (no ephemeral IDs, no Clerk orgs)  2. ES256 &gt; HS256 for service-to-service  3. yata COO = SecurityScope source of truth</text>
   <text x="120" y="6948" fill="#94a3b8" font-size="10">4. SecurityFilter is O(1) (no MemoryGraph fallback)  5. Partition ≠ security boundary  6. Consent via owner_hash (FNV-1a O(1))  7. AT Protocol faithful (Session+ServiceAuth JWT)</text>
 
   <!-- ================================================================ -->
