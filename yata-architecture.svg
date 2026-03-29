@@ -1,0 +1,539 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 2200" font-family="'SF Mono','Menlo','Monaco',monospace" font-size="11">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#0a0e17;stop-opacity:1"/>
+      <stop offset="100%" style="stop-color:#111827;stop-opacity:1"/>
+    </linearGradient>
+    <linearGradient id="hotGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#dc2626;stop-opacity:0.15"/>
+      <stop offset="100%" style="stop-color:#f97316;stop-opacity:0.08"/>
+    </linearGradient>
+    <linearGradient id="warmGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#f59e0b;stop-opacity:0.12"/>
+      <stop offset="100%" style="stop-color:#eab308;stop-opacity:0.06"/>
+    </linearGradient>
+    <linearGradient id="coldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#3b82f6;stop-opacity:0.12"/>
+      <stop offset="100%" style="stop-color:#06b6d4;stop-opacity:0.06"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="2" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="redGlow">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feFlood flood-color="#ef4444" flood-opacity="0.4" result="color"/>
+      <feComposite in="color" in2="blur" operator="in" result="shadow"/>
+      <feMerge><feMergeNode in="shadow"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="yellowGlow">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feFlood flood-color="#f59e0b" flood-opacity="0.4" result="color"/>
+      <feComposite in="color" in2="blur" operator="in" result="shadow"/>
+      <feMerge><feMergeNode in="shadow"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#4b5563" stroke="none"/>
+    </marker>
+    <marker id="arrowRed" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#ef4444" stroke="none"/>
+    </marker>
+    <marker id="arrowAmber" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#f59e0b" stroke="none"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1600" height="2200" fill="url(#bgGrad)"/>
+
+  <!-- Title -->
+  <text x="800" y="40" text-anchor="middle" fill="#f8fafc" font-size="22" font-weight="bold">yata — Rust Cypher Graph Engine Architecture</text>
+  <text x="800" y="62" text-anchor="middle" fill="#94a3b8" font-size="13">12 crates | 854 tests | CSR + ArrowFragment + R2 | Shannon Information-Theoretic Analysis</text>
+
+  <!-- ==================== LAYER 0 ==================== -->
+  <text x="40" y="105" fill="#64748b" font-size="10" font-weight="bold">LAYER 0 — Zero Dependencies (Foundation)</text>
+  <line x1="40" y1="110" x2="1560" y2="110" stroke="#1e293b" stroke-width="1"/>
+
+  <!-- yata-core -->
+  <rect x="60" y="125" width="340" height="110" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="80" y="148" fill="#e2e8f0" font-size="13" font-weight="bold">yata-core</text>
+  <text x="280" y="148" fill="#64748b" font-size="9">~10,130 LOC</text>
+  <text x="80" y="167" fill="#94a3b8" font-size="10">GlobalVid(u64) = [16b partition][48b local]</text>
+  <text x="80" y="182" fill="#94a3b8" font-size="10">Blake3Hash, PayloadRef(Arrow|JSON|CBOR)</text>
+  <text x="80" y="197" fill="#94a3b8" font-size="10">ObjectStorage, AppendLog, WrpcBroker traits</text>
+  <text x="80" y="212" fill="#94a3b8" font-size="10">YataError, ObjectManifest, ChunkRef</text>
+  <text x="80" y="227" fill="#475569" font-size="9">deps: blake3, uuid, serde, async-trait</text>
+
+  <!-- yata-grin -->
+  <rect x="440" y="125" width="340" height="110" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="460" y="148" fill="#e2e8f0" font-size="13" font-weight="bold">yata-grin</text>
+  <text x="660" y="148" fill="#64748b" font-size="9">~314 LOC</text>
+  <text x="460" y="167" fill="#94a3b8" font-size="10">GRIN Traits (Storage-Agnostic Abstraction)</text>
+  <text x="460" y="182" fill="#94a3b8" font-size="10">Topology | Property | Schema | Scannable</text>
+  <text x="460" y="197" fill="#94a3b8" font-size="10">Mutable | Tiered | Versioned | Partitioned</text>
+  <text x="460" y="212" fill="#94a3b8" font-size="10">PropValue, Direction, Predicate, Neighbor</text>
+  <text x="460" y="227" fill="#475569" font-size="9">deps: serde (only)</text>
+
+  <!-- ==================== LAYER 1 ==================== -->
+  <text x="40" y="270" fill="#64748b" font-size="10" font-weight="bold">LAYER 1 — Core Primitives</text>
+  <line x1="40" y1="275" x2="1560" y2="275" stroke="#1e293b" stroke-width="1"/>
+
+  <!-- yata-arrow -->
+  <rect x="60" y="290" width="300" height="100" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="80" y="313" fill="#e2e8f0" font-size="13" font-weight="bold">yata-arrow</text>
+  <text x="250" y="313" fill="#64748b" font-size="9">~640 LOC</text>
+  <text x="80" y="332" fill="#94a3b8" font-size="10">ArrowBatchHandle, SchemaRegistry</text>
+  <text x="80" y="347" fill="#94a3b8" font-size="10">IPC serialize/deserialize, mmap read</text>
+  <text x="80" y="362" fill="#94a3b8" font-size="10">Schema compatibility (Backward/Full)</text>
+  <text x="80" y="377" fill="#475569" font-size="9">deps: arrow v53, memmap2, once_cell</text>
+
+  <!-- yata-object -->
+  <rect x="400" y="290" width="300" height="100" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="420" y="313" fill="#e2e8f0" font-size="13" font-weight="bold">yata-object</text>
+  <text x="590" y="313" fill="#64748b" font-size="9">~800 LOC</text>
+  <text x="420" y="332" fill="#94a3b8" font-size="10">LocalObjectStore (CAS + MDAG)</text>
+  <text x="420" y="347" fill="#94a3b8" font-size="10">chunk_size=128MB, inline=256KB</text>
+  <text x="420" y="362" fill="#94a3b8" font-size="10">Blake3 hash directory layout</text>
+  <text x="420" y="377" fill="#475569" font-size="9">deps: core, async-trait, ciborium</text>
+
+  <!-- yata-vineyard -->
+  <rect x="740" y="290" width="340" height="100" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="760" y="313" fill="#e2e8f0" font-size="13" font-weight="bold">yata-vineyard</text>
+  <text x="960" y="313" fill="#64748b" font-size="9">~1,500 LOC</text>
+  <text x="760" y="332" fill="#94a3b8" font-size="10">ArrowFragment (canonical snapshot format)</text>
+  <text x="760" y="347" fill="#94a3b8" font-size="10">NbrUnit64 (packed CSR, 25x faster)</text>
+  <text x="760" y="362" fill="#94a3b8" font-size="10">csr_to_fragment(), 32MB row-group chunk</text>
+  <text x="760" y="377" fill="#475569" font-size="9">deps: core, grin, arrow, bytes</text>
+
+  <!-- Layer 0 → 1 dependency arrows -->
+  <line x1="230" y1="235" x2="210" y2="288" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="230" y1="235" x2="550" y2="288" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="610" y1="235" x2="910" y2="288" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="230" y1="235" x2="910" y2="288" stroke="#334155" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+
+  <!-- ==================== LAYER 2 ==================== -->
+  <text x="40" y="425" fill="#64748b" font-size="10" font-weight="bold">LAYER 2 — Graph Storage</text>
+  <line x1="40" y1="430" x2="1560" y2="430" stroke="#1e293b" stroke-width="1"/>
+
+  <!-- yata-cypher -->
+  <rect x="60" y="445" width="300" height="100" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="80" y="468" fill="#e2e8f0" font-size="13" font-weight="bold">yata-cypher</text>
+  <text x="250" y="468" fill="#64748b" font-size="9">~500 LOC</text>
+  <text x="80" y="487" fill="#94a3b8" font-size="10">Full Cypher parser (regex lexing)</text>
+  <text x="80" y="502" fill="#94a3b8" font-size="10">CSR-based executor</text>
+  <text x="80" y="517" fill="#94a3b8" font-size="10">Graph trait, Value, NodeRef, RelRef</text>
+  <text x="80" y="532" fill="#475569" font-size="9">deps: serde_json, indexmap, regex</text>
+
+  <!-- yata-store -->
+  <rect x="400" y="445" width="340" height="100" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="420" y="468" fill="#e2e8f0" font-size="13" font-weight="bold">yata-store</text>
+  <text x="620" y="468" fill="#64748b" font-size="9">~2,000 LOC</text>
+  <text x="420" y="487" fill="#94a3b8" font-size="10">MutableCsrStore (in-memory, GRIN impl)</text>
+  <text x="420" y="502" fill="#94a3b8" font-size="10">DiskVineyard/MmapVineyard (LRU cache)</text>
+  <text x="420" y="517" fill="#94a3b8" font-size="10">GraphStoreEnum dispatch, PartitionedStore</text>
+  <text x="420" y="532" fill="#475569" font-size="9">deps: grin, cypher, vineyard, core, memmap2</text>
+
+  <!-- yata-graph -->
+  <rect x="780" y="445" width="300" height="100" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="800" y="468" fill="#e2e8f0" font-size="13" font-weight="bold">yata-graph</text>
+  <text x="960" y="468" fill="#64748b" font-size="9">~800 LOC</text>
+  <text x="800" y="487" fill="#94a3b8" font-size="10">GraphStore (in-memory + vector idx)</text>
+  <text x="800" y="502" fill="#94a3b8" font-size="10">LRU QueryCache, coordinator</text>
+  <text x="800" y="517" fill="#94a3b8" font-size="10">Pipeline, per-label operations</text>
+  <text x="800" y="532" fill="#475569" font-size="9">deps: cypher, vex, arrow, tokio</text>
+
+  <!-- Layer 1→2 arrows -->
+  <line x1="210" y1="390" x2="210" y2="443" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="550" y1="390" x2="570" y2="443" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="910" y1="390" x2="570" y2="443" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="210" y1="390" x2="570" y2="443" stroke="#334155" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+
+  <!-- ==================== LAYER 3 ==================== -->
+  <text x="40" y="580" fill="#64748b" font-size="10" font-weight="bold">LAYER 3 — Graph Engine</text>
+  <line x1="40" y1="585" x2="1560" y2="585" stroke="#1e293b" stroke-width="1"/>
+
+  <!-- yata-gie -->
+  <rect x="60" y="600" width="320" height="110" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="80" y="623" fill="#e2e8f0" font-size="13" font-weight="bold">yata-gie</text>
+  <text x="250" y="623" fill="#64748b" font-size="9">~1,500 LOC</text>
+  <text x="80" y="642" fill="#94a3b8" font-size="10">GIE Push-Based Executor</text>
+  <text x="80" y="657" fill="#94a3b8" font-size="10">LogicalOp IR (Scan/Filter/Project/Agg)</text>
+  <text x="80" y="672" fill="#94a3b8" font-size="10">SecurityScope predicate pushdown</text>
+  <text x="80" y="687" fill="#94a3b8" font-size="10">Distributed planner + Exchange ops</text>
+  <text x="80" y="702" fill="#475569" font-size="9">deps: grin, store, cypher, serde_json</text>
+
+  <!-- yata-engine (MAIN) -->
+  <rect x="420" y="600" width="400" height="110" rx="8" fill="#1e293b" stroke="#60a5fa" stroke-width="2"/>
+  <text x="440" y="623" fill="#60a5fa" font-size="13" font-weight="bold">yata-engine (MAIN)</text>
+  <text x="680" y="623" fill="#64748b" font-size="9">~3,000 LOC</text>
+  <text x="440" y="642" fill="#94a3b8" font-size="10">TieredGraphEngine (HOT/Warm/Cold)</text>
+  <text x="440" y="657" fill="#94a3b8" font-size="10">RwLock&lt;GraphStoreEnum&gt;, QueryCache</text>
+  <text x="440" y="672" fill="#94a3b8" font-size="10">WAL ring buffer, RLS, snapshot</text>
+  <text x="440" y="687" fill="#94a3b8" font-size="10">Label-selective R2 page-in, frontier BFS</text>
+  <text x="440" y="702" fill="#475569" font-size="9">deps: core,grin,store,cypher,gie,graph,s3,vineyard</text>
+
+  <!-- yata-vex -->
+  <rect x="860" y="600" width="300" height="55" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="880" y="623" fill="#e2e8f0" font-size="13" font-weight="bold">yata-vex</text>
+  <text x="1040" y="623" fill="#64748b" font-size="9">~1,500 LOC</text>
+  <text x="880" y="642" fill="#94a3b8" font-size="10">IVF_PQ + DiskANN (Vamana) vector index</text>
+
+  <!-- yata-s3 -->
+  <rect x="860" y="665" width="300" height="55" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="880" y="688" fill="#e2e8f0" font-size="13" font-weight="bold">yata-s3</text>
+  <text x="1020" y="688" fill="#64748b" font-size="9">~500 LOC</text>
+  <text x="880" y="703" fill="#94a3b8" font-size="10">R2 sync (ureq + rustls + SigV4)</text>
+
+  <!-- Layer 2→3 arrows -->
+  <line x1="210" y1="545" x2="220" y2="598" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="570" y1="545" x2="220" y2="598" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="570" y1="545" x2="620" y2="598" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="930" y1="545" x2="620" y2="598" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="930" y1="545" x2="1010" y2="598" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+
+  <!-- ==================== LAYER 4 ==================== -->
+  <text x="40" y="745" fill="#64748b" font-size="10" font-weight="bold">LAYER 4 — Protocol</text>
+  <line x1="40" y1="750" x2="1560" y2="750" stroke="#1e293b" stroke-width="1"/>
+
+  <!-- yata-server -->
+  <rect x="200" y="765" width="400" height="100" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="2"/>
+  <text x="220" y="788" fill="#22c55e" font-size="13" font-weight="bold">yata-server (ENTRY)</text>
+  <text x="470" y="788" fill="#64748b" font-size="9">~1,000+ LOC</text>
+  <text x="220" y="807" fill="#94a3b8" font-size="10">/xrpc/ai.gftd.yata.cypher (unified R/W)</text>
+  <text x="220" y="822" fill="#94a3b8" font-size="10">Broker (engine + objects + CAS)</text>
+  <text x="220" y="837" fill="#94a3b8" font-size="10">Prometheus metrics, graceful shutdown</text>
+  <text x="220" y="852" fill="#475569" font-size="9">deps: engine, graph, s3, object, axum, tokio, metrics</text>
+
+  <!-- yata-client -->
+  <rect x="640" y="765" width="240" height="60" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="660" y="788" fill="#e2e8f0" font-size="13" font-weight="bold">yata-client</text>
+  <text x="800" y="788" fill="#64748b" font-size="9">~100 LOC</text>
+  <text x="660" y="807" fill="#94a3b8" font-size="10">Async client API (KV/Log/Lance)</text>
+
+  <!-- Layer 3→4 arrows -->
+  <line x1="620" y1="710" x2="400" y2="763" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="620" y1="710" x2="760" y2="763" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+
+  <!-- ==================== LAYER 5 ==================== -->
+  <text x="40" y="900" fill="#64748b" font-size="10" font-weight="bold">LAYER 5 — Dev / Bench</text>
+  <line x1="40" y1="905" x2="1560" y2="905" stroke="#1e293b" stroke-width="1"/>
+
+  <!-- yata-bench -->
+  <rect x="200" y="920" width="400" height="55" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="220" y="943" fill="#e2e8f0" font-size="13" font-weight="bold">yata-bench</text>
+  <text x="400" y="943" fill="#64748b" font-size="9">~1,000 LOC</text>
+  <text x="220" y="962" fill="#94a3b8" font-size="10">Integration benchmarks, trillion-scale projection test</text>
+
+  <line x1="400" y1="865" x2="400" y2="918" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
+
+  <!-- ======================================================== -->
+  <!-- TIERED STORAGE ARCHITECTURE -->
+  <!-- ======================================================== -->
+  <text x="800" y="1020" text-anchor="middle" fill="#f8fafc" font-size="18" font-weight="bold">Tiered Storage Data Flow</text>
+  <line x1="40" y1="1030" x2="1560" y2="1030" stroke="#334155" stroke-width="1"/>
+
+  <!-- HOT tier -->
+  <rect x="60" y="1050" width="460" height="180" rx="10" fill="url(#hotGrad)" stroke="#dc2626" stroke-width="1.5" stroke-opacity="0.5"/>
+  <text x="80" y="1075" fill="#fca5a5" font-size="14" font-weight="bold">HOT (CSR In-Memory)</text>
+  <text x="360" y="1075" fill="#dc2626" font-size="11">&lt;1us query</text>
+
+  <rect x="80" y="1090" width="200" height="50" rx="6" fill="#1e293b" stroke="#dc2626" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="95" y="1110" fill="#e2e8f0" font-size="11">MutableCsrStore</text>
+  <text x="95" y="1127" fill="#94a3b8" font-size="9">RwLock&lt;GraphStoreEnum&gt;</text>
+
+  <rect x="300" y="1090" width="200" height="50" rx="6" fill="#1e293b" stroke="#dc2626" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="315" y="1110" fill="#e2e8f0" font-size="11">QueryCache (LRU+TTL)</text>
+  <text x="315" y="1127" fill="#94a3b8" font-size="9">generation invalidation</text>
+
+  <rect x="80" y="1150" width="200" height="50" rx="6" fill="#1e293b" stroke="#dc2626" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="95" y="1170" fill="#e2e8f0" font-size="11">GIE Push Executor</text>
+  <text x="95" y="1187" fill="#94a3b8" font-size="9">Cypher → IR → push records</text>
+
+  <rect x="300" y="1150" width="200" height="50" rx="6" fill="#1e293b" stroke="#dc2626" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="315" y="1170" fill="#e2e8f0" font-size="11">SecurityFilter (RLS)</text>
+  <text x="315" y="1187" fill="#94a3b8" font-size="9">org_id, clearance, consent</text>
+
+  <!-- WARM tier -->
+  <rect x="570" y="1050" width="340" height="180" rx="10" fill="url(#warmGrad)" stroke="#f59e0b" stroke-width="1.5" stroke-opacity="0.5"/>
+  <text x="590" y="1075" fill="#fcd34d" font-size="14" font-weight="bold">WARM (Disk Cache)</text>
+  <text x="810" y="1075" fill="#f59e0b" font-size="11">~100us</text>
+
+  <rect x="590" y="1090" width="140" height="55" rx="6" fill="#1e293b" stroke="#f59e0b" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="605" y="1110" fill="#e2e8f0" font-size="11">DiskVineyard</text>
+  <text x="605" y="1130" fill="#94a3b8" font-size="9">LRU evict cache</text>
+
+  <rect x="750" y="1090" width="140" height="55" rx="6" fill="#1e293b" stroke="#f59e0b" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="765" y="1110" fill="#e2e8f0" font-size="11">MmapVineyard</text>
+  <text x="765" y="1130" fill="#94a3b8" font-size="9">zero-copy mmap</text>
+
+  <rect x="590" y="1155" width="300" height="50" rx="6" fill="#1e293b" stroke="#f59e0b" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="605" y="1175" fill="#e2e8f0" font-size="11">ArrowFragment blobs (per-label IPC)</text>
+  <text x="605" y="1192" fill="#94a3b8" font-size="9">8GB ephemeral disk, write-through from R2</text>
+
+  <!-- COLD tier -->
+  <rect x="960" y="1050" width="320" height="180" rx="10" fill="url(#coldGrad)" stroke="#3b82f6" stroke-width="1.5" stroke-opacity="0.5"/>
+  <text x="980" y="1075" fill="#93c5fd" font-size="14" font-weight="bold">COLD (R2 Source of Truth)</text>
+  <text x="1200" y="1075" fill="#3b82f6" font-size="11">~3-5ms</text>
+
+  <rect x="980" y="1090" width="280" height="50" rx="6" fill="#1e293b" stroke="#3b82f6" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="995" y="1110" fill="#e2e8f0" font-size="11">snap/fragment/meta.json</text>
+  <text x="995" y="1127" fill="#94a3b8" font-size="9">schema + blob manifest</text>
+
+  <rect x="980" y="1150" width="280" height="50" rx="6" fill="#1e293b" stroke="#3b82f6" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="995" y="1170" fill="#e2e8f0" font-size="11">vertex_table_N / edge_table_N</text>
+  <text x="995" y="1187" fill="#94a3b8" font-size="9">Arrow IPC, 32MB chunks, SigV4</text>
+
+  <!-- Tier flow arrows -->
+  <line x1="520" y1="1140" x2="568" y2="1140" stroke="#f59e0b" stroke-width="2" marker-end="url(#arrowAmber)"/>
+  <text x="525" y="1133" fill="#f59e0b" font-size="8">page-in</text>
+  <line x1="910" y1="1140" x2="958" y2="1140" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="915" y="1133" fill="#3b82f6" font-size="8">fetch</text>
+
+  <!-- ======================================================== -->
+  <!-- WRITE PATH -->
+  <!-- ======================================================== -->
+  <rect x="60" y="1260" width="1220" height="80" rx="10" fill="#1e293b" stroke="#22c55e" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="80" y="1285" fill="#22c55e" font-size="13" font-weight="bold">Write Path</text>
+  <text x="80" y="1305" fill="#94a3b8" font-size="11">App → PDS_RPC.createRecord → Pipeline.send() (durable, ~1ms) → YATA_RPC.mergeRecord() (CSR append, no page-in) → dirty=true</text>
+  <text x="80" y="1325" fill="#94a3b8" font-size="11">Snapshot: cron 1min, dirty-gated → csr_to_fragment() → R2 PUT (full compaction, dirty labels only [DESIGN])</text>
+
+  <!-- ======================================================== -->
+  <!-- SHANNON ANALYSIS -->
+  <!-- ======================================================== -->
+  <text x="800" y="1390" text-anchor="middle" fill="#f8fafc" font-size="18" font-weight="bold">Shannon Information-Theoretic Problem Analysis</text>
+  <line x1="40" y1="1400" x2="1560" y2="1400" stroke="#334155" stroke-width="1"/>
+
+  <!-- MEMORY Problems -->
+  <rect x="60" y="1420" width="730" height="170" rx="10" fill="#1e293b" stroke="#ef4444" stroke-width="2" stroke-opacity="0.7" filter="url(#redGlow)"/>
+  <text x="80" y="1445" fill="#ef4444" font-size="14" font-weight="bold">MEMORY (4GB RAM per Container)</text>
+
+  <!-- Problem 1 -->
+  <rect x="80" y="1460" width="340" height="60" rx="6" fill="#1a0505" stroke="#7f1d1d" stroke-width="1"/>
+  <text x="95" y="1478" fill="#fca5a5" font-size="11" font-weight="bold">P1: Full CSR in RAM</text>
+  <text x="95" y="1493" fill="#f87171" font-size="10">~20M nodes/4GB = 200B/node avg</text>
+  <text x="95" y="1508" fill="#94a3b8" font-size="9">H(CSR) = topology+props; no spill-to-disk</text>
+
+  <!-- Problem 2 -->
+  <rect x="440" y="1460" width="330" height="60" rx="6" fill="#1a0505" stroke="#7f1d1d" stroke-width="1"/>
+  <text x="455" y="1478" fill="#fca5a5" font-size="11" font-weight="bold">P2: Full Compaction Snapshot</text>
+  <text x="455" y="1493" fill="#f87171" font-size="10">O(N) serialize even for 1 dirty label</text>
+  <text x="455" y="1508" fill="#94a3b8" font-size="9">H(snapshot)/H(delta) = N/delta = ~10,000x waste</text>
+
+  <!-- Problem 3 -->
+  <rect x="80" y="1530" width="690" height="45" rx="6" fill="#1a0505" stroke="#7f1d1d" stroke-width="1"/>
+  <text x="95" y="1548" fill="#fca5a5" font-size="11" font-weight="bold">P3: QueryCache + CSR + ArrowFragment = triple memory residence</text>
+  <text x="95" y="1563" fill="#94a3b8" font-size="9">Shannon redundancy ~200% — same data in 3 representations. LRU eviction is the only relief valve.</text>
+
+  <!-- NETWORK Problems -->
+  <rect x="60" y="1605" width="730" height="170" rx="10" fill="#1e293b" stroke="#f59e0b" stroke-width="2" stroke-opacity="0.7" filter="url(#yellowGlow)"/>
+  <text x="80" y="1630" fill="#f59e0b" font-size="14" font-weight="bold">NETWORK (Workers RPC + R2 API)</text>
+
+  <!-- Problem 4 -->
+  <rect x="80" y="1645" width="340" height="60" rx="6" fill="#1a0a00" stroke="#78350f" stroke-width="1"/>
+  <text x="95" y="1663" fill="#fcd34d" font-size="11" font-weight="bold">P4: Full Page-In on Cold Start</text>
+  <text x="95" y="1678" fill="#fbbf24" font-size="10">ALL labels from R2 = O(N) network</text>
+  <text x="95" y="1693" fill="#94a3b8" font-size="9">Cold start 2.8s. η(needed/total) = ~5%</text>
+
+  <!-- Problem 5 -->
+  <rect x="440" y="1645" width="330" height="60" rx="6" fill="#1a0a00" stroke="#78350f" stroke-width="1"/>
+  <text x="455" y="1663" fill="#fcd34d" font-size="11" font-weight="bold">P5: Coordinator Fan-Out Overhead</text>
+  <text x="455" y="1678" fill="#fbbf24" font-size="10">103 QPS (6-node) vs 205K QPS (local)</text>
+  <text x="455" y="1693" fill="#94a3b8" font-size="9">2ms coordinator latency, 2000x degradation</text>
+
+  <!-- Problem 6 -->
+  <rect x="80" y="1715" width="690" height="45" rx="6" fill="#1a0a00" stroke="#78350f" stroke-width="1"/>
+  <text x="95" y="1733" fill="#fcd34d" font-size="11" font-weight="bold">P6: Pipeline WAL + R2 Snapshot = dual persistence (Shannon redundancy ~100%)</text>
+  <text x="95" y="1748" fill="#94a3b8" font-size="9">Both Pipeline WAL (R2 JSON, 10s) and snapshot (R2 ArrowFragment) persist the same data. Snapshot = pure checkpoint.</text>
+
+  <!-- DISK Problems -->
+  <rect x="830" y="1420" width="440" height="170" rx="10" fill="#1e293b" stroke="#a855f7" stroke-width="2" stroke-opacity="0.7"/>
+  <text x="850" y="1445" fill="#a855f7" font-size="14" font-weight="bold">DISK (8GB Ephemeral)</text>
+
+  <!-- Problem 7 -->
+  <rect x="850" y="1460" width="400" height="55" rx="6" fill="#0f0520" stroke="#581c87" stroke-width="1"/>
+  <text x="865" y="1478" fill="#d8b4fe" font-size="11" font-weight="bold">P7: DiskVineyard LRU pressure</text>
+  <text x="865" y="1493" fill="#c084fc" font-size="10">8GB disk, many labels = frequent eviction</text>
+  <text x="865" y="1508" fill="#94a3b8" font-size="9">Re-fetch from R2 on eviction → network amplification</text>
+
+  <!-- Problem 8 -->
+  <rect x="850" y="1525" width="400" height="55" rx="6" fill="#0f0520" stroke="#581c87" stroke-width="1"/>
+  <text x="865" y="1543" fill="#d8b4fe" font-size="11" font-weight="bold">P8: mmap fragmentation (MmapVineyard)</text>
+  <text x="865" y="1558" fill="#c084fc" font-size="10">500M edge claim but page faults are OS-dependent</text>
+  <text x="865" y="1573" fill="#94a3b8" font-size="9">No control over page-in granularity</text>
+
+  <!-- COMPUTE Problems -->
+  <rect x="830" y="1605" width="440" height="170" rx="10" fill="#1e293b" stroke="#06b6d4" stroke-width="2" stroke-opacity="0.7"/>
+  <text x="850" y="1630" fill="#06b6d4" font-size="14" font-weight="bold">COMPUTE (1 vCPU per Container)</text>
+
+  <!-- Problem 9 -->
+  <rect x="850" y="1645" width="400" height="55" rx="6" fill="#001a20" stroke="#155e75" stroke-width="1"/>
+  <text x="865" y="1663" fill="#67e8f9" font-size="11" font-weight="bold">P9: Mutation = CSR rebuild O(V+E)</text>
+  <text x="865" y="1678" fill="#22d3ee" font-size="10">~500ms mutation (MemoryGraph copy → rebuild)</text>
+  <text x="865" y="1693" fill="#94a3b8" font-size="9">Single vCPU bottleneck, write lock duration</text>
+
+  <!-- Problem 10 -->
+  <rect x="850" y="1710" width="400" height="55" rx="6" fill="#001a20" stroke="#155e75" stroke-width="1"/>
+  <text x="865" y="1728" fill="#67e8f9" font-size="11" font-weight="bold">P10: csr_to_fragment() serialization</text>
+  <text x="865" y="1743" fill="#22d3ee" font-size="10">15ms@10K, projected ~150s@10M (linear)</text>
+  <text x="865" y="1758" fill="#94a3b8" font-size="9">Blocks snapshot cron on single vCPU</text>
+
+  <!-- ======================================================== -->
+  <!-- SHANNON EFFICIENCY TABLE -->
+  <!-- ======================================================== -->
+  <text x="800" y="1830" text-anchor="middle" fill="#f8fafc" font-size="16" font-weight="bold">Shannon Efficiency Summary (H = entropy bits transferred / total bits moved)</text>
+
+  <!-- Table header -->
+  <rect x="100" y="1845" width="1400" height="30" rx="4" fill="#334155"/>
+  <text x="140" y="1865" fill="#e2e8f0" font-size="11" font-weight="bold">Dimension</text>
+  <text x="340" y="1865" fill="#e2e8f0" font-size="11" font-weight="bold">Current State</text>
+  <text x="640" y="1865" fill="#e2e8f0" font-size="11" font-weight="bold">Shannon Waste</text>
+  <text x="940" y="1865" fill="#e2e8f0" font-size="11" font-weight="bold">Optimal Target</text>
+  <text x="1240" y="1865" fill="#e2e8f0" font-size="11" font-weight="bold">Gain</text>
+
+  <!-- Memory row -->
+  <rect x="100" y="1878" width="1400" height="28" rx="0" fill="#1e293b"/>
+  <rect x="100" y="1878" width="30" height="28" fill="#ef4444" fill-opacity="0.3"/>
+  <text x="140" y="1897" fill="#fca5a5" font-size="11">MEMORY</text>
+  <text x="340" y="1897" fill="#94a3b8" font-size="10">CSR + Cache + ArrowBlob = 3x residence (4GB)</text>
+  <text x="640" y="1897" fill="#f87171" font-size="10">~200% redundancy (same data 3 forms)</text>
+  <text x="940" y="1897" fill="#94a3b8" font-size="10">CSR-only + on-demand Arrow decode</text>
+  <text x="1240" y="1897" fill="#22c55e" font-size="10">~2x capacity</text>
+
+  <!-- Network row -->
+  <rect x="100" y="1908" width="1400" height="28" rx="0" fill="#1a2332"/>
+  <rect x="100" y="1908" width="30" height="28" fill="#f59e0b" fill-opacity="0.3"/>
+  <text x="140" y="1927" fill="#fcd34d" font-size="11">NETWORK</text>
+  <text x="340" y="1927" fill="#94a3b8" font-size="10">Full page-in + full snapshot PUT = O(N) both ways</text>
+  <text x="640" y="1927" fill="#fbbf24" font-size="10">η(cold)=5%, η(snap)=0.01% (N=1M, Δ=100)</text>
+  <text x="940" y="1927" fill="#94a3b8" font-size="10">Label-selective + dirty-delta PUT</text>
+  <text x="1240" y="1927" fill="#22c55e" font-size="10">η→85%</text>
+
+  <!-- Disk row -->
+  <rect x="100" y="1938" width="1400" height="28" rx="0" fill="#1e293b"/>
+  <rect x="100" y="1938" width="30" height="28" fill="#a855f7" fill-opacity="0.3"/>
+  <text x="140" y="1957" fill="#d8b4fe" font-size="11">DISK</text>
+  <text x="340" y="1957" fill="#94a3b8" font-size="10">8GB LRU cache, eviction → R2 re-fetch</text>
+  <text x="640" y="1957" fill="#c084fc" font-size="10">Re-fetch = wasted prior download bits</text>
+  <text x="940" y="1957" fill="#94a3b8" font-size="10">Priority-based eviction (hot labels kept)</text>
+  <text x="1240" y="1957" fill="#22c55e" font-size="10">~3x hit rate</text>
+
+  <!-- Compute row -->
+  <rect x="100" y="1968" width="1400" height="28" rx="0" fill="#1a2332"/>
+  <rect x="100" y="1968" width="30" height="28" fill="#06b6d4" fill-opacity="0.3"/>
+  <text x="140" y="1987" fill="#67e8f9" font-size="11">COMPUTE</text>
+  <text x="340" y="1987" fill="#94a3b8" font-size="10">CSR rebuild O(V+E) per mutation, 1 vCPU</text>
+  <text x="640" y="1987" fill="#22d3ee" font-size="10">500ms/mutation (rebuild entire graph)</text>
+  <text x="940" y="1987" fill="#94a3b8" font-size="10">Incremental CSR update (add/delete only)</text>
+  <text x="1240" y="1987" fill="#22c55e" font-size="10">~1000x</text>
+
+  <!-- Dual persistence row -->
+  <rect x="100" y="1998" width="1400" height="28" rx="0" fill="#1e293b"/>
+  <rect x="100" y="1998" width="30" height="28" fill="#ef4444" fill-opacity="0.3"/>
+  <text x="140" y="2017" fill="#fca5a5" font-size="11">PERSISTENCE</text>
+  <text x="340" y="2017" fill="#94a3b8" font-size="10">Pipeline WAL (R2 JSON) + Snapshot (R2 Arrow)</text>
+  <text x="640" y="2017" fill="#f87171" font-size="10">~100% (same data in 2 R2 paths)</text>
+  <text x="940" y="2017" fill="#94a3b8" font-size="10">WAL = truth, Snapshot = checkpoint only</text>
+  <text x="1240" y="2017" fill="#94a3b8" font-size="10">(by design)</text>
+
+  <!-- ======================================================== -->
+  <!-- LEGEND -->
+  <!-- ======================================================== -->
+  <rect x="100" y="2050" width="1400" height="100" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <text x="120" y="2075" fill="#e2e8f0" font-size="12" font-weight="bold">Legend</text>
+
+  <rect x="120" y="2085" width="14" height="14" rx="2" fill="#dc2626" fill-opacity="0.4"/>
+  <text x="140" y="2097" fill="#fca5a5" font-size="10">CRITICAL: Capacity limit / high waste</text>
+
+  <rect x="370" y="2085" width="14" height="14" rx="2" fill="#f59e0b" fill-opacity="0.4"/>
+  <text x="390" y="2097" fill="#fcd34d" font-size="10">WARNING: Suboptimal efficiency</text>
+
+  <rect x="620" y="2085" width="14" height="14" rx="2" fill="#a855f7" fill-opacity="0.4"/>
+  <text x="640" y="2097" fill="#d8b4fe" font-size="10">INFO: OS-dependent / design tradeoff</text>
+
+  <rect x="870" y="2085" width="14" height="14" rx="2" fill="#06b6d4" fill-opacity="0.4"/>
+  <text x="890" y="2097" fill="#67e8f9" font-size="10">COMPUTE: Single-thread bottleneck</text>
+
+  <line x1="120" y1="2115" x2="170" y2="2115" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="180" y="2119" fill="#94a3b8" font-size="10">crate dependency</text>
+
+  <line x1="320" y1="2115" x2="370" y2="2115" stroke="#334155" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+  <text x="380" y="2119" fill="#94a3b8" font-size="10">indirect dependency</text>
+
+  <rect x="520" y="2108" width="60" height="16" rx="4" fill="none" stroke="#60a5fa" stroke-width="2"/>
+  <text x="590" y="2119" fill="#60a5fa" font-size="10">main orchestrator</text>
+
+  <rect x="750" y="2108" width="60" height="16" rx="4" fill="none" stroke="#22c55e" stroke-width="2"/>
+  <text x="820" y="2119" fill="#22c55e" font-size="10">entry point</text>
+
+  <text x="120" y="2140" fill="#475569" font-size="10">12 crates | ~22,000 LOC | 854 tests | Edition 2024 | Apache-2.0 | Cross-compile: cargo zigbuild x86_64-unknown-linux-gnu</text>
+
+  <!-- ======================================================== -->
+  <!-- EXTERNAL DEPS on the right side -->
+  <!-- ======================================================== -->
+  <rect x="1160" y="125" width="380" height="480" rx="10" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <text x="1180" y="150" fill="#94a3b8" font-size="13" font-weight="bold">External Dependencies</text>
+
+  <text x="1180" y="175" fill="#64748b" font-size="10" font-weight="bold">Core</text>
+  <text x="1180" y="192" fill="#94a3b8" font-size="10">arrow v53 (IPC, columnar)</text>
+  <text x="1180" y="207" fill="#94a3b8" font-size="10">tokio (async runtime)</text>
+  <text x="1180" y="222" fill="#94a3b8" font-size="10">serde + serde_json</text>
+  <text x="1180" y="237" fill="#94a3b8" font-size="10">rkyv (zero-copy WAL)</text>
+
+  <text x="1180" y="262" fill="#64748b" font-size="10" font-weight="bold">Crypto</text>
+  <text x="1180" y="279" fill="#94a3b8" font-size="10">blake3 (content hash)</text>
+  <text x="1180" y="294" fill="#94a3b8" font-size="10">sha2 + hmac (SigV4)</text>
+  <text x="1180" y="309" fill="#94a3b8" font-size="10">rustls (TLS, no openssl)</text>
+
+  <text x="1180" y="334" fill="#64748b" font-size="10" font-weight="bold">HTTP / Server</text>
+  <text x="1180" y="351" fill="#94a3b8" font-size="10">axum 0.7 + tower-http</text>
+  <text x="1180" y="366" fill="#94a3b8" font-size="10">ureq (sync S3 client)</text>
+
+  <text x="1180" y="391" fill="#64748b" font-size="10" font-weight="bold">Storage</text>
+  <text x="1180" y="408" fill="#94a3b8" font-size="10">memmap2 (zero-copy mmap)</text>
+  <text x="1180" y="423" fill="#94a3b8" font-size="10">ciborium (CBOR)</text>
+
+  <text x="1180" y="448" fill="#64748b" font-size="10" font-weight="bold">Observability</text>
+  <text x="1180" y="465" fill="#94a3b8" font-size="10">metrics 0.24 + prometheus</text>
+  <text x="1180" y="480" fill="#94a3b8" font-size="10">tracing + subscriber (JSON)</text>
+
+  <text x="1180" y="505" fill="#64748b" font-size="10" font-weight="bold">Misc</text>
+  <text x="1180" y="522" fill="#94a3b8" font-size="10">indexmap, regex, uuid</text>
+  <text x="1180" y="537" fill="#94a3b8" font-size="10">rayon (parallel vex), rand</text>
+  <text x="1180" y="552" fill="#94a3b8" font-size="10">thiserror, anyhow</text>
+  <text x="1180" y="567" fill="#94a3b8" font-size="10">once_cell, bytes</text>
+
+  <text x="1180" y="592" fill="#ef4444" font-size="10" font-weight="bold">BANNED: reqwest, aws-lc-sys, openssl</text>
+
+  <!-- Query pipeline on right side -->
+  <rect x="1160" y="625" width="380" height="240" rx="10" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <text x="1180" y="650" fill="#94a3b8" font-size="13" font-weight="bold">Query Execution Pipeline</text>
+
+  <rect x="1195" y="665" width="160" height="24" rx="4" fill="#334155"/>
+  <text x="1210" y="682" fill="#e2e8f0" font-size="10">Cypher string</text>
+
+  <line x1="1275" y1="689" x2="1275" y2="700" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="1195" y="700" width="160" height="24" rx="4" fill="#334155"/>
+  <text x="1210" y="717" fill="#e2e8f0" font-size="10">yata_cypher::parse()</text>
+
+  <line x1="1275" y1="724" x2="1275" y2="735" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="1195" y="735" width="160" height="24" rx="4" fill="#334155"/>
+  <text x="1210" y="752" fill="#e2e8f0" font-size="10">yata_gie::transpile()</text>
+
+  <line x1="1275" y1="759" x2="1275" y2="770" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="1195" y="770" width="160" height="24" rx="4" fill="#334155"/>
+  <text x="1210" y="787" fill="#e2e8f0" font-size="10">yata_gie::optimize()</text>
+
+  <line x1="1275" y1="794" x2="1275" y2="805" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="1195" y="805" width="160" height="24" rx="4" fill="#334155"/>
+  <text x="1210" y="822" fill="#e2e8f0" font-size="10">yata_gie::execute()</text>
+
+  <line x1="1275" y1="829" x2="1275" y2="840" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="1195" y="840" width="160" height="24" rx="4" fill="#22c55e" fill-opacity="0.2" stroke="#22c55e" stroke-width="1"/>
+  <text x="1210" y="857" fill="#22c55e" font-size="10">Vec&lt;Record&gt;</text>
+
+  <text x="1375" y="682" fill="#64748b" font-size="9">regex lexing</text>
+  <text x="1375" y="717" fill="#64748b" font-size="9">AST → LogicalOp</text>
+  <text x="1375" y="752" fill="#64748b" font-size="9">+ SecurityScope</text>
+  <text x="1375" y="787" fill="#64748b" font-size="9">cost-based</text>
+  <text x="1375" y="822" fill="#64748b" font-size="9">push-based stream</text>
+</svg>
