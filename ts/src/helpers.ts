@@ -1,35 +1,17 @@
 /**
  * @gftd/yata — Helper functions for yata graph interaction.
  *
- * Encoding, escaping, label conversion, merge props, record decode.
+ * Encoding, escaping, merge props, record decode, row mapping.
+ * Primitives (generateTid, toBase64, fnv1a32, cl, collectionToLabel) are
+ * re-exported from @gftd/xrpc (Single Source of Truth).
  */
 
 import type { MergeProps } from "./types.js";
+import { toBase64, fnv1a32 } from "@gftd/xrpc/encode";
 
-// ── AT Protocol TID (Timestamp ID) generation ──
-
-const TID_CHARSET = "234567abcdefghijklmnopqrstuvwxyz";
-let _lastTid = 0n;
-
-/**
- * Generate an AT Protocol TID (timestamp-based, base32-sortable, 13 chars).
- * Guaranteed monotonically increasing within this instance.
- */
-export function generateTid(): string {
-  const micros = BigInt(Date.now()) * 1000n;
-  const clockId = BigInt(Math.floor(Math.random() * 1024));
-  let tidVal = (micros << 10n) | clockId;
-  if (tidVal <= _lastTid) {
-    tidVal = _lastTid + 1n;
-  }
-  _lastTid = tidVal;
-  const chars: string[] = new Array(13);
-  for (let i = 12; i >= 0; i--) {
-    chars[i] = TID_CHARSET[Number(tidVal & 0x1fn)];
-    tidVal >>= 5n;
-  }
-  return chars.join("");
-}
+// Re-export from @gftd/xrpc (Single Source of Truth — Shannon: no local copies)
+export { collectionToLabel, expandCollection } from "@gftd/xrpc/nsid";
+export { generateTid, toBase64, fnv1a32, cl } from "@gftd/xrpc/encode";
 
 // ── Cypher escaping ──
 
@@ -43,39 +25,7 @@ export function multiDidFilter(field: string, did: string): string {
   return `(${field} = "${esc(did)}" OR ${field} STARTS WITH "${esc(did)}:")`;
 }
 
-// ── Collection ↔ Label conversion ──
-
-/**
- * Convert AT Protocol collection (NSID) to yata Cypher label.
- * "app.bsky.feed.post" → "Post"
- * "ai.gftd.apps.news.article" → "Article"
- * "app.bsky.graph.follow" → "Follow"
- */
-export function collectionToLabel(collection: string): string {
-  const parts = collection.split(".");
-  const last = parts[parts.length - 1];
-  return last
-    .split(/[-_]/)
-    .map((seg) => seg.charAt(0).toUpperCase() + seg.slice(1))
-    .join("");
-}
-
-/**
- * Expand a short kind to full AT Protocol collection NSID.
- * "article" → "ai.gftd.apps.news.article" (if appName="news")
- * "app.bsky.feed.post" → "app.bsky.feed.post" (passthrough)
- */
-export function expandCollection(kind: string, appName?: string): string {
-  if (!kind || kind.includes(".")) return kind;
-  return appName ? `ai.gftd.apps.${appName}.${kind}` : kind;
-}
-
-// ── Encoding / Decoding ──
-
-/** Encode string to base64 (browser + Worker compatible). */
-export function toBase64(str: string): string {
-  return btoa(String.fromCodePoint(...new TextEncoder().encode(str)));
-}
+// ── Decoding ──
 
 /** Decode base64-encoded value_b64 to a record object. Returns {} on failure. */
 export function tryDecodeRecord(b64: unknown): Record<string, unknown> {
@@ -92,29 +42,9 @@ export function tryDecodeRecord(b64: unknown): Record<string, unknown> {
   }
 }
 
-/** Clean a Cypher result value (strip surrounding quotes). */
-export function cl(v: unknown): string {
-  return typeof v === "string" ? v.replace(/"/g, "") : String(v ?? "");
-}
-
-// ── FNV-1a hash (for owner_hash property) ──
-
-/** FNV-1a 32-bit hash. Used for owner_hash vertex property. */
-export function fnv1a32(input: string): number {
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < input.length; i++) {
-    hash ^= input.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return hash >>> 0;
-}
-
 // ── Merge Props ──
 
-/**
- * Build merge properties for YATA_RPC.mergeRecord().
- * Computes sensitivity_ord and owner_hash from repo DID.
- */
+/** Build merge properties for YATA_RPC.mergeRecord(). */
 export function buildMergeProps(
   collection: string,
   json: string,

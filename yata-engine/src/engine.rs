@@ -146,6 +146,32 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Infrastructure blobs that are always uploaded (schema, ivnums).
+/// meta.json is handled separately.
+fn is_infra_blob(name: &str) -> bool {
+    name == "schema" || name == "ivnums"
+}
+
+/// Check if blob name corresponds to a dirty vertex label.
+/// Blob names: `vertex_table_{i}` or `vertex_table_{i}_chunk_{j}`.
+fn is_dirty_vertex_blob(name: &str, dirty_vlabel_ids: &HashSet<usize>) -> bool {
+    if let Some(rest) = name.strip_prefix("vertex_table_") {
+        // Extract label index: first numeric segment before '_chunk_' or end
+        let idx_str = rest.split('_').next().unwrap_or("");
+        if let Ok(idx) = idx_str.parse::<usize>() {
+            return dirty_vlabel_ids.contains(&idx);
+        }
+    }
+    false
+}
+
+/// Edge and topology blobs: edge_table_*, oe_*, ie_*.
+fn is_edge_or_topology_blob(name: &str) -> bool {
+    name.starts_with("edge_table_")
+        || name.starts_with("oe_")
+        || name.starts_with("ie_")
+}
+
 /// Mutation context: metadata auto-injected into every mutated node.
 #[derive(Debug, Clone, Default)]
 pub struct MutationContext {
@@ -1005,20 +1031,27 @@ impl TieredGraphEngine {
     }
 
     fn trigger_snapshot_inner(&self, force: bool) -> Result<(u64, u64), String> {
-        // Skip if no mutations since last snapshot
-        let has_dirty_labels = if let Ok(dl) = self.dirty_labels.lock() {
-            !dl.is_empty()
+        // Drain dirty_labels atomically — snapshot owns this set from here.
+        let dirty_set: HashSet<String> = if let Ok(mut dl) = self.dirty_labels.lock() {
+            dl.drain().collect()
         } else {
-            false
+            HashSet::new()
         };
-        if !self.dirty.load(Ordering::Relaxed) && !has_dirty_labels {
+        let had_dirty_flag = self.dirty.load(Ordering::Relaxed);
+
+        // Skip if no mutations since last snapshot
+        if !had_dirty_flag && dirty_set.is_empty() {
             return Ok((0, 0));
         }
 
         // Check batch_commit_threshold: skip snapshot if not enough pending writes
         let pending = self.pending_writes.load(Ordering::Relaxed);
         if pending < self.config.batch_commit_threshold as usize && !force {
-            return Ok((0, 0)); // Not enough writes to justify snapshot
+            // Put dirty labels back — they weren't consumed
+            if let Ok(mut dl) = self.dirty_labels.lock() {
+                dl.extend(dirty_set);
+            }
+            return Ok((0, 0));
         }
 
         let s3 = self.get_s3_client()
@@ -1029,16 +1062,23 @@ impl TieredGraphEngine {
         self.hot_initialized.store(true, Ordering::Relaxed);
 
         // Serialize CSR → ArrowFragment → MemoryBlobStore
-        let (v_count, e_count, blob_store, meta) = if let Ok(csr) = self.hot.read() {
+        // Uses selective conversion: only dirty vertex labels get property extraction.
+        let (v_count, e_count, blob_store, meta, dirty_vlabel_ids) = if let Ok(csr) = self.hot.read() {
             let store = csr.as_single()
                 .ok_or_else(|| "no CSR store available".to_string())?;
             let pid = store.partition_id_raw().get();
-            let frag = yata_vineyard::convert::csr_to_fragment(store, pid);
+            let frag = yata_vineyard::convert::csr_to_fragment_selective(store, pid, &dirty_set);
             let vc = frag.ivnums.iter().sum::<u64>();
             let ec = frag.edge_num();
+            // Compute dirty vertex label IDs for selective blob upload
+            let ids: HashSet<usize> = frag.schema.vertex_entries.iter()
+                .enumerate()
+                .filter(|(_, e)| dirty_set.contains(&e.label))
+                .map(|(i, _)| i)
+                .collect();
             let bs = yata_vineyard::blob::MemoryBlobStore::new();
             let m = frag.serialize(&bs);
-            (vc, ec, bs, m)
+            (vc, ec, bs, m, ids)
         } else {
             return Err("failed to acquire CSR lock".into());
         };
@@ -1049,11 +1089,19 @@ impl TieredGraphEngine {
             return Ok((0, 0));
         }
 
-        // WAL mode: CSR is authoritative. No partial page-in guard needed.
-
-        // Upload ArrowFragment blobs to R2 (name-based, no CAS)
+        // Dirty label delta upload: only PUT blobs for dirty vertex labels.
+        // Infrastructure blobs (schema, ivnums, meta.json) are always uploaded.
+        // Edge/topology blobs are uploaded only when dirty flag indicates edge mutations.
         let mut uploaded = 0u32;
+        let mut skipped = 0u32;
         for name in meta.blobs.keys() {
+            let should_upload = is_infra_blob(name)
+                || is_dirty_vertex_blob(name, &dirty_vlabel_ids)
+                || (had_dirty_flag && is_edge_or_topology_blob(name));
+            if !should_upload {
+                skipped += 1;
+                continue;
+            }
             if let Some(data) = BlobStore::get(&blob_store, name) {
                 let full_key = format!("{prefix}snap/fragment/{name}");
                 if let Err(e) = s3.put_sync(&full_key, data) {
@@ -1064,20 +1112,24 @@ impl TieredGraphEngine {
             }
         }
 
-        // Upload fragment meta (ObjectMeta JSON)
+        // Upload fragment meta (ObjectMeta JSON) — always, reflects full CSR state
         let meta_json = serde_json::to_vec(&meta).unwrap_or_default();
         let meta_key = format!("{prefix}snap/fragment/meta.json");
         if let Err(e) = s3.put_sync(&meta_key, bytes::Bytes::from(meta_json.clone())) {
             tracing::error!(error = %e, "R2 fragment meta upload failed");
         }
 
-        // Write blobs to YATA_VINEYARD_DIR on disk (fallback/cache for Container process restarts)
+        // Write dirty blobs to YATA_VINEYARD_DIR on disk (same selective logic)
         if let Ok(vineyard_dir) = std::env::var("YATA_VINEYARD_DIR") {
             let snap_dir = format!("{vineyard_dir}/snap/fragment");
             if let Err(e) = std::fs::create_dir_all(&snap_dir) {
                 tracing::warn!(error = %e, "failed to create vineyard snap dir for disk cache");
             } else {
                 for name in meta.blobs.keys() {
+                    let should_write = is_infra_blob(name)
+                        || is_dirty_vertex_blob(name, &dirty_vlabel_ids)
+                        || (had_dirty_flag && is_edge_or_topology_blob(name));
+                    if !should_write { continue; }
                     if let Some(data) = BlobStore::get(&blob_store, name) {
                         let path = format!("{snap_dir}/{name}");
                         if let Err(e) = std::fs::write(&path, &data[..]) {
@@ -1085,12 +1137,12 @@ impl TieredGraphEngine {
                         }
                     }
                 }
-                // Write meta.json to disk
+                // Write meta.json to disk — always
                 let meta_path = format!("{snap_dir}/meta.json");
                 if let Err(e) = std::fs::write(&meta_path, &meta_json) {
                     tracing::warn!(error = %e, "failed to write meta.json to disk cache");
                 }
-                tracing::debug!(snap_dir, "snapshot blobs written to disk cache");
+                tracing::debug!(snap_dir, "delta snapshot blobs written to disk cache");
             }
         }
 
@@ -1110,14 +1162,16 @@ impl TieredGraphEngine {
             tracing::error!(error = %e, "R2 snapshot manifest upload failed");
         }
 
-        // Clear dirty flag, dirty labels, pending writes, and update last snapshot count
+        // Clear dirty flag and pending writes (dirty_labels already drained above)
         self.dirty.store(false, Ordering::Relaxed);
         self.pending_writes.store(0, Ordering::Relaxed);
-        if let Ok(mut dl) = self.dirty_labels.lock() {
-            dl.clear();
-        }
 
-        tracing::info!(vertices = v_count, edges = e_count, blobs = uploaded, "R2 checkpoint written");
+        tracing::info!(
+            vertices = v_count, edges = e_count,
+            uploaded = uploaded, skipped = skipped,
+            dirty_labels = dirty_set.len(),
+            "R2 delta checkpoint written (dirty labels only)"
+        );
         Ok((v_count, e_count))
     }
 

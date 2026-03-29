@@ -26,10 +26,38 @@ pub fn csr_to_fragment<S>(store: &S, partition_id: u32) -> ArrowFragment
 where
     S: GrinSchema + Property + Scannable + yata_grin::Topology,
 {
+    csr_to_fragment_inner(store, partition_id, None)
+}
+
+/// Selective variant: only extract vertex properties for `dirty_labels`.
+/// Clean labels get empty vertex tables (schema + ivnums are still correct).
+/// Topology (CSR offsets/nbrs) is always built for all labels.
+///
+/// Shannon optimization: avoids O(V_clean × P) property extraction.
+/// Dirty label blobs are the only ones uploaded to R2.
+pub fn csr_to_fragment_selective<S>(
+    store: &S,
+    partition_id: u32,
+    dirty_labels: &std::collections::HashSet<String>,
+) -> ArrowFragment
+where
+    S: GrinSchema + Property + Scannable + yata_grin::Topology,
+{
+    csr_to_fragment_inner(store, partition_id, Some(dirty_labels))
+}
+
+fn csr_to_fragment_inner<S>(
+    store: &S,
+    partition_id: u32,
+    dirty_labels: Option<&std::collections::HashSet<String>>,
+) -> ArrowFragment
+where
+    S: GrinSchema + Property + Scannable + yata_grin::Topology,
+{
     let v_labels = GrinSchema::vertex_labels(store);
     let e_labels = GrinSchema::edge_labels(store);
 
-    // Build schema
+    // Build schema (always full — needed for correct meta.json)
     let mut schema = PropertyGraphSchema::new();
     let mut vlabel_map: HashMap<String, i32> = HashMap::new();
     let mut elabel_map: HashMap<String, i32> = HashMap::new();
@@ -58,37 +86,48 @@ where
     let mut frag = ArrowFragment::new(partition_id, 1, true, schema);
 
     // ── Vertex tables ──
+    // Selective mode: only extract properties for dirty labels.
+    // Clean labels get empty vertex tables (ivnums still correct for VID ordering).
     for label in &v_labels {
         let vids = Scannable::scan_vertices_by_label(store, label);
-        let prop_keys = store.vertex_prop_keys(label);
+        let is_dirty = dirty_labels.map_or(true, |dl| dl.contains(label));
 
-        // Build columnar arrays
-        let mut columns: Vec<(&str, Vec<PropValue>)> = prop_keys
-            .iter()
-            .map(|k| (k.as_str(), Vec::with_capacity(vids.len())))
-            .collect();
+        if is_dirty {
+            let prop_keys = store.vertex_prop_keys(label);
 
-        for &vid in &vids {
-            for (i, key) in prop_keys.iter().enumerate() {
-                let val = store
-                    .vertex_prop(vid, key)
-                    .unwrap_or(PropValue::Null);
-                columns[i].1.push(val);
+            // Build columnar arrays
+            let mut columns: Vec<(&str, Vec<PropValue>)> = prop_keys
+                .iter()
+                .map(|k| (k.as_str(), Vec::with_capacity(vids.len())))
+                .collect();
+
+            for &vid in &vids {
+                for (i, key) in prop_keys.iter().enumerate() {
+                    let val = store
+                        .vertex_prop(vid, key)
+                        .unwrap_or(PropValue::Null);
+                    columns[i].1.push(val);
+                }
             }
-        }
 
-        let (fields, arrays): (Vec<_>, Vec<_>) = columns
-            .iter()
-            .map(|(name, vals)| prop_values_to_arrow(name, vals))
-            .unzip();
+            let (fields, arrays): (Vec<_>, Vec<_>) = columns
+                .iter()
+                .map(|(name, vals)| prop_values_to_arrow(name, vals))
+                .unzip();
 
-        if !fields.is_empty() && !vids.is_empty() {
-            let schema = Arc::new(Schema::new(fields));
-            if let Ok(batch) = RecordBatch::try_new(schema, arrays) {
-                frag.vertex_tables.push(batch);
+            if !fields.is_empty() && !vids.is_empty() {
+                let arrow_schema = Arc::new(Schema::new(fields));
+                if let Ok(batch) = RecordBatch::try_new(arrow_schema, arrays) {
+                    frag.vertex_tables.push(batch);
+                } else {
+                    frag.vertex_tables.push(RecordBatch::new_empty(Arc::new(Schema::empty())));
+                }
+            } else {
+                frag.vertex_tables.push(RecordBatch::new_empty(Arc::new(Schema::empty())));
             }
         } else {
-            // Push empty batch to maintain index alignment
+            // Clean label: empty vertex table (properties not extracted).
+            // R2 retains the previous snapshot's blob for this label.
             frag.vertex_tables.push(RecordBatch::new_empty(Arc::new(Schema::empty())));
         }
 

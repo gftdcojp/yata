@@ -13,5 +13,8 @@
     "./helpers": "./src/helpers.ts"
   },
   "files": ["src"],
+  "dependencies": {
+    "@gftd/xrpc": "file:../../../runtime/magatama/xrpc"
+  },
   "license": "UNLICENSED"
 }
