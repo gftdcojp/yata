@@ -74,7 +74,7 @@
 
   <!-- Title -->
   <text x="800" y="40" text-anchor="middle" fill="#f8fafc" font-size="22" font-weight="bold">yata — Rust Cypher Graph Engine Architecture</text>
-  <text x="800" y="62" text-anchor="middle" fill="#94a3b8" font-size="13">14 crates | 985+ tests | CSR + Arrow IPC WAL + Per-label Compaction + R2 | Critical Path + Shannon + Kaizen + Security</text>
+  <text x="800" y="62" text-anchor="middle" fill="#94a3b8" font-size="13">14 crates | 1,060+ tests | CSR + Arrow IPC WAL + Per-label Compaction + Blake3 + Two-phase PUT + R2 | Critical Path + Shannon + Kaizen + Security</text>
 
   <!-- ==================== CRITICAL ISSUES (2026-03-29) ==================== -->
   <g transform="translate(40, 80)">
@@ -329,8 +329,8 @@
   <rect x="60" y="1220" width="1220" height="100" rx="10" fill="url(#fixedGrad)" stroke="#22c55e" stroke-width="2" filter="url(#greenGlow)"/>
   <text x="80" y="1245" fill="#22c55e" font-size="14" font-weight="bold">Write Path — Per-label Delta Compaction [PRODUCTION]</text>
   <text x="80" y="1267" fill="#e2e8f0" font-size="11">1. App -> PDS_RPC.createRecord -> Pipeline.send() (durable) -> YATA_RPC.mergeRecord() -> WAL append + dirty_labels.insert(label)</text>
-  <text x="80" y="1287" fill="#e2e8f0" font-size="11">2. Compaction cron: wal_flush_segment() -> drain_dirty_labels() -> per dirty label: PK-dedup -> R2 PUT label/{label}.arrow</text>
-  <text x="80" y="1307" fill="#4ade80" font-size="11">3. Clean labels = zero R2 I/O | Manifest v2 per-label tracking | v1 monolithic auto-migration</text>
+  <text x="80" y="1287" fill="#e2e8f0" font-size="11">2. Compaction cron: wal_flush_segment() (safe guard) -> drain_dirty_labels() -> Phase 1: per-label PK-dedup + Blake3 -> R2 PUT (skip failed)</text>
+  <text x="80" y="1307" fill="#4ade80" font-size="11">3. Phase 2: manifest v2 from success only -> R2 PUT | Clean labels = zero R2 I/O | Cold start Blake3 verify | v1 auto-migration (safe)</text>
 
   <!-- ======================================================== -->
   <!-- SHANNON BEFORE vs AFTER -->
@@ -607,15 +607,18 @@
   <text x="350" y="2434" fill="#22c55e" font-size="9">O(dirty_entries) only</text>
   <line x1="514" y1="2424" x2="534" y2="2424" stroke="#22c55e" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
   <rect x="536" y="2406" width="170" height="36" rx="5" fill="#052e16" stroke="#22c55e" stroke-width="1.5"/>
-  <text x="548" y="2424" fill="#4ade80" font-size="9">R2 PUT (dirty labels)</text>
-  <text x="548" y="2436" fill="#22c55e" font-size="7">label/{label}.arrow per dirty</text>
+  <text x="548" y="2420" fill="#4ade80" font-size="9">Phase 1: R2 PUT + Blake3</text>
+  <text x="548" y="2432" fill="#22c55e" font-size="7">label/{label}.arrow + checksum</text>
+  <text x="548" y="2442" fill="#f59e0b" font-size="6">failed labels skipped</text>
   <line x1="706" y1="2424" x2="726" y2="2424" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
-  <rect x="728" y="2406" width="120" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
-  <text x="740" y="2424" fill="#e2e8f0" font-size="9">manifest v2 PUT</text>
-  <rect x="60" y="2450" width="788" height="5" rx="2" fill="#1e293b"/>
+  <rect x="728" y="2406" width="150" height="36" rx="5" fill="#052e16" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="740" y="2420" fill="#4ade80" font-size="9" font-weight="bold">Phase 2: manifest v2</text>
+  <text x="740" y="2434" fill="#22c55e" font-size="7">success labels only → PUT</text>
+  <rect x="60" y="2450" width="818" height="5" rx="2" fill="#1e293b"/>
   <rect x="334" y="2450" width="180" height="5" rx="2" fill="#22c55e" fill-opacity="0.4"/>
   <rect x="536" y="2450" width="80" height="5" rx="2" fill="#22c55e" fill-opacity="0.3"/>
-  <text x="860" y="2455" fill="#22c55e" font-size="8">FIXED: O(dirty) not O(total)</text>
+  <rect x="728" y="2450" width="150" height="5" rx="2" fill="#22c55e" fill-opacity="0.2"/>
+  <text x="890" y="2455" fill="#22c55e" font-size="8">FIXED: two-phase + Blake3 + O(dirty)</text>
 
   <!-- CP5: Mutation (OPTIMIZED — incremental delta-apply) -->
   <text x="60" y="2486" fill="#a855f7" font-size="13" font-weight="bold">CP5: Mutation Path (Total ~500ms → ~55ms with delta-apply)</text>
@@ -976,12 +979,14 @@
   <text x="980" y="3910" fill="#94a3b8" font-size="9">Shannon R=0.15 (WAL+compaction unified Arrow IPC)</text>
 
   <!-- Shannon η summary at bottom -->
-  <rect x="960" y="3940" width="310" height="90" rx="6" fill="#1e293b" stroke="#22c55e" stroke-width="1"/>
-  <text x="980" y="3962" fill="#22c55e" font-size="11" font-weight="bold">Shannon Efficiency (Phase 0-5)</text>
+  <rect x="960" y="3940" width="310" height="128" rx="6" fill="#1e293b" stroke="#22c55e" stroke-width="1"/>
+  <text x="980" y="3962" fill="#22c55e" font-size="11" font-weight="bold">Shannon Efficiency (Phase 0-6)</text>
   <text x="980" y="3982" fill="#4ade80" font-size="10">write: PropValue→Vec (0 JSON, was JSON→Map)</text>
   <text x="980" y="4000" fill="#4ade80" font-size="10">WAL: Arrow IPC (mmap-ready, was NDJSON text)</text>
-  <text x="980" y="4018" fill="#4ade80" font-size="10">cold: mmap ~100µs (was R2 GET ~5ms)</text>
+  <text x="980" y="4018" fill="#4ade80" font-size="10">cold: mmap ~100µs + Blake3 verify (was R2 GET ~5ms)</text>
   <text x="980" y="4036" fill="#4ade80" font-size="10">recovery: P=1.0 (compacted+tail, was P=0.7)</text>
+  <text x="980" y="4054" fill="#4ade80" font-size="10">integrity: Blake3 checksum (was none)</text>
+  <text x="980" y="4072" fill="#4ade80" font-size="10">atomicity: two-phase PUT (was independent)</text>
 
   <!-- ================================================================ -->
   <!-- FALLBACK PATH MAP -->
