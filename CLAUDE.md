@@ -120,29 +120,19 @@ R2 = source of truth。**Append-only write**: mergeRecord は page-in 不要 (in
 
 WAL + query storage schema の Shannon 情報効率比較: `docs/260329-yata-arrow-ipc-shannon-analysis.md`。結論: WAL=Edge List Arrow IPC + Query=CSR が Shannon 最適 (加重 71.8%)。NDJSON→Arrow IPC 移行で +9.3%。YataFragment 抽象は memmap2 直接置き換え候補。
 
-## Snapshot Model — Dirty Label Delta `[IMPLEMENTED]`
+## Persistence Model — Arrow IPC WAL + L1 Compaction (legacy ArrowFragment 除去済み)
 
-**Dirty label delta snapshot**: `trigger_snapshot()` は dirty vertex label の blob のみ R2 PUT。`csr_to_fragment_selective()` が dirty label のみ property 抽出 (clean label は empty vertex table)。`is_dirty_vertex_blob()` / `is_edge_or_topology_blob()` / `is_infra_blob()` で blob 分類。η: 0.01% → ~85%。
+**Durability は Pipeline WAL が保証。** Pipeline → R2 JSON (10s flush) が WAL source of truth。
 
-**Durability は Pipeline WAL が保証。** Pipeline → R2 JSON (10s flush) が WAL source of truth。yata snapshot は CSR の performance checkpoint であり、Pipeline WAL から rebuild 可能。
-
-| 層 | Model | Durability | Shannon 冗長度 |
+| 層 | Format | Trigger | 用途 |
 |---|---|---|---|
-| **Pipeline WAL** | Append-only (R2 JSON, `pipeline/wal/`) | **source of truth** — `Pipeline.send()` resolve = durable | 0% (唯一の authoritative write) |
-| **yata R2 snapshot** | Dirty label delta PUT (`snap/fragment/`) | **performance checkpoint** — CSR cold start 復旧用 | ~15% (dirty label のみ転送) |
+| **Pipeline WAL** | R2 JSON (`pipeline/wal/`) | `Pipeline.send()` 10s flush | source of truth (durable) |
+| **yata WAL segments** | Arrow IPC (`wal/segments/{pid}/`) | cron 10s `walFlushSegment` | Cold start replay |
+| **L1 Compacted segment** | Arrow IPC (`log/compacted/{pid}/`) | `trigger_compaction` | PK-dedup recovery (P=1.0) |
 
-**Delta snapshot flow (engine.rs `trigger_snapshot_inner`):**
-1. `dirty_labels.drain()` → dirty set を atomically 取得
-2. `csr_to_fragment_selective(store, pid, &dirty_set)` → dirty label のみ property 抽出
-3. `frag.serialize(&blob_store)` → 全 blob 生成 (meta.json は full state)
-4. Selective upload: `is_dirty_vertex_blob()` = dirty label の `vertex_table_{i}*` のみ PUT。`is_infra_blob()` (schema, ivnums) は常に PUT。Edge/topology は `dirty` flag (edge mutation) 時のみ PUT
-5. `meta.json` は常に PUT (full label manifest を R2 に反映)
+**`trigger_snapshot()` = `wal_flush_segment` + `trigger_compaction`。** Legacy `trigger_snapshot_inner` (ArrowFragment serialize) は除去済み。`restore_from_r2` (ArrowFragment page-in) も除去済み。
 
-**Page-in safety (CRITICAL, 2026-03-25 fix)**:
-- `ensure_labels` の R2 page-in は CSR を **merge** (上書きではない)。既存 `mergeRecord` データを保護
-- Empty fragment / R2 error でも `hot_initialized = true` を設定し、再 page-in による上書きを防止
-
-**禁止**: Pipeline WAL replay を snapshot の代替にすること (cold start 数十秒は許容不可)。snapshot checkpoint は cold start <5s のために維持。
+**Cold start**: `ensure_labels` → `hot_initialized == false` → `wal_cold_start()` 自動実行。disk cache mmap (~100µs) → R2 GET compacted segment → WAL tail replay (segment registry from `head.json`)。Read replica は初 query で自動 cold start。
 
 ## Arrow IPC WAL + L1 Compaction `[PRODUCTION]` (verified 2026-03-29)
 
@@ -151,8 +141,10 @@ WAL + query storage schema の Shannon 情報効率比較: `docs/260329-yata-arr
 - **WAL format**: Arrow IPC File (default `YATA_WAL_FORMAT=arrow`)。`WalEntry.props` = `Vec<(String, PropValue)>` (typed, zero JSON overhead)。custom serde で flat JSON map backward compat
 - **Segment registry**: `head.json` の `segments` array に全 segment key を記録。R2 ListObjectsV2 不使用 (S3 signing issue 回避)
 - **L1 Compaction**: `trigger_compaction()` が WAL segments を PK-dedup → compacted Arrow IPC segment。R2 key: `log/compacted/{pid}/manifest.json` + `log/compacted/{pid}/compacted_{seq}.arrow`。XRPC: `/xrpc/ai.gftd.yata.compact`
-- **Cold start**: L1 compacted segment (disk cache mmap ~100µs → R2 GET fallback) → WAL tail replay → legacy YataFragment fallback。`ArrowWalStore::from_file()` (mmap I/O utility)
+- **Cold start**: L1 compacted segment (disk cache mmap ~100µs → R2 GET fallback) → WAL tail replay (segment registry)。Legacy ArrowFragment path 除去。`ArrowWalStore::from_file()` (mmap I/O utility)。Read replica は初 query で `ensure_labels` → `wal_cold_start` 自動実行 (cron 依存不要)
 - **Replica transport**: `/xrpc/ai.gftd.yata.walTailArrow` (Arrow IPC body) + `/xrpc/ai.gftd.yata.walApplyArrow`。JSON endpoints 維持 (backward compat)
+- **Migration CLI**: `gftd yata migrate --from snapshot --to arrow-wal` (forward) / `--from arrow-wal --to snapshot` (rollback)
+- **Edge cache 除去**: PDS `cyCached` → `cy` 直接 (graph data は mutation-driven、edge cache は stale 原因)
 
 | Path | Before | After |
 |---|---|---|
@@ -161,6 +153,9 @@ WAL + query storage schema の Shannon 情報効率比較: `docs/260329-yata-arr
 | WAL format | NDJSON | Arrow IPC (mmap-ready) |
 | Cold start (disk) | R2 GET ~5ms | mmap ~100µs |
 | Recovery | P=0.7 (delta snapshot) | P=1.0 (compacted + tail) |
+| PDS read cache | CF edge cache 60s (stale) | No cache (always fresh from yata) |
+
+**禁止**: `restore_from_r2` (legacy ArrowFragment page-in、除去済み)。`trigger_snapshot_inner` (legacy snapshot serialize、除去済み)。PDS `cyCached` に edge cache 再導入 (stale 原因)
 
 ## CRITICAL: 3 概念は直交 — partition ≠ label ≠ security
 
