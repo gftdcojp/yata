@@ -439,14 +439,13 @@ async fn wal_tail_arrow_handler<G: GraphQueryExecutor>(
             let head_seq = state.graph.wal_head_seq();
             match yata_engine::arrow_wal::serialize_segment_arrow(&entries) {
                 Ok(arrow_bytes) => {
-                    let mut resp = axum::response::Response::builder()
+                    axum::response::Response::builder()
                         .status(StatusCode::OK)
                         .header("content-type", "application/vnd.apache.arrow.ipc")
                         .header("x-wal-head-seq", head_seq.to_string())
                         .header("x-wal-count", entries.len().to_string())
                         .body(axum::body::Body::from(arrow_bytes.to_vec()))
-                        .unwrap();
-                    resp
+                        .unwrap()
                 }
                 Err(e) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
