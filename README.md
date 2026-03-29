@@ -27,7 +27,7 @@ Arrow-native graph database and event store with Raft consensus.
 │  yata-store (MutableCSR)  yata-graph  yata-cypher           │
 ├─────────────────────────────────────────────────────────────┤
 │                Layer 1.5: Persistence Format                 │
-│  yata-vineyard (ArrowFragment, NbrUnit zero-copy CSR)       │
+│  yata-format (YataFragment, NbrUnit zero-copy CSR)          │
 ├─────────────────────────────────────────────────────────────┤
 │                 Layer 1: Core Primitives                     │
 │  yata-arrow  yata-object                                    │
@@ -45,12 +45,12 @@ Arrow-native graph database and event store with Raft consensus.
 | **yata-grin** | GRIN storage-agnostic graph traits (Topology, Property, Schema, Mutable) |
 | **yata-arrow** | Arrow IPC encode/decode |
 | **yata-object** | Object storage abstraction (CAS + S3 write-through) |
-| **yata-vineyard** | ArrowFragment format — NbrUnit zero-copy CSR, PropertyGraphSchema, BlobStore |
+| **yata-format** | YataFragment format — NbrUnit zero-copy CSR, PropertyGraphSchema, BlobStore |
 | **yata-cypher** | Pure-Rust Cypher parser and execution engine |
-| **yata-store** | MutableCSR in-memory graph, ArrowGraphStore, DiskVineyard/MmapVineyard |
+| **yata-store** | MutableCSR in-memory graph, ArrowGraphStore, DiskBlobCache/MmapBlobCache |
 | **yata-graph** | Graph store with CSR cache, yata-vex vector search |
 | **yata-gie** | Graph Interactive Engine (IR operators, push-based executor) |
-| **yata-engine** | TieredGraphEngine — ArrowFragment snapshot/page-in, partition routing |
+| **yata-engine** | TieredGraphEngine — YataFragment snapshot/page-in, partition routing |
 | **yata-s3** | S3/R2 adapter (sync ureq+rustls, SigV4) |
 | **yata-vex** | Vector index (IVF_PQ + DiskANN) |
 | **yata-server** | XRPC API server (Cypher, mergeRecord, triggerSnapshot) |
