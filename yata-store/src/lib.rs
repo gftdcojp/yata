@@ -1,12 +1,15 @@
-//! MutableCSR: GraphScope Flex-inspired mutable compressed sparse row graph store.
+//! MutableCSR: GraphScope Flex-inspired graph store with COO + Lazy CSR architecture.
 //!
-//! Design:
+//! Design (COO + Lazy CSR):
 //! - Vertices: dense u32 VID array, label list, alive bitvec
-//! - Edges: per-label CSR segments (offsets + edge_ids packed array)
+//! - Edges: flat arrays (edge_src, edge_dst, edge_labels) = COO-style primary storage
+//! - CSR: lazy derived index, rebuilt on-demand per-label on first Topology access after mutation
 //! - Properties: per-vertex HashMap (mutable) + columnar cache (read-optimized, rebuilt on commit)
 //! - Columnar property cache: per-label, per-key Vec<Option<PropValue>> for cache-friendly scan
 //! - Label bitmap: Vec<bool> per-label for O(V/64) bitwise scan
-//! - Mutations: append-only within current version, CSR rebuilt on commit (incremental for dirty labels)
+//! - Write path: O(1) — append to edge arrays + mark CSR stale (no rebuild)
+//! - Read path: lazy CSR rebuild for stale labels only, then O(1) adjacency lookup
+//! - commit() rebuilds property indexes only (needed for merge_by_pk O(1)), NOT CSR
 
 pub mod arrow_store;
 pub mod arrow_wal_store;
@@ -2340,7 +2343,9 @@ impl Mutable for MutableCsrStore {
         }
         ver
     }
+}
 
+impl MutableCsrStore {
     /// Force immediate CSR rebuild for all stale labels.
     /// Use after batch operations (cold start, bulk import) where
     /// you want CSR ready before read queries arrive.

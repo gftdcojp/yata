@@ -15,7 +15,7 @@ use crate::config::TieredEngineConfig;
 use crate::loader;
 use crate::router;
 
-/// CPM metrics: CP5 mutation frequency + read/write ratio + CP4 snapshot monitoring.
+/// CPM metrics: CP5 mutation frequency + read/write ratio + compaction monitoring.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CpmStats {
     pub cypher_read_count: u64,
@@ -26,7 +26,7 @@ pub struct CpmStats {
     pub mutation_ratio: f64,
     pub vertex_count: u64,
     pub edge_count: u64,
-    pub last_snapshot_serialize_ms: u64,
+    pub last_compaction_ms: u64,
 }
 
 /// Shared tokio runtime for all engine instances (avoids nested runtime issues).
@@ -100,7 +100,7 @@ pub struct MutationContext {
     pub actor_did: String,
 }
 
-/// Graph engine: MutableCSR in-memory + WAL Projection (R2 segments + checkpoints).
+/// Graph engine: Sorted COO in-memory + WAL Projection (R2 segments + L1 compaction).
 pub struct TieredGraphEngine {
     config: TieredEngineConfig,
     hot: Arc<RwLock<yata_store::GraphStoreEnum>>,
@@ -117,12 +117,12 @@ pub struct TieredGraphEngine {
     wal_last_flushed_seq: Arc<AtomicU64>,
     /// SecurityScope cache: DID → (SecurityScope, compiled_at). Design E.
     security_scope_cache: Arc<Mutex<HashMap<String, (yata_gie::ir::SecurityScope, std::time::Instant)>>>,
-    // CPM metrics: CP5 mutation frequency + CP4 snapshot monitoring
+    // CPM metrics: CP5 mutation frequency + compaction monitoring
     cypher_read_count: Arc<AtomicU64>,
     cypher_mutation_count: Arc<AtomicU64>,
     cypher_mutation_us_total: Arc<AtomicU64>,
     merge_record_count: Arc<AtomicU64>,
-    last_snapshot_serialize_ms: Arc<AtomicU64>,
+    last_compaction_ms: Arc<AtomicU64>,
 }
 
 impl TieredGraphEngine {
@@ -195,9 +195,9 @@ impl TieredGraphEngine {
         let s3_prefix = std::env::var("YATA_S3_PREFIX").unwrap_or_default();
         let s3_client = Arc::new(Mutex::new(None));
 
-        // WAL Projection: MutableCsrStore (GIE query path needs as_single()).
+        // Sorted COO store (GIE query path needs as_single()).
         let hot_store = yata_store::GraphStoreEnum::new(partition_count, hot_partition_id);
-        tracing::info!("using MutableCsrStore (WAL Projection)");
+        tracing::info!("using Sorted COO store (WAL Projection)");
         let wal_ring_capacity = config.wal_ring_capacity;
         Self {
             config,
@@ -218,7 +218,7 @@ impl TieredGraphEngine {
             cypher_mutation_count: Arc::new(AtomicU64::new(0)),
             cypher_mutation_us_total: Arc::new(AtomicU64::new(0)),
             merge_record_count: Arc::new(AtomicU64::new(0)),
-            last_snapshot_serialize_ms: Arc::new(AtomicU64::new(0)),
+            last_compaction_ms: Arc::new(AtomicU64::new(0)),
         }
         // No startup restore — labels are lazy-loaded from R2 on first query (page-in).
         // Write path: Pipeline.send() + mergeRecord() (PDS Worker).
@@ -857,12 +857,12 @@ impl TieredGraphEngine {
             .map_err(|e| format!("create index: {e}"))
     }
 
-    /// CSR-direct MERGE by primary key: O(1) lookup, no Cypher parse, no MemoryGraph copy.
-    /// GraphScope Groot parity: get_vertex_by_primary_key → upsert.
-    /// Used by Pipeline + mergeRecord (PDS) for high-throughput projection.
-    ///
-    /// In WalProjection mode: also appends a WalEntry to the ring buffer.
-    /// The returned WalEntry (if any) should be pushed to read replicas by the coordinator.
+    /// L0 compact threshold: trigger compaction when pending_writes exceeds this.
+    /// Size-based (workload-adaptive), replaces time-based cron.
+    const L0_COMPACT_THRESHOLD: usize = 10_000;
+
+    /// MERGE by primary key: O(1) lookup, no Cypher parse, no MemoryGraph copy.
+    /// L0 buffer append + WAL ring append. Size-based compaction trigger.
     pub fn merge_record(
         &self,
         label: &str,
