@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="7480" viewBox="0 0 1600 7480" font-family="'SF Mono','Menlo','Monaco',monospace" font-size="11">
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="7780" viewBox="0 0 1600 7780" font-family="'SF Mono','Menlo','Monaco',monospace" font-size="11">
   <defs>
     <linearGradient id="bgGrad" x1="0%" y1="0%" x2="0%" y2="100%">
       <stop offset="0%" style="stop-color:#0a0e17;stop-opacity:1"/>
@@ -70,11 +70,56 @@
     </filter>
   </defs>
 
-  <rect width="1600" height="7480" fill="url(#bgGrad)"/>
+  <rect width="1600" height="7780" fill="url(#bgGrad)"/>
 
   <!-- Title -->
   <text x="800" y="40" text-anchor="middle" fill="#f8fafc" font-size="22" font-weight="bold">yata — Rust Cypher Graph Engine Architecture</text>
   <text x="800" y="62" text-anchor="middle" fill="#94a3b8" font-size="13">14 crates | 985+ tests | CSR + Arrow IPC WAL + Per-label Compaction + R2 | Critical Path + Shannon + Kaizen + Security</text>
+
+  <!-- ==================== CRITICAL ISSUES (2026-03-29) ==================== -->
+  <g transform="translate(40, 80)">
+    <rect x="0" y="0" width="1520" height="280" rx="8" fill="url(#criticalGrad)" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="6,3"/>
+    <text x="20" y="24" fill="#ef4444" font-size="14" font-weight="bold" filter="url(#criticalGlow)">CRITICAL ISSUES (2026-03-29) — Container Deploy Instability</text>
+
+    <!-- Issue 1: Cold Start Blind Spot -->
+    <rect x="20" y="40" width="470" height="120" rx="6" fill="#1e1e2e" stroke="#ef4444" stroke-width="1" opacity="0.9"/>
+    <text x="35" y="60" fill="#ef4444" font-size="11" font-weight="bold">P0: Cold Start Blind Spot (12-52s)</text>
+    <text x="35" y="78" fill="#94a3b8" font-size="10">Deploy new image → Container restart → CSR lost</text>
+    <text x="35" y="93" fill="#94a3b8" font-size="10">→ R2 page-in 12-52s → ALL queries return empty</text>
+    <text x="35" y="108" fill="#94a3b8" font-size="10">Read replicas: cron 5min cold start (gap)</text>
+    <text x="35" y="123" fill="#94a3b8" font-size="10">Write partition: on-demand page-in (slow)</text>
+    <text x="35" y="143" fill="#f59e0b" font-size="10" font-weight="bold">Fix: edge cache restored + write fallback</text>
+
+    <!-- Issue 2: Read Replica Empty -->
+    <rect x="510" y="40" width="470" height="120" rx="6" fill="#1e1e2e" stroke="#f59e0b" stroke-width="1" opacity="0.9"/>
+    <text x="525" y="60" fill="#f59e0b" font-size="11" font-weight="bold">P1: Read Replicas Empty After Deploy</text>
+    <text x="525" y="78" fill="#94a3b8" font-size="10">WAL push = fire-and-forget (no ack, no retry)</text>
+    <text x="525" y="93" fill="#94a3b8" font-size="10">Cold start = cron 5min (not on first query)</text>
+    <text x="525" y="108" fill="#94a3b8" font-size="10">Empty response = HTTP 200 (no error signal)</text>
+    <text x="525" y="123" fill="#94a3b8" font-size="10">PDS cannot distinguish empty vs no-data</text>
+    <text x="525" y="143" fill="#f59e0b" font-size="10" font-weight="bold">Fix: fetchStubFast 8s → write fallback</text>
+
+    <!-- Issue 3: Edge Cache Removal -->
+    <rect x="1000" y="40" width="470" height="120" rx="6" fill="#1e1e2e" stroke="#06b6d4" stroke-width="1" opacity="0.9"/>
+    <text x="1015" y="60" fill="#06b6d4" font-size="11" font-weight="bold">P2: Edge Cache Removed (stale fear)</text>
+    <text x="1015" y="78" fill="#94a3b8" font-size="10">cyCached → cy() direct (every request to yata)</text>
+    <text x="1015" y="93" fill="#94a3b8" font-size="10">Before: CF Cache API 60s TTL masked cold starts</text>
+    <text x="1015" y="108" fill="#94a3b8" font-size="10">After: zero resilience to yata unavailability</text>
+    <text x="1015" y="123" fill="#94a3b8" font-size="10">Result: feed/search empty during cold start</text>
+    <text x="1015" y="143" fill="#22c55e" font-size="10" font-weight="bold">Fixed: edge cache restored (deployed)</text>
+
+    <!-- Architecture Comparison -->
+    <rect x="20" y="170" width="1450" height="95" rx="6" fill="#1e1e2e" stroke="#3b82f6" stroke-width="1" opacity="0.8"/>
+    <text x="35" y="190" fill="#3b82f6" font-size="11" font-weight="bold">Architecture Stability Comparison (Shannon η)</text>
+    <text x="35" y="210" fill="#94a3b8" font-size="10">A: Current (CSR+WAL+edge cache)  η=71.8%  Avail=95%   Cold=12-52s   Cost=$3/mo</text>
+    <text x="35" y="225" fill="#94a3b8" font-size="10">B: R2 Direct Query (no Container) η=58.2%  Avail=99.9% Cold=0s       Cost=$0.50/mo</text>
+    <text x="35" y="240" fill="#94a3b8" font-size="10">C: Warm Standby (blue-green)      η=71.8%  Avail=99.5% Cold=0s       Cost=$6/mo</text>
+    <text x="35" y="255" fill="#22c55e" font-size="10" font-weight="bold">D: Hybrid R2+CSR (recommended)    η=68.4%  Avail=99.9% Cold=0s       Cost=$3/mo  ← R2 scan fallback when CSR cold</text>
+    <text x="770" y="210" fill="#94a3b8" font-size="10">E: Pipeline Materialized View     η=75.1%  Avail=99.9% Cold=0s       Cost=$0.50/mo (Pipeline GA required)</text>
+  </g>
+
+  <!-- Shift all existing content down by 300px to make room for critical issues section -->
+  <g transform="translate(0, 300)">
 
   <!-- ==================== LAYER 0 ==================== -->
   <text x="40" y="105" fill="#64748b" font-size="10" font-weight="bold">LAYER 0 — Zero Dependencies (Foundation)</text>
@@ -1632,5 +1677,7 @@
   <!-- Semilattice property annotation -->
   <text x="800" y="7440" text-anchor="middle" fill="#475569" font-size="10">Meet-semilattice: ∀ a,b ∈ Crates, a ∧ b = greatest common dependency. Acyclic (Cargo enforces). Unique ⊥ = {core, grin}. Unique ⊤ = {server}.</text>
   <text x="800" y="7458" text-anchor="middle" fill="#475569" font-size="10">Shannon criterion: each node contributes unique information (H &gt; 0). ⚠ nodes have H ≈ 0 (single-consumer wrapper = entropy redundancy). Merge restores H &gt; 0.</text>
+
+  </g><!-- end of 300px shift group -->
 
 </svg>

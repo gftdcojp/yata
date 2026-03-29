@@ -3265,6 +3265,7 @@ name = "yata-engine"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "blake3",
  "bytes",
  "chrono",
  "indexmap",

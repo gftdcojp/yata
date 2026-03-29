@@ -115,6 +115,10 @@ R2 = source of truth。**Per-label compacted segments**: `log/compacted/{pid}/la
 
 **Append-only write safety**: mergeRecord は page-in 不要 → write lock scope は merge_by_pk + commit のみ (~µs)。snapshot compaction が write lock を取るのは R2 既存データの CSR merge 時のみ (初回 1 回)。
 
+**`hot_initialized` AtomicBool**: `Ordering::SeqCst` (全 load/store)。`Relaxed` は concurrent cold start 重複実行リスクがあったため昇格。
+
+**`loaded_labels` guard (CRITICAL)**: `ensure_labels()` は `enrich_label_from_r2()` 成功時のみ `loaded_labels` に追加。失敗時は追加しない → 次回 query で再試行。以前は失敗時も loaded 扱いで Container 再起動まで永久に空結果だった。
+
 ## Arrow IPC Shannon Analysis
 
 WAL + query storage schema の Shannon 情報効率比較: `docs/260329-yata-arrow-ipc-shannon-analysis.md`。結論: WAL=Edge List Arrow IPC + Query=CSR が Shannon 最適 (加重 71.8%)。NDJSON→Arrow IPC 移行で +9.3%。YataFragment 抽象は memmap2 直接置き換え候補。
@@ -145,6 +149,7 @@ WAL + query storage schema の Shannon 情報効率比較: `docs/260329-yata-arr
 - **Replica transport**: `/xrpc/ai.gftd.yata.walTailArrow` (Arrow IPC body) + `/xrpc/ai.gftd.yata.walApplyArrow`。JSON endpoints 維持 (backward compat)
 - **Migration CLI**: `gftd yata migrate --from snapshot --to arrow-wal` (forward) / `--from arrow-wal --to snapshot` (rollback)
 - **Edge cache 除去**: PDS `cyCached` → `cy` 直接 (graph data は mutation-driven、edge cache は stale 原因)
+- **PDS `cyRetry` (CRITICAL)**: `cyCached` が `cyRetry` 経由で yata 呼出。空結果時に1回リトライ。Container cold start / 一時的 R2 label page-in 失敗に対する defense-in-depth
 
 | Path | Before | After |
 |---|---|---|

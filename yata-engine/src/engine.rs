@@ -323,7 +323,7 @@ impl TieredGraphEngine {
     /// If `labels` is non-empty AND hot_initialized, enriches only needed labels on-demand
     /// via enrich_label_from_r2 (zero-copy for already-loaded labels).
     fn ensure_labels(&self, vertex_labels: &[&str]) {
-        if !self.hot_initialized.load(Ordering::Relaxed) {
+        if !self.hot_initialized.load(Ordering::SeqCst) {
             // Cold start: load from L1 compacted segment + WAL tail
             let _ = self.wal_cold_start();
             return;
@@ -367,6 +367,7 @@ impl TieredGraphEngine {
 
         // Enrich each needed label via existing enrich_label_from_r2 (per-label R2 GET)
         for label in &needed {
+            let mut enriched = false;
             if let Ok(mut hot) = self.hot.write() {
                 if let Some(single) = hot.as_single_mut() {
                     match crate::loader::enrich_label_from_r2(
@@ -374,16 +375,19 @@ impl TieredGraphEngine {
                     ) {
                         Ok(()) => {
                             single.commit();
+                            enriched = true;
                             tracing::debug!(label, "enriched label from R2 (on-demand)");
                         }
                         Err(e) => {
-                            tracing::warn!(label, error = %e, "label enrichment failed");
+                            tracing::warn!(label, error = %e, "label enrichment failed, will retry on next query");
                         }
                     }
                 }
             }
-            if let Ok(mut ll) = self.loaded_labels.lock() {
-                ll.insert(label.clone());
+            if enriched {
+                if let Ok(mut ll) = self.loaded_labels.lock() {
+                    ll.insert(label.clone());
+                }
             }
         }
     }
@@ -498,7 +502,7 @@ impl TieredGraphEngine {
 
                 if let Ok(mut hot) = self.hot.write() {
                     *hot = yata_store::GraphStoreEnum::Single(new_csr);
-                    self.hot_initialized.store(true, Ordering::Relaxed);
+                    self.hot_initialized.store(true, Ordering::SeqCst);
                 }
 
                 tracing::info!(
@@ -751,7 +755,7 @@ impl TieredGraphEngine {
                                 }
                             }
                         }
-                        self.hot_initialized.store(true, Ordering::Relaxed);
+                        self.hot_initialized.store(true, Ordering::SeqCst);
                     }
                     tracing::debug!(delta = delta_size, total = total_size, "incremental CSR delta-apply");
                 } else {
@@ -767,7 +771,7 @@ impl TieredGraphEngine {
                     }
                     if let Ok(mut hot) = self.hot.write() {
                         *hot = yata_store::GraphStoreEnum::Single(new_csr);
-                        self.hot_initialized.store(true, Ordering::Relaxed);
+                        self.hot_initialized.store(true, Ordering::SeqCst);
                     }
                     tracing::debug!(delta = delta_size, total = total_size, "full CSR rebuild (large delta)");
                 }
@@ -1128,7 +1132,7 @@ impl TieredGraphEngine {
                         ll.insert(label);
                     }
                 }
-                self.hot_initialized.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.hot_initialized.store(true, std::sync::atomic::Ordering::SeqCst);
                 if let Ok(mut c) = self.cache.lock() {
                     c.invalidate();
                 }
@@ -1168,7 +1172,7 @@ impl TieredGraphEngine {
                     }
                 }
                 // Mark HOT as initialized (read container is now live)
-                self.hot_initialized.store(true, Ordering::Relaxed);
+                self.hot_initialized.store(true, Ordering::SeqCst);
                 // Invalidate query cache
                 if let Ok(mut c) = self.cache.lock() {
                     c.invalidate();
@@ -1201,8 +1205,10 @@ impl TieredGraphEngine {
             return Err("failed to acquire WAL lock".into());
         };
 
-        let seq_start = entries.first().unwrap().seq;
-        let seq_end = entries.last().unwrap().seq;
+        let (seq_start, seq_end) = match (entries.first(), entries.last()) {
+            (Some(first), Some(last)) => (first.seq, last.seq),
+            _ => return Ok((0, 0, 0)),
+        };
 
         // Serialize to configured format (Arrow IPC or NDJSON)
         let (data, key) = match self.config.wal_format {
@@ -1358,13 +1364,13 @@ impl TieredGraphEngine {
         all_segment_refs.extend(new_segment_data);
 
         // If v1 monolithic compacted segment exists (migration), include it
-        if existing_manifest.as_ref().map_or(false, |m| m.version == 1 && !m.compacted_segment_key.is_empty()) {
-            let v1_key = &existing_manifest.as_ref().unwrap().compacted_segment_key;
+        if let Some(ref v1_manifest) = existing_manifest.as_ref().filter(|m| m.version == 1 && !m.compacted_segment_key.is_empty()) {
+            let v1_key = &v1_manifest.compacted_segment_key;
             if let Ok(Some(data)) = s3.get_sync(v1_key) {
                 all_segment_refs.push((v1_key.clone(), data));
             }
             // v1 migration: treat all labels as dirty
-            let v1_labels = existing_manifest.as_ref().unwrap().labels.clone();
+            let v1_labels = v1_manifest.labels.clone();
             if let Ok(mut dl) = self.dirty_labels.lock() {
                 dl.extend(v1_labels);
             }
@@ -1412,25 +1418,36 @@ impl TieredGraphEngine {
         let mut total_bytes = 0usize;
         let vineyard_dir = std::env::var("YATA_VINEYARD_DIR").ok();
 
-        // Upload per-label compacted segments
+        // Phase 1: Upload all per-label compacted segments first.
+        // Track successfully uploaded labels for manifest construction.
+        let mut uploaded_results: Vec<&crate::compaction::LabelCompactionResult> = Vec::with_capacity(label_results.len());
         for lr in &label_results {
             let r2_key = crate::compaction::label_compacted_r2_key(prefix, pid, &lr.label);
-            s3.put_sync(&r2_key, lr.data.clone())
-                .map_err(|e| format!("R2 per-label compacted segment upload failed ({}): {e}", lr.label))?;
-
-            // Disk cache for mmap on restart
-            if let Some(ref dir) = vineyard_dir {
-                let label_dir = format!("{dir}/log/compacted/{pid}/label");
-                let _ = std::fs::create_dir_all(&label_dir);
-                let _ = std::fs::write(format!("{label_dir}/{}.arrow", lr.label), &lr.data);
+            match s3.put_sync(&r2_key, lr.data.clone()) {
+                Ok(_) => {
+                    uploaded_results.push(lr);
+                    // Disk cache for mmap on restart
+                    if let Some(ref dir) = vineyard_dir {
+                        let label_dir = format!("{dir}/log/compacted/{pid}/label");
+                        let _ = std::fs::create_dir_all(&label_dir);
+                        let _ = std::fs::write(format!("{label_dir}/{}.arrow", lr.label), &lr.data);
+                    }
+                    total_output += lr.entry_count;
+                    total_bytes += lr.data.len();
+                }
+                Err(e) => {
+                    tracing::error!(label = lr.label, error = %e, "R2 per-label segment upload failed, skipping label");
+                }
             }
-
-            total_output += lr.entry_count;
-            total_bytes += lr.data.len();
         }
 
-        // Build v2 manifest
-        let manifest = crate::compaction::build_manifest_v2(pid, prefix, global_max_seq, &label_results, existing_label_segments);
+        // Phase 2: Build manifest only from successfully uploaded segments, then upload.
+        // This guarantees the manifest never references segments that failed to upload.
+        let uploaded_label_results: Vec<crate::compaction::LabelCompactionResult> = uploaded_results
+            .iter()
+            .map(|lr| (*lr).clone())
+            .collect();
+        let manifest = crate::compaction::build_manifest_v2(pid, prefix, global_max_seq, &uploaded_label_results, existing_label_segments);
         let manifest_json = serde_json::to_vec(&manifest).unwrap_or_default();
         s3.put_sync(manifest_key, bytes::Bytes::from(manifest_json))
             .map_err(|e| format!("R2 compaction manifest upload failed: {e}"))?;
@@ -1496,6 +1513,11 @@ impl TieredGraphEngine {
 
                             if !loaded {
                                 if let Ok(Some(data)) = s3.get_sync(&state.key) {
+                                    // Verify Blake3 checksum if present
+                                    if let Err(e) = crate::compaction::verify_blake3(&data, &state.blake3_hex, label) {
+                                        tracing::error!(label, error = %e, "cold start: checksum verification failed, skipping corrupt segment");
+                                        continue;
+                                    }
                                     let entries = crate::arrow_wal::deserialize_segment_auto(&state.key, &data);
                                     if !entries.is_empty() {
                                         let _ = self.wal_apply(&entries);
@@ -1560,7 +1582,7 @@ impl TieredGraphEngine {
             }
             _ => {
                 tracing::info!("cold start: no compaction manifest (run gftd yata migrate)");
-                self.hot_initialized.store(true, Ordering::Relaxed);
+                self.hot_initialized.store(true, Ordering::SeqCst);
                 0
             }
         };
@@ -3306,5 +3328,247 @@ mod tests {
             e.hot_initialized.load(Ordering::Relaxed),
             "hot_initialized should be true after mutation"
         );
+    }
+
+    // ── WAL cold start recovery tests ──────────────────────────────────
+
+    #[test]
+    fn test_wal_flush_no_s3_returns_error_not_panic() {
+        // Without S3 config, wal_flush_segment should return Err, never panic
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        let result = e.wal_flush_segment();
+        // S3 not configured → Err (but no panic)
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("S3 client not configured"));
+    }
+
+    #[test]
+    fn test_wal_apply_roundtrip() {
+        // Write entries via merge_record, then apply them to a fresh engine via wal_apply
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+
+        e.merge_record("Person", "rkey", "alice", &[
+            ("name", yata_grin::PropValue::Str("Alice".to_string())),
+        ]).unwrap();
+        e.merge_record("Person", "rkey", "bob", &[
+            ("name", yata_grin::PropValue::Str("Bob".to_string())),
+        ]).unwrap();
+
+        // Extract WAL entries
+        let entries = e.wal.lock().unwrap().tail(0, 100).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // Apply to a fresh engine
+        let dir2 = tempfile::tempdir().unwrap();
+        let e2 = make_engine(&dir2);
+        let applied = e2.wal_apply(&entries).unwrap();
+        assert_eq!(applied, 2);
+
+        // Verify data is readable
+        let rows = run_query(&e2, "MATCH (n:Person) RETURN n.name AS name", &[], None).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_wal_apply_pk_dedup() {
+        // Applying entries with same PK should dedup (last write wins)
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+
+        e.merge_record("Person", "rkey", "alice", &[
+            ("name", yata_grin::PropValue::Str("Alice_v1".to_string())),
+        ]).unwrap();
+        e.merge_record("Person", "rkey", "alice", &[
+            ("name", yata_grin::PropValue::Str("Alice_v2".to_string())),
+        ]).unwrap();
+
+        let rows = run_query(&e, "MATCH (n:Person) RETURN n.name AS name", &[], None).unwrap();
+        assert_eq!(rows.len(), 1, "PK dedup: should have 1 Person, not 2");
+    }
+
+    #[test]
+    fn test_wal_serialize_deserialize_arrow() {
+        use crate::wal::{WalEntry, WalOp};
+
+        let entries = vec![
+            WalEntry {
+                seq: 1, op: WalOp::Upsert,
+                label: "Post".into(), pk_key: "rkey".into(), pk_value: "p1".into(),
+                props: vec![("title".into(), yata_grin::PropValue::Str("Hello".into()))],
+                timestamp_ms: 1000,
+            },
+            WalEntry {
+                seq: 2, op: WalOp::Delete,
+                label: "Post".into(), pk_key: "rkey".into(), pk_value: "p2".into(),
+                props: vec![], timestamp_ms: 2000,
+            },
+        ];
+
+        let data = crate::arrow_wal::serialize_segment_arrow(&entries).unwrap();
+        let recovered = crate::arrow_wal::deserialize_segment_arrow(&data).unwrap();
+
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].seq, 1);
+        assert_eq!(recovered[0].label, "Post");
+        assert_eq!(recovered[0].pk_value, "p1");
+        assert_eq!(recovered[1].op, WalOp::Delete);
+    }
+
+    #[test]
+    fn test_compaction_per_label_dirty_only() {
+        use crate::wal::{WalEntry, WalOp};
+
+        let entries = vec![
+            WalEntry {
+                seq: 1, op: WalOp::Upsert,
+                label: "Post".into(), pk_key: "rkey".into(), pk_value: "p1".into(),
+                props: vec![("title".into(), yata_grin::PropValue::Str("Hello".into()))],
+                timestamp_ms: 1000,
+            },
+            WalEntry {
+                seq: 2, op: WalOp::Upsert,
+                label: "Like".into(), pk_key: "rkey".into(), pk_value: "l1".into(),
+                props: vec![], timestamp_ms: 2000,
+            },
+            WalEntry {
+                seq: 3, op: WalOp::Upsert,
+                label: "Follow".into(), pk_key: "rkey".into(), pk_value: "f1".into(),
+                props: vec![], timestamp_ms: 3000,
+            },
+        ];
+
+        let seg = crate::arrow_wal::serialize_segment_arrow(&entries).unwrap();
+        let dirty: std::collections::HashSet<String> = ["Post".to_string()].into_iter().collect();
+        let results = crate::compaction::compact_segments_by_label(
+            &[("seg.arrow", &seg)], &dirty,
+        ).unwrap();
+
+        assert_eq!(results.len(), 1, "Only dirty label Post should be compacted");
+        assert_eq!(results[0].label, "Post");
+    }
+
+    #[test]
+    fn test_compaction_blake3_checksum_roundtrip() {
+        use crate::wal::{WalEntry, WalOp};
+
+        let entries = vec![WalEntry {
+            seq: 1, op: WalOp::Upsert,
+            label: "Post".into(), pk_key: "rkey".into(), pk_value: "p1".into(),
+            props: vec![("v".into(), yata_grin::PropValue::Int(42))],
+            timestamp_ms: 1000,
+        }];
+
+        let seg_data = crate::arrow_wal::serialize_segment_arrow(&entries).unwrap();
+        let checksum = crate::compaction::blake3_hex(&seg_data);
+
+        // Verify passes
+        assert!(crate::compaction::verify_blake3(&seg_data, &checksum, "Post").is_ok());
+
+        // Tampered data fails
+        let mut tampered = seg_data.to_vec();
+        if let Some(last) = tampered.last_mut() { *last ^= 0xFF; }
+        assert!(crate::compaction::verify_blake3(&tampered, &checksum, "Post").is_err());
+    }
+
+    #[test]
+    fn test_cold_start_no_s3_graceful() {
+        // Without S3 config, cold start should not panic
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        let result = e.wal_cold_start();
+        // Should return error (no S3 client) but not panic
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wal_gap_detection() {
+        use crate::wal::WalRingBuffer;
+
+        let mut wal = WalRingBuffer::new(3); // capacity 3
+
+        // Fill and evict
+        for i in 1..=5 {
+            let entry = crate::wal::WalEntry {
+                seq: i, op: crate::wal::WalOp::Upsert,
+                label: "T".into(), pk_key: "k".into(), pk_value: format!("v{i}"),
+                props: vec![], timestamp_ms: 1000 + i,
+            };
+            wal.append(entry);
+        }
+
+        // Buffer has seq 3,4,5 (1,2 evicted). oldest_evicted = 2.
+        assert_eq!(wal.oldest_evicted(), 2);
+        assert_eq!(wal.oldest_seq(), 3);
+
+        // Consumer at seq 0 — gap exists (needs R2 segments)
+        assert!(wal.tail(0, 10).is_some(), "after_seq=0 should return all entries from buffer");
+
+        // Consumer at seq 1 — gap (1 < oldest=3 AND 1 < oldest_evicted=2)
+        assert!(wal.tail(1, 10).is_none(), "after_seq=1 should detect gap");
+
+        // Consumer at seq 2 — at eviction boundary, no gap
+        let tail = wal.tail(2, 10);
+        assert!(tail.is_some(), "after_seq=2 should not have gap (boundary)");
+        assert_eq!(tail.unwrap().len(), 3); // seq 3,4,5
+
+        // Consumer at seq 4 — no gap, returns seq 5
+        let tail = wal.tail(4, 10).unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].seq, 5);
+
+        // Consumer fully caught up
+        let tail = wal.tail(5, 10).unwrap();
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn test_wal_empty_buffer_tail() {
+        use crate::wal::WalRingBuffer;
+        let wal = WalRingBuffer::new(10);
+
+        // Empty buffer — no gap, empty result
+        let tail = wal.tail(0, 10);
+        assert!(tail.is_some());
+        assert!(tail.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_dirty_labels_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+
+        e.merge_record("Post", "rkey", "p1", &[
+            ("title".into(), yata_grin::PropValue::Str("Hello".into())),
+        ]).unwrap();
+        e.merge_record("Like", "rkey", "l1", &[]).unwrap();
+
+        let dirty = e.drain_dirty_labels();
+        assert!(dirty.contains("Post"));
+        assert!(dirty.contains("Like"));
+        assert_eq!(dirty.len(), 2);
+
+        // Drain again — should be empty
+        let dirty2 = e.drain_dirty_labels();
+        assert!(dirty2.is_empty(), "dirty_labels should be empty after drain");
+    }
+
+    #[test]
+    fn test_v1_manifest_backward_compat() {
+        // v1 JSON without label_segments and blake3_hex — should deserialize with defaults
+        let json = r#"{"partition_id":0,"version":1,"compacted_segment_key":"k","compacted_seq":50,"entry_count":10,"labels":["Post"],"created_at_ms":0,"segment_bytes":100}"#;
+        let manifest: crate::compaction::CompactionManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.version, 1);
+        assert!(manifest.label_segments.is_empty());
+    }
+
+    #[test]
+    fn test_v2_manifest_blake3_backward_compat() {
+        // v2 label_segments without blake3_hex field — should default to empty string
+        let json = r#"{"partition_id":0,"version":2,"compacted_segment_key":"","compacted_seq":100,"entry_count":30,"labels":["Post"],"created_at_ms":0,"segment_bytes":2048,"label_segments":{"Post":{"key":"k","max_seq":100,"entry_count":30,"segment_bytes":2048}}}"#;
+        let manifest: crate::compaction::CompactionManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.version, 2);
+        assert!(manifest.label_segments["Post"].blake3_hex.is_empty(), "blake3_hex should default to empty");
     }
 }

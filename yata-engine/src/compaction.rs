@@ -251,6 +251,29 @@ pub struct LabelSegmentState {
     pub entry_count: usize,
     /// Segment size in bytes.
     pub segment_bytes: usize,
+    /// Blake3 hash of the segment data (hex-encoded). Empty for legacy segments.
+    #[serde(default)]
+    pub blake3_hex: String,
+}
+
+/// Compute Blake3 hash of data, return hex string.
+pub fn blake3_hex(data: &[u8]) -> String {
+    blake3::hash(data).to_hex().to_string()
+}
+
+/// Verify Blake3 checksum. Returns Ok if checksum matches or is empty (legacy).
+/// Returns Err with details if mismatch.
+pub fn verify_blake3(data: &[u8], expected_hex: &str, label: &str) -> Result<(), String> {
+    if expected_hex.is_empty() {
+        return Ok(()); // legacy segment without checksum
+    }
+    let actual = blake3_hex(data);
+    if actual != expected_hex {
+        return Err(format!(
+            "Blake3 checksum mismatch for label {label}: expected {expected_hex}, got {actual}"
+        ));
+    }
+    Ok(())
 }
 
 /// Build R2 key for the compaction manifest.
@@ -314,11 +337,13 @@ pub fn build_manifest_v2(
 
     for lr in label_results {
         let key = label_compacted_r2_key(prefix, partition_id, &lr.label);
+        let checksum = blake3_hex(&lr.data);
         label_segments.insert(lr.label.clone(), LabelSegmentState {
             key,
             max_seq: lr.max_seq,
             entry_count: lr.entry_count,
             segment_bytes: lr.data.len(),
+            blake3_hex: checksum,
         });
     }
 
@@ -600,6 +625,7 @@ mod tests {
             max_seq: 100,
             entry_count: 30,
             segment_bytes: 2048,
+            blake3_hex: "abc123".to_string(),
         });
         let manifest = CompactionManifest {
             partition_id: 0,
@@ -690,6 +716,7 @@ mod tests {
             max_seq: 5,
             entry_count: 3,
             segment_bytes: 100,
+            blake3_hex: String::new(),
         });
         let results = vec![
             LabelCompactionResult {
@@ -703,5 +730,60 @@ mod tests {
         assert_eq!(manifest.label_segments.len(), 2);
         assert_eq!(manifest.labels, vec!["Like", "Post"]);
         assert_eq!(manifest.entry_count, 8); // 3 + 5
+    }
+
+    #[test]
+    fn test_blake3_hex_deterministic() {
+        let data = b"hello yata";
+        let h1 = blake3_hex(data);
+        let h2 = blake3_hex(data);
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64); // 256-bit = 64 hex chars
+    }
+
+    #[test]
+    fn test_verify_blake3_match() {
+        let data = b"test segment data";
+        let hash = blake3_hex(data);
+        assert!(verify_blake3(data, &hash, "Post").is_ok());
+    }
+
+    #[test]
+    fn test_verify_blake3_mismatch() {
+        let data = b"test segment data";
+        let result = verify_blake3(data, "0000000000000000000000000000000000000000000000000000000000000000", "Post");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn test_verify_blake3_empty_skips() {
+        let data = b"any data";
+        assert!(verify_blake3(data, "", "Legacy").is_ok());
+    }
+
+    #[test]
+    fn test_build_manifest_v2_includes_blake3() {
+        let entries = vec![make(1, "Post", "pk_1", WalOp::Upsert, "v1")];
+        let data = crate::arrow_wal::serialize_segment_arrow(&entries).unwrap();
+        let expected_hash = blake3_hex(&data);
+
+        let results = vec![LabelCompactionResult {
+            label: "Post".to_string(),
+            data,
+            max_seq: 1,
+            entry_count: 1,
+        }];
+        let manifest = build_manifest_v2(0, "yata/", 1, &results, &HashMap::new());
+        assert_eq!(manifest.label_segments["Post"].blake3_hex, expected_hash);
+        assert!(!expected_hash.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_v2_blake3_serde_backward_compat() {
+        // v2 JSON without blake3_hex field — should deserialize with default empty string
+        let json = r#"{"key":"k","max_seq":50,"entry_count":10,"segment_bytes":100}"#;
+        let parsed: LabelSegmentState = serde_json::from_str(json).unwrap();
+        assert!(parsed.blake3_hex.is_empty());
     }
 }
