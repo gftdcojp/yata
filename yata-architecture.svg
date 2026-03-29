@@ -912,8 +912,8 @@
   <!-- L2 Checkpoint -->
   <line x1="620" y1="4071" x2="680" y2="4071" stroke="#3b82f6" stroke-width="1" marker-end="url(#arrow)"/>
   <rect x="682" y="4046" width="200" height="50" rx="6" fill="#1e293b" stroke="#3b82f6" stroke-width="1.5"/>
-  <text x="702" y="4066" fill="#3b82f6" font-size="10" font-weight="bold">L1 Compaction + L2 Checkpoint</text>
-  <text x="702" y="4082" fill="#94a3b8" font-size="9">PK-dedup Arrow IPC (compact) / YataFragment (legacy)</text>
+  <text x="702" y="4066" fill="#3b82f6" font-size="10" font-weight="bold">L1 Compaction (Arrow IPC)</text>
+  <text x="702" y="4082" fill="#94a3b8" font-size="9">PK-dedup Arrow IPC — legacy ArrowFragment 除去済み</text>
   <text x="702" y="4092" fill="#3b82f6" font-size="7">MMAP-FIRST COLD START (disk ~100µs → R2 fallback)</text>
 
   <!-- Read Replicas -->
