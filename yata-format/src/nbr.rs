@@ -1,6 +1,6 @@
-//! NbrUnit: Vineyard-compatible packed neighbor unit.
+//! NbrUnit: packed neighbor unit for CSR adjacency.
 //!
-//! In Vineyard's ArrowFragment, CSR adjacency lists store packed NbrUnit structs:
+//! CSR adjacency lists store packed NbrUnit structs:
 //! ```c++
 //! template <typename VID_T, typename EID_T>
 //! struct NbrUnit {
@@ -9,17 +9,15 @@
 //! } __attribute__((packed, aligned(4)));
 //! ```
 //!
-//! We use the same binary layout for wire compatibility with Vineyard/GraphScope.
+//! repr(C) layout for zero-copy cast between bytes and NbrUnit slices.
 
-/// Packed neighbor unit (Vineyard-compatible binary layout).
+/// Packed neighbor unit for CSR adjacency.
 ///
-/// VID=u64, EID=u64 → 16 bytes total (same as `NbrUnit<uint64_t, uint64_t>`).
-/// VID=u64, EID=u32 → 12 bytes total (same as `NbrUnit<uint64_t, uint32_t>`).
+/// VID=u64, EID=u64 → 16 bytes total.
+/// VID=u64, EID=u32 → 12 bytes total.
 ///
 /// Default: VID=u64, EID=u64 for maximum vertex/edge capacity.
-/// For u64+u64 (16B) and u64+u32 (12B with 4B padding), repr(C) matches
-/// Vineyard's `__attribute__((packed, aligned(4)))` because both fields are
-/// naturally aligned. repr(C) avoids UB from unaligned references in Rust.
+/// repr(C) ensures stable layout for zero-copy cast between bytes and NbrUnit slices.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NbrUnit<VID = u64, EID = u64> {
@@ -33,7 +31,7 @@ impl<VID: Copy, EID: Copy> NbrUnit<VID, EID> {
     }
 }
 
-/// Standard NbrUnit with u64 vid + u64 eid (16 bytes, Vineyard default).
+/// Standard NbrUnit with u64 vid + u64 eid (16 bytes).
 pub type NbrUnit64 = NbrUnit<u64, u64>;
 
 /// Size of a NbrUnit64 in bytes (16B: u64 vid + u64 eid).
@@ -57,7 +55,7 @@ pub fn bytes_to_nbr_units(data: &[u8]) -> Option<&[NbrUnit64]> {
     Some(unsafe { std::slice::from_raw_parts(data.as_ptr() as *const NbrUnit64, count) })
 }
 
-/// Build NbrUnit array from separate vid/eid arrays (yata CSR → Vineyard conversion).
+/// Build NbrUnit array from separate vid/eid arrays.
 pub fn build_nbr_units(vids: &[u64], eids: &[u64]) -> Vec<NbrUnit64> {
     assert_eq!(vids.len(), eids.len());
     vids.iter()

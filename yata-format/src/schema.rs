@@ -1,8 +1,6 @@
-//! PropertyGraphSchema: Vineyard-compatible graph schema.
+//! PropertyGraphSchema: typed graph schema.
 //!
-//! Reference: https://github.com/v6d-io/v6d/blob/main/modules/graph/fragment/graph_schema.h
-//!
-//! Vineyard PropertyGraphSchema stores:
+//! PropertyGraphSchema stores:
 //! - vertex_entries: per-label schema (label name, property definitions)
 //! - edge_entries: per-label schema (label name, property definitions)
 //! - label_id ↔ label_name bidirectional mapping
@@ -85,10 +83,9 @@ impl SchemaEntry {
     }
 }
 
-/// Vineyard-compatible property graph schema.
+/// Property graph schema.
 ///
-/// Mirrors `vineyard::PropertyGraphSchema` with JSON serialization
-/// compatible with Vineyard's `ToJSON()`/`FromJSON()`.
+/// JSON-serializable vertex/edge label definitions with Arrow-typed properties.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PropertyGraphSchema {
     pub vertex_entries: Vec<SchemaEntry>,
@@ -175,7 +172,7 @@ impl PropertyGraphSchema {
     }
 }
 
-// ── Arrow DataType ↔ String conversion (Vineyard-compatible) ────────
+// ── Arrow DataType ↔ String conversion ────────
 
 fn arrow_type_to_string(dt: &DataType) -> String {
     match dt {

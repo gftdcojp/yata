@@ -1,4 +1,4 @@
-//! Integration tests for yata-vineyard ArrowFragment.
+//! Integration tests for yata-format YataFragment.
 
 use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -7,7 +7,7 @@ use bytes::Bytes;
 use std::sync::Arc;
 
 use crate::blob::{BlobStore, MemoryBlobStore};
-use crate::fragment::{ArrowFragment, split_record_batch};
+use crate::fragment::{YataFragment, split_record_batch};
 use crate::nbr::{self, NbrUnit64};
 use crate::schema::PropertyGraphSchema;
 
@@ -15,7 +15,7 @@ use crate::schema::PropertyGraphSchema;
 /// - 3 Person vertices (id=0,1,2) with name + age props
 /// - 2 KNOWS edges (0→1, 1→2) with weight prop
 /// - Directed, single fragment
-fn build_test_fragment() -> ArrowFragment {
+fn build_test_fragment() -> YataFragment {
     let mut schema = PropertyGraphSchema::new();
     let vlabel = schema.add_vertex_label("Person");
     schema
@@ -33,7 +33,7 @@ fn build_test_fragment() -> ArrowFragment {
         .unwrap()
         .add_prop("weight", &DataType::Float64);
 
-    let mut frag = ArrowFragment::new(0, 1, true, schema);
+    let mut frag = YataFragment::new(0, 1, true, schema);
 
     // Vertex table: Person
     let vertex_schema = Arc::new(Schema::new(vec![
@@ -161,10 +161,10 @@ fn fragment_serialize_deserialize_roundtrip() {
 
     // Serialize
     let meta = frag.serialize(&store);
-    assert_eq!(meta.typename, "vineyard::ArrowFragment<int64,uint64>");
+    assert_eq!(meta.typename, "yata::Fragment");
 
     // Deserialize
-    let restored = ArrowFragment::deserialize(&meta, &store).unwrap();
+    let restored = YataFragment::deserialize(&meta, &store).unwrap();
 
     // Verify structure
     assert_eq!(restored.fid, frag.fid);
@@ -250,11 +250,11 @@ fn blob_store_name_based() {
 #[test]
 fn empty_fragment_roundtrip() {
     let schema = PropertyGraphSchema::new();
-    let frag = ArrowFragment::new(0, 1, true, schema);
+    let frag = YataFragment::new(0, 1, true, schema);
     let store = MemoryBlobStore::new();
 
     let meta = frag.serialize(&store);
-    let restored = ArrowFragment::deserialize(&meta, &store).unwrap();
+    let restored = YataFragment::deserialize(&meta, &store).unwrap();
 
     assert_eq!(restored.vertex_label_num(), 0);
     assert_eq!(restored.edge_label_num(), 0);
@@ -278,13 +278,13 @@ fn multi_label_fragment() {
     let _knows_id = schema.add_edge_label("KNOWS");
     let _works_id = schema.add_edge_label("WORKS_AT");
 
-    let frag = ArrowFragment::new(0, 1, true, schema);
+    let frag = YataFragment::new(0, 1, true, schema);
     assert_eq!(frag.vertex_label_num(), 2);
     assert_eq!(frag.edge_label_num(), 2);
 
     let store = MemoryBlobStore::new();
     let meta = frag.serialize(&store);
-    let restored = ArrowFragment::deserialize(&meta, &store).unwrap();
+    let restored = YataFragment::deserialize(&meta, &store).unwrap();
     assert_eq!(restored.vertex_label_num(), 2);
     assert_eq!(restored.edge_label_num(), 2);
     assert_eq!(
@@ -353,7 +353,7 @@ fn split_record_batch_smaller_than_chunk() {
 }
 
 /// Build a large test fragment with N vertices to exercise chunked serialization.
-fn build_large_fragment(n: usize) -> ArrowFragment {
+fn build_large_fragment(n: usize) -> YataFragment {
     let mut schema = PropertyGraphSchema::new();
     let vlabel = schema.add_vertex_label("Node");
     schema.vertex_entry_mut(vlabel).unwrap().add_prop("id", &DataType::Int64);
@@ -361,7 +361,7 @@ fn build_large_fragment(n: usize) -> ArrowFragment {
 
     let _elabel = schema.add_edge_label("LINK");
 
-    let mut frag = ArrowFragment::new(0, 1, true, schema);
+    let mut frag = YataFragment::new(0, 1, true, schema);
 
     let ids: Vec<i64> = (0..n as i64).collect();
     let names: Vec<String> = (0..n).map(|i| format!("node_{}", i)).collect();
@@ -410,7 +410,7 @@ fn chunked_serialize_deserialize_roundtrip() {
     }
 
     // Deserialize and verify full data integrity
-    let restored = ArrowFragment::deserialize(&meta, &store).unwrap();
+    let restored = YataFragment::deserialize(&meta, &store).unwrap();
     assert_eq!(restored.inner_vertex_num(0), 500);
 
     let batch = restored.vertex_table(0).unwrap();
@@ -441,7 +441,7 @@ fn chunked_backward_compat_small_batch() {
     assert!(meta.blobs.contains_key("vertex_table_0"));
     assert!(meta.get_field("vertex_table_0_chunks").is_none());
 
-    let restored = ArrowFragment::deserialize(&meta, &store).unwrap();
+    let restored = YataFragment::deserialize(&meta, &store).unwrap();
     assert_eq!(restored.inner_vertex_num(0), 50);
     assert_eq!(restored.vertex_table(0).unwrap().num_rows(), 50);
 }
@@ -459,7 +459,7 @@ fn byte_based_chunking_default() {
     assert!(meta.blobs.contains_key("vertex_table_0"));
     assert!(meta.get_field("vertex_table_0_chunks").is_none());
 
-    let restored = ArrowFragment::deserialize(&meta, &store).unwrap();
+    let restored = YataFragment::deserialize(&meta, &store).unwrap();
     assert_eq!(restored.inner_vertex_num(0), 1000);
 }
 
@@ -478,7 +478,7 @@ fn byte_based_chunking_small_target() {
     assert!(chunk_count.unwrap() >= 2, "expected multiple chunks");
 
     // Roundtrip should be intact
-    let restored = ArrowFragment::deserialize(&meta, &store).unwrap();
+    let restored = YataFragment::deserialize(&meta, &store).unwrap();
     assert_eq!(restored.inner_vertex_num(0), 10_000);
     let batch = restored.vertex_table(0).unwrap();
     assert_eq!(batch.num_rows(), 10_000);
@@ -499,7 +499,7 @@ fn chunked_with_csr_topology_roundtrip() {
         .unwrap();
     assert_eq!(chunk_count, 2);
 
-    let restored = ArrowFragment::deserialize(&meta, &store).unwrap();
+    let restored = YataFragment::deserialize(&meta, &store).unwrap();
     assert_eq!(restored.inner_vertex_num(0), 3);
 
     // Verify vertex data

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use yata_cypher::Graph;
 use yata_graph::{GraphStore, QueryableGraph};
 use yata_grin::{Mutable, Predicate, PropValue, Property, Scannable, Topology};
-use yata_vineyard::BlobStore;
+use yata_format::BlobStore;
 use yata_store::vineyard::{
     DiskVineyard, EdgeVineyard, FragmentManifest, MmapVineyard, VineyardStore,
 };
@@ -360,7 +360,7 @@ impl TieredGraphEngine {
             Some(b) => b,
             None => { tracing::warn!("ensure_labels: schema blob not found"); return; }
         };
-        let schema: yata_vineyard::schema::PropertyGraphSchema = match serde_json::from_slice(&schema_bytes) {
+        let schema: yata_format::schema::PropertyGraphSchema = match serde_json::from_slice(&schema_bytes) {
             Ok(s) => s,
             Err(e) => { tracing::warn!(error = %e, "ensure_labels: schema parse failed"); return; }
         };
@@ -787,7 +787,7 @@ impl TieredGraphEngine {
         })
     }
 
-    /// Restore CSR from R2 ArrowFragment snapshot.
+    /// Restore CSR from R2 YataFragment snapshot.
     pub fn restore_from_r2(&self) {
         let s3 = match self.get_s3_client() {
             Some(s3) => s3.clone(),
@@ -808,7 +808,7 @@ impl TieredGraphEngine {
                     *hot = yata_store::GraphStoreEnum::Single(store);
                     self.hot_initialized.store(true, Ordering::Relaxed);
                 }
-                tracing::info!(vertices = vc, edges = ec, "restored from R2 ArrowFragment");
+                tracing::info!(vertices = vc, edges = ec, "restored from R2 YataFragment");
             }
             Err(e) => {
                 tracing::warn!("R2 restore failed: {e}");
@@ -1046,7 +1046,7 @@ impl TieredGraphEngine {
         }
     }
 
-    /// Trigger R2 checkpoint: serialize CSR → ArrowFragment → R2 PUT.
+    /// Trigger R2 checkpoint: serialize CSR → YataFragment → R2 PUT.
     /// WAL Projection: CSR is authoritative (no R2 compaction).
     pub fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
         self.trigger_snapshot_inner(false)
@@ -1086,14 +1086,14 @@ impl TieredGraphEngine {
         // WAL Projection: no R2 compaction. CSR is authoritative (built from WAL).
         self.hot_initialized.store(true, Ordering::Relaxed);
 
-        // Serialize CSR → ArrowFragment → MemoryBlobStore
+        // Serialize CSR → YataFragment → MemoryBlobStore
         // Uses selective conversion: only dirty vertex labels get property extraction.
         let serialize_start = std::time::Instant::now();
         let (v_count, e_count, blob_store, meta, dirty_vlabel_ids) = if let Ok(csr) = self.hot.read() {
             let store = csr.as_single()
                 .ok_or_else(|| "no CSR store available".to_string())?;
             let pid = store.partition_id_raw().get();
-            let frag = yata_vineyard::convert::csr_to_fragment_selective(store, pid, &dirty_set);
+            let frag = yata_format::convert::csr_to_fragment_selective(store, pid, &dirty_set);
             let vc = frag.ivnums.iter().sum::<u64>();
             let ec = frag.edge_num();
             // Compute dirty vertex label IDs for selective blob upload
@@ -1102,7 +1102,7 @@ impl TieredGraphEngine {
                 .filter(|(_, e)| dirty_set.contains(&e.label))
                 .map(|(i, _)| i)
                 .collect();
-            let bs = yata_vineyard::blob::MemoryBlobStore::new();
+            let bs = yata_format::blob::MemoryBlobStore::new();
             let m = frag.serialize(&bs);
             (vc, ec, bs, m, ids)
         } else {
@@ -1155,7 +1155,7 @@ impl TieredGraphEngine {
             if let Some(data) = BlobStore::get(&blob_store, name) {
                 let full_key = format!("{prefix}snap/fragment/{name}");
                 if let Err(e) = s3.put_sync(&full_key, data.clone()) {
-                    tracing::error!(name, error = %e, "R2 ArrowFragment blob upload failed");
+                    tracing::error!(name, error = %e, "R2 YataFragment blob upload failed");
                 } else {
                     uploaded += 1;
                 }
@@ -1382,7 +1382,7 @@ impl TieredGraphEngine {
         Ok((seq_start, seq_end, data.len()))
     }
 
-    /// Checkpoint: serialize CSR → ArrowFragment → R2 (same as trigger_snapshot).
+    /// Checkpoint: serialize CSR → YataFragment → R2 (same as trigger_snapshot).
     /// Also writes checkpoint metadata with the current WAL head seq.
     /// Used for cold start recovery: page-in checkpoint + replay WAL segments after checkpoint_seq.
     pub fn wal_checkpoint(&self) -> Result<(u64, u64), String> {
@@ -1391,7 +1391,7 @@ impl TieredGraphEngine {
 
         let checkpoint_seq = self.wal_head_seq();
 
-        // Use the existing trigger_snapshot_inner for ArrowFragment serialization
+        // Use the existing trigger_snapshot_inner for YataFragment serialization
         let result = self.trigger_snapshot_inner(true)?;
 
         // Write checkpoint metadata
@@ -1452,10 +1452,19 @@ impl TieredGraphEngine {
 
         // List WAL segments in R2
         let segment_prefix = format!("{prefix}wal/segments/{pid}/");
-        let segment_objects = s3.list_sync(&segment_prefix).unwrap_or_default();
+        let segment_objects = match s3.list_sync(&segment_prefix) {
+            Ok(objects) => {
+                tracing::info!(prefix = %segment_prefix, count = objects.len(), "compaction: listed WAL segments");
+                objects
+            }
+            Err(e) => {
+                tracing::error!(prefix = %segment_prefix, error = %e, "compaction: R2 list failed");
+                return Err(format!("R2 list failed for {segment_prefix}: {e}"));
+            }
+        };
 
         if segment_objects.is_empty() {
-            tracing::debug!("compaction: no WAL segments found");
+            tracing::info!(prefix = %segment_prefix, "compaction: no WAL segments found");
             return Ok(crate::compaction::CompactionResult {
                 data: bytes::Bytes::new(),
                 min_seq: 0,
@@ -1562,9 +1571,9 @@ impl TieredGraphEngine {
     /// Cold start for Read Container in WalProjection mode:
     ///
     /// **L1 path (preferred)**: CompactionManifest → compacted Arrow IPC segment → WAL tail replay.
-    /// **Legacy path (fallback)**: ArrowFragment checkpoint → checkpoint_seq → WAL segment replay.
+    /// **Legacy path (fallback)**: YataFragment checkpoint → checkpoint_seq → WAL segment replay.
     ///
-    /// The L1 path is Shannon-optimal: single Arrow IPC format, no ArrowFragment deserialize.
+    /// The L1 path is Shannon-optimal: single Arrow IPC format, no YataFragment deserialize.
     pub fn wal_cold_start(&self) -> Result<u64, String> {
         let s3 = self.get_s3_client()
             .ok_or_else(|| "S3 client not configured".to_string())?;
@@ -1658,8 +1667,8 @@ impl TieredGraphEngine {
 
             manifest.compacted_seq
         } else {
-            // Legacy path: ArrowFragment checkpoint
-            tracing::info!("cold start: no compaction manifest, using legacy ArrowFragment path");
+            // Legacy path: YataFragment checkpoint
+            tracing::info!("cold start: no compaction manifest, using legacy YataFragment path");
             self.restore_from_r2();
 
             // Read legacy checkpoint metadata

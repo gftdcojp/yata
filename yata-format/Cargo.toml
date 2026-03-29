@@ -1,10 +1,10 @@
 [package]
-name = "yata-vineyard"
+name = "yata-format"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Vineyard-native ArrowFragment format for yata graph engine"
+description = "YataFragment: native property graph snapshot format for yata graph engine"
 
 [dependencies]
 yata-arrow = { workspace = true }

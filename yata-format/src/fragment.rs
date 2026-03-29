@@ -1,6 +1,4 @@
-//! ArrowFragment: Vineyard-compatible property graph fragment in pure Rust.
-//!
-//! Reference: v6d ArrowFragment<OID_T=int64, VID_T=uint64>
+//! YataFragment: native property graph fragment format.
 //!
 //! Layout:
 //! - Per vertex label: Arrow RecordBatch (property columns, row index = local VID)
@@ -31,12 +29,12 @@ pub const DEFAULT_CHUNK_TARGET_BYTES: usize = 32 * 1024 * 1024; // 32 MB
 /// Override via YATA_CHUNK_ROWS env var.
 pub const DEFAULT_CHUNK_ROWS: usize = 100_000;
 
-/// Vineyard-compatible ArrowFragment.
+/// Native property graph fragment.
 ///
 /// Stores a single partition (fid) of a property graph using Arrow columnar format.
-/// CSR topology uses packed NbrUnit arrays (Vineyard binary-compatible).
+/// CSR topology uses packed NbrUnit arrays.
 #[derive(Clone)]
-pub struct ArrowFragment {
+pub struct YataFragment {
     /// Fragment ID within the distributed graph.
     pub fid: u32,
     /// Total number of fragments.
@@ -71,7 +69,7 @@ pub struct ArrowFragment {
     pub ie_nbrs: Vec<Vec<Option<Bytes>>>,
 }
 
-impl ArrowFragment {
+impl YataFragment {
     /// Create an empty fragment.
     pub fn new(fid: u32, fnum: u32, directed: bool, schema: PropertyGraphSchema) -> Self {
         let vlabel_count = schema.vertex_entries.len();
@@ -231,7 +229,7 @@ impl ArrowFragment {
     ) -> ObjectMeta {
         let mut meta = ObjectMeta::new(
             ObjectId::new(self.fid as u64),
-            "vineyard::ArrowFragment<int64,uint64>",
+            "yata::Fragment",
         );
         meta.set_field("fid", self.fid as i64);
         meta.set_field("fnum", self.fnum as i64);

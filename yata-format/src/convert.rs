@@ -1,7 +1,7 @@
-//! Conversion between MutableCsrStore and ArrowFragment.
+//! Conversion between MutableCsrStore and YataFragment.
 //!
-//! MutableCsrStore (mutable, in-memory) ↔ ArrowFragment (immutable, serializable).
-//! ArrowFragment uses NbrUnit zero-copy CSR which is ~2x faster for neighbor traversal.
+//! MutableCsrStore (mutable, in-memory) ↔ YataFragment (immutable, serializable).
+//! YataFragment uses NbrUnit zero-copy CSR which is ~2x faster for neighbor traversal.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,15 +14,15 @@ use bytes::Bytes;
 
 use yata_grin::{PropValue, Property, Scannable, Schema as GrinSchema};
 
-use crate::fragment::ArrowFragment;
+use crate::YataFragment;
 use crate::nbr::{self, NbrUnit64};
 use crate::schema::PropertyGraphSchema;
 
-/// Convert a MutableCsrStore to an ArrowFragment.
+/// Convert a MutableCsrStore to an YataFragment.
 ///
 /// Extracts all vertices/edges per label into Arrow columnar format,
 /// builds bidirectional CSR with packed NbrUnit for zero-copy traversal.
-pub fn csr_to_fragment<S>(store: &S, partition_id: u32) -> ArrowFragment
+pub fn csr_to_fragment<S>(store: &S, partition_id: u32) -> YataFragment
 where
     S: GrinSchema + Property + Scannable + yata_grin::Topology,
 {
@@ -39,7 +39,7 @@ pub fn csr_to_fragment_selective<S>(
     store: &S,
     partition_id: u32,
     dirty_labels: &std::collections::HashSet<String>,
-) -> ArrowFragment
+) -> YataFragment
 where
     S: GrinSchema + Property + Scannable + yata_grin::Topology,
 {
@@ -50,7 +50,7 @@ fn csr_to_fragment_inner<S>(
     store: &S,
     partition_id: u32,
     dirty_labels: Option<&std::collections::HashSet<String>>,
-) -> ArrowFragment
+) -> YataFragment
 where
     S: GrinSchema + Property + Scannable + yata_grin::Topology,
 {
@@ -83,7 +83,7 @@ where
         elabel_map.insert(label.clone(), id);
     }
 
-    let mut frag = ArrowFragment::new(partition_id, 1, true, schema);
+    let mut frag = YataFragment::new(partition_id, 1, true, schema);
 
     // ── Vertex tables ──
     // Selective mode: only extract properties for dirty labels.

@@ -41,7 +41,7 @@ ring.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-yata-vineyard = { path = "../yata-vineyard" }
+yata-format = { path = "../yata-format" }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 serde_json = "1"
 arrow = { version = "53", features = ["ipc"] }

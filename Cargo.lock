@@ -3276,12 +3276,28 @@ dependencies = [
  "yata-arrow",
  "yata-core",
  "yata-cypher",
+ "yata-format",
  "yata-gie",
  "yata-graph",
  "yata-grin",
  "yata-s3",
  "yata-store",
- "yata-vineyard",
+]
+
+[[package]]
+name = "yata-format"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "bytes",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "yata-arrow",
+ "yata-core",
+ "yata-grin",
 ]
 
 [[package]]
@@ -3388,12 +3404,12 @@ dependencies = [
  "yata-arrow",
  "yata-core",
  "yata-engine",
+ "yata-format",
  "yata-graph",
  "yata-grin",
  "yata-object",
  "yata-s3",
  "yata-store",
- "yata-vineyard",
 ]
 
 [[package]]
@@ -3434,22 +3450,6 @@ dependencies = [
  "tokio",
  "yata-arrow",
  "yata-core",
-]
-
-[[package]]
-name = "yata-vineyard"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "arrow-array",
- "arrow-schema",
- "bytes",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "yata-arrow",
- "yata-core",
- "yata-grin",
 ]
 
 [[package]]

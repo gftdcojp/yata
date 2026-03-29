@@ -1,4 +1,4 @@
-//! Name-based blob storage for ArrowFragment persistence.
+//! Name-based blob storage for YataFragment persistence.
 //!
 //! Blobs are stored by name (e.g., "vertex_table_0", "oe_offsets_0_0").
 //! R2 key = `snap/fragment/{name}`. No content-addressing (CAS removed).
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// Vineyard ObjectID (uint64, same as v6d).
+/// Fragment ObjectID (uint64).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ObjectId(pub u64);
 
@@ -24,7 +24,7 @@ impl std::fmt::Display for ObjectId {
     }
 }
 
-/// Metadata value (Vineyard's JSON tree value types).
+/// Metadata value (JSON tree value types).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MetaValue {
@@ -105,7 +105,7 @@ impl From<bool> for MetaValue {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectMeta {
     pub id: ObjectId,
-    /// Vineyard type name (e.g., "vineyard::ArrowFragment<int64,uint64>").
+    /// Fragment type name.
     pub typename: String,
     /// Scalar fields.
     pub fields: HashMap<String, MetaValue>,

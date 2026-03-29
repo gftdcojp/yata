@@ -1,4 +1,4 @@
-//! Local load test + partition simulation + ArrowFragment roundtrip.
+//! Local load test + partition simulation + YataFragment roundtrip.
 //!
 //! Usage:
 //!   cargo test -p yata-server --test local_loadtest -- --nocapture
@@ -144,9 +144,9 @@ async fn partition_simulation_label_routing() {
 async fn arrow_fragment_snapshot_roundtrip() {
     use yata_grin::Mutable;
     use yata_store::MutableCsrStore;
-    use yata_vineyard::convert::csr_to_fragment;
-    use yata_vineyard::BlobStore;
-    use yata_vineyard::MemoryBlobStore;
+    use yata_format::convert::csr_to_fragment;
+    use yata_format::BlobStore;
+    use yata_format::MemoryBlobStore;
 
     let mut store = MutableCsrStore::new();
 
@@ -169,7 +169,7 @@ async fn arrow_fragment_snapshot_roundtrip() {
     store.add_edge(0, 2, "LIKES", &[]);
     store.commit();
 
-    // Convert to ArrowFragment
+    // Convert to YataFragment
     let frag = csr_to_fragment(&store, 0);
     assert_eq!(frag.vertex_label_num(), 2);
     assert_eq!(frag.edge_label_num(), 2);
@@ -177,7 +177,7 @@ async fn arrow_fragment_snapshot_roundtrip() {
     // Serialize → Deserialize roundtrip
     let blob_store = MemoryBlobStore::new();
     let meta = frag.serialize(&blob_store);
-    let restored = yata_vineyard::ArrowFragment::deserialize(&meta, &blob_store).unwrap();
+    let restored = yata_format::YataFragment::deserialize(&meta, &blob_store).unwrap();
 
     assert_eq!(restored.vertex_label_num(), 2);
     assert_eq!(restored.edge_label_num(), 2);
@@ -186,7 +186,7 @@ async fn arrow_fragment_snapshot_roundtrip() {
     assert_eq!(restored.inner_vertex_num(0), 2);
 
     eprintln!(
-        "ArrowFragment roundtrip: {} v_labels, {} e_labels, {} edges",
+        "YataFragment roundtrip: {} v_labels, {} e_labels, {} edges",
         restored.vertex_label_num(),
         restored.edge_label_num(),
         restored.edge_num(),

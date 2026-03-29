@@ -1,7 +1,7 @@
 //! Snapshot manifest types for R2 persistence.
 //!
 //! Legacy SnapshotBundle / serialize_snapshot / restore_snapshot_bundle are removed.
-//! ArrowFragment (yata-vineyard) is the canonical snapshot format.
+//! YataFragment (yata-format) is the canonical snapshot format.
 //! This module retains only SnapshotManifest for backward-compat manifest.json parsing.
 
 use serde::{Deserialize, Serialize};

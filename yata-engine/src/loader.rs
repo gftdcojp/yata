@@ -175,12 +175,12 @@ pub fn rebuild_csr_from_graph_with_partition(
     csr
 }
 
-/// Restore CSR from an ArrowFragment (deserialized from R2 blobs).
+/// Restore CSR from an YataFragment (deserialized from R2 blobs).
 ///
 /// Reads vertex RecordBatch columns → add_vertex, then uses CSR topology
 /// from NbrUnit packed bytes for edge reconstruction.
 pub fn restore_csr_from_fragment(
-    frag: &yata_vineyard::ArrowFragment,
+    frag: &yata_format::YataFragment,
     partition_id: PartitionId,
 ) -> MutableCsrStore {
     use arrow::array::{Int64Array, Float64Array, StringArray, BooleanArray};
@@ -238,12 +238,12 @@ pub fn restore_csr_from_fragment(
     tracing::info!(
         vertices = csr.vertex_count(),
         edges = csr.edge_count(),
-        "CSR restored from ArrowFragment"
+        "CSR restored from YataFragment"
     );
     csr
 }
 
-/// Page-in ArrowFragment and restore to CSR.
+/// Page-in YataFragment and restore to CSR.
 ///
 /// 3-tier fetch: disk cache (`YATA_VINEYARD_DIR`) → R2 → write-through to disk.
 /// Cold start with warm disk: ~100µs per blob (vs ~3-5ms R2 GET).
@@ -252,7 +252,7 @@ pub fn page_in_from_r2(
     prefix: &str,
     partition_id: PartitionId,
 ) -> Result<MutableCsrStore, String> {
-    use yata_vineyard::blob::{BlobStore, MemoryBlobStore};
+    use yata_format::blob::{BlobStore, MemoryBlobStore};
 
     let disk_dir = disk_cache_dir();
     let disk_ref = disk_dir.as_deref();
@@ -260,7 +260,7 @@ pub fn page_in_from_r2(
     // 1. Fetch fragment meta (disk → R2)
     let meta_bytes = fetch_blob_cached(s3, prefix, "meta.json", disk_ref)
         .ok_or_else(|| "no fragment meta.json in disk or R2".to_string())?;
-    let meta: yata_vineyard::blob::ObjectMeta = serde_json::from_slice(&meta_bytes)
+    let meta: yata_format::blob::ObjectMeta = serde_json::from_slice(&meta_bytes)
         .map_err(|e| format!("parse fragment meta: {e}"))?;
 
     // 2. Fetch all blobs (disk → R2, write-through)
@@ -277,9 +277,9 @@ pub fn page_in_from_r2(
         }
     }
 
-    // 3. Deserialize ArrowFragment
-    let frag = yata_vineyard::ArrowFragment::deserialize(&meta, &blob_store)
-        .map_err(|e| format!("ArrowFragment deserialize: {e}"))?;
+    // 3. Deserialize YataFragment
+    let frag = yata_format::YataFragment::deserialize(&meta, &blob_store)
+        .map_err(|e| format!("YataFragment deserialize: {e}"))?;
 
     // 4. Restore CSR
     let csr = restore_csr_from_fragment(&frag, partition_id);
@@ -305,8 +305,8 @@ pub fn page_in_topology_from_r2(
     s3: &yata_s3::s3::S3Client,
     prefix: &str,
     partition_id: PartitionId,
-) -> Result<(MutableCsrStore, yata_vineyard::blob::ObjectMeta, yata_vineyard::schema::PropertyGraphSchema, HashMap<String, u32>), String> {
-    use yata_vineyard::blob::{BlobStore, MemoryBlobStore};
+) -> Result<(MutableCsrStore, yata_format::blob::ObjectMeta, yata_format::schema::PropertyGraphSchema, HashMap<String, u32>), String> {
+    use yata_format::blob::{BlobStore, MemoryBlobStore};
 
     let disk_dir = disk_cache_dir();
     let disk_ref = disk_dir.as_deref();
@@ -314,7 +314,7 @@ pub fn page_in_topology_from_r2(
     // 1. Fetch meta
     let meta_bytes = fetch_blob_cached(s3, prefix, "meta.json", disk_ref)
         .ok_or("no fragment meta.json in disk or R2")?;
-    let meta: yata_vineyard::blob::ObjectMeta = serde_json::from_slice(&meta_bytes)
+    let meta: yata_format::blob::ObjectMeta = serde_json::from_slice(&meta_bytes)
         .map_err(|e| format!("parse fragment meta: {e}"))?;
 
     // 2. Fetch schema + ivnums (always needed)
@@ -327,7 +327,7 @@ pub fn page_in_topology_from_r2(
 
     let schema_bytes = blob_store.get("schema")
         .ok_or("schema blob missing")?;
-    let schema: yata_vineyard::schema::PropertyGraphSchema =
+    let schema: yata_format::schema::PropertyGraphSchema =
         serde_json::from_slice(&schema_bytes)
             .map_err(|e| format!("parse schema: {e}"))?;
 
@@ -355,8 +355,8 @@ pub fn page_in_topology_from_r2(
         topo_meta.fields.remove(&chunks_key);
     }
 
-    // 5. Deserialize topology-only ArrowFragment (no vertex tables → empty vertex_tables vec)
-    let frag = yata_vineyard::ArrowFragment::deserialize(&topo_meta, &blob_store)
+    // 5. Deserialize topology-only YataFragment (no vertex tables → empty vertex_tables vec)
+    let frag = yata_format::YataFragment::deserialize(&topo_meta, &blob_store)
         .map_err(|e| format!("topology deserialize: {e}"))?;
 
     // 6. Build CSR with stubs for ALL labels (VID ordering from ivnums)
@@ -394,8 +394,8 @@ pub fn page_in_selective_from_r2(
     prefix: &str,
     partition_id: PartitionId,
     needed_labels: &std::collections::HashSet<String>,
-) -> Result<(MutableCsrStore, yata_vineyard::blob::ObjectMeta, yata_vineyard::schema::PropertyGraphSchema, std::collections::HashSet<String>), String> {
-    use yata_vineyard::blob::{BlobStore, MemoryBlobStore};
+) -> Result<(MutableCsrStore, yata_format::blob::ObjectMeta, yata_format::schema::PropertyGraphSchema, std::collections::HashSet<String>), String> {
+    use yata_format::blob::{BlobStore, MemoryBlobStore};
 
     let disk_dir = disk_cache_dir();
     let disk_ref = disk_dir.as_deref();
@@ -403,7 +403,7 @@ pub fn page_in_selective_from_r2(
     // 1. Fetch meta (disk → R2)
     let meta_bytes = fetch_blob_cached(s3, prefix, "meta.json", disk_ref)
         .ok_or("no fragment meta.json in disk or R2")?;
-    let meta: yata_vineyard::blob::ObjectMeta = serde_json::from_slice(&meta_bytes)
+    let meta: yata_format::blob::ObjectMeta = serde_json::from_slice(&meta_bytes)
         .map_err(|e| format!("parse fragment meta: {e}"))?;
 
     // 2. Build selective blob store
@@ -419,7 +419,7 @@ pub fn page_in_selective_from_r2(
     // Parse schema
     let schema_bytes = blob_store.get("schema")
         .ok_or("schema blob missing")?;
-    let schema: yata_vineyard::schema::PropertyGraphSchema =
+    let schema: yata_format::schema::PropertyGraphSchema =
         serde_json::from_slice(&schema_bytes)
             .map_err(|e| format!("parse schema: {e}"))?;
 
@@ -480,9 +480,9 @@ pub fn page_in_selective_from_r2(
         filtered_meta.fields.remove(&chunks_key);
     }
 
-    // 6. Deserialize partial ArrowFragment
-    let frag = yata_vineyard::ArrowFragment::deserialize(&filtered_meta, &blob_store)
-        .map_err(|e| format!("ArrowFragment selective deserialize: {e}"))?;
+    // 6. Deserialize partial YataFragment
+    let frag = yata_format::YataFragment::deserialize(&filtered_meta, &blob_store)
+        .map_err(|e| format!("YataFragment selective deserialize: {e}"))?;
 
     // 7. Restore CSR with stubs for non-loaded labels
     let csr = restore_csr_selective(&frag, partition_id, &needed_vlabel_ids);
@@ -503,12 +503,12 @@ pub fn page_in_selective_from_r2(
     Ok((csr, meta, schema, loaded))
 }
 
-/// Restore CSR from ArrowFragment, using stubs for non-loaded vertex labels.
+/// Restore CSR from YataFragment, using stubs for non-loaded vertex labels.
 ///
 /// Labels in `loaded_vlabel_ids` get full properties from vertex_table.
 /// Other labels get `ivnums[i]` stub vertices (just label, no props) to maintain VID ordering.
 fn restore_csr_selective(
-    frag: &yata_vineyard::ArrowFragment,
+    frag: &yata_format::YataFragment,
     partition_id: PartitionId,
     loaded_vlabel_ids: &std::collections::HashSet<usize>,
 ) -> MutableCsrStore {
@@ -573,13 +573,13 @@ fn restore_csr_selective(
 pub fn enrich_label_from_r2(
     s3: &yata_s3::s3::S3Client,
     prefix: &str,
-    meta: &yata_vineyard::blob::ObjectMeta,
-    schema: &yata_vineyard::schema::PropertyGraphSchema,
+    meta: &yata_format::blob::ObjectMeta,
+    schema: &yata_format::schema::PropertyGraphSchema,
     label_name: &str,
     csr: &mut MutableCsrStore,
     vid_offset: u32,
 ) -> Result<(), String> {
-    use yata_vineyard::blob::{BlobStore, MemoryBlobStore};
+    use yata_format::blob::{BlobStore, MemoryBlobStore};
 
     let (label_id, entry) = schema.vertex_entries.iter().enumerate()
         .find(|(_, e)| e.label == label_name)
@@ -625,7 +625,7 @@ pub fn enrich_label_from_r2(
 /// Apply Arrow RecordBatch properties to existing CSR vertices via set_vertex_prop.
 fn apply_batch_properties(
     batch: &arrow::record_batch::RecordBatch,
-    entry: &yata_vineyard::schema::SchemaEntry,
+    entry: &yata_format::schema::SchemaEntry,
     csr: &mut MutableCsrStore,
     vid_offset: u32,
 ) {
@@ -685,7 +685,7 @@ pub fn page_in_vertex_chunk_from_r2(
 /// Get the chunk count for a vertex label from fragment meta.
 /// Returns None if the label uses single-blob format (pre-chunking).
 pub fn vertex_label_chunk_count(
-    meta: &yata_vineyard::blob::ObjectMeta,
+    meta: &yata_format::blob::ObjectMeta,
     label_id: usize,
 ) -> Option<usize> {
     let key = format!("vertex_table_{}_chunks", label_id);
@@ -697,7 +697,7 @@ pub fn vertex_label_chunk_count(
 pub fn fetch_fragment_meta(
     s3: &yata_s3::s3::S3Client,
     prefix: &str,
-) -> Result<yata_vineyard::blob::ObjectMeta, String> {
+) -> Result<yata_format::blob::ObjectMeta, String> {
     let meta_key = format!("{prefix}snap/fragment/meta.json");
     let meta_bytes = s3.get_sync(&meta_key)
         .map_err(|e| format!("R2 meta fetch: {e}"))?
@@ -842,8 +842,8 @@ mod tests {
 
     #[test]
     fn test_vertex_label_chunk_count_none_for_missing() {
-        let meta = yata_vineyard::blob::ObjectMeta {
-            id: yata_vineyard::blob::ObjectId(0),
+        let meta = yata_format::blob::ObjectMeta {
+            id: yata_format::blob::ObjectId(0),
             typename: String::new(),
             fields: HashMap::new(),
             members: HashMap::new(),
@@ -854,8 +854,8 @@ mod tests {
 
     #[test]
     fn test_vertex_label_chunk_count_some_when_present() {
-        let mut meta = yata_vineyard::blob::ObjectMeta {
-            id: yata_vineyard::blob::ObjectId(0),
+        let mut meta = yata_format::blob::ObjectMeta {
+            id: yata_format::blob::ObjectId(0),
             typename: String::new(),
             fields: HashMap::new(),
             members: HashMap::new(),
@@ -863,7 +863,7 @@ mod tests {
         };
         meta.fields.insert(
             "vertex_table_0_chunks".into(),
-            yata_vineyard::blob::MetaValue::Int(5),
+            yata_format::blob::MetaValue::Int(5),
         );
         assert_eq!(vertex_label_chunk_count(&meta, 0), Some(5));
     }
