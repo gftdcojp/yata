@@ -1671,6 +1671,12 @@ impl TieredGraphEngine {
                 }
             }
 
+            // Also load legacy ArrowFragment snapshot (contains edge topology + vertex data
+            // not captured by WAL — WAL only has mergeRecord vertex entries).
+            // restore_from_r2 does CSR merge (not replace), so compacted WAL data is preserved.
+            self.restore_from_r2();
+            tracing::info!("cold start: legacy ArrowFragment merged on top of compacted WAL");
+
             manifest.compacted_seq
         } else {
             // Legacy path: YataFragment checkpoint
