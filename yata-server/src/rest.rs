@@ -70,6 +70,11 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
         Err("wal_cold_start not implemented".to_string())
     }
 
+    /// L1 Compaction: PK-dedup WAL segments → compacted Arrow IPC segment.
+    fn trigger_compaction(&self) -> Result<yata_engine::compaction::CompactionResult, String> {
+        Err("trigger_compaction not implemented".to_string())
+    }
+
     /// Current WAL head sequence number.
     fn wal_head_seq(&self) -> u64 { 0 }
 
@@ -121,6 +126,7 @@ pub fn router<G: GraphQueryExecutor>(state: YataRestState<G>) -> Router {
         .route("/xrpc/ai.gftd.yata.walFlushSegment", post(wal_flush_segment_handler::<G>))
         .route("/xrpc/ai.gftd.yata.walCheckpoint", post(wal_checkpoint_handler::<G>))
         .route("/xrpc/ai.gftd.yata.walColdStart", post(wal_cold_start_handler::<G>))
+        .route("/xrpc/ai.gftd.yata.compact", post(compact_handler::<G>))
         .route("/xrpc/ai.gftd.yata.mergeRecordWal", post(merge_record_wal_handler::<G>))
         .route("/xrpc/ai.gftd.yata.stats", get(stats_handler::<G>))
         .with_state(state)
@@ -457,6 +463,29 @@ async fn wal_cold_start_handler<G: GraphQueryExecutor>(
     }
 }
 
+/// POST /xrpc/ai.gftd.yata.compact — L1 Compaction: PK-dedup WAL segments.
+/// Write Container only.
+async fn compact_handler<G: GraphQueryExecutor>(
+    State(state): State<YataRestState<G>>,
+) -> impl IntoResponse {
+    if state.readonly {
+        return (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"error": "read-only container"})));
+    }
+    let graph = state.graph.clone();
+    let result = tokio::task::spawn_blocking(move || graph.trigger_compaction()).await;
+    match result {
+        Ok(Ok(r)) => (StatusCode::OK, Json(serde_json::json!({
+            "input_entries": r.input_entries,
+            "output_entries": r.output_entries,
+            "compacted_seq": r.max_seq,
+            "labels": r.labels,
+            "bytes": r.data.len(),
+        }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
 /// POST /xrpc/ai.gftd.yata.mergeRecordWal — Merge record AND return WAL entry.
 /// Write Container only. Coordinator uses this to get the WAL entry for pushing to read replicas.
 async fn merge_record_wal_handler<G: GraphQueryExecutor>(
@@ -562,6 +591,10 @@ impl GraphQueryExecutor for yata_engine::TieredGraphEngine {
         self.wal_cold_start()
     }
 
+    fn trigger_compaction(&self) -> Result<yata_engine::compaction::CompactionResult, String> {
+        self.trigger_compaction()
+    }
+
     fn wal_head_seq(&self) -> u64 {
         self.wal_head_seq()
     }
@@ -635,6 +668,10 @@ mod tests {
 
         fn wal_cold_start(&self) -> Result<u64, String> {
             self.engine.wal_cold_start()
+        }
+
+        fn trigger_compaction(&self) -> Result<yata_engine::compaction::CompactionResult, String> {
+            self.engine.trigger_compaction()
         }
 
         fn wal_head_seq(&self) -> u64 {

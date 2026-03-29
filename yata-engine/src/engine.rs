@@ -49,20 +49,9 @@ fn fnv1a_32(data: &[u8]) -> u32 {
     hash
 }
 
-/// Convert PropValue slice to JSON map (for WAL entry serialization).
-fn props_to_json(props: &[(&str, yata_grin::PropValue)]) -> serde_json::Map<String, serde_json::Value> {
-    let mut m = serde_json::Map::new();
-    for (k, v) in props {
-        let jv = match v {
-            yata_grin::PropValue::Str(s) => serde_json::Value::String(s.clone()),
-            yata_grin::PropValue::Int(n) => serde_json::Value::Number((*n).into()),
-            yata_grin::PropValue::Float(f) => serde_json::json!(*f),
-            yata_grin::PropValue::Bool(b) => serde_json::Value::Bool(*b),
-            yata_grin::PropValue::Null => serde_json::Value::Null,
-        };
-        m.insert(k.to_string(), jv);
-    }
-    m
+/// Convert borrowed PropValue slice to owned Vec for WalEntry storage.
+fn props_to_owned(props: &[(&str, yata_grin::PropValue)]) -> Vec<(String, yata_grin::PropValue)> {
+    props.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
 }
 
 fn now_ms() -> u64 {
@@ -885,14 +874,13 @@ impl TieredGraphEngine {
         self.mark_label_dirty(label);
         self.invalidate_security_cache_if_policy(label, props);
 
-        // WAL append
+        // WAL append (typed PropValue, zero JSON overhead)
         if let Ok(mut wal) = self.wal.lock() {
             let seq = wal.next_seq();
-            let json_props = props_to_json(props);
             let entry = crate::wal::WalEntry {
                 seq, op: crate::wal::WalOp::Upsert,
                 label: label.to_string(), pk_key: pk_key.to_string(),
-                pk_value: pk_value.to_string(), props: json_props,
+                pk_value: pk_value.to_string(), props: props_to_owned(props),
                 timestamp_ms: now_ms(),
             };
             wal.append(entry);
@@ -922,31 +910,17 @@ impl TieredGraphEngine {
         pk_value: &str,
         props: &[(&str, yata_grin::PropValue)],
     ) -> Result<(u32, Option<crate::wal::WalEntry>), String> {
-        // Build WAL entry before CSR merge
+        // Build WAL entry before CSR merge (typed PropValue, zero JSON overhead)
         let wal_entry = if let Ok(mut wal) = self.wal.lock() {
             let seq = wal.next_seq();
-            let mut json_props = serde_json::Map::new();
-            for (k, v) in props {
-                let jv = match v {
-                    yata_grin::PropValue::Str(s) => serde_json::Value::String(s.clone()),
-                    yata_grin::PropValue::Int(n) => serde_json::Value::Number((*n).into()),
-                    yata_grin::PropValue::Float(f) => serde_json::json!(*f),
-                    yata_grin::PropValue::Bool(b) => serde_json::Value::Bool(*b),
-                    yata_grin::PropValue::Null => serde_json::Value::Null,
-                };
-                json_props.insert(k.to_string(), jv);
-            }
             let entry = crate::wal::WalEntry {
                 seq,
                 op: crate::wal::WalOp::Upsert,
                 label: label.to_string(),
                 pk_key: pk_key.to_string(),
                 pk_value: pk_value.to_string(),
-                props: json_props,
-                timestamp_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
+                props: props_to_owned(props),
+                timestamp_ms: now_ms(),
             };
             wal.append(entry.clone());
             Some(entry)
@@ -989,7 +963,7 @@ impl TieredGraphEngine {
             let entry = crate::wal::WalEntry {
                 seq, op: crate::wal::WalOp::Delete,
                 label: label.to_string(), pk_key: pk_key.to_string(),
-                pk_value: pk_value.to_string(), props: serde_json::Map::new(),
+                pk_value: pk_value.to_string(), props: Vec::new(),
                 timestamp_ms: now_ms(),
             };
             wal.append(entry);
@@ -1024,11 +998,8 @@ impl TieredGraphEngine {
                 label: label.to_string(),
                 pk_key: pk_key.to_string(),
                 pk_value: pk_value.to_string(),
-                props: serde_json::Map::new(),
-                timestamp_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
+                props: Vec::new(),
+                timestamp_ms: now_ms(),
             };
             wal.append(entry.clone());
             Some(entry)
@@ -1276,22 +1247,9 @@ impl TieredGraphEngine {
                 for entry in entries {
                     match entry.op {
                         crate::wal::WalOp::Upsert => {
+                            // Phase 1: props are already typed PropValue — zero conversion
                             let props: Vec<(&str, yata_grin::PropValue)> = entry.props.iter()
-                                .map(|(k, v)| {
-                                    let pv = match v {
-                                        serde_json::Value::String(s) => yata_grin::PropValue::Str(s.clone()),
-                                        serde_json::Value::Number(n) => {
-                                            if let Some(i) = n.as_i64() {
-                                                yata_grin::PropValue::Int(i)
-                                            } else {
-                                                yata_grin::PropValue::Float(n.as_f64().unwrap_or(0.0))
-                                            }
-                                        }
-                                        serde_json::Value::Bool(b) => yata_grin::PropValue::Bool(*b),
-                                        _ => yata_grin::PropValue::Str(v.to_string()),
-                                    };
-                                    (k.as_str(), pv)
-                                })
+                                .map(|(k, v)| (k.as_str(), v.clone()))
                                 .collect();
                             let pk = yata_grin::PropValue::Str(entry.pk_value.clone());
                             single.merge_by_pk(&entry.label, &entry.pk_key, &pk, &props);
@@ -1346,9 +1304,20 @@ impl TieredGraphEngine {
         let seq_start = entries.first().unwrap().seq;
         let seq_end = entries.last().unwrap().seq;
 
-        // Serialize to NDJSON
-        let data = crate::wal::serialize_segment(&entries);
-        let key = crate::wal::segment_r2_key(prefix, pid, seq_start, seq_end);
+        // Serialize to configured format (Arrow IPC or NDJSON)
+        let (data, key) = match self.config.wal_format {
+            crate::config::WalFormat::Arrow => {
+                let arrow_data = crate::arrow_wal::serialize_segment_arrow(&entries)
+                    .map_err(|e| format!("Arrow WAL serialize failed: {e}"))?;
+                let k = crate::arrow_wal::segment_r2_key_arrow(prefix, pid, seq_start, seq_end);
+                (arrow_data.to_vec(), k)
+            }
+            crate::config::WalFormat::Ndjson => {
+                let ndjson_data = crate::wal::serialize_segment(&entries);
+                let k = crate::wal::segment_r2_key(prefix, pid, seq_start, seq_end);
+                (ndjson_data, k)
+            }
+        };
         s3.put_sync(&key, bytes::Bytes::from(data.clone()))
             .map_err(|e| format!("R2 WAL segment upload failed: {e}"))?;
 
@@ -1408,34 +1377,224 @@ impl TieredGraphEngine {
         Ok(result)
     }
 
+    /// L1 Compaction: read WAL segments from R2, PK-dedup, write compacted segment + manifest.
+    ///
+    /// This is the Shannon-optimal replacement for trigger_snapshot:
+    /// - No CSR serialization (no OOM risk)
+    /// - Operates on WAL segments only (streaming, bounded memory)
+    /// - Output is same Arrow IPC format as WAL (uniform mmap path)
+    /// - Idempotent: re-compacting produces the same result
+    ///
+    /// Write Container only. Called by cron (5min default) or manually.
+    pub fn trigger_compaction(&self) -> Result<crate::compaction::CompactionResult, String> {
+        let s3 = self.get_s3_client()
+            .ok_or_else(|| "S3 client not configured".to_string())?;
+        let prefix = &self.s3_prefix;
+        let pid = self.config.hot_partition_id.get();
+
+        // First flush pending WAL entries to R2
+        let _ = self.wal_flush_segment();
+
+        // Read existing compaction manifest (if any) to know where to start
+        let manifest_key = crate::compaction::manifest_r2_key(prefix, pid);
+        let existing_compacted_seq = match s3.get_sync(&manifest_key) {
+            Ok(Some(data)) => {
+                serde_json::from_slice::<crate::compaction::CompactionManifest>(&data)
+                    .ok()
+                    .map(|m| m.compacted_seq)
+                    .unwrap_or(0)
+            }
+            _ => 0,
+        };
+
+        // List WAL segments in R2
+        let segment_prefix = format!("{prefix}wal/segments/{pid}/");
+        let segment_objects = s3.list_sync(&segment_prefix).unwrap_or_default();
+
+        if segment_objects.is_empty() {
+            tracing::debug!("compaction: no WAL segments found");
+            return Ok(crate::compaction::CompactionResult {
+                data: bytes::Bytes::new(),
+                min_seq: 0,
+                max_seq: 0,
+                input_entries: 0,
+                output_entries: 0,
+                labels: Vec::new(),
+            });
+        }
+
+        // Load existing compacted segment (if any) + all new WAL segments
+        let mut segment_data: Vec<(String, bytes::Bytes)> = Vec::new();
+
+        // Include existing compacted segment as input for re-compaction
+        if existing_compacted_seq > 0 {
+            let compacted_key = crate::compaction::compacted_segment_r2_key(prefix, pid, existing_compacted_seq);
+            if let Ok(Some(data)) = s3.get_sync(&compacted_key) {
+                segment_data.push((compacted_key, data));
+            }
+        }
+
+        // Load WAL segments (only those after the existing compacted_seq)
+        for obj in &segment_objects {
+            let key = &obj.key;
+            if let Some(filename) = key.rsplit('/').next() {
+                let stripped = filename.strip_suffix(".ndjson")
+                    .or_else(|| filename.strip_suffix(".arrow"));
+                if let Some(stripped) = stripped {
+                    let parts: Vec<&str> = stripped.split('-').collect();
+                    if parts.len() == 2 {
+                        if let Ok(seg_end) = parts[1].parse::<u64>() {
+                            // Skip segments fully covered by existing compaction
+                            if seg_end <= existing_compacted_seq {
+                                continue;
+                            }
+                            if let Ok(Some(data)) = s3.get_sync(key) {
+                                segment_data.push((key.clone(), data));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if segment_data.is_empty() {
+            tracing::debug!("compaction: no new segments to compact");
+            return Ok(crate::compaction::CompactionResult {
+                data: bytes::Bytes::new(),
+                min_seq: 0,
+                max_seq: existing_compacted_seq,
+                input_entries: 0,
+                output_entries: 0,
+                labels: Vec::new(),
+            });
+        }
+
+        // Build references for compact_segments
+        let refs: Vec<(&str, &[u8])> = segment_data.iter()
+            .map(|(k, d)| (k.as_str(), d.as_ref()))
+            .collect();
+
+        let result = crate::compaction::compact_segments(&refs)?;
+
+        if result.data.is_empty() {
+            tracing::info!("compaction: all entries were tombstoned, nothing to write");
+            return Ok(result);
+        }
+
+        // Upload compacted segment
+        let compacted_key = crate::compaction::compacted_segment_r2_key(prefix, pid, result.max_seq);
+        s3.put_sync(&compacted_key, result.data.clone())
+            .map_err(|e| format!("R2 compacted segment upload failed: {e}"))?;
+
+        // Write to disk cache too (for fast mmap on restart)
+        if let Ok(vineyard_dir) = std::env::var("YATA_VINEYARD_DIR") {
+            let compact_dir = format!("{vineyard_dir}/log/compacted/{pid}");
+            let _ = std::fs::create_dir_all(&compact_dir);
+            let filename = compacted_key.rsplit('/').next().unwrap_or("compacted.arrow");
+            let path = format!("{compact_dir}/{filename}");
+            let _ = std::fs::write(&path, &result.data);
+        }
+
+        // Upload manifest
+        let manifest = crate::compaction::build_manifest(pid, prefix, &result);
+        let manifest_json = serde_json::to_vec(&manifest).unwrap_or_default();
+        s3.put_sync(&manifest_key, bytes::Bytes::from(manifest_json))
+            .map_err(|e| format!("R2 compaction manifest upload failed: {e}"))?;
+
+        // Old compacted segment left in R2 (overwritten on next compaction cycle).
+        // R2 lifecycle rules can clean up stale compacted_* files if needed.
+
+        tracing::info!(
+            input_entries = result.input_entries,
+            output_entries = result.output_entries,
+            labels = result.labels.len(),
+            compacted_seq = result.max_seq,
+            bytes = result.data.len(),
+            "L1 compaction complete"
+        );
+
+        Ok(result)
+    }
+
     /// Cold start for Read Container in WalProjection mode:
-    /// 1. Load latest R2 checkpoint (ArrowFragment)
-    /// 2. Read checkpoint metadata to get checkpoint_seq
-    /// 3. Replay WAL segments from R2 after checkpoint_seq
-    /// 4. Catch up from Write Container WAL tail (done by coordinator, not here)
+    ///
+    /// **L1 path (preferred)**: CompactionManifest → compacted Arrow IPC segment → WAL tail replay.
+    /// **Legacy path (fallback)**: ArrowFragment checkpoint → checkpoint_seq → WAL segment replay.
+    ///
+    /// The L1 path is Shannon-optimal: single Arrow IPC format, no ArrowFragment deserialize.
     pub fn wal_cold_start(&self) -> Result<u64, String> {
         let s3 = self.get_s3_client()
             .ok_or_else(|| "S3 client not configured".to_string())?;
         let prefix = &self.s3_prefix;
         let pid = self.config.hot_partition_id.get();
 
-        // Step 1: Load ArrowFragment checkpoint
-        self.restore_from_r2();
+        // Try L1 compacted segment first
+        let manifest_key = crate::compaction::manifest_r2_key(prefix, pid);
+        let compaction_manifest = match s3.get_sync(&manifest_key) {
+            Ok(Some(data)) => serde_json::from_slice::<crate::compaction::CompactionManifest>(&data).ok(),
+            _ => None,
+        };
 
-        // Step 2: Read checkpoint metadata
-        let checkpoint_key = crate::wal::checkpoint_meta_r2_key(prefix, pid);
-        let checkpoint_seq = match s3.get_sync(&checkpoint_key) {
-            Ok(Some(data)) => {
-                if let Ok(meta) = serde_json::from_slice::<crate::wal::CheckpointMeta>(&data) {
-                    tracing::info!(checkpoint_seq = meta.checkpoint_seq, "loaded checkpoint metadata");
-                    meta.checkpoint_seq
-                } else {
-                    0
+        let checkpoint_seq = if let Some(ref manifest) = compaction_manifest {
+            // L1 path: load compacted segment → wal_apply
+            tracing::info!(
+                compacted_seq = manifest.compacted_seq,
+                entries = manifest.entry_count,
+                labels = manifest.labels.len(),
+                "cold start: loading L1 compacted segment"
+            );
+
+            match s3.get_sync(&manifest.compacted_segment_key) {
+                Ok(Some(data)) => {
+                    let entries = crate::arrow_wal::deserialize_segment_auto(
+                        &manifest.compacted_segment_key,
+                        &data,
+                    );
+                    if !entries.is_empty() {
+                        self.wal_apply(&entries)?;
+                        tracing::info!(
+                            applied = entries.len(),
+                            "cold start: L1 compacted segment applied"
+                        );
+                    }
+                }
+                Ok(None) => {
+                    tracing::warn!(key = %manifest.compacted_segment_key, "compacted segment not found, falling back to legacy");
+                    self.restore_from_r2();
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to load compacted segment, falling back to legacy");
+                    self.restore_from_r2();
                 }
             }
-            _ => {
-                tracing::info!("no checkpoint metadata found, starting from seq 0");
-                0
+
+            // Also write to disk cache for next restart
+            if let Ok(vineyard_dir) = std::env::var("YATA_VINEYARD_DIR") {
+                let compact_dir = format!("{vineyard_dir}/log/compacted/{pid}");
+                let _ = std::fs::create_dir_all(&compact_dir);
+            }
+
+            manifest.compacted_seq
+        } else {
+            // Legacy path: ArrowFragment checkpoint
+            tracing::info!("cold start: no compaction manifest, using legacy ArrowFragment path");
+            self.restore_from_r2();
+
+            // Read legacy checkpoint metadata
+            let checkpoint_key = crate::wal::checkpoint_meta_r2_key(prefix, pid);
+            match s3.get_sync(&checkpoint_key) {
+                Ok(Some(data)) => {
+                    if let Ok(meta) = serde_json::from_slice::<crate::wal::CheckpointMeta>(&data) {
+                        tracing::info!(checkpoint_seq = meta.checkpoint_seq, "loaded legacy checkpoint metadata");
+                        meta.checkpoint_seq
+                    } else {
+                        0
+                    }
+                }
+                _ => {
+                    tracing::info!("no checkpoint metadata found, starting from seq 0");
+                    0
+                }
             }
         };
 
@@ -1446,25 +1605,29 @@ impl TieredGraphEngine {
         let mut replayed = 0u64;
         for obj in &segment_objects {
             let key = &obj.key;
-            // Parse seq range from filename: {seq_start:020}-{seq_end:020}.ndjson
+            // Parse seq range from filename: {seq_start:020}-{seq_end:020}.{ndjson|arrow}
             if let Some(filename) = key.rsplit('/').next() {
-                if let Some(stripped) = filename.strip_suffix(".ndjson") {
+                // Strip either extension
+                let stripped = filename.strip_suffix(".ndjson")
+                    .or_else(|| filename.strip_suffix(".arrow"));
+                if let Some(stripped) = stripped {
                     let parts: Vec<&str> = stripped.split('-').collect();
                     if parts.len() == 2 {
-                        if let (Ok(seg_start), Ok(seg_end)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                        if let (Ok(_seg_start), Ok(seg_end)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
                             if seg_end <= checkpoint_seq {
                                 continue; // Already included in checkpoint
                             }
                             match s3.get_sync(key) {
                                 Ok(Some(data)) => {
-                                    let mut entries = crate::wal::deserialize_segment(&data);
+                                    // Auto-detect format from key extension
+                                    let mut entries = crate::arrow_wal::deserialize_segment_auto(key, &data);
                                     // Filter entries already in checkpoint
                                     entries.retain(|e| e.seq > checkpoint_seq);
                                     if !entries.is_empty() {
                                         let count = entries.len();
                                         self.wal_apply(&entries)?;
                                         replayed += count as u64;
-                                        tracing::info!(seg_start, seg_end, applied = count, "replayed WAL segment");
+                                        tracing::info!(seg_end, applied = count, format = %if key.ends_with(".arrow") { "arrow" } else { "ndjson" }, "replayed WAL segment");
                                     }
                                 }
                                 Ok(None) => tracing::warn!(key, "WAL segment not found in R2"),

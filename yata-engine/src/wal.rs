@@ -6,10 +6,14 @@
 //! WAL entries are stored in an in-memory ring buffer with monotonic sequence numbers.
 //! The YataRPC Worker coordinator pushes entries from Write → Read containers.
 //! R2 segments provide durability for cold start recovery.
+//!
+//! Phase 1: props stored as Vec<(String, PropValue)> — zero JSON overhead on write/apply.
+//! NDJSON backward compat via custom serde (flat JSON map format).
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
+use yata_grin::PropValue;
 
 /// Operation type for a WAL entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +24,9 @@ pub enum WalOp {
 }
 
 /// A single WAL entry representing a graph mutation.
+///
+/// Phase 1: props uses typed PropValue directly (no JSON intermediary).
+/// Serde serializes props as a flat JSON object for backward compat with NDJSON segments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalEntry {
     /// Monotonically increasing sequence number (unique per write container).
@@ -32,10 +39,81 @@ pub struct WalEntry {
     pub pk_key: String,
     /// Primary key value.
     pub pk_value: String,
-    /// Properties as JSON key-value pairs. Empty for Delete ops.
-    pub props: serde_json::Map<String, serde_json::Value>,
+    /// Typed properties. Serialized as flat JSON object for NDJSON backward compat.
+    #[serde(with = "props_serde")]
+    pub props: Vec<(String, PropValue)>,
     /// Timestamp (millis since epoch).
     pub timestamp_ms: u64,
+}
+
+/// Custom serde for Vec<(String, PropValue)> ↔ flat JSON object.
+/// Maintains backward compatibility with existing NDJSON segments that use serde_json::Map.
+mod props_serde {
+    use serde::{Deserializer, Serializer, Deserialize};
+    use serde::ser::SerializeMap;
+    use yata_grin::PropValue;
+
+    pub fn serialize<S: Serializer>(
+        props: &[(String, PropValue)],
+        ser: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut map = ser.serialize_map(Some(props.len()))?;
+        for (k, v) in props {
+            match v {
+                PropValue::Null => map.serialize_entry(k, &serde_json::Value::Null)?,
+                PropValue::Bool(b) => map.serialize_entry(k, b)?,
+                PropValue::Int(n) => map.serialize_entry(k, n)?,
+                PropValue::Float(f) => map.serialize_entry(k, f)?,
+                PropValue::Str(s) => map.serialize_entry(k, s)?,
+            }
+        }
+        map.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        de: D,
+    ) -> Result<Vec<(String, PropValue)>, D::Error> {
+        let map = serde_json::Map::<String, serde_json::Value>::deserialize(de)?;
+        Ok(map
+            .into_iter()
+            .map(|(k, v)| {
+                let pv = json_value_to_prop_value(&v);
+                (k, pv)
+            })
+            .collect())
+    }
+
+    fn json_value_to_prop_value(v: &serde_json::Value) -> PropValue {
+        match v {
+            serde_json::Value::String(s) => PropValue::Str(s.clone()),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    PropValue::Int(i)
+                } else {
+                    PropValue::Float(n.as_f64().unwrap_or(0.0))
+                }
+            }
+            serde_json::Value::Bool(b) => PropValue::Bool(*b),
+            serde_json::Value::Null => PropValue::Null,
+            _ => PropValue::Str(v.to_string()),
+        }
+    }
+}
+
+/// Convert PropValue slice to serde_json::Map (for legacy callers during migration).
+pub fn props_to_json_map(props: &[(String, PropValue)]) -> serde_json::Map<String, serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    for (k, v) in props {
+        let jv = match v {
+            PropValue::Str(s) => serde_json::Value::String(s.clone()),
+            PropValue::Int(n) => serde_json::Value::Number((*n).into()),
+            PropValue::Float(f) => serde_json::json!(*f),
+            PropValue::Bool(b) => serde_json::Value::Bool(*b),
+            PropValue::Null => serde_json::Value::Null,
+        };
+        m.insert(k.clone(), jv);
+    }
+    m
 }
 
 /// Fixed-capacity ring buffer for WAL entries.
@@ -228,7 +306,7 @@ mod tests {
             label: label.to_string(),
             pk_key: "rkey".to_string(),
             pk_value: pk.to_string(),
-            props: serde_json::Map::new(),
+            props: Vec::new(),
             timestamp_ms: 1000 + seq,
         }
     }

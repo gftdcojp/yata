@@ -5,7 +5,9 @@
 //! - Delta write-back (mutation tracking + CSR rebuild)
 //! - Vineyard page-in / page-out (lazy label loading)
 
+pub mod arrow_wal;
 pub mod cache;
+pub mod compaction;
 pub mod config;
 pub mod distributed;
 pub mod engine;
@@ -18,7 +20,7 @@ pub mod sharded_coordinator;
 pub mod snapshot;
 pub mod wal;
 
-pub use config::TieredEngineConfig;
+pub use config::{TieredEngineConfig, WalFormat};
 pub use engine::{CpmStats, MutationContext, TieredGraphEngine};
 pub use partition_query::PartitionQueryMetrics;
 pub use partition_router::{PartitionHints, PartitionScope, extract_partition_hints, route};

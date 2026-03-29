@@ -1,5 +1,23 @@
 use yata_core::PartitionId;
 
+/// WAL segment serialization format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalFormat {
+    /// NDJSON (legacy, default for backward compatibility).
+    Ndjson,
+    /// Arrow IPC File format (zero-copy mmap, Phase 0 of Shannon-optimal architecture).
+    Arrow,
+}
+
+impl WalFormat {
+    pub fn from_env() -> Self {
+        match std::env::var("YATA_WAL_FORMAT").as_deref() {
+            Ok("ndjson") => WalFormat::Ndjson,
+            _ => WalFormat::Arrow, // Default: Arrow IPC (Phase 1)
+        }
+    }
+}
+
 /// Configuration for the tiered graph engine (WAL Projection only).
 #[derive(Debug, Clone)]
 pub struct TieredEngineConfig {
@@ -26,6 +44,8 @@ pub struct TieredEngineConfig {
     pub wal_segment_max_age_secs: u64,
     /// WAL checkpoint interval (seconds). ArrowFragment for cold start.
     pub wal_checkpoint_interval_secs: u64,
+    /// WAL segment format (ndjson or arrow). Arrow enables zero-copy mmap reads.
+    pub wal_format: WalFormat,
 }
 
 impl Default for TieredEngineConfig {
@@ -76,6 +96,7 @@ impl Default for TieredEngineConfig {
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(10),
             wal_checkpoint_interval_secs: std::env::var("YATA_WAL_CHECKPOINT_INTERVAL_SECS")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(300),
+            wal_format: WalFormat::from_env(),
         }
     }
 }
