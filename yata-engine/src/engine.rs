@@ -324,8 +324,8 @@ impl TieredGraphEngine {
     /// via enrich_label_from_r2 (zero-copy for already-loaded labels).
     fn ensure_labels(&self, vertex_labels: &[&str]) {
         if !self.hot_initialized.load(Ordering::Relaxed) {
-            // Cold start: full page-in (topology + all labels needed for CSR)
-            self.restore_from_r2();
+            // Cold start: load from L1 compacted segment + WAL tail
+            let _ = self.wal_cold_start();
             return;
         }
 
@@ -787,31 +787,27 @@ impl TieredGraphEngine {
         })
     }
 
-    /// Restore CSR from R2 YataFragment snapshot.
-    pub fn restore_from_r2(&self) {
+    /// Restore CSR from R2 YataFragment snapshot (legacy fallback).
+    /// Replaces current CSR with the restored snapshot.
+    fn restore_from_r2(&self) {
         let s3 = match self.get_s3_client() {
-            Some(s3) => s3.clone(),
+            Some(s3) => s3,
             None => {
                 tracing::warn!("restore_from_r2: no S3 client configured");
                 return;
             }
         };
-        match crate::loader::page_in_from_r2(
-            &s3,
-            &self.s3_prefix,
-            self.config.hot_partition_id,
-        ) {
-            Ok(store) => {
-                let vc = store.vertex_count();
-                let ec = store.edge_count();
+        let pid = self.config.hot_partition_id;
+        match crate::loader::page_in_from_r2(&s3, &self.s3_prefix, pid) {
+            Ok(restored) => {
+                let v = restored.vertex_count();
                 if let Ok(mut hot) = self.hot.write() {
-                    *hot = yata_store::GraphStoreEnum::Single(store);
-                    self.hot_initialized.store(true, Ordering::Relaxed);
+                    *hot = yata_store::GraphStoreEnum::Single(restored);
+                    tracing::info!(vertices = v, "restore_from_r2: replaced CSR from R2 YataFragment");
                 }
-                tracing::info!(vertices = vc, edges = ec, "restored from R2 YataFragment");
             }
             Err(e) => {
-                tracing::warn!("R2 restore failed: {e}");
+                tracing::warn!(error = %e, "restore_from_r2: page-in failed");
             }
         }
     }
@@ -1046,168 +1042,21 @@ impl TieredGraphEngine {
         }
     }
 
-    /// Trigger R2 checkpoint: serialize CSR → YataFragment → R2 PUT.
-    /// WAL Projection: CSR is authoritative (no R2 compaction).
+    /// Trigger persistence: flush WAL + L1 compaction.
+    /// Legacy ArrowFragment snapshot path removed — all persistence is Arrow IPC WAL.
     pub fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
-        self.trigger_snapshot_inner(false)
+        let _ = self.wal_flush_segment();
+        let result = self.trigger_compaction()?;
+        Ok((result.output_entries as u64, 0))
     }
 
-    /// Force-trigger R2 snapshot, bypassing the batch_commit_threshold check.
+    /// Force-trigger persistence (alias for trigger_snapshot).
     pub fn trigger_snapshot_force(&self) -> Result<(u64, u64), String> {
-        self.trigger_snapshot_inner(true)
+        self.trigger_snapshot()
     }
 
-    fn trigger_snapshot_inner(&self, force: bool) -> Result<(u64, u64), String> {
-        // Drain dirty_labels atomically — snapshot owns this set from here.
-        let dirty_set: HashSet<String> = match self.dirty_labels.lock() {
-            Ok(mut dl) => dl.drain().collect(),
-            Err(e) => {
-                tracing::error!("dirty_labels poisoned in snapshot: {e}");
-                HashSet::new()
-            }
-        };
-        // Skip if no mutations since last snapshot
-        if dirty_set.is_empty() {
-            return Ok((0, 0));
-        }
-
-        // Check batch_commit_threshold: skip snapshot if not enough pending writes
-        let pending = self.pending_writes.load(Ordering::Relaxed);
-        if pending < self.config.batch_commit_threshold as usize && !force {
-            // Put dirty labels back — they weren't consumed
-            self.mark_labels_dirty(dirty_set);
-            return Ok((0, 0));
-        }
-
-        let s3 = self.get_s3_client()
-            .ok_or_else(|| "S3 client not configured".to_string())?;
-        let prefix = &self.s3_prefix;
-
-        // WAL Projection: no R2 compaction. CSR is authoritative (built from WAL).
-        self.hot_initialized.store(true, Ordering::Relaxed);
-
-        // Serialize CSR → YataFragment → MemoryBlobStore
-        // Uses selective conversion: only dirty vertex labels get property extraction.
-        let serialize_start = std::time::Instant::now();
-        let (v_count, e_count, blob_store, meta, dirty_vlabel_ids) = if let Ok(csr) = self.hot.read() {
-            let store = csr.as_single()
-                .ok_or_else(|| "no CSR store available".to_string())?;
-            let pid = store.partition_id_raw().get();
-            let frag = yata_format::convert::csr_to_fragment_selective(store, pid, &dirty_set);
-            let vc = frag.ivnums.iter().sum::<u64>();
-            let ec = frag.edge_num();
-            // Compute dirty vertex label IDs for selective blob upload
-            let ids: HashSet<usize> = frag.schema.vertex_entries.iter()
-                .enumerate()
-                .filter(|(_, e)| dirty_set.contains(&e.label))
-                .map(|(i, _)| i)
-                .collect();
-            let bs = yata_format::blob::MemoryBlobStore::new();
-            let m = frag.serialize(&bs);
-            (vc, ec, bs, m, ids)
-        } else {
-            return Err("failed to acquire CSR lock".into());
-        };
-        let serialize_ms = serialize_start.elapsed().as_millis() as u64;
-        self.last_snapshot_serialize_ms.store(serialize_ms, Ordering::Relaxed);
-        // CP4 monitoring: warn when vertex count approaches threshold where serialize becomes bottleneck
-        if v_count > 100_000 {
-            tracing::warn!(
-                vertices = v_count, edges = e_count, serialize_ms,
-                "CP4 threshold: vertex count >100K, snapshot serialize may become bottleneck (projected {}ms at 1M)",
-                serialize_ms * 10
-            );
-        } else if serialize_ms > 100 {
-            tracing::warn!(
-                vertices = v_count, edges = e_count, serialize_ms,
-                "CP4: snapshot serialize >100ms"
-            );
-        }
-
-        // Guard: never overwrite a non-empty R2 snapshot with an empty one.
-        if v_count == 0 && e_count == 0 {
-            tracing::info!("snapshot skipped: CSR is empty (v=0, e=0), preserving existing R2 snapshot");
-            return Ok((0, 0));
-        }
-
-        // Dirty label delta upload + disk cache in single pass.
-        // Infrastructure blobs (schema, ivnums) are always persisted.
-        // Edge/topology blobs: always persisted (dirty_set is non-empty at this point).
-        // Clean vertex blobs are skipped.
-        let meta_json = serde_json::to_vec(&meta).unwrap_or_default();
-        let snap_dir = std::env::var("YATA_VINEYARD_DIR").ok().map(|d| {
-            let sd = format!("{d}/snap/fragment");
-            if let Err(e) = std::fs::create_dir_all(&sd) {
-                tracing::warn!(error = %e, "failed to create vineyard snap dir for disk cache");
-            }
-            sd
-        });
-        let mut uploaded = 0u32;
-        let mut skipped = 0u32;
-        for name in meta.blobs.keys() {
-            let dominated = is_infra_blob(name)
-                || is_dirty_vertex_blob(name, &dirty_vlabel_ids)
-                || is_edge_or_topology_blob(name);
-            if !dominated {
-                skipped += 1;
-                continue;
-            }
-            if let Some(data) = BlobStore::get(&blob_store, name) {
-                let full_key = format!("{prefix}snap/fragment/{name}");
-                if let Err(e) = s3.put_sync(&full_key, data.clone()) {
-                    tracing::error!(name, error = %e, "R2 YataFragment blob upload failed");
-                } else {
-                    uploaded += 1;
-                }
-                if let Some(ref sd) = snap_dir {
-                    let path = format!("{sd}/{name}");
-                    if let Err(e) = std::fs::write(&path, &data[..]) {
-                        tracing::warn!(path, error = %e, "failed to write blob to disk cache");
-                    }
-                }
-            }
-        }
-
-        // Upload fragment meta (ObjectMeta JSON) — always, reflects full CSR state
-        let meta_key = format!("{prefix}snap/fragment/meta.json");
-        if let Err(e) = s3.put_sync(&meta_key, bytes::Bytes::from(meta_json.clone())) {
-            tracing::error!(error = %e, "R2 fragment meta upload failed");
-        }
-        if let Some(ref sd) = snap_dir {
-            let meta_path = format!("{sd}/meta.json");
-            if let Err(e) = std::fs::write(&meta_path, &meta_json) {
-                tracing::warn!(error = %e, "failed to write meta.json to disk cache");
-            }
-            tracing::debug!(snap_dir = %sd, "delta snapshot blobs written to disk cache");
-        }
-
-        // Upload manifest (backward-compat for existing page-in path)
-        let snap_manifest = serde_json::json!({
-            "version": yata_core::SNAPSHOT_FORMAT_VERSION,
-            "format": "arrow_fragment",
-            "partition_id": self.config.hot_partition_id.get(),
-            "vertex_count": v_count,
-            "edge_count": e_count,
-            "blob_count": uploaded,
-            "partition_count": 1,
-        });
-        let key = format!("{prefix}snap/manifest.json");
-        let data = bytes::Bytes::from(serde_json::to_vec(&snap_manifest).unwrap_or_default());
-        if let Err(e) = s3.put_sync(&key, data) {
-            tracing::error!(error = %e, "R2 snapshot manifest upload failed");
-        }
-
-        // Clear pending writes (dirty_labels already drained above)
-        self.pending_writes.store(0, Ordering::Relaxed);
-
-        tracing::info!(
-            vertices = v_count, edges = e_count,
-            uploaded = uploaded, skipped = skipped,
-            dirty_labels = dirty_set.len(),
-            "R2 delta checkpoint written (dirty labels only)"
-        );
-        Ok((v_count, e_count))
-    }
+    // trigger_snapshot_inner removed — legacy ArrowFragment snapshot path eliminated.
+    // All persistence is Arrow IPC WAL + L1 compaction (trigger_compaction).
 
     /// Export snapshot blobs for external upload (TS Worker → R2).
     // ── WAL Projection API ──────────────────────────────────────────────
@@ -1395,42 +1244,11 @@ impl TieredGraphEngine {
         Ok((seq_start, seq_end, data.len()))
     }
 
-    /// Checkpoint: serialize CSR → YataFragment → R2 (same as trigger_snapshot).
-    /// Also writes checkpoint metadata with the current WAL head seq.
-    /// Used for cold start recovery: page-in checkpoint + replay WAL segments after checkpoint_seq.
+    /// Checkpoint: flush WAL + L1 compaction. Legacy ArrowFragment path removed.
     pub fn wal_checkpoint(&self) -> Result<(u64, u64), String> {
-        // First flush any pending WAL entries to R2
         let _ = self.wal_flush_segment();
-
-        let checkpoint_seq = self.wal_head_seq();
-
-        // Use the existing trigger_snapshot_inner for YataFragment serialization
-        let result = self.trigger_snapshot_inner(true)?;
-
-        // Write checkpoint metadata
-        if let Some(s3) = self.get_s3_client() {
-            let prefix = &self.s3_prefix;
-            let pid = self.config.hot_partition_id.get();
-            let meta = crate::wal::CheckpointMeta {
-                partition_id: pid,
-                checkpoint_seq,
-                vertex_count: result.0,
-                edge_count: result.1,
-                created_at_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
-            };
-            let key = crate::wal::checkpoint_meta_r2_key(prefix, pid);
-            let data = bytes::Bytes::from(serde_json::to_vec(&meta).unwrap_or_default());
-            if let Err(e) = s3.put_sync(&key, data) {
-                tracing::error!(error = %e, "failed to write checkpoint metadata to R2");
-            } else {
-                tracing::info!(checkpoint_seq, vertices = result.0, edges = result.1, "WAL checkpoint written");
-            }
-        }
-
-        Ok(result)
+        let result = self.trigger_compaction()?;
+        Ok((result.output_entries as u64, 0))
     }
 
     /// L1 Compaction: read WAL segments from R2, PK-dedup, write compacted segment + manifest.
