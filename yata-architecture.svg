@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 2200" font-family="'SF Mono','Menlo','Monaco',monospace" font-size="11">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 3150" font-family="'SF Mono','Menlo','Monaco',monospace" font-size="11">
   <defs>
     <linearGradient id="bgGrad" x1="0%" y1="0%" x2="0%" y2="100%">
       <stop offset="0%" style="stop-color:#0a0e17;stop-opacity:1"/>
@@ -41,14 +41,27 @@
     <marker id="arrowAmber" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
       <path d="M0,0 L8,3 L0,6" fill="#f59e0b" stroke="none"/>
     </marker>
+    <marker id="arrowGreen" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#22c55e" stroke="none"/>
+    </marker>
+    <linearGradient id="criticalGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#ef4444;stop-opacity:0.25"/>
+      <stop offset="100%" style="stop-color:#ef4444;stop-opacity:0.05"/>
+    </linearGradient>
+    <filter id="criticalGlow">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feFlood flood-color="#ef4444" flood-opacity="0.6" result="color"/>
+      <feComposite in="color" in2="blur" operator="in" result="shadow"/>
+      <feMerge><feMergeNode in="shadow"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
   </defs>
 
   <!-- Background -->
-  <rect width="1600" height="2200" fill="url(#bgGrad)"/>
+  <rect width="1600" height="3150" fill="url(#bgGrad)"/>
 
   <!-- Title -->
   <text x="800" y="40" text-anchor="middle" fill="#f8fafc" font-size="22" font-weight="bold">yata — Rust Cypher Graph Engine Architecture</text>
-  <text x="800" y="62" text-anchor="middle" fill="#94a3b8" font-size="13">12 crates | 854 tests | CSR + ArrowFragment + R2 | Shannon Information-Theoretic Analysis</text>
+  <text x="800" y="62" text-anchor="middle" fill="#94a3b8" font-size="13">12 crates | 854 tests | CSR + ArrowFragment + R2 | Shannon Analysis + Critical Path Analysis</text>
 
   <!-- ==================== LAYER 0 ==================== -->
   <text x="40" y="105" fill="#64748b" font-size="10" font-weight="bold">LAYER 0 — Zero Dependencies (Foundation)</text>
@@ -536,4 +549,322 @@
   <text x="1375" y="752" fill="#64748b" font-size="9">+ SecurityScope</text>
   <text x="1375" y="787" fill="#64748b" font-size="9">cost-based</text>
   <text x="1375" y="822" fill="#64748b" font-size="9">push-based stream</text>
+
+  <!-- ======================================================== -->
+  <!-- CRITICAL PATH ANALYSIS -->
+  <!-- ======================================================== -->
+  <text x="800" y="2200" text-anchor="middle" fill="#f8fafc" font-size="22" font-weight="bold">Critical Path Analysis</text>
+  <text x="800" y="2222" text-anchor="middle" fill="#94a3b8" font-size="13">Latency breakdown per operation | Bottleneck nodes highlighted in red | Measured values from production E2E</text>
+  <line x1="40" y1="2232" x2="1560" y2="2232" stroke="#334155" stroke-width="1"/>
+
+  <!-- ==================== CP1: WRITE PATH ==================== -->
+  <text x="60" y="2260" fill="#22c55e" font-size="14" font-weight="bold">CP1: Write Path (Total: ~2ms, dominated by Pipeline.send())</text>
+
+  <rect x="60" y="2275" width="120" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="82" y="2293" fill="#e2e8f0" font-size="10">App Worker</text>
+  <text x="82" y="2306" fill="#64748b" font-size="8">~0us (origin)</text>
+
+  <line x1="180" y1="2295" x2="218" y2="2295" stroke="#22c55e" stroke-width="2" marker-end="url(#arrowGreen)"/>
+  <text x="185" y="2288" fill="#22c55e" font-size="7">RPC</text>
+
+  <rect x="220" y="2275" width="150" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="237" y="2293" fill="#e2e8f0" font-size="10">PDS createRecord</text>
+  <text x="237" y="2306" fill="#64748b" font-size="8">~200us (dispatch)</text>
+
+  <line x1="370" y1="2295" x2="408" y2="2295" stroke="#22c55e" stroke-width="2" marker-end="url(#arrowGreen)"/>
+  <text x="375" y="2288" fill="#22c55e" font-size="7">ACK</text>
+
+  <!-- BOTTLENECK: Pipeline.send -->
+  <rect x="410" y="2270" width="200" height="50" rx="6" fill="url(#criticalGrad)" stroke="#ef4444" stroke-width="2" filter="url(#criticalGlow)"/>
+  <text x="430" y="2290" fill="#fca5a5" font-size="11" font-weight="bold">Pipeline.send()</text>
+  <text x="430" y="2305" fill="#f87171" font-size="10">~1ms (AT commit + MST)</text>
+  <text x="430" y="2316" fill="#ef4444" font-size="8">BOTTLENECK — durable write</text>
+
+  <line x1="610" y1="2295" x2="648" y2="2295" stroke="#22c55e" stroke-width="2" marker-end="url(#arrowGreen)"/>
+  <text x="613" y="2288" fill="#64748b" font-size="7">fire-forget</text>
+
+  <rect x="650" y="2275" width="180" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="668" y="2293" fill="#e2e8f0" font-size="10">YATA mergeRecord</text>
+  <text x="668" y="2306" fill="#64748b" font-size="8">~500us (CSR append)</text>
+
+  <line x1="830" y1="2295" x2="868" y2="2295" stroke="#22c55e" stroke-width="2" marker-end="url(#arrowGreen)"/>
+
+  <rect x="870" y="2275" width="120" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="888" y="2293" fill="#e2e8f0" font-size="10">dirty = true</text>
+  <text x="888" y="2306" fill="#64748b" font-size="8">~0us (atomic)</text>
+
+  <!-- Timing bar CP1 -->
+  <rect x="60" y="2325" width="930" height="6" rx="3" fill="#1e293b" stroke="#334155" stroke-width="0.5"/>
+  <rect x="60" y="2325" width="80" height="6" rx="3" fill="#22c55e" fill-opacity="0.3"/>
+  <rect x="220" y="2325" width="75" height="6" rx="3" fill="#22c55e" fill-opacity="0.3"/>
+  <rect x="410" y="2325" width="200" height="6" rx="3" fill="#ef4444" fill-opacity="0.7"/>
+  <rect x="650" y="2325" width="90" height="6" rx="3" fill="#22c55e" fill-opacity="0.3"/>
+  <text x="1000" y="2333" fill="#94a3b8" font-size="9">Pipeline.send() = 50% of total latency</text>
+
+  <!-- ==================== CP2: COLD READ PATH ==================== -->
+  <text x="60" y="2370" fill="#ef4444" font-size="14" font-weight="bold">CP2: Cold Read Path (Total: ~2.8s, dominated by Container wake + R2 page-in)</text>
+
+  <rect x="60" y="2385" width="100" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="73" y="2403" fill="#e2e8f0" font-size="10">XRPC req</text>
+  <text x="73" y="2416" fill="#64748b" font-size="8">~0ms</text>
+
+  <line x1="160" y1="2405" x2="178" y2="2405" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="180" y="2385" width="110" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="193" y="2403" fill="#e2e8f0" font-size="10">PDS dispatch</text>
+  <text x="193" y="2416" fill="#64748b" font-size="8">~5ms</text>
+
+  <line x1="290" y1="2405" x2="308" y2="2405" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- BOTTLENECK 1: Container wake -->
+  <rect x="310" y="2380" width="190" height="50" rx="6" fill="url(#criticalGrad)" stroke="#ef4444" stroke-width="2" filter="url(#criticalGlow)"/>
+  <text x="328" y="2400" fill="#fca5a5" font-size="11" font-weight="bold">Container Wake</text>
+  <text x="328" y="2415" fill="#f87171" font-size="10">~1,500ms (sleep to run)</text>
+  <text x="328" y="2426" fill="#ef4444" font-size="8">BOTTLENECK #1</text>
+
+  <line x1="500" y1="2405" x2="518" y2="2405" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arrowRed)"/>
+
+  <!-- BOTTLENECK 2: R2 page-in -->
+  <rect x="520" y="2380" width="200" height="50" rx="6" fill="url(#criticalGrad)" stroke="#ef4444" stroke-width="2" filter="url(#criticalGlow)"/>
+  <text x="538" y="2400" fill="#fca5a5" font-size="11" font-weight="bold">R2 Page-In (ALL)</text>
+  <text x="538" y="2415" fill="#f87171" font-size="10">~1,200ms (full labels)</text>
+  <text x="538" y="2426" fill="#ef4444" font-size="8">BOTTLENECK #2</text>
+
+  <line x1="720" y1="2405" x2="738" y2="2405" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="740" y="2385" width="120" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="755" y="2403" fill="#e2e8f0" font-size="10">CSR Build</text>
+  <text x="755" y="2416" fill="#64748b" font-size="8">~50ms</text>
+
+  <line x1="860" y1="2405" x2="878" y2="2405" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="880" y="2385" width="140" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="895" y="2403" fill="#e2e8f0" font-size="10">Cypher Execute</text>
+  <text x="895" y="2416" fill="#64748b" font-size="8">&lt;1us (CSR direct)</text>
+
+  <line x1="1020" y1="2405" x2="1038" y2="2405" stroke="#22c55e" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+
+  <rect x="1040" y="2385" width="100" height="40" rx="6" fill="#22c55e" fill-opacity="0.15" stroke="#22c55e" stroke-width="1"/>
+  <text x="1057" y="2403" fill="#22c55e" font-size="10">Response</text>
+  <text x="1057" y="2416" fill="#22c55e" font-size="8">2.8s total</text>
+
+  <!-- Timing bar CP2 -->
+  <rect x="60" y="2440" width="1080" height="6" rx="3" fill="#1e293b" stroke="#334155" stroke-width="0.5"/>
+  <rect x="310" y="2440" width="190" height="6" rx="3" fill="#ef4444" fill-opacity="0.7"/>
+  <rect x="520" y="2440" width="200" height="6" rx="3" fill="#ef4444" fill-opacity="0.7"/>
+  <rect x="740" y="2440" width="25" height="6" rx="3" fill="#f59e0b" fill-opacity="0.5"/>
+  <text x="1150" y="2448" fill="#94a3b8" font-size="9">Wake+PageIn = 96% of cold read</text>
+
+  <!-- ==================== CP3: WARM READ PATH ==================== -->
+  <text x="60" y="2480" fill="#22c55e" font-size="14" font-weight="bold">CP3: Warm Read Path (Total: ~271ms, dominated by coordinator overhead)</text>
+
+  <rect x="60" y="2495" width="100" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="73" y="2513" fill="#e2e8f0" font-size="10">XRPC req</text>
+  <text x="73" y="2526" fill="#64748b" font-size="8">~0ms</text>
+
+  <line x1="160" y1="2515" x2="178" y2="2515" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="180" y="2495" width="120" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="195" y="2513" fill="#e2e8f0" font-size="10">PDS dispatch</text>
+  <text x="195" y="2526" fill="#64748b" font-size="8">~5ms</text>
+
+  <line x1="300" y1="2515" x2="318" y2="2515" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- BOTTLENECK: YataRPC coordinator -->
+  <rect x="320" y="2490" width="220" height="50" rx="6" fill="url(#criticalGrad)" stroke="#ef4444" stroke-width="2" filter="url(#criticalGlow)"/>
+  <text x="340" y="2510" fill="#fca5a5" font-size="11" font-weight="bold">YataRPC Coordinator</text>
+  <text x="340" y="2525" fill="#f87171" font-size="10">~260ms (Workers RPC OH)</text>
+  <text x="340" y="2536" fill="#ef4444" font-size="8">BOTTLENECK — 2000x vs in-process</text>
+
+  <line x1="540" y1="2515" x2="558" y2="2515" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="560" y="2495" width="150" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="578" y="2513" fill="#e2e8f0" font-size="10">ensure_labels()</text>
+  <text x="578" y="2526" fill="#64748b" font-size="8">~0ms (hot)</text>
+
+  <line x1="710" y1="2515" x2="728" y2="2515" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="730" y="2495" width="150" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="748" y="2513" fill="#e2e8f0" font-size="10">GIE Execute</text>
+  <text x="748" y="2526" fill="#64748b" font-size="8">&lt;1us (CSR push)</text>
+
+  <line x1="880" y1="2515" x2="898" y2="2515" stroke="#22c55e" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+
+  <rect x="900" y="2495" width="140" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="918" y="2513" fill="#e2e8f0" font-size="10">mergeResults()</text>
+  <text x="918" y="2526" fill="#64748b" font-size="8">~5ms (agg merge)</text>
+
+  <line x1="1040" y1="2515" x2="1058" y2="2515" stroke="#22c55e" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+
+  <rect x="1060" y="2495" width="100" height="40" rx="6" fill="#22c55e" fill-opacity="0.15" stroke="#22c55e" stroke-width="1"/>
+  <text x="1077" y="2513" fill="#22c55e" font-size="10">Response</text>
+  <text x="1077" y="2526" fill="#22c55e" font-size="8">271ms total</text>
+
+  <!-- Timing bar CP3 -->
+  <rect x="60" y="2545" width="1100" height="6" rx="3" fill="#1e293b" stroke="#334155" stroke-width="0.5"/>
+  <rect x="320" y="2545" width="220" height="6" rx="3" fill="#ef4444" fill-opacity="0.7"/>
+  <text x="1170" y="2553" fill="#94a3b8" font-size="9">Coordinator = 96% of warm read</text>
+
+  <!-- ==================== CP4: SNAPSHOT PATH ==================== -->
+  <text x="60" y="2590" fill="#06b6d4" font-size="14" font-weight="bold">CP4: Snapshot Path (Total: ~15ms@10K, ~150s@10M projected, dominated by serialization)</text>
+
+  <rect x="60" y="2605" width="120" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="76" y="2623" fill="#e2e8f0" font-size="10">cron 1min</text>
+  <text x="76" y="2636" fill="#64748b" font-size="8">trigger check</text>
+
+  <line x1="180" y1="2625" x2="198" y2="2625" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="200" y="2605" width="120" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="215" y="2623" fill="#e2e8f0" font-size="10">dirty check</text>
+  <text x="215" y="2636" fill="#64748b" font-size="8">~0us (atomic)</text>
+
+  <line x1="320" y1="2625" x2="338" y2="2625" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="340" y="2605" width="160" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="356" y="2623" fill="#e2e8f0" font-size="10">hot.read() lock</text>
+  <text x="356" y="2636" fill="#64748b" font-size="8">~0us (RwLock)</text>
+
+  <line x1="500" y1="2625" x2="518" y2="2625" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- BOTTLENECK: serialize -->
+  <rect x="520" y="2600" width="220" height="50" rx="6" fill="url(#criticalGrad)" stroke="#ef4444" stroke-width="2" filter="url(#criticalGlow)"/>
+  <text x="540" y="2620" fill="#fca5a5" font-size="11" font-weight="bold">csr_to_fragment()</text>
+  <text x="540" y="2635" fill="#f87171" font-size="10">~10ms@10K (linear O(V+E))</text>
+  <text x="540" y="2646" fill="#ef4444" font-size="8">BOTTLENECK — blocks 1 vCPU</text>
+
+  <line x1="740" y1="2625" x2="758" y2="2625" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arrowRed)"/>
+
+  <!-- Secondary bottleneck: R2 PUT -->
+  <rect x="760" y="2600" width="190" height="50" rx="6" fill="#1a0a00" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="778" y="2620" fill="#fcd34d" font-size="11" font-weight="bold">R2 PUT (full)</text>
+  <text x="778" y="2635" fill="#fbbf24" font-size="10">~3-5ms (network I/O)</text>
+  <text x="778" y="2646" fill="#f59e0b" font-size="8">O(N) bytes even for 1 dirty label</text>
+
+  <line x1="950" y1="2625" x2="968" y2="2625" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="970" y="2605" width="160" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="988" y="2623" fill="#e2e8f0" font-size="10">dirty = false</text>
+  <text x="988" y="2636" fill="#64748b" font-size="8">~0us (atomic clear)</text>
+
+  <!-- Timing bar CP4 -->
+  <rect x="60" y="2660" width="1070" height="6" rx="3" fill="#1e293b" stroke="#334155" stroke-width="0.5"/>
+  <rect x="520" y="2660" width="220" height="6" rx="3" fill="#ef4444" fill-opacity="0.7"/>
+  <rect x="760" y="2660" width="100" height="6" rx="3" fill="#f59e0b" fill-opacity="0.5"/>
+  <text x="1140" y="2668" fill="#94a3b8" font-size="9">Serialize = 67% of snapshot</text>
+
+  <!-- ==================== CP5: MUTATION PATH ==================== -->
+  <text x="60" y="2705" fill="#a855f7" font-size="14" font-weight="bold">CP5: Mutation Path (Total: ~500ms, dominated by CSR rebuild)</text>
+
+  <rect x="60" y="2720" width="130" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="76" y="2738" fill="#e2e8f0" font-size="10">Cypher CREATE</text>
+  <text x="76" y="2751" fill="#64748b" font-size="8">parse ~0.1ms</text>
+
+  <line x1="190" y1="2740" x2="208" y2="2740" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="210" y="2720" width="160" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="228" y="2738" fill="#e2e8f0" font-size="10">MemoryGraph copy</text>
+  <text x="228" y="2751" fill="#64748b" font-size="8">~50ms (clone CSR)</text>
+
+  <line x1="370" y1="2740" x2="388" y2="2740" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="390" y="2720" width="140" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="408" y="2738" fill="#e2e8f0" font-size="10">mutate (insert)</text>
+  <text x="408" y="2751" fill="#64748b" font-size="8">~10ms</text>
+
+  <line x1="530" y1="2740" x2="548" y2="2740" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- BOTTLENECK: CSR rebuild -->
+  <rect x="550" y="2715" width="230" height="50" rx="6" fill="url(#criticalGrad)" stroke="#ef4444" stroke-width="2" filter="url(#criticalGlow)"/>
+  <text x="568" y="2735" fill="#fca5a5" font-size="11" font-weight="bold">CSR Rebuild O(V+E)</text>
+  <text x="568" y="2750" fill="#f87171" font-size="10">~400ms (full topology rebuild)</text>
+  <text x="568" y="2761" fill="#ef4444" font-size="8">BOTTLENECK — write lock held</text>
+
+  <line x1="780" y1="2740" x2="798" y2="2740" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arrowRed)"/>
+
+  <rect x="800" y="2720" width="160" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="818" y="2738" fill="#e2e8f0" font-size="10">merge_by_pk O(1)</text>
+  <text x="818" y="2751" fill="#64748b" font-size="8">~5ms (prop_eq_idx)</text>
+
+  <line x1="960" y1="2740" x2="978" y2="2740" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="980" y="2720" width="120" height="40" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="998" y="2738" fill="#e2e8f0" font-size="10">commit + dirty</text>
+  <text x="998" y="2751" fill="#64748b" font-size="8">~0us</text>
+
+  <!-- Timing bar CP5 -->
+  <rect x="60" y="2770" width="1040" height="6" rx="3" fill="#1e293b" stroke="#334155" stroke-width="0.5"/>
+  <rect x="550" y="2770" width="230" height="6" rx="3" fill="#ef4444" fill-opacity="0.7"/>
+  <rect x="210" y="2770" width="55" height="6" rx="3" fill="#f59e0b" fill-opacity="0.4"/>
+  <text x="1110" y="2778" fill="#94a3b8" font-size="9">CSR rebuild = 80% of mutation</text>
+
+  <!-- ==================== CRITICAL PATH SUMMARY TABLE ==================== -->
+  <text x="800" y="2820" text-anchor="middle" fill="#f8fafc" font-size="16" font-weight="bold">Critical Path Summary — Bottleneck Ranking</text>
+
+  <!-- Table header -->
+  <rect x="100" y="2835" width="1400" height="28" rx="4" fill="#334155"/>
+  <text x="120" y="2854" fill="#e2e8f0" font-size="11" font-weight="bold">Rank</text>
+  <text x="170" y="2854" fill="#e2e8f0" font-size="11" font-weight="bold">Path</text>
+  <text x="370" y="2854" fill="#e2e8f0" font-size="11" font-weight="bold">Bottleneck</text>
+  <text x="640" y="2854" fill="#e2e8f0" font-size="11" font-weight="bold">Latency</text>
+  <text x="800" y="2854" fill="#e2e8f0" font-size="11" font-weight="bold">% of Path</text>
+  <text x="940" y="2854" fill="#e2e8f0" font-size="11" font-weight="bold">Impact</text>
+  <text x="1200" y="2854" fill="#e2e8f0" font-size="11" font-weight="bold">Mitigation</text>
+
+  <!-- Row 1 -->
+  <rect x="100" y="2865" width="1400" height="26" rx="0" fill="#1a0505"/>
+  <text x="130" y="2883" fill="#ef4444" font-size="12" font-weight="bold">1</text>
+  <text x="170" y="2883" fill="#fca5a5" font-size="10">CP2 Cold Read</text>
+  <text x="370" y="2883" fill="#f87171" font-size="10">Container Wake + R2 Page-In</text>
+  <text x="640" y="2883" fill="#f87171" font-size="10">2,700ms</text>
+  <text x="800" y="2883" fill="#ef4444" font-size="10" font-weight="bold">96%</text>
+  <text x="940" y="2883" fill="#94a3b8" font-size="10">First request after sleep = 2.8s</text>
+  <text x="1200" y="2883" fill="#94a3b8" font-size="10">Keep-alive heartbeat, selective page-in</text>
+
+  <!-- Row 2 -->
+  <rect x="100" y="2893" width="1400" height="26" rx="0" fill="#1e293b"/>
+  <text x="130" y="2911" fill="#ef4444" font-size="12" font-weight="bold">2</text>
+  <text x="170" y="2911" fill="#fca5a5" font-size="10">CP5 Mutation</text>
+  <text x="370" y="2911" fill="#f87171" font-size="10">CSR Rebuild O(V+E)</text>
+  <text x="640" y="2911" fill="#f87171" font-size="10">400ms</text>
+  <text x="800" y="2911" fill="#ef4444" font-size="10" font-weight="bold">80%</text>
+  <text x="940" y="2911" fill="#94a3b8" font-size="10">Write lock blocks all reads</text>
+  <text x="1200" y="2911" fill="#94a3b8" font-size="10">Incremental CSR (append-only)</text>
+
+  <!-- Row 3 -->
+  <rect x="100" y="2921" width="1400" height="26" rx="0" fill="#1a2332"/>
+  <text x="130" y="2939" fill="#f59e0b" font-size="12" font-weight="bold">3</text>
+  <text x="170" y="2939" fill="#fcd34d" font-size="10">CP3 Warm Read</text>
+  <text x="370" y="2939" fill="#fbbf24" font-size="10">YataRPC Coordinator Overhead</text>
+  <text x="640" y="2939" fill="#fbbf24" font-size="10">260ms</text>
+  <text x="800" y="2939" fill="#f59e0b" font-size="10" font-weight="bold">96%</text>
+  <text x="940" y="2939" fill="#94a3b8" font-size="10">205K QPS local vs 103 QPS distributed</text>
+  <text x="1200" y="2939" fill="#94a3b8" font-size="10">Connection pooling, batch queries</text>
+
+  <!-- Row 4 -->
+  <rect x="100" y="2949" width="1400" height="26" rx="0" fill="#1e293b"/>
+  <text x="130" y="2967" fill="#f59e0b" font-size="12" font-weight="bold">4</text>
+  <text x="170" y="2967" fill="#fcd34d" font-size="10">CP4 Snapshot</text>
+  <text x="370" y="2967" fill="#fbbf24" font-size="10">csr_to_fragment() serialization</text>
+  <text x="640" y="2967" fill="#fbbf24" font-size="10">10ms@10K</text>
+  <text x="800" y="2967" fill="#f59e0b" font-size="10" font-weight="bold">67%</text>
+  <text x="940" y="2967" fill="#94a3b8" font-size="10">Linear scale: ~150s@10M projected</text>
+  <text x="1200" y="2967" fill="#94a3b8" font-size="10">Dirty label delta PUT</text>
+
+  <!-- Row 5 -->
+  <rect x="100" y="2977" width="1400" height="26" rx="0" fill="#1a2332"/>
+  <text x="130" y="2995" fill="#22c55e" font-size="12" font-weight="bold">5</text>
+  <text x="170" y="2995" fill="#86efac" font-size="10">CP1 Write</text>
+  <text x="370" y="2995" fill="#22c55e" font-size="10">Pipeline.send() (durable commit)</text>
+  <text x="640" y="2995" fill="#22c55e" font-size="10">1ms</text>
+  <text x="800" y="2995" fill="#22c55e" font-size="10" font-weight="bold">50%</text>
+  <text x="940" y="2995" fill="#94a3b8" font-size="10">Acceptable — durability guarantee</text>
+  <text x="1200" y="2995" fill="#94a3b8" font-size="10">N/A (by design, non-negotiable)</text>
+
+  <!-- Critical chain dependencies -->
+  <rect x="100" y="3020" width="1400" height="85" rx="8" fill="#1e293b" stroke="#ef4444" stroke-width="1" stroke-opacity="0.3"/>
+  <text x="120" y="3042" fill="#ef4444" font-size="12" font-weight="bold">Critical Chain Dependencies</text>
+  <text x="120" y="3062" fill="#94a3b8" font-size="10">CP2 (Cold) to CP3 (Warm): Container wake is one-time; after warm-up, coordinator overhead dominates. Keep-alive heartbeat (5min cron) prevents CP2 regression.</text>
+  <text x="120" y="3078" fill="#94a3b8" font-size="10">CP5 (Mutation) to CP4 (Snapshot): Every mutation sets dirty flag, next cron triggers snapshot. At scale, mutation backlog + snapshot serialization compete for 1 vCPU.</text>
+  <text x="120" y="3094" fill="#94a3b8" font-size="10">CP1 (Write) vs CP5 (Mutation): mergeRecord (append-only, ~500us) is decoupled from Cypher CREATE mutation (~500ms). Append path bypasses CSR rebuild entirely.</text>
+
 </svg>
