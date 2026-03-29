@@ -9,15 +9,15 @@
 //! - Mutations: append-only within current version, CSR rebuilt on commit (incremental for dirty labels)
 
 pub mod arrow_store;
+pub mod arrow_wal_store;
 pub mod graph_store_enum;
 pub mod mirror;
-pub mod mmap_wal_store;
 pub mod partition;
 pub mod partitioned;
 pub mod vineyard;
 pub use arrow_store::ArrowGraphStore;
+pub use arrow_wal_store::ArrowWalStore;
 pub use graph_store_enum::{GraphStoreEnum, MemoryBudget};
-pub use mmap_wal_store::MmapWalStore;
 pub use mirror::{MirrorEdge, MirrorRegistry, MirrorVertex};
 pub use partitioned::PartitionedGraphStore;
 pub use vineyard::{

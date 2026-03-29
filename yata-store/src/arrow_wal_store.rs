@@ -1,16 +1,13 @@
-//! MmapWalStore: zero-copy graph store backed by mmap'd Arrow IPC WAL segments.
+//! ArrowWalStore: I/O utility for loading compacted Arrow IPC WAL segments.
 //!
-//! Loads a compacted WAL segment from disk via mmap (zero kernel→user copy).
+//! Loads a compacted WAL segment from disk via mmap (zero kernel→user copy)
+//! or from raw bytes. Provides vertex data access for cold start recovery.
+//!
+//! NOT a GraphStoreEnum variant — this is a loading utility, not a query store.
+//! Cold start path: ArrowWalStore::from_file() → iterate entries → wal_apply → MutableCsrStore.
+//!
+//! The mmap optimization avoids R2 fetch + heap allocation for the initial load.
 //! Arrow FileReader reads column buffers directly from mmap'd pages.
-//! Vertex properties are served from Arrow StringArray/Int64Array etc. without
-//! copying into HashMap<String, PropValue>.
-//!
-//! Implements read-only GRIN traits (Topology, Property, Schema, Scannable).
-//! Does NOT implement Mutable — writes go through WalEntry → MutableCsrStore.
-//!
-//! This is a vertex-only store (WAL entries don't contain edge topology).
-//! Edge queries return empty results. The engine overlays edge data from
-//! ArrowFragment snapshot or Cypher mutations on the MutableCsrStore delta.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -22,7 +19,7 @@ use yata_grin::*;
 ///
 /// Zero-copy for property reads: Arrow column buffers reference mmap'd pages.
 /// The OS page cache manages eviction — no application-level memory management.
-pub struct MmapWalStore {
+pub struct ArrowWalStore {
     /// Per-VID vertex data, indexed by position in the compacted segment.
     /// VID = array index (0-based, dense).
     labels: Vec<String>,
@@ -50,8 +47,8 @@ pub struct MmapWalStore {
     _mmap: Option<memmap2::Mmap>,
 }
 
-impl MmapWalStore {
-    /// Create an empty MmapWalStore.
+impl ArrowWalStore {
+    /// Create an empty ArrowWalStore.
     pub fn new() -> Self {
         Self {
             labels: Vec::new(),
@@ -223,21 +220,21 @@ fn parse_props_json(json: &str) -> HashMap<String, PropValue> {
 
 // ── Mutable trait (read-only store — panics on mutation) ──
 
-impl Mutable for MmapWalStore {
+impl Mutable for ArrowWalStore {
     fn add_vertex(&mut self, _label: &str, _props: &[(&str, PropValue)]) -> u32 {
-        panic!("MmapWalStore is read-only")
+        panic!("ArrowWalStore is read-only")
     }
     fn add_edge(&mut self, _src: u32, _dst: u32, _label: &str, _props: &[(&str, PropValue)]) -> u32 {
-        panic!("MmapWalStore is read-only")
+        panic!("ArrowWalStore is read-only")
     }
     fn set_vertex_prop(&mut self, _vid: u32, _key: &str, _value: PropValue) {
-        panic!("MmapWalStore is read-only")
+        panic!("ArrowWalStore is read-only")
     }
     fn delete_vertex(&mut self, _vid: u32) {
-        panic!("MmapWalStore is read-only")
+        panic!("ArrowWalStore is read-only")
     }
     fn delete_edge(&mut self, _edge_id: u32) {
-        panic!("MmapWalStore is read-only")
+        panic!("ArrowWalStore is read-only")
     }
     fn commit(&mut self) -> u64 {
         0
@@ -246,7 +243,7 @@ impl Mutable for MmapWalStore {
 
 // ── GRIN trait implementations (read-only, vertex-only) ──
 
-impl Topology for MmapWalStore {
+impl Topology for ArrowWalStore {
     fn vertex_count(&self) -> usize {
         self.count
     }
@@ -284,7 +281,7 @@ impl Topology for MmapWalStore {
     }
 }
 
-impl Property for MmapWalStore {
+impl Property for ArrowWalStore {
     fn vertex_labels(&self, vid: u32) -> Vec<String> {
         if let Some(label) = self.labels.get(vid as usize) {
             vec![label.clone()]
@@ -330,7 +327,7 @@ impl Property for MmapWalStore {
     }
 }
 
-impl Schema for MmapWalStore {
+impl Schema for ArrowWalStore {
     fn vertex_labels(&self) -> Vec<String> {
         self.known_labels.clone()
     }
@@ -344,7 +341,7 @@ impl Schema for MmapWalStore {
     }
 }
 
-impl Scannable for MmapWalStore {
+impl Scannable for ArrowWalStore {
     fn scan_vertices(&self, label: &str, predicate: &Predicate) -> Vec<u32> {
         let vids = match self.label_index.get(label) {
             Some(vids) => vids,
@@ -491,7 +488,7 @@ mod tests {
 
     #[test]
     fn test_empty_store() {
-        let store = MmapWalStore::new();
+        let store = ArrowWalStore::new();
         assert_eq!(store.len(), 0);
         assert!(store.is_empty());
         assert_eq!(store.vertex_count(), 0);
@@ -510,7 +507,7 @@ mod tests {
             ]),
         ]);
 
-        let store = MmapWalStore::from_arrow_ipc_bytes(&data).unwrap();
+        let store = ArrowWalStore::from_arrow_ipc_bytes(&data).unwrap();
         assert_eq!(store.len(), 2);
         assert_eq!(store.vertex_count(), 2);
 
@@ -540,7 +537,7 @@ mod tests {
             ]),
         ]);
 
-        let store = MmapWalStore::from_arrow_ipc_bytes(&data).unwrap();
+        let store = ArrowWalStore::from_arrow_ipc_bytes(&data).unwrap();
 
         assert_eq!(store.vertex_prop(0, "name"), Some(PropValue::Str("alice".into())));
         assert_eq!(store.vertex_prop(0, "age"), Some(PropValue::Int(30)));
@@ -554,7 +551,7 @@ mod tests {
         let data = build_test_arrow_ipc(&[
             (1, "Post", "pk_1", "upsert", vec![]),
         ]);
-        let store = MmapWalStore::from_arrow_ipc_bytes(&data).unwrap();
+        let store = ArrowWalStore::from_arrow_ipc_bytes(&data).unwrap();
         assert_eq!(Property::vertex_labels(&store, 0), vec!["Post".to_string()]);
         assert!(Property::vertex_labels(&store, 999).is_empty());
     }
@@ -566,7 +563,7 @@ mod tests {
             (2, "Post", "pk_2", "upsert", vec![("age".into(), PropValue::Int(25))]),
             (3, "Post", "pk_3", "upsert", vec![("age".into(), PropValue::Int(35))]),
         ]);
-        let store = MmapWalStore::from_arrow_ipc_bytes(&data).unwrap();
+        let store = ArrowWalStore::from_arrow_ipc_bytes(&data).unwrap();
 
         // Eq predicate
         let result = store.scan_vertices("Post", &Predicate::Eq("age".into(), PropValue::Int(30)));
@@ -583,7 +580,7 @@ mod tests {
             (1, "Post", "pk_1", "upsert", vec![("name".into(), PropValue::Str("alice".into()))]),
             (2, "Post", "pk_2", "upsert", vec![("name".into(), PropValue::Str("bob".into()))]),
         ]);
-        let store = MmapWalStore::from_arrow_ipc_bytes(&data).unwrap();
+        let store = ArrowWalStore::from_arrow_ipc_bytes(&data).unwrap();
 
         assert_eq!(store.find_vid_by_pk("Post", "rkey", "pk_1"), Some(0));
         assert_eq!(store.find_vid_by_pk("Post", "rkey", "pk_2"), Some(1));
@@ -596,7 +593,7 @@ mod tests {
             (1, "Post", "pk_1", "upsert", vec![("name".into(), PropValue::Str("alice".into()))]),
             (2, "Post", "pk_2", "delete", vec![]),
         ]);
-        let store = MmapWalStore::from_arrow_ipc_bytes(&data).unwrap();
+        let store = ArrowWalStore::from_arrow_ipc_bytes(&data).unwrap();
         // Delete entry should be skipped
         assert_eq!(store.len(), 1);
         assert_eq!(store.vertex_prop(0, "name"), Some(PropValue::Str("alice".into())));
@@ -610,7 +607,7 @@ mod tests {
                 ("age".into(), PropValue::Int(30)),
             ]),
         ]);
-        let store = MmapWalStore::from_arrow_ipc_bytes(&data).unwrap();
+        let store = ArrowWalStore::from_arrow_ipc_bytes(&data).unwrap();
         let all = store.vertex_all_props(0);
         assert_eq!(all.len(), 2);
         assert_eq!(all.get("name"), Some(&PropValue::Str("alice".into())));
@@ -629,7 +626,7 @@ mod tests {
                 ("score".into(), PropValue::Float(9.5)),
             ]),
         ]);
-        let store = MmapWalStore::from_arrow_ipc_bytes(&data).unwrap();
+        let store = ArrowWalStore::from_arrow_ipc_bytes(&data).unwrap();
         let keys = store.vertex_prop_keys("Post");
         assert!(keys.contains(&"name".to_string()));
         assert!(keys.contains(&"age".to_string()));
@@ -638,7 +635,7 @@ mod tests {
 
     #[test]
     fn test_edge_operations_return_empty() {
-        let store = MmapWalStore::new();
+        let store = ArrowWalStore::new();
         assert_eq!(store.edge_count(), 0);
         assert!(store.out_neighbors(0).is_empty());
         assert!(store.in_neighbors(0).is_empty());
@@ -657,7 +654,7 @@ mod tests {
         let path = dir.path().join("compacted.arrow");
         std::fs::write(&path, &data).unwrap();
 
-        let store = MmapWalStore::from_file(&path).unwrap();
+        let store = ArrowWalStore::from_file(&path).unwrap();
         assert_eq!(store.len(), 1);
         assert_eq!(store.vertex_prop(0, "name"), Some(PropValue::Str("alice".into())));
         // mmap handle should be held
