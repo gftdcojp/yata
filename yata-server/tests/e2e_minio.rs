@@ -3,7 +3,7 @@
 //! WIT coverage: repoWrite repoUpdate repoDelete queryG queryGExec gExec
 //!   didCreate didWrite didDeleteRecord didUpdateRecord didDeactivate didRotateKey
 //!   cypherQuery cypherQueryJson cypherBatchExec mergeRecord deleteRecord batchImport
-//!   createRecord triggerSnapshot pageInFromR2 writePost writeLike writeRepost
+//!   createRecord compact pageInFromR2 writePost writeLike writeRepost
 //!   writeFollow writeProfile rotateKey updateRecord vectorSearch
 //!
 //! Prerequisite:
@@ -15,7 +15,7 @@
 //! Tests:
 //!   1. Health check
 //!   2. mergeRecord → Cypher query roundtrip
-//!   3. trigger_snapshot → MinIO persistence
+//!   3. compact → MinIO persistence
 //!   4. Cold restart → page-in from MinIO
 //!   5. 2-partition label routing
 //!   6. Load test (concurrent writes + reads)
@@ -63,9 +63,9 @@ fn merge_record(url: &str, label: &str, rkey: &str, props: serde_json::Value) {
     assert!(resp.status().is_success(), "merge failed: {} — {}", resp.status(), resp.text().unwrap_or_default());
 }
 
-fn trigger_snapshot(url: &str) -> bool {
+fn trigger_compaction(url: &str) -> bool {
     let resp = client()
-        .post(&format!("{url}/xrpc/ai.gftd.yata.triggerSnapshot"))
+        .post(&format!("{url}/xrpc/ai.gftd.yata.compact"))
         .header("X-Magatama-Verified", "true")
         .json(&serde_json::json!({}))
         .send()
@@ -113,10 +113,10 @@ fn t03_snapshot_to_minio() {
         cypher(P0_URL, &create);
     }
 
-    // Trigger snapshot → MinIO
-    let ok = trigger_snapshot(P0_URL);
-    assert!(ok, "snapshot failed");
-    eprintln!("t03: snapshot triggered successfully");
+    // Trigger compaction → MinIO
+    let ok = trigger_compaction(P0_URL);
+    assert!(ok, "compaction failed");
+    eprintln!("t03: compaction triggered successfully");
 
     // Verify data survives
     let result = cypher(P0_URL, "MATCH (n:SnapshotTest) RETURN count(n) AS cnt");
@@ -251,10 +251,10 @@ fn t08_per_partition_snapshot_and_restore() {
         }
     }
 
-    // Trigger snapshot on both
-    assert!(trigger_snapshot(P0_URL), "P0 snapshot failed");
+    // Trigger compaction on both
+    assert!(trigger_compaction(P0_URL), "P0 compaction failed");
     if p1_ok {
-        assert!(trigger_snapshot(P1_URL), "P1 snapshot failed");
+        assert!(trigger_compaction(P1_URL), "P1 compaction failed");
     }
 
     // Verify counts

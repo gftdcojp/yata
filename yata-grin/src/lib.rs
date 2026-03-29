@@ -118,7 +118,7 @@ impl<T: GraphStore + Mutable> MutableGraphStore for T {}
 /// Storage temperature tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Tier {
-    /// In-memory MutableCSR (ns latency, bounded by RAM).
+    /// In-memory Sorted COO (ns latency, bounded by RAM).
     Hot,
     /// Disk-backed (ms latency, bounded by disk).
     Warm,

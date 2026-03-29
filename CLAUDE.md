@@ -96,10 +96,10 @@ env.YATA.stats()                        // → all partition CpmStats (K3a)
 | `yata-engine` | TieredGraphEngine, CpmStats (K3a), **LSM compaction** (`compaction.rs`: L0+L1 merge-sort, PK-dedup, CompactionManifest v2 per-label tracking, dirty_labels drain), **Arrow IPC WAL** (`arrow_wal.rs`: serialize/deserialize/auto-detect, default format), cold start (per-label sorted COO segment mmap → R2 GET → L0 tail replay), 3-tier blob fetch (`fetch_blob_cached`: disk → R2 → write-through), Frontier BFS, ShardedCoordinator, WAL Projection (ring buffer + segment flush + compaction)。Design E SecurityScope (`query_with_did` → policy vertex lookup) |
 | `yata-cypher` | Full Cypher parser + executor (incl. untyped edge traversal) |
 | `yata-gie` | GIE push-based executor, IR (Exchange/Receive/Gather, serde-serializable), distributed planner, `execute_step()` (Phase 5: stateless per-round fragment execution), `MaterializedRecord` (rkey-based cross-partition exchange), `ExchangePayload` (HTTP transport) |
-| `yata-s3` | R2 persistence (sync ureq+rustls S3 client, SigV4)。`trigger_snapshot()` → R2 PUT、page-in → R2 GET |
+| `yata-s3` | R2 persistence (sync ureq+rustls S3 client, SigV4)。`trigger_compaction()` → R2 PUT、page-in → R2 GET |
 | `yata-vex` | Vector index (IVF_PQ + DiskANN) |
 | `yata-bench` | Benchmarks + trillion-scale test |
-| `yata-server` | XRPC API server (`/xrpc/ai.gftd.yata.cypher` + `triggerSnapshot`)。GraphQueryExecutor trait |
+| `yata-server` | XRPC API server (`/xrpc/ai.gftd.yata.cypher` + `compact`)。GraphQueryExecutor trait |
 
 ## GraphScope Parity
 
@@ -163,7 +163,7 @@ R2 = source of truth。**Per-label sorted COO segments**: `log/coo/{pid}/label/{
 - **Migration CLI**: `gftd yata migrate --from csr --to coo` (CSR→COO forward) / `--from coo --to csr` (rollback)
 - **Edge cache 除去**: PDS `cyCached` → `cy` 直接 (graph data は mutation-driven)
 - **PDS `cyRetry` (CRITICAL)**: 空結果時に1回リトライ (5s timeout)。Container cold start / segment page-in 失敗に対する defense-in-depth
-- **Cron compaction (CRITICAL)**: YataRPC cron が毎 5 分に LSM compaction 呼出
+- **Size-based compaction (CRITICAL)**: `L0_COMPACT_THRESHOLD` (default 10,000) pending_writes で自動 trigger。cron 排除 (workload-adaptive)
 
 | Path | CSR (Before) | COO (After) |
 |---|---|---|
@@ -176,7 +176,7 @@ R2 = source of truth。**Per-label sorted COO segments**: `log/coo/{pid}/label/{
 | Traversal | O(1) + O(degree) CSR direct | O(log 256) + O(degree) sparse index |
 | Recovery | P=1.0 (compacted + tail) | P=1.0 (sorted segments + tail) |
 
-**禁止**: CSR offsets rebuild の新規導入。mutable snapshot (commit() → serialize → R2 PUT)。PDS `cyCached` に edge cache 再導入。monolithic compacted segment
+**禁止**: CSR offsets rebuild の新規導入。mutable snapshot (commit() → serialize → R2 PUT)。PDS `cyCached` に edge cache 再導入。monolithic compacted segment。time-based cron compaction (size-based のみ)
 
 ## CRITICAL: 3 概念は直交 — partition ≠ label ≠ security
 
@@ -205,7 +205,6 @@ Production: PARTITION_COUNT=1, per-label sorted COO Arrow IPC, segment-level pag
 | `YATA_S3_*` | (empty) | R2 endpoint/bucket/key/secret/prefix |
 | `YATA_MMAP_VINEYARD` | `false` | Enable MmapBlobCache (zero-copy) |
 | `YATA_DIRECT_FAN_OUT_LIMIT` | `8` | Below this, direct fan-out; above, hierarchical √N `[IMPLEMENTED]` (companion Worker adaptive routing) |
-| `YATA_BATCH_COMMIT_THRESHOLD` | `10` | R2 snapshot skipped if pending_writes < threshold `[IMPLEMENTED]` (engine.rs pending_writes gate) |
 | `YATA_CHUNK_TARGET_BYTES` | `33554432` (32 MB) | Arrow row-group chunk target byte size per blob。R2/S3 最適 8-64 MB |
 | `YATA_CHUNK_ROWS` | (unset) | 設定時は byte-based estimation を override し固定 row 数で chunk 分割 |
 | `YATA_WAL_FORMAT` | `arrow` | WAL segment format (`arrow` or `ndjson`)。Arrow = zero-copy mmap |

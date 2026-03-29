@@ -64,7 +64,7 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
         Err("wal_tail not implemented".to_string())
     }
 
-    /// Apply WAL entries to the CSR (read container).
+    /// Apply WAL entries to the store (read container).
     fn wal_apply(&self, entries: &[yata_engine::wal::WalEntry]) -> Result<u64, String> {
         let _ = entries;
         Err("wal_apply not implemented".to_string())
@@ -75,12 +75,7 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
         Err("wal_flush_segment not implemented".to_string())
     }
 
-    /// Create a checkpoint (ArrowFragment + WAL metadata) for cold start recovery.
-    fn wal_checkpoint(&self) -> Result<(u64, u64), String> {
-        Err("wal_checkpoint not implemented".to_string())
-    }
-
-    /// Cold start from R2 checkpoint + WAL segment replay.
+    /// Cold start from R2 compacted segments + WAL segment replay.
     fn wal_cold_start(&self) -> Result<u64, String> {
         Err("wal_cold_start not implemented".to_string())
     }
@@ -113,7 +108,7 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
 
 pub struct YataRestState<G: GraphQueryExecutor> {
     pub graph: Arc<G>,
-    /// When true, reject write operations (mergeRecord, triggerSnapshot, mutation cypher).
+    /// When true, reject write operations (mergeRecord, compact, mutation cypher).
     /// Set via YATA_READONLY env var for read replica containers.
     pub readonly: bool,
 }
@@ -142,7 +137,6 @@ pub fn router<G: GraphQueryExecutor>(state: YataRestState<G>) -> Router {
         .route("/xrpc/ai.gftd.yata.walTailArrow", post(wal_tail_arrow_handler::<G>))
         .route("/xrpc/ai.gftd.yata.walApplyArrow", post(wal_apply_arrow_handler::<G>))
         .route("/xrpc/ai.gftd.yata.walFlushSegment", post(wal_flush_segment_handler::<G>))
-        .route("/xrpc/ai.gftd.yata.walCheckpoint", post(wal_checkpoint_handler::<G>))
         .route("/xrpc/ai.gftd.yata.walColdStart", post(wal_cold_start_handler::<G>))
         .route("/xrpc/ai.gftd.yata.compact", post(compact_handler::<G>))
         .route("/xrpc/ai.gftd.yata.mergeRecordWal", post(merge_record_wal_handler::<G>))
@@ -563,23 +557,6 @@ async fn wal_flush_segment_handler<G: GraphQueryExecutor>(
     }
 }
 
-/// POST /xrpc/ai.gftd.yata.walCheckpoint — Create ArrowFragment checkpoint + WAL metadata.
-/// Write Container only.
-async fn wal_checkpoint_handler<G: GraphQueryExecutor>(
-    State(state): State<YataRestState<G>>,
-) -> impl IntoResponse {
-    if state.readonly {
-        return (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"error": "read-only container"})));
-    }
-    let graph = state.graph.clone();
-    let result = tokio::task::spawn_blocking(move || graph.wal_checkpoint()).await;
-    match result {
-        Ok(Ok((v, e))) => (StatusCode::OK, Json(serde_json::json!({"vertices": v, "edges": e}))),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
-    }
-}
-
 /// POST /xrpc/ai.gftd.yata.walColdStart — Cold start from R2 checkpoint + WAL replay.
 /// Read Container only.
 async fn wal_cold_start_handler<G: GraphQueryExecutor>(
@@ -725,10 +702,6 @@ impl GraphQueryExecutor for yata_engine::TieredGraphEngine {
         self.wal_flush_segment()
     }
 
-    fn wal_checkpoint(&self) -> Result<(u64, u64), String> {
-        self.wal_checkpoint()
-    }
-
     fn wal_cold_start(&self) -> Result<u64, String> {
         self.wal_cold_start()
     }
@@ -813,10 +786,6 @@ mod tests {
 
         fn wal_flush_segment(&self) -> Result<(u64, u64, usize), String> {
             self.engine.wal_flush_segment()
-        }
-
-        fn wal_checkpoint(&self) -> Result<(u64, u64), String> {
-            self.engine.wal_checkpoint()
         }
 
         fn wal_cold_start(&self) -> Result<u64, String> {
@@ -925,7 +894,7 @@ mod tests {
         assert_eq!(json["cypher_read_count"], 0);
         assert_eq!(json["cypher_mutation_count"], 0);
         assert_eq!(json["merge_record_count"], 0);
-        assert_eq!(json["last_snapshot_serialize_ms"], 0);
+        assert_eq!(json["last_compaction_ms"], 0);
     }
 
 }

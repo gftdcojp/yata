@@ -107,11 +107,11 @@ async fn write_read_scale_projection() {
     let scan_qps = scan_iters as f64 / scan_elapsed.as_secs_f64();
     eprintln!("SCAN: {scan_iters} full scans in {:?} ({:.0} QPS)", scan_elapsed, scan_qps);
 
-    // ── 6. ArrowFragment snapshot benchmark ──
+    // ── 6. L1 compaction benchmark ──
     let snap_start2 = Instant::now();
-    let result = engine.trigger_snapshot();
+    let result = engine.trigger_compaction();
     let snap_elapsed = snap_start2.elapsed();
-    eprintln!("SNAPSHOT: trigger_snapshot in {:?} (result: {:?})", snap_elapsed, result);
+    eprintln!("COMPACT: trigger_compaction in {:?} (result: {:?})", snap_elapsed, result);
 
     // ── 7. Extrapolation ──
     eprintln!("\n============================================================");

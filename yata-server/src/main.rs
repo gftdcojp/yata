@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
 
     let readonly = std::env::var("YATA_READONLY").unwrap_or_default() == "true";
     if readonly {
-        tracing::info!("read-only mode: write endpoints (mergeRecord, triggerSnapshot) disabled");
+        tracing::info!("read-only mode: write endpoints (mergeRecord, compact) disabled");
     }
 
     let state = rest::YataRestState {

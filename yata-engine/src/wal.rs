@@ -1,13 +1,14 @@
-//! WAL (Write-Ahead Log) for Kafka-style projection architecture.
+//! WAL (Write-Ahead Log) for Sorted COO projection architecture.
 //!
-//! Write Container: merge_record → WAL append + CSR merge → R2 segment flush.
-//! Read Container:  WAL apply → incremental CSR merge → serve queries.
+//! Write Container: merge_record → L0 buffer append + WAL ring append → R2 segment flush.
+//! Read Container:  WAL apply → incremental store merge → serve queries.
 //!
 //! WAL entries are stored in an in-memory ring buffer with monotonic sequence numbers.
 //! The YataRPC Worker coordinator pushes entries from Write → Read containers.
 //! R2 segments provide durability for cold start recovery.
+//! Compaction is size-based (L0_COMPACT_THRESHOLD), not time-based cron.
 //!
-//! Phase 1: props stored as Vec<(String, PropValue)> — zero JSON overhead on write/apply.
+//! Props stored as Vec<(String, PropValue)> — zero JSON overhead on write/apply.
 //! NDJSON backward compat via custom serde (flat JSON map format).
 
 use base64::Engine as _;

@@ -67,9 +67,9 @@ fn merge_record(url: &str, label: &str, rkey: &str, props: &serde_json::Value) -
     Ok(())
 }
 
-fn trigger_snapshot(url: &str) -> bool {
+fn trigger_compaction(url: &str) -> bool {
     client()
-        .post(&format!("{url}/xrpc/ai.gftd.yata.triggerSnapshot"))
+        .post(&format!("{url}/xrpc/ai.gftd.yata.compact"))
         .header("X-Magatama-Verified", "true")
         .json(&serde_json::json!({}))
         .send()
@@ -147,15 +147,15 @@ fn t02_cold_write_10k_distributed() {
 }
 
 #[test]
-fn t03_snapshot_all_nodes() {
+fn t03_compact_all_nodes() {
     let start = Instant::now();
     for (i, url) in NODES.iter().enumerate() {
         if client().get(&format!("{url}/health")).send().map(|r| r.status().is_success()).unwrap_or(false) {
-            let ok = trigger_snapshot(url);
-            eprintln!("  P{i} snapshot: {}", if ok { "OK" } else { "FAIL" });
+            let ok = trigger_compaction(url);
+            eprintln!("  P{i} compact: {}", if ok { "OK" } else { "FAIL" });
         }
     }
-    eprintln!("t03: all snapshots in {:?}", start.elapsed());
+    eprintln!("t03: all compactions in {:?}", start.elapsed());
 }
 
 #[test]

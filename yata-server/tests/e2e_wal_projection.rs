@@ -211,17 +211,17 @@ fn test_wal_flush_segment() {
         result["seq_start"], result["seq_end"], result["bytes"]);
 }
 
-// ── Test 6: walCheckpoint → ArrowFragment ──
+// ── Test 6: compact (L1 compaction) ──
 
 #[test]
-fn test_wal_checkpoint() {
+fn test_compact() {
     if skip_if_not_running() { return; }
 
     for i in 0..5 {
         post(
             &format!("{WRITE_URL}/xrpc/ai.gftd.yata.mergeRecordWal"),
             json!({
-                "label": "CheckpointTest",
+                "label": "CompactTest",
                 "pk_key": "rkey",
                 "pk_value": format!("cp_{i}"),
                 "props": {"idx": i}
@@ -230,14 +230,13 @@ fn test_wal_checkpoint() {
     }
 
     let result = post(
-        &format!("{WRITE_URL}/xrpc/ai.gftd.yata.walCheckpoint"),
+        &format!("{WRITE_URL}/xrpc/ai.gftd.yata.compact"),
         json!({}),
     ).unwrap();
 
-    let v = result["vertices"].as_u64().unwrap_or(0);
-    let e = result["edges"].as_u64().unwrap_or(0);
-    eprintln!("  walCheckpoint: {v}v {e}e");
-    assert!(v > 0, "checkpoint should have vertices");
+    let output = result["output_entries"].as_u64().unwrap_or(0);
+    eprintln!("  compact: {output} entries");
+    assert!(output > 0, "compaction should produce entries");
 }
 
 // ── Test 7: walColdStart on read replica ──

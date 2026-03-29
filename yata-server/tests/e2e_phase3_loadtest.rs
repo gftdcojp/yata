@@ -60,14 +60,14 @@ fn merge_record(label: &str, rkey: &str, extra_props: &str) {
     assert!(resp.status().is_success(), "mergeRecord {label}/{rkey} failed: {}", resp.status());
 }
 
-fn trigger_snapshot() -> serde_json::Value {
+fn trigger_compaction() -> serde_json::Value {
     let resp = client()
-        .post(&format!("{URL}/xrpc/ai.gftd.yata.triggerSnapshot"))
+        .post(&format!("{URL}/xrpc/ai.gftd.yata.compact"))
         .header("X-Magatama-Verified", "true")
         .json(&serde_json::json!({}))
         .send()
         .unwrap();
-    assert!(resp.status().is_success(), "snapshot failed: {}", resp.status());
+    assert!(resp.status().is_success(), "compaction failed: {}", resp.status());
     resp.json().unwrap_or(serde_json::Value::Null)
 }
 
@@ -170,7 +170,7 @@ fn t02_seed_multi_label_graph() {
 #[test]
 fn t03_chunked_snapshot() {
     let start = Instant::now();
-    let result = trigger_snapshot();
+    let result = trigger_compaction();
     let elapsed = start.elapsed();
     eprintln!("t03: snapshot in {:?} — {}", elapsed, serde_json::to_string_pretty(&result).unwrap());
 }
@@ -253,7 +253,7 @@ fn t06_mixed_read_write_load() {
 #[test]
 fn t07_snapshot_after_load() {
     let start = Instant::now();
-    let result = trigger_snapshot();
+    let result = trigger_compaction();
     let elapsed = start.elapsed();
     eprintln!("t07: post-load snapshot in {:?} — {}", elapsed, serde_json::to_string_pretty(&result).unwrap());
 

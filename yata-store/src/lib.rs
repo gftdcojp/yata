@@ -516,6 +516,8 @@ struct LazyCsrCache {
     stale: HashSet<String>,
     /// All labels stale (set on first commit or when pending_edges exist).
     all_stale: bool,
+    /// Labels individually rebuilt while all_stale was set.
+    rebuilt: HashSet<String>,
 }
 
 impl LazyCsrCache {
@@ -525,28 +527,38 @@ impl LazyCsrCache {
             in_: HashMap::new(),
             stale: HashSet::new(),
             all_stale: false,
+            rebuilt: HashSet::new(),
         }
     }
 
     fn mark_stale(&mut self, label: &str) {
         self.stale.insert(label.to_string());
+        self.rebuilt.remove(label);
     }
 
     fn mark_all_stale(&mut self) {
         self.all_stale = true;
+        self.rebuilt.clear();
     }
 
     fn is_stale(&self, label: &str) -> bool {
+        if self.rebuilt.contains(label) {
+            return false; // individually rebuilt while all_stale
+        }
         self.all_stale || self.stale.contains(label)
     }
 
     fn mark_fresh(&mut self, label: &str) {
         self.stale.remove(label);
+        if self.all_stale {
+            self.rebuilt.insert(label.to_string());
+        }
     }
 
     fn mark_all_fresh(&mut self) {
         self.stale.clear();
         self.all_stale = false;
+        self.rebuilt.clear();
     }
 }
 
@@ -557,6 +569,7 @@ impl Clone for LazyCsrCache {
             in_: self.in_.clone(),
             stale: self.stale.clone(),
             all_stale: self.all_stale,
+            rebuilt: self.rebuilt.clone(),
         }
     }
 }
@@ -3206,6 +3219,209 @@ mod tests {
         // Degrees reflect the self-loop
         assert_eq!(store.out_degree(v), 1);
         assert_eq!(store.in_degree(v), 1);
+    }
+}
+
+#[cfg(test)]
+mod lazy_csr_tests {
+    use super::*;
+
+    #[test]
+    fn test_commit_does_not_rebuild_csr() {
+        let mut store = MutableCsrStore::new();
+        let a = store.add_vertex_with_labels(&["Person".into()], &[]);
+        let b = store.add_vertex_with_labels(&["Person".into()], &[]);
+        store.add_edge(a, b, "KNOWS", &[]);
+        store.commit();
+
+        // CSR should be stale after commit (lazy)
+        let csr = store.csr.lock().unwrap();
+        assert!(
+            csr.is_stale("KNOWS") || csr.all_stale,
+            "CSR should be stale after commit"
+        );
+    }
+
+    #[test]
+    fn test_lazy_csr_builds_on_read() {
+        let mut store = MutableCsrStore::new();
+        let a = store.add_vertex_with_labels(&["Person".into()], &[]);
+        let b = store.add_vertex_with_labels(&["Person".into()], &[]);
+        store.add_edge(a, b, "KNOWS", &[]);
+        store.commit();
+
+        // Before any Topology call, CSR is stale
+        {
+            let csr = store.csr.lock().unwrap();
+            assert!(csr.is_stale("KNOWS") || csr.all_stale);
+        }
+
+        // Topology call triggers lazy rebuild
+        let neighbors = store.out_neighbors_by_label(a, "KNOWS");
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].vid, b);
+
+        // After read, CSR for "KNOWS" should be fresh
+        {
+            let csr = store.csr.lock().unwrap();
+            assert!(!csr.is_stale("KNOWS"), "CSR should be fresh after read");
+        }
+    }
+
+    #[test]
+    fn test_lazy_csr_per_label_staleness() {
+        let mut store = MutableCsrStore::new();
+        let a = store.add_vertex_with_labels(&["Person".into()], &[]);
+        let b = store.add_vertex_with_labels(&["Company".into()], &[]);
+        let c = store.add_vertex_with_labels(&["Person".into()], &[]);
+
+        store.add_edge(a, b, "WORKS_AT", &[]);
+        store.commit();
+
+        // Read WORKS_AT to make it fresh
+        let _ = store.out_neighbors_by_label(a, "WORKS_AT");
+
+        // Now add a KNOWS edge (only KNOWS becomes stale)
+        store.add_edge(a, c, "KNOWS", &[]);
+        store.commit();
+
+        // WORKS_AT CSR should still be usable without rebuild
+        // KNOWS should be stale
+        {
+            let csr = store.csr.lock().unwrap();
+            assert!(csr.is_stale("KNOWS"), "KNOWS should be stale");
+            // WORKS_AT may or may not be stale depending on all_stale flag
+        }
+
+        // Reading KNOWS triggers lazy rebuild
+        let knows_neighbors = store.out_neighbors_by_label(a, "KNOWS");
+        assert_eq!(knows_neighbors.len(), 1);
+        assert_eq!(knows_neighbors[0].vid, c);
+    }
+
+    #[test]
+    fn test_force_rebuild_csr() {
+        let mut store = MutableCsrStore::new();
+        let a = store.add_vertex_with_labels(&["Person".into()], &[]);
+        let b = store.add_vertex_with_labels(&["Person".into()], &[]);
+        store.add_edge(a, b, "KNOWS", &[]);
+        store.commit();
+
+        // Force rebuild
+        store.force_rebuild_csr();
+
+        // CSR should be fresh for all labels
+        {
+            let csr = store.csr.lock().unwrap();
+            assert!(!csr.all_stale, "all_stale should be false after force rebuild");
+            assert!(csr.stale.is_empty(), "no stale labels after force rebuild");
+            assert!(csr.out.contains_key("KNOWS"), "CSR should have KNOWS segment");
+        }
+    }
+
+    #[test]
+    fn test_merge_by_pk_with_lazy_csr() {
+        let mut store = MutableCsrStore::new();
+
+        // First merge: creates vertex
+        let pk = PropValue::Str("rkey1".into());
+        let v1 = store.merge_by_pk("Post", "rkey", &pk, &[("title", PropValue::Str("Hello".into()))]);
+        store.commit();
+
+        // Second merge: updates same vertex (O(1) via prop_eq_index)
+        let v2 = store.merge_by_pk("Post", "rkey", &pk, &[("title", PropValue::Str("Updated".into()))]);
+        store.commit();
+
+        assert_eq!(v1, v2, "merge_by_pk should return same vid for same PK");
+
+        // Property should be updated
+        let title = store.vertex_prop(v1, "title");
+        assert_eq!(title, Some(PropValue::Str("Updated".into())));
+    }
+
+    #[test]
+    fn test_write_read_interleave() {
+        // Simulate production pattern: many writes then read
+        let mut store = MutableCsrStore::new();
+        let mut vids = Vec::new();
+
+        // 100 writes
+        for i in 0..100 {
+            let pk = PropValue::Str(format!("node_{}", i));
+            let vid = store.merge_by_pk(
+                "Node",
+                "rkey",
+                &pk,
+                &[("idx", PropValue::Int(i as i64))],
+            );
+            vids.push(vid);
+            store.commit();
+        }
+
+        // Add edges
+        for i in 0..99 {
+            store.add_edge(vids[i], vids[i + 1], "NEXT", &[]);
+        }
+        store.commit();
+
+        // Read: first access triggers lazy CSR build
+        let mid = vids[50];
+        let neighbors = store.out_neighbors_by_label(mid, "NEXT");
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].vid, vids[51]);
+
+        // Reverse direction
+        let in_neighbors = store.in_neighbors_by_label(mid, "NEXT");
+        assert_eq!(in_neighbors.len(), 1);
+        assert_eq!(in_neighbors[0].vid, vids[49]);
+    }
+
+    #[test]
+    fn test_degree_with_lazy_csr() {
+        let mut store = MutableCsrStore::new();
+        let hub = store.add_vertex_with_labels(&["Hub".into()], &[]);
+        for _ in 0..10 {
+            let leaf = store.add_vertex_with_labels(&["Leaf".into()], &[]);
+            store.add_edge(hub, leaf, "LINK", &[]);
+        }
+        store.commit();
+
+        assert_eq!(store.out_degree(hub), 10);
+        assert_eq!(store.in_degree(hub), 0);
+    }
+
+    #[test]
+    fn test_csr_raw_returns_fresh_data() {
+        let mut store = MutableCsrStore::new();
+        let a = store.add_vertex_with_labels(&["A".into()], &[]);
+        let b = store.add_vertex_with_labels(&["B".into()], &[]);
+        store.add_edge(a, b, "E", &[]);
+        store.commit();
+
+        // out_csr_raw should trigger lazy rebuild and return fresh data
+        let out = store.out_csr_raw();
+        assert!(out.contains_key("E"));
+        let seg = &out["E"];
+        assert!(!seg.edge_ids.is_empty());
+    }
+
+    #[test]
+    fn test_clone_preserves_lazy_state() {
+        let mut store = MutableCsrStore::new();
+        let a = store.add_vertex_with_labels(&["X".into()], &[]);
+        let b = store.add_vertex_with_labels(&["X".into()], &[]);
+        store.add_edge(a, b, "R", &[]);
+        store.commit();
+
+        // Clone while CSR is stale
+        let cloned = store.clone();
+
+        // Both should return correct neighbors via lazy rebuild
+        let orig_n = store.out_neighbors_by_label(a, "R");
+        let clone_n = cloned.out_neighbors_by_label(a, "R");
+        assert_eq!(orig_n.len(), 1);
+        assert_eq!(clone_n.len(), 1);
+        assert_eq!(orig_n[0].vid, clone_n[0].vid);
     }
 }
 

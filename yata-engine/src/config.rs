@@ -29,8 +29,6 @@ pub struct TieredEngineConfig {
     pub cache_ttl_secs: u64,
     pub adj_expansion_limit: usize,
     pub runtime_workers: usize,
-    pub batch_commit_threshold: u32,
-    pub batch_commit_timeout_ms: u64,
     pub enable_ocel_events: bool,
     pub app_id: String,
     pub org_id: String,
@@ -44,8 +42,6 @@ pub struct TieredEngineConfig {
     pub wal_segment_max_bytes: usize,
     /// WAL segment max age (seconds) before R2 flush.
     pub wal_segment_max_age_secs: u64,
-    /// WAL checkpoint interval (seconds). ArrowFragment for cold start.
-    pub wal_checkpoint_interval_secs: u64,
     /// WAL segment format (ndjson or arrow). Arrow enables zero-copy mmap reads.
     pub wal_format: WalFormat,
     /// Partition assignment strategy (derived from YATA_PARTITION_LABELS env var).
@@ -77,10 +73,6 @@ impl Default for TieredEngineConfig {
             cache_ttl_secs: 30,
             adj_expansion_limit: 5_000,
             runtime_workers: 2,
-            batch_commit_threshold: std::env::var("YATA_BATCH_COMMIT_THRESHOLD")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(1),
-            batch_commit_timeout_ms: std::env::var("YATA_BATCH_COMMIT_TIMEOUT_MS")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(2_000),
             enable_ocel_events: std::env::var("YATA_OCEL_EVENTS")
                 .map(|s| s == "true" || s == "1").unwrap_or(false),
             app_id,
@@ -100,8 +92,6 @@ impl Default for TieredEngineConfig {
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(1_048_576),
             wal_segment_max_age_secs: std::env::var("YATA_WAL_SEGMENT_MAX_AGE_SECS")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(10),
-            wal_checkpoint_interval_secs: std::env::var("YATA_WAL_CHECKPOINT_INTERVAL_SECS")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(300),
             wal_format: WalFormat::from_env(),
             partition_assignment: parse_partition_assignment(),
         }
@@ -175,7 +165,6 @@ mod tests {
         assert_eq!(cfg.wal_ring_capacity, 100_000);
         assert_eq!(cfg.wal_segment_max_bytes, 1_048_576);
         assert_eq!(cfg.wal_segment_max_age_secs, 10);
-        assert_eq!(cfg.wal_checkpoint_interval_secs, 300);
     }
 
     #[test]

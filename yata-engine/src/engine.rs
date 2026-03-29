@@ -894,7 +894,12 @@ impl TieredGraphEngine {
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     ll.insert(label.to_string());
                 }
-                self.pending_writes.fetch_add(1, Ordering::Relaxed);
+                let pw = self.pending_writes.fetch_add(1, Ordering::Relaxed) + 1;
+                // Size-based compaction: trigger when L0 exceeds threshold
+                if pw >= Self::L0_COMPACT_THRESHOLD {
+                    self.pending_writes.store(0, Ordering::Relaxed);
+                    let _ = self.trigger_compaction();
+                }
                 return Ok(vid);
             }
         }
@@ -910,7 +915,6 @@ impl TieredGraphEngine {
         pk_value: &str,
         props: &[(&str, yata_grin::PropValue)],
     ) -> Result<(u32, Option<crate::wal::WalEntry>), String> {
-        // Build WAL entry before CSR merge (typed PropValue, zero JSON overhead)
         let wal_entry = if let Ok(mut wal) = self.wal.lock() {
             let seq = wal.next_seq();
             let entry = crate::wal::WalEntry {
@@ -939,15 +943,18 @@ impl TieredGraphEngine {
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     ll.insert(label.to_string());
                 }
-                self.pending_writes.fetch_add(1, Ordering::Relaxed);
+                let pw = self.pending_writes.fetch_add(1, Ordering::Relaxed) + 1;
+                if pw >= Self::L0_COMPACT_THRESHOLD {
+                    self.pending_writes.store(0, Ordering::Relaxed);
+                    let _ = self.trigger_compaction();
+                }
                 return Ok((vid, wal_entry));
             }
         }
         Err("failed to acquire hot store lock".into())
     }
 
-    /// CSR-direct DELETE by primary key: O(1) lookup.
-    /// In WalProjection mode: also appends a Delete WalEntry.
+    /// DELETE by primary key: O(1) lookup + WAL Delete entry.
     pub fn delete_record(
         &self,
         label: &str,
@@ -1042,21 +1049,8 @@ impl TieredGraphEngine {
             },
             vertex_count: v_count,
             edge_count: e_count,
-            last_snapshot_serialize_ms: self.last_snapshot_serialize_ms.load(Ordering::Relaxed),
+            last_compaction_ms: self.last_compaction_ms.load(Ordering::Relaxed),
         }
-    }
-
-    /// Trigger persistence: flush WAL + per-label L1 compaction (dirty labels only).
-    /// Clean labels incur zero R2 I/O.
-    pub fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
-        let _ = self.wal_flush_segment();
-        let result = self.trigger_compaction()?;
-        Ok((result.output_entries as u64, 0))
-    }
-
-    /// Force-trigger persistence (alias for trigger_snapshot).
-    pub fn trigger_snapshot_force(&self) -> Result<(u64, u64), String> {
-        self.trigger_snapshot()
     }
 
     /// Drain dirty_labels and return the set. After drain, dirty_labels is empty.
@@ -1096,9 +1090,7 @@ impl TieredGraphEngine {
         }
     }
 
-    /// Apply WAL entries to the CSR (incremental merge). Read Container only.
-    /// Each entry is applied as merge_by_pk (upsert) or delete_by_pk (delete).
-    /// Apply vertex data from an ArrowWalStore (mmap'd compacted segment) to the CSR.
+    /// Apply vertex data from an ArrowWalStore (mmap'd compacted segment) to the store.
     /// Uses GRIN Property trait to read vertex data without intermediate WalEntry allocation.
     fn apply_arrow_wal_store(&self, store: &yata_store::ArrowWalStore) -> Result<u64, String> {
         use yata_grin::{Property, Scannable, Schema};
@@ -1258,22 +1250,13 @@ impl TieredGraphEngine {
         Ok((seq_start, seq_end, data.len()))
     }
 
-    /// Checkpoint: flush WAL + per-label L1 compaction.
-    pub fn wal_checkpoint(&self) -> Result<(u64, u64), String> {
-        let _ = self.wal_flush_segment();
-        let result = self.trigger_compaction()?;
-        Ok((result.output_entries as u64, 0))
-    }
-
     /// L1 Compaction: read WAL segments from R2, PK-dedup, write compacted segment + manifest.
     ///
-    /// This is the Shannon-optimal replacement for trigger_snapshot:
-    /// - No CSR serialization (no OOM risk)
     /// - Operates on WAL segments only (streaming, bounded memory)
     /// - Output is same Arrow IPC format as WAL (uniform mmap path)
     /// - Idempotent: re-compacting produces the same result
     ///
-    /// Write Container only. Called by cron (5min default) or manually.
+    /// Triggered by size-based threshold (L0_COMPACT_THRESHOLD) or manually via XRPC.
     pub fn trigger_compaction(&self) -> Result<crate::compaction::CompactionResult, String> {
         let s3 = self.get_s3_client()
             .ok_or_else(|| "S3 client not configured".to_string())?;
