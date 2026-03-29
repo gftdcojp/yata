@@ -443,5 +443,468 @@
   <text x="1120" y="1957" fill="#22c55e" font-size="10">changed crate</text>
   <rect x="1270" y="1945" width="50" height="14" rx="4" fill="none" stroke="#60a5fa" stroke-width="2"/>
   <text x="1330" y="1957" fill="#60a5fa" font-size="10">entry point</text>
-  <text x="120" y="1985" fill="#475569" font-size="10">12 crates | ~22,000 LOC | 822 tests pass | Edition 2024 | Apache-2.0 | cargo zigbuild x86_64-unknown-linux-gnu</text>
+  <text x="120" y="1985" fill="#475569" font-size="10">12 crates | ~22,000 LOC | 854 tests pass | Edition 2024 | Apache-2.0 | cargo zigbuild x86_64-unknown-linux-gnu</text>
+
+  <!-- ================================================================ -->
+  <!-- CRITICAL PATH ANALYSIS (5 paths with bottleneck identification) -->
+  <!-- ================================================================ -->
+  <text x="800" y="2060" text-anchor="middle" fill="#f8fafc" font-size="22" font-weight="bold">Critical Path Analysis</text>
+  <text x="800" y="2082" text-anchor="middle" fill="#94a3b8" font-size="13">Latency breakdown per operation | Bottleneck nodes in red | Production E2E measured values</text>
+  <line x1="40" y1="2092" x2="1560" y2="2092" stroke="#334155" stroke-width="1"/>
+
+  <!-- CP1: Write -->
+  <text x="60" y="2118" fill="#22c55e" font-size="13" font-weight="bold">CP1: Write Path (Total ~2ms)</text>
+  <rect x="60" y="2130" width="110" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="75" y="2148" fill="#e2e8f0" font-size="9">App Worker</text>
+  <text x="75" y="2160" fill="#64748b" font-size="7">0us</text>
+  <line x1="170" y1="2148" x2="200" y2="2148" stroke="#22c55e" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+  <rect x="202" y="2130" width="140" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="215" y="2148" fill="#e2e8f0" font-size="9">PDS createRecord</text>
+  <text x="215" y="2160" fill="#64748b" font-size="7">~200us</text>
+  <line x1="342" y1="2148" x2="372" y2="2148" stroke="#22c55e" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+  <rect x="374" y="2126" width="185" height="44" rx="5" fill="url(#criticalGrad)" stroke="#ef4444" stroke-width="2" filter="url(#criticalGlow)"/>
+  <text x="390" y="2145" fill="#fca5a5" font-size="10" font-weight="bold">Pipeline.send()</text>
+  <text x="390" y="2158" fill="#f87171" font-size="9">~1ms (AT commit+MST)</text>
+  <text x="390" y="2168" fill="#ef4444" font-size="7">BOTTLENECK (durable)</text>
+  <line x1="559" y1="2148" x2="589" y2="2148" stroke="#22c55e" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+  <rect x="591" y="2130" width="160" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="604" y="2148" fill="#e2e8f0" font-size="9">YATA mergeRecord</text>
+  <text x="604" y="2160" fill="#64748b" font-size="7">~500us (CSR append)</text>
+  <line x1="751" y1="2148" x2="781" y2="2148" stroke="#22c55e" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+  <rect x="783" y="2130" width="100" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="796" y="2148" fill="#e2e8f0" font-size="9">dirty=true</text>
+  <text x="796" y="2160" fill="#64748b" font-size="7">0us (atomic)</text>
+  <rect x="60" y="2175" width="823" height="5" rx="2" fill="#1e293b"/>
+  <rect x="374" y="2175" width="185" height="5" rx="2" fill="#ef4444" fill-opacity="0.6"/>
+  <text x="900" y="2180" fill="#94a3b8" font-size="8">Pipeline.send = 50%</text>
+
+  <!-- CP2: Cold Read -->
+  <text x="60" y="2208" fill="#ef4444" font-size="13" font-weight="bold">CP2: Cold Read Path (Total ~2.8s)</text>
+  <rect x="60" y="2220" width="90" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="72" y="2238" fill="#e2e8f0" font-size="9">XRPC req</text>
+  <text x="72" y="2250" fill="#64748b" font-size="7">0ms</text>
+  <line x1="150" y1="2238" x2="170" y2="2238" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="172" y="2220" width="100" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="184" y="2238" fill="#e2e8f0" font-size="9">PDS dispatch</text>
+  <text x="184" y="2250" fill="#64748b" font-size="7">~5ms</text>
+  <line x1="272" y1="2238" x2="292" y2="2238" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="294" y="2216" width="175" height="44" rx="5" fill="url(#criticalGrad)" stroke="#ef4444" stroke-width="2" filter="url(#criticalGlow)"/>
+  <text x="308" y="2235" fill="#fca5a5" font-size="10" font-weight="bold">Container Wake</text>
+  <text x="308" y="2248" fill="#f87171" font-size="9">~1,500ms</text>
+  <text x="308" y="2258" fill="#ef4444" font-size="7">BOTTLENECK #1</text>
+  <line x1="469" y1="2238" x2="489" y2="2238" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arrowRed)"/>
+  <rect x="491" y="2216" width="175" height="44" rx="5" fill="url(#criticalGrad)" stroke="#ef4444" stroke-width="2" filter="url(#criticalGlow)"/>
+  <text x="505" y="2235" fill="#fca5a5" font-size="10" font-weight="bold">R2 Page-In (ALL)</text>
+  <text x="505" y="2248" fill="#f87171" font-size="9">~1,200ms</text>
+  <text x="505" y="2258" fill="#ef4444" font-size="7">BOTTLENECK #2</text>
+  <line x1="666" y1="2238" x2="686" y2="2238" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="688" y="2220" width="100" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="700" y="2238" fill="#e2e8f0" font-size="9">CSR Build</text>
+  <text x="700" y="2250" fill="#64748b" font-size="7">~50ms</text>
+  <line x1="788" y1="2238" x2="808" y2="2238" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="810" y="2220" width="110" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="822" y="2238" fill="#e2e8f0" font-size="9">Cypher Exec</text>
+  <text x="822" y="2250" fill="#64748b" font-size="7">&lt;1us</text>
+  <line x1="920" y1="2238" x2="940" y2="2238" stroke="#22c55e" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+  <rect x="942" y="2220" width="90" height="36" rx="5" fill="#22c55e" fill-opacity="0.12" stroke="#22c55e" stroke-width="1"/>
+  <text x="957" y="2238" fill="#22c55e" font-size="9">2.8s total</text>
+  <rect x="60" y="2266" width="972" height="5" rx="2" fill="#1e293b"/>
+  <rect x="294" y="2266" width="175" height="5" rx="2" fill="#ef4444" fill-opacity="0.6"/>
+  <rect x="491" y="2266" width="175" height="5" rx="2" fill="#ef4444" fill-opacity="0.6"/>
+  <text x="1042" y="2271" fill="#94a3b8" font-size="8">Wake+PageIn = 96%</text>
+
+  <!-- CP3: Warm Read -->
+  <text x="60" y="2300" fill="#f59e0b" font-size="13" font-weight="bold">CP3: Warm Read Path (Total ~271ms)</text>
+  <rect x="60" y="2312" width="90" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="72" y="2330" fill="#e2e8f0" font-size="9">XRPC req</text>
+  <line x1="150" y1="2330" x2="170" y2="2330" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="172" y="2312" width="100" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="184" y="2330" fill="#e2e8f0" font-size="9">PDS dispatch</text>
+  <text x="184" y="2342" fill="#64748b" font-size="7">~5ms</text>
+  <line x1="272" y1="2330" x2="292" y2="2330" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="294" y="2308" width="210" height="44" rx="5" fill="url(#criticalGrad)" stroke="#ef4444" stroke-width="2" filter="url(#criticalGlow)"/>
+  <text x="310" y="2327" fill="#fca5a5" font-size="10" font-weight="bold">YataRPC Coordinator</text>
+  <text x="310" y="2340" fill="#f87171" font-size="9">~260ms (Workers RPC OH)</text>
+  <text x="310" y="2350" fill="#ef4444" font-size="7">BOTTLENECK (2000x vs in-process)</text>
+  <line x1="504" y1="2330" x2="524" y2="2330" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="526" y="2312" width="120" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="538" y="2330" fill="#e2e8f0" font-size="9">GIE Execute</text>
+  <text x="538" y="2342" fill="#64748b" font-size="7">&lt;1us (CSR)</text>
+  <line x1="646" y1="2330" x2="666" y2="2330" stroke="#22c55e" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+  <rect x="668" y="2312" width="120" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="680" y="2330" fill="#e2e8f0" font-size="9">mergeResults</text>
+  <text x="680" y="2342" fill="#64748b" font-size="7">~5ms</text>
+  <line x1="788" y1="2330" x2="808" y2="2330" stroke="#22c55e" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+  <rect x="810" y="2312" width="90" height="36" rx="5" fill="#22c55e" fill-opacity="0.12" stroke="#22c55e" stroke-width="1"/>
+  <text x="825" y="2330" fill="#22c55e" font-size="9">271ms</text>
+  <rect x="60" y="2356" width="840" height="5" rx="2" fill="#1e293b"/>
+  <rect x="294" y="2356" width="210" height="5" rx="2" fill="#ef4444" fill-opacity="0.6"/>
+  <text x="910" y="2361" fill="#94a3b8" font-size="8">Coordinator = 96%</text>
+
+  <!-- CP4: Snapshot -->
+  <text x="60" y="2394" fill="#06b6d4" font-size="13" font-weight="bold">CP4: Snapshot Path (Total ~15ms@10K, ~150s@10M projected)</text>
+  <rect x="60" y="2406" width="100" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="72" y="2424" fill="#e2e8f0" font-size="9">cron 1min</text>
+  <line x1="160" y1="2424" x2="180" y2="2424" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="182" y="2406" width="110" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="194" y="2424" fill="#e2e8f0" font-size="9">dirty check</text>
+  <text x="194" y="2436" fill="#64748b" font-size="7">0us</text>
+  <line x1="292" y1="2424" x2="312" y2="2424" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="314" y="2402" width="200" height="44" rx="5" fill="url(#criticalGrad)" stroke="#ef4444" stroke-width="2" filter="url(#criticalGlow)"/>
+  <text x="330" y="2421" fill="#fca5a5" font-size="10" font-weight="bold">csr_to_fragment()</text>
+  <text x="330" y="2434" fill="#f87171" font-size="9">~10ms@10K O(V+E)</text>
+  <text x="330" y="2444" fill="#ef4444" font-size="7">BOTTLENECK (1 vCPU)</text>
+  <line x1="514" y1="2424" x2="534" y2="2424" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arrowRed)"/>
+  <rect x="536" y="2406" width="170" height="36" rx="5" fill="#1a0a00" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="548" y="2424" fill="#fcd34d" font-size="9">R2 PUT (full)</text>
+  <text x="548" y="2436" fill="#f59e0b" font-size="7">~3-5ms, O(N) even 1 label</text>
+  <line x1="706" y1="2424" x2="726" y2="2424" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="728" y="2406" width="120" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="740" y="2424" fill="#e2e8f0" font-size="9">dirty=false</text>
+  <rect x="60" y="2450" width="788" height="5" rx="2" fill="#1e293b"/>
+  <rect x="314" y="2450" width="200" height="5" rx="2" fill="#ef4444" fill-opacity="0.6"/>
+  <rect x="536" y="2450" width="80" height="5" rx="2" fill="#f59e0b" fill-opacity="0.4"/>
+  <text x="860" y="2455" fill="#94a3b8" font-size="8">Serialize = 67%</text>
+
+  <!-- CP5: Mutation -->
+  <text x="60" y="2486" fill="#a855f7" font-size="13" font-weight="bold">CP5: Mutation Path (Total ~500ms)</text>
+  <rect x="60" y="2498" width="110" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="72" y="2516" fill="#e2e8f0" font-size="9">Cypher CREATE</text>
+  <text x="72" y="2528" fill="#64748b" font-size="7">parse ~0.1ms</text>
+  <line x1="170" y1="2516" x2="190" y2="2516" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="192" y="2498" width="140" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="204" y="2516" fill="#e2e8f0" font-size="9">MemoryGraph copy</text>
+  <text x="204" y="2528" fill="#64748b" font-size="7">~50ms (clone)</text>
+  <line x1="332" y1="2516" x2="352" y2="2516" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="354" y="2494" width="210" height="44" rx="5" fill="url(#criticalGrad)" stroke="#ef4444" stroke-width="2" filter="url(#criticalGlow)"/>
+  <text x="370" y="2513" fill="#fca5a5" font-size="10" font-weight="bold">CSR Rebuild O(V+E)</text>
+  <text x="370" y="2526" fill="#f87171" font-size="9">~400ms (write lock held)</text>
+  <text x="370" y="2536" fill="#ef4444" font-size="7">BOTTLENECK (blocks reads)</text>
+  <line x1="564" y1="2516" x2="584" y2="2516" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arrowRed)"/>
+  <rect x="586" y="2498" width="140" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="598" y="2516" fill="#e2e8f0" font-size="9">merge_by_pk O(1)</text>
+  <text x="598" y="2528" fill="#64748b" font-size="7">~5ms</text>
+  <line x1="726" y1="2516" x2="746" y2="2516" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="748" y="2498" width="100" height="36" rx="5" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="760" y="2516" fill="#e2e8f0" font-size="9">commit</text>
+  <rect x="60" y="2542" width="788" height="5" rx="2" fill="#1e293b"/>
+  <rect x="354" y="2542" width="210" height="5" rx="2" fill="#ef4444" fill-opacity="0.6"/>
+  <text x="860" y="2547" fill="#94a3b8" font-size="8">CSR rebuild = 80%</text>
+
+  <!-- Bottleneck Ranking Table -->
+  <text x="800" y="2585" text-anchor="middle" fill="#f8fafc" font-size="16" font-weight="bold">Critical Path Summary — Bottleneck Ranking</text>
+  <rect x="100" y="2598" width="1400" height="26" rx="4" fill="#334155"/>
+  <text x="120" y="2616" fill="#e2e8f0" font-size="10" font-weight="bold">Rank</text>
+  <text x="170" y="2616" fill="#e2e8f0" font-size="10" font-weight="bold">Path</text>
+  <text x="350" y="2616" fill="#e2e8f0" font-size="10" font-weight="bold">Bottleneck</text>
+  <text x="620" y="2616" fill="#e2e8f0" font-size="10" font-weight="bold">Latency</text>
+  <text x="730" y="2616" fill="#e2e8f0" font-size="10" font-weight="bold">%</text>
+  <text x="800" y="2616" fill="#e2e8f0" font-size="10" font-weight="bold">Impact</text>
+  <text x="1100" y="2616" fill="#e2e8f0" font-size="10" font-weight="bold">Mitigation</text>
+
+  <rect x="100" y="2626" width="1400" height="24" fill="#1a0505"/>
+  <text x="130" y="2643" fill="#ef4444" font-size="11" font-weight="bold">1</text>
+  <text x="170" y="2643" fill="#fca5a5" font-size="9">CP2 Cold Read</text>
+  <text x="350" y="2643" fill="#f87171" font-size="9">Container Wake + R2 Page-In</text>
+  <text x="620" y="2643" fill="#f87171" font-size="9">2,700ms</text>
+  <text x="730" y="2643" fill="#ef4444" font-size="9" font-weight="bold">96%</text>
+  <text x="800" y="2643" fill="#94a3b8" font-size="9">First request after sleep = 2.8s</text>
+  <text x="1100" y="2643" fill="#94a3b8" font-size="9">Keep-alive heartbeat, label-selective page-in</text>
+
+  <rect x="100" y="2652" width="1400" height="24" fill="#1e293b"/>
+  <text x="130" y="2669" fill="#ef4444" font-size="11" font-weight="bold">2</text>
+  <text x="170" y="2669" fill="#fca5a5" font-size="9">CP5 Mutation</text>
+  <text x="350" y="2669" fill="#f87171" font-size="9">CSR Rebuild O(V+E)</text>
+  <text x="620" y="2669" fill="#f87171" font-size="9">400ms</text>
+  <text x="730" y="2669" fill="#ef4444" font-size="9" font-weight="bold">80%</text>
+  <text x="800" y="2669" fill="#94a3b8" font-size="9">Write lock blocks all reads during rebuild</text>
+  <text x="1100" y="2669" fill="#94a3b8" font-size="9">Incremental CSR (append-only, skip clean labels)</text>
+
+  <rect x="100" y="2678" width="1400" height="24" fill="#1a2332"/>
+  <text x="130" y="2695" fill="#f59e0b" font-size="11" font-weight="bold">3</text>
+  <text x="170" y="2695" fill="#fcd34d" font-size="9">CP3 Warm Read</text>
+  <text x="350" y="2695" fill="#fbbf24" font-size="9">YataRPC Coordinator OH</text>
+  <text x="620" y="2695" fill="#fbbf24" font-size="9">260ms</text>
+  <text x="730" y="2695" fill="#f59e0b" font-size="9" font-weight="bold">96%</text>
+  <text x="800" y="2695" fill="#94a3b8" font-size="9">205K QPS local vs 103 QPS distributed</text>
+  <text x="1100" y="2695" fill="#94a3b8" font-size="9">CF Container structural limit (HTTP only)</text>
+
+  <rect x="100" y="2704" width="1400" height="24" fill="#1e293b"/>
+  <text x="130" y="2721" fill="#f59e0b" font-size="11" font-weight="bold">4</text>
+  <text x="170" y="2721" fill="#fcd34d" font-size="9">CP4 Snapshot</text>
+  <text x="350" y="2721" fill="#fbbf24" font-size="9">csr_to_fragment() serialize</text>
+  <text x="620" y="2721" fill="#fbbf24" font-size="9">10ms@10K</text>
+  <text x="730" y="2721" fill="#f59e0b" font-size="9" font-weight="bold">67%</text>
+  <text x="800" y="2721" fill="#94a3b8" font-size="9">Linear: ~150s@10M projected</text>
+  <text x="1100" y="2721" fill="#94a3b8" font-size="9">Dirty label delta PUT (skip clean labels)</text>
+
+  <rect x="100" y="2730" width="1400" height="24" fill="#1a2332"/>
+  <text x="130" y="2747" fill="#22c55e" font-size="11" font-weight="bold">5</text>
+  <text x="170" y="2747" fill="#86efac" font-size="9">CP1 Write</text>
+  <text x="350" y="2747" fill="#22c55e" font-size="9">Pipeline.send() durable</text>
+  <text x="620" y="2747" fill="#22c55e" font-size="9">1ms</text>
+  <text x="730" y="2747" fill="#22c55e" font-size="9" font-weight="bold">50%</text>
+  <text x="800" y="2747" fill="#94a3b8" font-size="9">Acceptable — durability guarantee</text>
+  <text x="1100" y="2747" fill="#94a3b8" font-size="9">N/A (by design, non-negotiable)</text>
+
+  <!-- ================================================================ -->
+  <!-- FULL-STACK SHANNON REDUNDANCY MAP -->
+  <!-- ================================================================ -->
+  <text x="800" y="2810" text-anchor="middle" fill="#f8fafc" font-size="22" font-weight="bold">Full-Stack Shannon Redundancy Map</text>
+  <text x="800" y="2832" text-anchor="middle" fill="#94a3b8" font-size="13">PDS Worker + YataRPC Coordinator + yata Container + XRPC Transport | Redundancy identification + Kaizen</text>
+  <line x1="40" y1="2842" x2="1560" y2="2842" stroke="#334155" stroke-width="1"/>
+
+  <!-- S1: commit() 6-rebuild -->
+  <rect x="60" y="2860" width="720" height="70" rx="8" fill="#1e293b" stroke="#ef4444" stroke-width="2" stroke-opacity="0.6"/>
+  <text x="80" y="2882" fill="#ef4444" font-size="12" font-weight="bold">S1: commit() 6-way index rebuild — label_index + label_bitmap + columnar_cache = 3x same data</text>
+  <text x="80" y="2900" fill="#94a3b8" font-size="10">yata-store/src/lib.rs:2099 | rebuild_label_index O(V*L) + rebuild_label_bitmap O(V*L) + rebuild_columnar_cache O(V*P)</text>
+  <text x="80" y="2916" fill="#f87171" font-size="10">Shannon waste: 200% redundancy. 20M vertices + 10 labels = 200MB bitmap alloc per single-record commit</text>
+  <rect x="690" y="2868" width="80" height="18" rx="4" fill="#ef4444" fill-opacity="0.2"/>
+  <text x="700" y="2881" fill="#ef4444" font-size="9" font-weight="bold">CRITICAL</text>
+
+  <!-- S2: L1 WAL safety net -->
+  <rect x="60" y="2940" width="720" height="55" rx="8" fill="#1e293b" stroke="#f59e0b" stroke-width="1.5" stroke-opacity="0.6"/>
+  <text x="80" y="2962" fill="#f59e0b" font-size="12" font-weight="bold">S2: L1 yata WAL safety net — redundant with L0 Pipeline WAL (exactly-once, durable)</text>
+  <text x="80" y="2978" fill="#94a3b8" font-size="10">container/yata/src/index.ts:7 | walFlushSegment cron 10s + pushWalToReplicas fire-and-forget</text>
+  <text x="80" y="2990" fill="#fbbf24" font-size="10">Shannon: L0 Pipeline.send() = source of truth. L1 = safety net while Pipeline Beta. Post-GA: delete L1</text>
+  <rect x="690" y="2948" width="80" height="18" rx="4" fill="#f59e0b" fill-opacity="0.2"/>
+  <text x="700" y="2961" fill="#f59e0b" font-size="9" font-weight="bold">PENDING</text>
+
+  <!-- S3: ensure_labels ignores hints -->
+  <rect x="60" y="3005" width="720" height="55" rx="8" fill="#1e293b" stroke="#ef4444" stroke-width="2" stroke-opacity="0.6"/>
+  <text x="80" y="3027" fill="#ef4444" font-size="12" font-weight="bold">S3: ensure_labels() ignores label hints — full page-in despite selective infrastructure existing</text>
+  <text x="80" y="3043" fill="#94a3b8" font-size="10">yata-engine/src/engine.rs:393 | ensure_labels_vineyard_only(_vertex_labels) discards label param</text>
+  <text x="80" y="3055" fill="#f87171" font-size="10">Shannon: eta(needed/total) = ~5%. enrich_label_from_r2() exists but not wired to query path</text>
+  <rect x="690" y="3013" width="80" height="18" rx="4" fill="#ef4444" fill-opacity="0.2"/>
+  <text x="700" y="3026" fill="#ef4444" font-size="9" font-weight="bold">CRITICAL</text>
+
+  <!-- S4: Regex per-call compilation (FIXED) -->
+  <rect x="60" y="3070" width="720" height="55" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="2" stroke-opacity="0.6"/>
+  <text x="80" y="3092" fill="#22c55e" font-size="12" font-weight="bold">S4: YataRPC regex per-call compilation — FIXED (cached as static fields)</text>
+  <text x="80" y="3108" fill="#94a3b8" font-size="10">container/yata/src/index.ts:160,256,234 | LABEL_RE, MUTATION_RE, AGG_RE now static readonly + Set dedup</text>
+  <text x="80" y="3120" fill="#4ade80" font-size="10">Fix: -50-100us/query. extractLabelHints uses Set instead of Array.includes O(N^2)</text>
+  <rect x="690" y="3078" width="80" height="18" rx="4" fill="#22c55e" fill-opacity="0.2"/>
+  <text x="706" y="3091" fill="#22c55e" font-size="9" font-weight="bold">FIXED</text>
+
+  <!-- S5: Double write serialization -->
+  <rect x="60" y="3135" width="720" height="55" rx="8" fill="#1e293b" stroke="#f59e0b" stroke-width="1.5" stroke-opacity="0.6"/>
+  <text x="80" y="3157" fill="#f59e0b" font-size="12" font-weight="bold">S5: Pipeline.send() + mergeRecord() = double JSON serialization of same record</text>
+  <text x="80" y="3173" fill="#94a3b8" font-size="10">pds-helpers.ts:79 | Array.from(recordBytes) serialized 2x (Pipeline JSON + mergeRecord body)</text>
+  <text x="80" y="3185" fill="#fbbf24" font-size="10">Shannon: 200-500 bytes/write * 2. Sequential (could parallelize Pipeline + mergeRecord)</text>
+
+  <!-- Right column: Infra / Transport -->
+  <rect x="800" y="2860" width="480" height="70" rx="8" fill="#1e293b" stroke="#06b6d4" stroke-width="1.5" stroke-opacity="0.6"/>
+  <text x="820" y="2882" fill="#06b6d4" font-size="12" font-weight="bold">S6: Container HTTP overhead (structural)</text>
+  <text x="820" y="2900" fill="#94a3b8" font-size="10">CF Container = gVisor sandbox. Workers RPC zero-copy impossible.</text>
+  <text x="820" y="2916" fill="#67e8f9" font-size="10">HTTP ~1-5ms per hop. Design: CSR &lt;1us absorbs. Not fixable.</text>
+
+  <rect x="800" y="2940" width="480" height="55" rx="8" fill="#1e293b" stroke="#06b6d4" stroke-width="1.5" stroke-opacity="0.6"/>
+  <text x="820" y="2962" fill="#06b6d4" font-size="12" font-weight="bold">S7: pushWalToReplicas fire-and-forget (silent loss)</text>
+  <text x="820" y="2978" fill="#94a3b8" font-size="10">index.ts:242 | .catch(warn) only. No retry, no DLQ.</text>
+  <text x="820" y="2990" fill="#67e8f9" font-size="10">~1 lost entry/replica/day at CF 99.99% reliability</text>
+
+  <rect x="800" y="3005" width="480" height="55" rx="8" fill="#1e293b" stroke="#94a3b8" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="820" y="3027" fill="#94a3b8" font-size="12" font-weight="bold">S8: XRPC BrowserTransport manual encodeURI</text>
+  <text x="820" y="3043" fill="#94a3b8" font-size="10">xrpc/src/transport.ts | encodeURIComponent per-param vs URLSearchParams</text>
+  <text x="820" y="3055" fill="#94a3b8" font-size="10">~10-50us/GET. Low priority (browser I/O dominates)</text>
+
+  <rect x="800" y="3070" width="480" height="55" rx="8" fill="#1e293b" stroke="#94a3b8" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="820" y="3092" fill="#94a3b8" font-size="12" font-weight="bold">S9: SSRTransport wrapper (indirection)</text>
+  <text x="820" y="3108" fill="#94a3b8" font-size="10">xrpc/src/transport.ts:124 | Delegates 100% to BindingTransport</text>
+  <text x="820" y="3120" fill="#94a3b8" font-size="10">~1us overhead. Could merge timeout into BindingTransport</text>
+
+  <rect x="800" y="3135" width="480" height="55" rx="8" fill="#1e293b" stroke="#94a3b8" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="820" y="3157" fill="#94a3b8" font-size="12" font-weight="bold">S10: Cypher cache 60s TTL (untested)</text>
+  <text x="820" y="3173" fill="#94a3b8" font-size="10">pds-dispatch.ts | 60s arbitrary. ~5-15% hit rate (unique params)</text>
+  <text x="820" y="3185" fill="#94a3b8" font-size="10">Needs measurement before tuning. Not Shannon waste.</text>
+
+  <!-- ================================================================ -->
+  <!-- KAIZEN PRIORITY TABLE -->
+  <!-- ================================================================ -->
+  <text x="800" y="3240" text-anchor="middle" fill="#f8fafc" font-size="22" font-weight="bold">Kaizen Priority — Effort vs Impact</text>
+  <line x1="40" y1="3250" x2="1560" y2="3250" stroke="#334155" stroke-width="1"/>
+
+  <rect x="100" y="3265" width="1400" height="26" rx="4" fill="#334155"/>
+  <text x="120" y="3283" fill="#e2e8f0" font-size="10" font-weight="bold">Priority</text>
+  <text x="200" y="3283" fill="#e2e8f0" font-size="10" font-weight="bold">ID</text>
+  <text x="250" y="3283" fill="#e2e8f0" font-size="10" font-weight="bold">Component</text>
+  <text x="460" y="3283" fill="#e2e8f0" font-size="10" font-weight="bold">Action</text>
+  <text x="820" y="3283" fill="#e2e8f0" font-size="10" font-weight="bold">Impact</text>
+  <text x="1100" y="3283" fill="#e2e8f0" font-size="10" font-weight="bold">Effort</text>
+  <text x="1200" y="3283" fill="#e2e8f0" font-size="10" font-weight="bold">Status</text>
+
+  <!-- K1 -->
+  <rect x="100" y="3293" width="1400" height="26" fill="#1a0505"/>
+  <text x="140" y="3311" fill="#ef4444" font-size="11" font-weight="bold">K1</text>
+  <text x="200" y="3311" fill="#fca5a5" font-size="9">S1</text>
+  <text x="250" y="3311" fill="#94a3b8" font-size="9">yata-store commit()</text>
+  <text x="460" y="3311" fill="#94a3b8" font-size="9">Incremental rebuild: skip clean labels in rebuild_label_bitmap + rebuild_columnar_cache</text>
+  <text x="820" y="3311" fill="#ef4444" font-size="9">200MB/commit at 20M nodes eliminated</text>
+  <text x="1100" y="3311" fill="#94a3b8" font-size="9">2 days</text>
+  <text x="1200" y="3311" fill="#f59e0b" font-size="9">DESIGN</text>
+
+  <!-- K2 -->
+  <rect x="100" y="3321" width="1400" height="26" fill="#1e293b"/>
+  <text x="140" y="3339" fill="#ef4444" font-size="11" font-weight="bold">K2</text>
+  <text x="200" y="3339" fill="#fca5a5" font-size="9">S3</text>
+  <text x="250" y="3339" fill="#94a3b8" font-size="9">yata-engine ensure_labels()</text>
+  <text x="460" y="3339" fill="#94a3b8" font-size="9">Wire label hints to page_in_selective_from_r2 (code exists). Cold start eta 5% to 85%</text>
+  <text x="820" y="3339" fill="#ef4444" font-size="9">Cold start 2.8s to ~0.5s (label-selective)</text>
+  <text x="1100" y="3339" fill="#94a3b8" font-size="9">1 day</text>
+  <text x="1200" y="3339" fill="#f59e0b" font-size="9">DESIGN</text>
+
+  <!-- K3 -->
+  <rect x="100" y="3349" width="1400" height="26" fill="#1a2332"/>
+  <text x="140" y="3367" fill="#22c55e" font-size="11" font-weight="bold">K3</text>
+  <text x="200" y="3367" fill="#86efac" font-size="9">S4</text>
+  <text x="250" y="3367" fill="#94a3b8" font-size="9">YataRPC coordinator</text>
+  <text x="460" y="3367" fill="#94a3b8" font-size="9">Cache regex as static readonly. extractLabelHints Set dedup. mergeResults cached AGG_RE</text>
+  <text x="820" y="3367" fill="#22c55e" font-size="9">-50-100us/query = -100ms/sec @ 1K QPS</text>
+  <text x="1100" y="3367" fill="#94a3b8" font-size="9">done</text>
+  <text x="1200" y="3367" fill="#22c55e" font-size="9" font-weight="bold">FIXED</text>
+
+  <!-- K4 -->
+  <rect x="100" y="3377" width="1400" height="26" fill="#1e293b"/>
+  <text x="140" y="3395" fill="#f59e0b" font-size="11" font-weight="bold">K4</text>
+  <text x="200" y="3395" fill="#fcd34d" font-size="9">S2</text>
+  <text x="250" y="3395" fill="#94a3b8" font-size="9">L1 WAL safety net</text>
+  <text x="460" y="3395" fill="#94a3b8" font-size="9">Delete walFlushSegment cron + pushWalToReplicas once Pipeline exits Beta</text>
+  <text x="820" y="3395" fill="#f59e0b" font-size="9">-$1.60/mo R2 ops, -10% write latency</text>
+  <text x="1100" y="3395" fill="#94a3b8" font-size="9">1 day</text>
+  <text x="1200" y="3395" fill="#f59e0b" font-size="9">POST-GA</text>
+
+  <!-- K5 -->
+  <rect x="100" y="3405" width="1400" height="26" fill="#1a2332"/>
+  <text x="140" y="3423" fill="#f59e0b" font-size="11" font-weight="bold">K5</text>
+  <text x="200" y="3423" fill="#fcd34d" font-size="9">S5</text>
+  <text x="250" y="3423" fill="#94a3b8" font-size="9">PDS write path</text>
+  <text x="460" y="3423" fill="#94a3b8" font-size="9">Parallelize Pipeline.send() + mergeRecord() (independent, no ordering constraint)</text>
+  <text x="820" y="3423" fill="#f59e0b" font-size="9">-5-10ms write latency (max() instead of sum())</text>
+  <text x="1100" y="3423" fill="#94a3b8" font-size="9">1 day</text>
+  <text x="1200" y="3423" fill="#94a3b8" font-size="9">TODO</text>
+
+  <!-- K6 -->
+  <rect x="100" y="3433" width="1400" height="26" fill="#1e293b"/>
+  <text x="140" y="3451" fill="#f59e0b" font-size="11" font-weight="bold">K6</text>
+  <text x="200" y="3451" fill="#fcd34d" font-size="9">S7</text>
+  <text x="250" y="3451" fill="#94a3b8" font-size="9">pushWalToReplicas</text>
+  <text x="460" y="3451" fill="#94a3b8" font-size="9">Add exponential backoff retry (3x) with DLQ. Reduces silent WAL entry loss</text>
+  <text x="820" y="3451" fill="#f59e0b" font-size="9">Reduce lost entries from ~1/day to ~0.001/day</text>
+  <text x="1100" y="3451" fill="#94a3b8" font-size="9">2 days</text>
+  <text x="1200" y="3451" fill="#94a3b8" font-size="9">TODO</text>
+
+  <!-- K7 -->
+  <rect x="100" y="3461" width="1400" height="26" fill="#1a2332"/>
+  <text x="140" y="3479" fill="#94a3b8" font-size="11" font-weight="bold">K7</text>
+  <text x="200" y="3479" fill="#94a3b8" font-size="9">S8</text>
+  <text x="250" y="3479" fill="#94a3b8" font-size="9">XRPC BrowserTransport</text>
+  <text x="460" y="3479" fill="#94a3b8" font-size="9">Replace manual encodeURIComponent with URLSearchParams</text>
+  <text x="820" y="3479" fill="#94a3b8" font-size="9">-10-50us/GET (browser I/O dominates, low priority)</text>
+  <text x="1100" y="3479" fill="#94a3b8" font-size="9">0.5 day</text>
+  <text x="1200" y="3479" fill="#94a3b8" font-size="9">LOW</text>
+
+  <!-- Critical Chain Dependencies -->
+  <rect x="100" y="3510" width="1400" height="100" rx="8" fill="#1e293b" stroke="#ef4444" stroke-width="1" stroke-opacity="0.3"/>
+  <text x="120" y="3532" fill="#ef4444" font-size="12" font-weight="bold">Critical Chain Dependencies</text>
+  <text x="120" y="3552" fill="#94a3b8" font-size="10">CP2 (Cold) chained to CP3 (Warm): Container wake is one-time. After warm-up, coordinator overhead dominates. Keep-alive heartbeat (5min cron) prevents CP2.</text>
+  <text x="120" y="3568" fill="#94a3b8" font-size="10">CP5 (Mutation) chained to CP4 (Snapshot): Every mutation dirty flag causes next cron snapshot. At scale, mutation + serialize compete for 1 vCPU.</text>
+  <text x="120" y="3584" fill="#94a3b8" font-size="10">CP1 (Write) decoupled from CP5 (Mutation): mergeRecord (append, ~500us) bypasses CSR rebuild. Cypher CREATE (~500ms) triggers full rebuild.</text>
+  <text x="120" y="3600" fill="#94a3b8" font-size="10">S1 (commit rebuild) amplifies CP5: Every mergeRecord calls commit() which does 6 rebuilds. Incremental rebuild (K1) would reduce CP5 from 500ms to ~10ms.</text>
+
+  <!-- Full-Stack Data Flow Diagram -->
+  <text x="800" y="3660" text-anchor="middle" fill="#f8fafc" font-size="18" font-weight="bold">Full-Stack Write Path — Shannon Redundancy Visualization</text>
+  <line x1="40" y1="3670" x2="1560" y2="3670" stroke="#334155" stroke-width="1"/>
+
+  <!-- App Worker -->
+  <rect x="60" y="3690" width="130" height="50" rx="6" fill="#334155" stroke="#4b5563" stroke-width="1"/>
+  <text x="85" y="3712" fill="#e2e8f0" font-size="11">App Worker</text>
+  <text x="85" y="3728" fill="#64748b" font-size="8">dispatch NS</text>
+
+  <line x1="190" y1="3715" x2="230" y2="3715" stroke="#22c55e" stroke-width="2" marker-end="url(#arrowGreen)"/>
+  <text x="195" y="3706" fill="#22c55e" font-size="7">HTTP proxy</text>
+
+  <!-- PDS Worker -->
+  <rect x="232" y="3685" width="240" height="60" rx="6" fill="#1e293b" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="252" y="3707" fill="#22c55e" font-size="11" font-weight="bold">PDS Worker</text>
+  <text x="252" y="3722" fill="#94a3b8" font-size="9">sendWalAndProject()</text>
+  <text x="252" y="3735" fill="#94a3b8" font-size="8">Pipeline.send + mergeRecord (sequential)</text>
+
+  <!-- Split into two paths -->
+  <line x1="352" y1="3745" x2="352" y2="3770" stroke="#ef4444" stroke-width="1" stroke-dasharray="3,2"/>
+  <line x1="352" y1="3770" x2="200" y2="3770" stroke="#ef4444" stroke-width="1"/>
+  <line x1="352" y1="3770" x2="520" y2="3770" stroke="#f59e0b" stroke-width="1"/>
+  <line x1="200" y1="3770" x2="200" y2="3790" stroke="#ef4444" stroke-width="1" marker-end="url(#arrowRed)"/>
+  <line x1="520" y1="3770" x2="520" y2="3790" stroke="#f59e0b" stroke-width="1" marker-end="url(#arrowAmber)"/>
+
+  <!-- L0 Pipeline WAL -->
+  <rect x="100" y="3792" width="200" height="50" rx="6" fill="#1e293b" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="120" y="3812" fill="#22c55e" font-size="10" font-weight="bold">L0 Pipeline WAL</text>
+  <text x="120" y="3828" fill="#94a3b8" font-size="9">R2 JSON (10s flush)</text>
+  <text x="120" y="3838" fill="#22c55e" font-size="7">SOURCE OF TRUTH</text>
+
+  <!-- YataRPC Coordinator -->
+  <rect x="420" y="3792" width="200" height="50" rx="6" fill="#1e293b" stroke="#60a5fa" stroke-width="1.5"/>
+  <text x="440" y="3812" fill="#60a5fa" font-size="10" font-weight="bold">YataRPC Coordinator</text>
+  <text x="440" y="3828" fill="#94a3b8" font-size="9">mergeRecord + WAL push</text>
+
+  <!-- Branch from YataRPC to Write Container + Read Replicas -->
+  <line x1="520" y1="3842" x2="520" y2="3862" stroke="#60a5fa" stroke-width="1" marker-end="url(#arrow)"/>
+
+  <!-- L1 WAL (redundant) -->
+  <rect x="420" y="3864" width="200" height="50" rx="6" fill="#1e293b" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <text x="440" y="3884" fill="#f59e0b" font-size="10" font-weight="bold">L1 yata WAL ring</text>
+  <text x="440" y="3900" fill="#fbbf24" font-size="9">R2 NDJSON (10s cron)</text>
+  <text x="440" y="3910" fill="#f59e0b" font-size="7">REDUNDANT post-Pipeline-GA (S2)</text>
+
+  <!-- Write Container -->
+  <line x1="520" y1="3914" x2="520" y2="3934" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="420" y="3936" width="200" height="50" rx="6" fill="#1e293b" stroke="#dc2626" stroke-width="1.5"/>
+  <text x="440" y="3956" fill="#dc2626" font-size="10" font-weight="bold">Write Container CSR</text>
+  <text x="440" y="3972" fill="#94a3b8" font-size="9">commit() = 6 rebuilds (S1)</text>
+
+  <!-- L2 Checkpoint -->
+  <line x1="620" y1="3961" x2="680" y2="3961" stroke="#3b82f6" stroke-width="1" marker-end="url(#arrow)"/>
+  <rect x="682" y="3936" width="200" height="50" rx="6" fill="#1e293b" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="702" y="3956" fill="#3b82f6" font-size="10" font-weight="bold">L2 Checkpoint</text>
+  <text x="702" y="3972" fill="#94a3b8" font-size="9">R2 ArrowFragment (5min)</text>
+  <text x="702" y="3982" fill="#3b82f6" font-size="7">COLD START RECOVERY</text>
+
+  <!-- Read Replicas -->
+  <line x1="620" y1="3880" x2="750" y2="3880" stroke="#4b5563" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arrow)"/>
+  <rect x="752" y="3860" width="200" height="45" rx="6" fill="#1e293b" stroke="#a855f7" stroke-width="1"/>
+  <text x="772" y="3880" fill="#a855f7" font-size="10" font-weight="bold">Read Replicas x N</text>
+  <text x="772" y="3895" fill="#94a3b8" font-size="9">walApply (fire-and-forget, S7)</text>
+
+  <!-- Annotations -->
+  <rect x="960" y="3690" width="310" height="120" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <text x="980" y="3712" fill="#e2e8f0" font-size="11" font-weight="bold">Data Persistence Count</text>
+  <text x="980" y="3732" fill="#22c55e" font-size="10">L0 Pipeline WAL — required (truth)</text>
+  <text x="980" y="3750" fill="#f59e0b" font-size="10">L1 yata WAL — removable (S2)</text>
+  <text x="980" y="3768" fill="#3b82f6" font-size="10">L2 Checkpoint — required (cold start)</text>
+  <text x="980" y="3786" fill="#dc2626" font-size="10">CSR in-memory — required (query)</text>
+  <text x="980" y="3800" fill="#94a3b8" font-size="9">Total: 4 copies. Optimal: 3 (remove L1)</text>
+
+  <!-- Shannon η summary at bottom -->
+  <rect x="960" y="3830" width="310" height="90" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <text x="980" y="3852" fill="#e2e8f0" font-size="11" font-weight="bold">Shannon Efficiency Targets</text>
+  <text x="980" y="3872" fill="#94a3b8" font-size="10">Current eta(write): ~33% (3 serial copies)</text>
+  <text x="980" y="3890" fill="#22c55e" font-size="10">Target eta(write): ~50% (remove L1, parallel)</text>
+  <text x="980" y="3908" fill="#94a3b8" font-size="10">Current eta(cold): ~5% (full page-in)</text>
+  <text x="980" y="3926" fill="#22c55e" font-size="10">Target eta(cold): ~85% (label-selective K2)</text>
+
+  <!-- Full-stack legend addition -->
+  <rect x="100" y="4000" width="1400" height="80" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <text x="120" y="4022" fill="#e2e8f0" font-size="12" font-weight="bold">Full-Stack Legend</text>
+  <rect x="120" y="4035" width="14" height="14" rx="2" fill="url(#criticalGrad)" stroke="#ef4444" stroke-width="1"/>
+  <text x="140" y="4047" fill="#fca5a5" font-size="10">Bottleneck (critical path dominator)</text>
+  <rect x="350" y="4035" width="14" height="14" rx="2" fill="#22c55e" fill-opacity="0.3"/>
+  <text x="370" y="4047" fill="#4ade80" font-size="10">FIXED (this session)</text>
+  <rect x="540" y="4035" width="14" height="14" rx="2" fill="#f59e0b" fill-opacity="0.3"/>
+  <text x="560" y="4047" fill="#fcd34d" font-size="10">Shannon redundant (kaizen target)</text>
+  <rect x="760" y="4035" width="14" height="14" rx="2" fill="#06b6d4" fill-opacity="0.3"/>
+  <text x="780" y="4047" fill="#67e8f9" font-size="10">Structural (CF platform limit)</text>
+  <rect x="990" y="4035" width="14" height="14" rx="2" fill="#94a3b8" fill-opacity="0.2"/>
+  <text x="1010" y="4047" fill="#94a3b8" font-size="10">Low priority / by design</text>
+  <text x="120" y="4070" fill="#475569" font-size="10">Full stack: App Worker + PDS Worker + YataRPC Coordinator + yata Container (Write + Read x N) + R2 (Pipeline WAL + Checkpoint) + XRPC Transport</text>
+
 </svg>

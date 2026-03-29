@@ -13,23 +13,6 @@ export interface CypherResult {
   org_id?: string;
 }
 
-// ── RLS (Row-Level Security) ──
-
-export interface RlsScopeHeader {
-  org_id: string;
-  user_did?: string;
-  actor_did?: string;
-  clearance?: string;
-}
-
-export interface RlsScopeData {
-  org_id: string;
-  user_did?: string;
-  clearance?: string;
-  consent_grants?: unknown[];
-  rbac_roles?: unknown[];
-}
-
 // ── WAL Entry (Kafka-style projection) ──
 
 export interface WalEntry {
@@ -74,9 +57,9 @@ export const CROSS_PARTITION = "" as AppId;
 
 export interface YataRPC {
   // Core
-  cypher(statement: string, appId?: string, parameters?: Record<string, unknown>, rlsScope?: RlsScopeData): Promise<CypherResult>;
-  query(statement: string, appId?: string, parameters?: Record<string, unknown>, rlsScope?: RlsScopeData): Promise<CypherResult>;
-  mutate(statement: string, appId?: string, parameters?: Record<string, unknown>, rlsScope?: RlsScopeData): Promise<CypherResult>;
+  cypher(statement: string, appId?: string, parameters?: Record<string, unknown>): Promise<CypherResult>;
+  query(statement: string, appId?: string, parameters?: Record<string, unknown>): Promise<CypherResult>;
+  mutate(statement: string, appId?: string, parameters?: Record<string, unknown>): Promise<CypherResult>;
   mergeRecord(label: string, pkKey: string, pkValue: string, props: Record<string, string>, appId?: string): Promise<{ vid: number }>;
   deleteRecord(label: string, pkKey: string, pkValue: string, appId?: string): Promise<{ deleted: boolean }>;
   cypherBatch(statements: string[], appId?: string): Promise<CypherResult[]>;

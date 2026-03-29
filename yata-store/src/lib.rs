@@ -726,6 +726,51 @@ impl MutableCsrStore {
         false
     }
 
+    /// Delete vertex by property value across all labels (for incremental CSR delta-apply).
+    pub fn delete_by_pk_any_label(&mut self, pk_key: &str, pk_value: &PropValue) -> bool {
+        let lookup_key = format!("{:?}", pk_value);
+        // Search all labels for the key
+        let mut found_vid = None;
+        let mut found_label = None;
+        for ((label, key), idx) in &self.prop_eq_index {
+            if key == pk_key {
+                if let Some(vids) = idx.get(&lookup_key) {
+                    if let Some(&vid) = vids.first() {
+                        found_vid = Some(vid);
+                        found_label = Some(label.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        if let (Some(vid), Some(label)) = (found_vid, found_label) {
+            if let Some(alive) = self.vertex_alive.get_mut(vid as usize) {
+                *alive = false;
+                self.vertex_count = self.vertex_count.saturating_sub(1);
+                self.dirty_vertex_labels.insert(label);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Find vertex ID by property value across all labels (for incremental CSR delta-apply).
+    pub fn find_vid_by_prop(&self, pk_key: &str, pk_value: &PropValue) -> Option<u32> {
+        let lookup_key = format!("{:?}", pk_value);
+        for ((_, key), idx) in &self.prop_eq_index {
+            if key == pk_key {
+                if let Some(vids) = idx.get(&lookup_key) {
+                    if let Some(&vid) = vids.first() {
+                        if self.vertex_alive.get(vid as usize).copied().unwrap_or(false) {
+                            return Some(vid);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Current snapshot version.
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::Relaxed)

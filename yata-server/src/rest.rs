@@ -74,6 +74,11 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
     /// Current WAL head sequence number.
     fn wal_head_seq(&self) -> u64 { 0 }
 
+    /// CPM metrics: read/mutation/mergeRecord counters.
+    fn cpm_stats(&self) -> Option<yata_engine::engine::CpmStats> {
+        None
+    }
+
     /// Merge record and return the WAL entry for pushing to read replicas.
     fn merge_record_with_wal(
         &self,
@@ -110,6 +115,7 @@ pub fn router<G: GraphQueryExecutor>(state: YataRestState<G>) -> Router {
         .route("/readyz", get(health))
         // XRPC — primary API (Workers RPC only)
         .route("/xrpc/ai.gftd.yata.cypher", post(xrpc_cypher::<G>))
+        .route("/xrpc/ai.gftd.yata.cypherBatch", post(xrpc_cypher_batch::<G>))
         // WAL Projection API
         .route("/xrpc/ai.gftd.yata.walTail", post(wal_tail_handler::<G>))
         .route("/xrpc/ai.gftd.yata.walApply", post(wal_apply_handler::<G>))
@@ -117,6 +123,7 @@ pub fn router<G: GraphQueryExecutor>(state: YataRestState<G>) -> Router {
         .route("/xrpc/ai.gftd.yata.walCheckpoint", post(wal_checkpoint_handler::<G>))
         .route("/xrpc/ai.gftd.yata.walColdStart", post(wal_cold_start_handler::<G>))
         .route("/xrpc/ai.gftd.yata.mergeRecordWal", post(merge_record_wal_handler::<G>))
+        .route("/xrpc/ai.gftd.yata.stats", get(stats_handler::<G>))
         .with_state(state)
 }
 
@@ -186,6 +193,16 @@ async fn health() -> impl IntoResponse {
     Json(HealthResp {
         status: "ok".into(),
     })
+}
+
+/// GET /xrpc/ai.gftd.yata.stats — CPM metrics (read/mutation/mergeRecord counters).
+async fn stats_handler<G: GraphQueryExecutor>(
+    State(state): State<YataRestState<G>>,
+) -> impl IntoResponse {
+    match state.graph.cpm_stats() {
+        Some(stats) => (StatusCode::OK, Json(serde_json::to_value(stats).unwrap_or_default())),
+        None => (StatusCode::OK, Json(serde_json::json!({"error": "stats not available"}))),
+    }
 }
 
 /// XRPC Cypher request: { statement, parameters? }
@@ -283,6 +300,58 @@ async fn xrpc_cypher<G: GraphQueryExecutor>(
             Json(serde_json::json!({"code":"internal","message":e.to_string()})),
         ),
     }
+}
+
+/// POST /xrpc/ai.gftd.yata.cypherBatch — execute multiple Cypher statements in one HTTP round-trip.
+/// CP3 optimization: reduces N × ~1-5ms coordinator overhead → 1 × ~1-5ms.
+/// All statements execute on the same Container (same partition) with shared auth context.
+#[derive(Deserialize)]
+struct XrpcCypherBatchReq {
+    statements: Vec<XrpcCypherReq>,
+}
+
+async fn xrpc_cypher_batch<G: GraphQueryExecutor>(
+    State(state): State<YataRestState<G>>,
+    headers: HeaderMap,
+    Json(req): Json<XrpcCypherBatchReq>,
+) -> impl IntoResponse {
+    let auth = match authorize(&headers, &state) {
+        Ok(a) => a,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"code":"unauthenticated","message":"unauthorized"})),
+            );
+        }
+    };
+
+    let results: Vec<serde_json::Value> = req.statements.into_iter().map(|stmt_req| {
+        let params = xrpc_parse_params(&stmt_req.parameters);
+        let result = match &auth {
+            AuthResult::Internal => state.graph.query(&stmt_req.statement, &params, None),
+            AuthResult::Authenticated { did } => state.graph.query_with_did(&stmt_req.statement, &params, did),
+            AuthResult::Public => state.graph.query_with_did(&stmt_req.statement, &params, ""),
+        };
+        match result {
+            Ok(raw_rows) => {
+                let columns: Vec<String> = if let Some(first) = raw_rows.first() {
+                    first.iter().map(|(col, _)| col.clone()).collect()
+                } else {
+                    Vec::new()
+                };
+                let rows: Vec<Vec<serde_json::Value>> = raw_rows
+                    .into_iter()
+                    .map(|row| row.into_iter().map(|(_, json_str)| {
+                        serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null)
+                    }).collect())
+                    .collect();
+                serde_json::json!({"columns": columns, "rows": rows})
+            }
+            Err(e) => serde_json::json!({"error": e}),
+        }
+    }).collect();
+
+    (StatusCode::OK, Json(serde_json::json!({"results": results})))
 }
 
 // ── DO R2 proxy snapshot endpoints ────────────────────────────────────────
@@ -507,6 +576,10 @@ impl GraphQueryExecutor for yata_engine::TieredGraphEngine {
     ) -> Result<(u32, Option<yata_engine::wal::WalEntry>), String> {
         self.merge_record_with_wal(label, pk_key, pk_value, props)
     }
+
+    fn cpm_stats(&self) -> Option<yata_engine::engine::CpmStats> {
+        Some(self.cpm_stats())
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -578,6 +651,10 @@ mod tests {
         ) -> Result<(u32, Option<yata_engine::wal::WalEntry>), String> {
             self.engine.merge_record_with_wal(label, pk_key, pk_value, props)
         }
+
+        fn cpm_stats(&self) -> Option<yata_engine::engine::CpmStats> {
+            Some(self.engine.cpm_stats())
+        }
     }
 
     fn test_state() -> YataRestState<TestGraphExecutor> {
@@ -611,6 +688,55 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let json = body_json(resp).await;
         assert_eq!(json["status"], "ok");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cypher_batch() {
+        let app = router(test_state());
+        let body = serde_json::json!({
+            "statements": [
+                {"statement": "RETURN 1 AS x", "parameters": {}},
+                {"statement": "RETURN 2 AS y", "parameters": {}}
+            ]
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/xrpc/ai.gftd.yata.cypherBatch")
+                    .header("Content-Type", "application/json")
+                    .header("X-Magatama-Verified", "true")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let results = json["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0]["columns"].as_array().is_some());
+        assert!(results[1]["columns"].as_array().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stats() {
+        let app = router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/xrpc/ai.gftd.yata.stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        assert_eq!(json["cypher_read_count"], 0);
+        assert_eq!(json["cypher_mutation_count"], 0);
+        assert_eq!(json["merge_record_count"], 0);
+        assert_eq!(json["last_snapshot_serialize_ms"], 0);
     }
 
 }

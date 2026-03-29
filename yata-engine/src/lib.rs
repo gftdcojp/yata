@@ -21,7 +21,7 @@ pub mod snapshot;
 pub mod wal;
 
 pub use config::TieredEngineConfig;
-pub use engine::{MutationContext, TieredGraphEngine};
+pub use engine::{CpmStats, MutationContext, TieredGraphEngine};
 pub use partition_query::PartitionQueryMetrics;
 pub use partition_router::{PartitionHints, PartitionScope, extract_partition_hints, route};
 pub use snapshot::SnapshotManifest;

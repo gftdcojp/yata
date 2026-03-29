@@ -16,7 +16,7 @@ use crate::loader;
 use crate::rls;
 use crate::router;
 
-/// CPM metrics: CP5 mutation frequency + read/write ratio.
+/// CPM metrics: CP5 mutation frequency + read/write ratio + CP4 snapshot monitoring.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CpmStats {
     pub cypher_read_count: u64,
@@ -27,6 +27,7 @@ pub struct CpmStats {
     pub mutation_ratio: f64,
     pub vertex_count: u64,
     pub edge_count: u64,
+    pub last_snapshot_serialize_ms: u64,
 }
 
 /// Shared tokio runtime for all engine instances (avoids nested runtime issues).
@@ -234,11 +235,12 @@ pub struct TieredGraphEngine {
     wal_last_flushed_seq: Arc<AtomicU64>,
     /// SecurityScope cache: DID → (SecurityScope, compiled_at). Design E.
     security_scope_cache: Arc<Mutex<HashMap<String, (yata_gie::ir::SecurityScope, std::time::Instant)>>>,
-    // CPM metrics: CP5 mutation frequency measurement
+    // CPM metrics: CP5 mutation frequency + CP4 snapshot monitoring
     cypher_read_count: Arc<AtomicU64>,
     cypher_mutation_count: Arc<AtomicU64>,
     cypher_mutation_us_total: Arc<AtomicU64>,
     merge_record_count: Arc<AtomicU64>,
+    last_snapshot_serialize_ms: Arc<AtomicU64>,
 }
 
 impl TieredGraphEngine {
@@ -335,6 +337,7 @@ impl TieredGraphEngine {
             cypher_mutation_count: Arc::new(AtomicU64::new(0)),
             cypher_mutation_us_total: Arc::new(AtomicU64::new(0)),
             merge_record_count: Arc::new(AtomicU64::new(0)),
+            last_snapshot_serialize_ms: Arc::new(AtomicU64::new(0)),
         }
         // No startup restore — labels are lazy-loaded from R2 on first query (page-in).
         // Write path: Pipeline.send() + mergeRecord() (PDS Worker).
@@ -756,22 +759,83 @@ impl TieredGraphEngine {
                 || router::is_cypher_mutation(cypher);
 
             if has_changes {
-                // Rebuild HOT CSR immediately (reads see latest state)
-                let new_csr = loader::rebuild_csr_from_graph_with_partition(&g, self.config.hot_partition_id);
+                // CP5 incremental CSR delta-apply: O(delta) instead of O(V+E) rebuild.
+                // Compute delta between before/after MemoryGraph, apply to existing CSR.
+                let new_vids: Vec<&String> = after_vids.difference(&before_vids).collect();
+                let del_vids: Vec<&String> = before_vids.difference(&after_vids).collect();
+                let new_eids: Vec<&String> = after_eids.difference(&before_eids).collect();
+                let del_eids: Vec<&String> = before_eids.difference(&after_eids).collect();
 
-                // Mark all labels in the new CSR as loaded
-                if let Ok(mut ll) = self.loaded_labels.lock() {
-                    for label in <yata_store::MutableCsrStore as yata_grin::Schema>::vertex_labels(&new_csr) {
-                        ll.insert(label);
-                    }
-                    for label in <yata_store::MutableCsrStore as yata_grin::Schema>::edge_labels(&new_csr) {
-                        ll.insert(label);
-                    }
-                }
+                let delta_size = new_vids.len() + del_vids.len() + new_eids.len() + del_eids.len();
+                let total_size = after_vids.len() + after_eids.len();
 
-                if let Ok(mut hot) = self.hot.write() {
-                    *hot = yata_store::GraphStoreEnum::Single(new_csr);
-                    self.hot_initialized.store(true, Ordering::Relaxed);
+                // Use incremental apply when delta is small relative to total graph.
+                // Fallback to full rebuild when delta > 50% (e.g., DETACH DELETE all).
+                if delta_size > 0 && delta_size * 2 < total_size {
+                    // Incremental path: apply delta to existing CSR
+                    if let Ok(mut hot) = self.hot.write() {
+                        if let Some(single) = hot.as_single_mut() {
+                            // Delete removed vertices (by _vid property)
+                            for vid_str in &del_vids {
+                                single.delete_by_pk_any_label("_vid", &PropValue::Str((*vid_str).clone()));
+                            }
+                            // Add new vertices
+                            for vid_str in &new_vids {
+                                if let Some(node) = g.0.nodes().iter().find(|n| &n.id == *vid_str) {
+                                    let props: Vec<(&str, PropValue)> = node.props.iter()
+                                        .map(|(k, v)| (k.as_str(), loader::cypher_to_prop(v)))
+                                        .chain(std::iter::once(("_vid", PropValue::Str(node.id.clone()))))
+                                        .collect();
+                                    single.add_vertex_with_labels(
+                                        &node.labels,
+                                        &props,
+                                    );
+                                }
+                            }
+                            // Add new edges
+                            for eid_str in &new_eids {
+                                if let Some(rel) = g.0.rels().iter().find(|r| &r.id == *eid_str) {
+                                    // Look up src/dst vids by _vid property
+                                    let src_vid = single.find_vid_by_prop("_vid", &PropValue::Str(rel.src.clone()));
+                                    let dst_vid = single.find_vid_by_prop("_vid", &PropValue::Str(rel.dst.clone()));
+                                    if let (Some(s), Some(d)) = (src_vid, dst_vid) {
+                                        let props: Vec<(&str, PropValue)> = rel.props.iter()
+                                            .map(|(k, v)| (k.as_str(), loader::cypher_to_prop(v)))
+                                            .collect();
+                                        single.add_edge(s, d, &rel.rel_type, &props);
+                                    }
+                                }
+                            }
+                            single.commit();
+
+                            if let Ok(mut ll) = self.loaded_labels.lock() {
+                                for label in <yata_store::MutableCsrStore as yata_grin::Schema>::vertex_labels(single) {
+                                    ll.insert(label);
+                                }
+                                for label in <yata_store::MutableCsrStore as yata_grin::Schema>::edge_labels(single) {
+                                    ll.insert(label);
+                                }
+                            }
+                        }
+                        self.hot_initialized.store(true, Ordering::Relaxed);
+                    }
+                    tracing::debug!(delta = delta_size, total = total_size, "incremental CSR delta-apply");
+                } else {
+                    // Full rebuild fallback (large delta or empty graph)
+                    let new_csr = loader::rebuild_csr_from_graph_with_partition(&g, self.config.hot_partition_id);
+                    if let Ok(mut ll) = self.loaded_labels.lock() {
+                        for label in <yata_store::MutableCsrStore as yata_grin::Schema>::vertex_labels(&new_csr) {
+                            ll.insert(label);
+                        }
+                        for label in <yata_store::MutableCsrStore as yata_grin::Schema>::edge_labels(&new_csr) {
+                            ll.insert(label);
+                        }
+                    }
+                    if let Ok(mut hot) = self.hot.write() {
+                        *hot = yata_store::GraphStoreEnum::Single(new_csr);
+                        self.hot_initialized.store(true, Ordering::Relaxed);
+                    }
+                    tracing::debug!(delta = delta_size, total = total_size, "full CSR rebuild (large delta)");
                 }
             }
 
@@ -1074,6 +1138,7 @@ impl TieredGraphEngine {
             },
             vertex_count: v_count,
             edge_count: e_count,
+            last_snapshot_serialize_ms: self.last_snapshot_serialize_ms.load(Ordering::Relaxed),
         }
     }
 
@@ -1121,6 +1186,7 @@ impl TieredGraphEngine {
 
         // Serialize CSR → ArrowFragment → MemoryBlobStore
         // Uses selective conversion: only dirty vertex labels get property extraction.
+        let serialize_start = std::time::Instant::now();
         let (v_count, e_count, blob_store, meta, dirty_vlabel_ids) = if let Ok(csr) = self.hot.read() {
             let store = csr.as_single()
                 .ok_or_else(|| "no CSR store available".to_string())?;
@@ -1140,6 +1206,21 @@ impl TieredGraphEngine {
         } else {
             return Err("failed to acquire CSR lock".into());
         };
+        let serialize_ms = serialize_start.elapsed().as_millis() as u64;
+        self.last_snapshot_serialize_ms.store(serialize_ms, Ordering::Relaxed);
+        // CP4 monitoring: warn when vertex count approaches threshold where serialize becomes bottleneck
+        if v_count > 100_000 {
+            tracing::warn!(
+                vertices = v_count, edges = e_count, serialize_ms,
+                "CP4 threshold: vertex count >100K, snapshot serialize may become bottleneck (projected {}ms at 1M)",
+                serialize_ms * 10
+            );
+        } else if serialize_ms > 100 {
+            tracing::warn!(
+                vertices = v_count, edges = e_count, serialize_ms,
+                "CP4: snapshot serialize >100ms"
+            );
+        }
 
         // Guard: never overwrite a non-empty R2 snapshot with an empty one.
         if v_count == 0 && e_count == 0 {

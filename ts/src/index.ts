@@ -12,8 +12,6 @@
 // Types
 export type {
   CypherResult,
-  RlsScopeHeader,
-  RlsScopeData,
   WalEntry,
   WalTailResult,
   WalFlushResult,
