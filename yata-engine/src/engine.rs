@@ -853,7 +853,6 @@ impl TieredGraphEngine {
         pk_value: &str,
         props: &[(&str, yata_grin::PropValue)],
     ) -> Result<u32, String> {
-        self.dirty.store(true, Ordering::Relaxed);
         self.merge_record_count.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut dl) = self.dirty_labels.lock() {
             dl.insert(label.to_string());
@@ -929,7 +928,6 @@ impl TieredGraphEngine {
             None
         };
 
-        self.dirty.store(true, Ordering::Relaxed);
         if let Ok(mut dl) = self.dirty_labels.lock() {
             dl.insert(label.to_string());
         }
@@ -959,7 +957,6 @@ impl TieredGraphEngine {
         pk_value: &str,
     ) -> Result<bool, String> {
         self.ensure_labels(&[label]);
-        self.dirty.store(true, Ordering::Relaxed);
         if let Ok(mut dl) = self.dirty_labels.lock() {
             dl.insert(label.to_string());
         }
