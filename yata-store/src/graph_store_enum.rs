@@ -607,23 +607,19 @@ impl GraphStoreEnum {
         }
     }
 
-    pub fn out_csr_raw(&self) -> &HashMap<String, crate::CsrSegment> {
-        static EMPTY: std::sync::LazyLock<HashMap<String, crate::CsrSegment>> =
-            std::sync::LazyLock::new(HashMap::new);
+    pub fn out_csr_raw(&self) -> HashMap<String, crate::CsrSegment> {
         match self {
             GraphStoreEnum::Single(s) => s.out_csr_raw(),
-            GraphStoreEnum::Partitioned(_) => &EMPTY,
-            GraphStoreEnum::Arrow(_) => &EMPTY,
+            GraphStoreEnum::Partitioned(_) => HashMap::new(),
+            GraphStoreEnum::Arrow(_) => HashMap::new(),
         }
     }
 
-    pub fn in_csr_raw(&self) -> &HashMap<String, crate::CsrSegment> {
-        static EMPTY: std::sync::LazyLock<HashMap<String, crate::CsrSegment>> =
-            std::sync::LazyLock::new(HashMap::new);
+    pub fn in_csr_raw(&self) -> HashMap<String, crate::CsrSegment> {
         match self {
             GraphStoreEnum::Single(s) => s.in_csr_raw(),
-            GraphStoreEnum::Partitioned(_) => &EMPTY,
-            GraphStoreEnum::Arrow(_) => &EMPTY,
+            GraphStoreEnum::Partitioned(_) => HashMap::new(),
+            GraphStoreEnum::Arrow(_) => HashMap::new(),
         }
     }
 

@@ -11,6 +11,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -646,7 +647,18 @@ async fn merge_record_wal_handler<G: GraphQueryExecutor>(
     if let Some(obj) = props_val.as_object() {
         for (k, v) in obj {
             let pv = match v {
-                serde_json::Value::String(s) => yata_grin::PropValue::Str(s.clone()),
+                serde_json::Value::String(s) => {
+                    // Detect base64-encoded binary with "b64:" prefix.
+                    if let Some(encoded) = s.strip_prefix("b64:") {
+                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) {
+                            yata_grin::PropValue::Binary(bytes)
+                        } else {
+                            yata_grin::PropValue::Str(s.clone())
+                        }
+                    } else {
+                        yata_grin::PropValue::Str(s.clone())
+                    }
+                }
                 serde_json::Value::Number(n) => {
                     if let Some(i) = n.as_i64() {
                         yata_grin::PropValue::Int(i)

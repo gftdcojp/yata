@@ -19,6 +19,7 @@ use arrow::array::{
     Array, ArrayRef, RecordBatch, StringArray, UInt64Array, UInt8Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
+use base64::Engine as _;
 use bytes::Bytes;
 use std::sync::Arc;
 
@@ -58,7 +59,15 @@ fn u8_to_op(v: u8) -> WalOp {
 /// Convert a serde_json::Value to PropValue (used during Arrow deserialization).
 fn json_to_prop_value(v: &serde_json::Value) -> yata_grin::PropValue {
     match v {
-        serde_json::Value::String(s) => yata_grin::PropValue::Str(s.clone()),
+        serde_json::Value::String(s) => {
+            // Detect base64-encoded binary with "b64:" prefix.
+            if let Some(encoded) = s.strip_prefix("b64:") {
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) {
+                    return yata_grin::PropValue::Binary(bytes);
+                }
+            }
+            yata_grin::PropValue::Str(s.clone())
+        }
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 yata_grin::PropValue::Int(i)
@@ -71,6 +80,7 @@ fn json_to_prop_value(v: &serde_json::Value) -> yata_grin::PropValue {
         _ => yata_grin::PropValue::Str(v.to_string()),
     }
 }
+
 
 /// Serialize WAL entries to Arrow IPC File format bytes.
 ///

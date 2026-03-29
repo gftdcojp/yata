@@ -9,6 +9,7 @@
 //! The mmap optimization avoids R2 fetch + heap allocation for the initial load.
 //! Arrow FileReader reads column buffers directly from mmap'd pages.
 
+use base64::Engine as _;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -201,7 +202,17 @@ fn parse_props_json(json: &str) -> HashMap<String, PropValue> {
     map.into_iter()
         .map(|(k, v)| {
             let pv = match &v {
-                serde_json::Value::String(s) => PropValue::Str(s.clone()),
+                serde_json::Value::String(s) => {
+                    if let Some(encoded) = s.strip_prefix("b64:") {
+                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) {
+                            PropValue::Binary(bytes)
+                        } else {
+                            PropValue::Str(s.clone())
+                        }
+                    } else {
+                        PropValue::Str(s.clone())
+                    }
+                }
                 serde_json::Value::Number(n) => {
                     if let Some(i) = n.as_i64() {
                         PropValue::Int(i)
@@ -439,6 +450,9 @@ mod tests {
                     PropValue::Float(f) => serde_json::json!(*f),
                     PropValue::Bool(b) => serde_json::Value::Bool(*b),
                     PropValue::Null => serde_json::Value::Null,
+                    PropValue::Binary(b) => {
+                        serde_json::Value::String(format!("b64:{}", base64::engine::general_purpose::STANDARD.encode(b)))
+                    }
                 };
                 map.insert(k.clone(), jv);
             }

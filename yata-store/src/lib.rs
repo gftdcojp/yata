@@ -34,6 +34,7 @@ pub type MmapVineyard = MmapBlobCache;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Mutex;
 use yata_core::{GlobalEid, GlobalVid, LocalEid, LocalVid, PartitionId};
 use yata_cypher::Graph;
 use yata_grin::*;
@@ -53,6 +54,7 @@ impl Ord for PropValueOrd {
             (PropValue::Float(a), PropValue::Float(b)) => {
                 a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
             }
+            (PropValue::Binary(a), PropValue::Binary(b)) => a.cmp(b),
             (PropValue::Null, PropValue::Null) => std::cmp::Ordering::Equal,
             // Different types: order by discriminant index
             (a, b) => discriminant_index(a).cmp(&discriminant_index(b)),
@@ -73,6 +75,7 @@ fn discriminant_index(v: &PropValue) -> u8 {
         PropValue::Int(_) => 2,
         PropValue::Float(_) => 3,
         PropValue::Str(_) => 4,
+        PropValue::Binary(_) => 5,
     }
 }
 
@@ -493,6 +496,68 @@ struct PendingEdge {
     edge_id: u32,
 }
 
+// ── Lazy CSR Cache (COO + Lazy CSR architecture) ─────────────────────
+//
+// CSR segments are derived indexes, rebuilt lazily on first read after mutation.
+// Write path: O(1) append to edge arrays + mark CSR stale.
+// Read path: if stale, rebuild CSR for needed label (one-time O(E_label)),
+//            then use CSR O(1) adjacency for traversal.
+// This eliminates O(E) CSR rebuild from commit(), making writes O(1).
+
+/// Lazy CSR cache: CSR segments rebuilt on-demand from edge arrays.
+/// Protected by Mutex for interior mutability during &self Topology calls.
+struct LazyCsrCache {
+    out: HashMap<String, CsrSegment>,
+    in_: HashMap<String, CsrSegment>,
+    /// Edge labels whose CSR is stale (needs rebuild before use).
+    stale: HashSet<String>,
+    /// All labels stale (set on first commit or when pending_edges exist).
+    all_stale: bool,
+}
+
+impl LazyCsrCache {
+    fn new() -> Self {
+        Self {
+            out: HashMap::new(),
+            in_: HashMap::new(),
+            stale: HashSet::new(),
+            all_stale: false,
+        }
+    }
+
+    fn mark_stale(&mut self, label: &str) {
+        self.stale.insert(label.to_string());
+    }
+
+    fn mark_all_stale(&mut self) {
+        self.all_stale = true;
+    }
+
+    fn is_stale(&self, label: &str) -> bool {
+        self.all_stale || self.stale.contains(label)
+    }
+
+    fn mark_fresh(&mut self, label: &str) {
+        self.stale.remove(label);
+    }
+
+    fn mark_all_fresh(&mut self) {
+        self.stale.clear();
+        self.all_stale = false;
+    }
+}
+
+impl Clone for LazyCsrCache {
+    fn clone(&self) -> Self {
+        Self {
+            out: self.out.clone(),
+            in_: self.in_.clone(),
+            stale: self.stale.clone(),
+            all_stale: self.all_stale,
+        }
+    }
+}
+
 // ── Global → Local ID map (M1: ID separation) ──────────────────────
 
 /// Bidirectional map between GlobalVid and local u32 VID within a partition.
@@ -548,6 +613,8 @@ impl GlobalToLocalMap {
 }
 
 /// MutableCSR graph store implementing all GRIN traits.
+/// Architecture: COO + Lazy CSR — edges stored in flat arrays (COO),
+/// CSR segments rebuilt lazily on first Topology access after mutation.
 pub struct MutableCsrStore {
     // Vertex storage
     vertex_labels: Vec<Vec<String>>,
@@ -558,9 +625,8 @@ pub struct MutableCsrStore {
     vid_alloc: AtomicU32,
     global_to_local_vid: HashMap<GlobalVid, LocalVid>,
 
-    // Edge storage: label -> CsrSegment
-    out_csr: HashMap<String, CsrSegment>,
-    in_csr: HashMap<String, CsrSegment>,
+    // Lazy CSR cache (rebuilt on-demand from edge arrays)
+    csr: Mutex<LazyCsrCache>,
 
     // Edge metadata indexed by edge_id
     edge_props: Vec<HashMap<String, PropValue>>,
@@ -639,8 +705,7 @@ impl MutableCsrStore {
             vertex_count: 0,
             vid_alloc: AtomicU32::new(0),
             global_to_local_vid: HashMap::new(),
-            out_csr: HashMap::new(),
-            in_csr: HashMap::new(),
+            csr: Mutex::new(LazyCsrCache::new()),
             edge_props: Vec::new(),
             edge_labels: Vec::new(),
             edge_src: Vec::new(),
@@ -863,11 +928,16 @@ impl MutableCsrStore {
     }
 
     /// Borrow CSR topology for snapshot serialization (GraphScope .adj equivalent).
-    pub fn out_csr_raw(&self) -> &HashMap<String, CsrSegment> {
-        &self.out_csr
+    /// Ensures CSR is fresh before returning.
+    pub fn out_csr_raw(&self) -> HashMap<String, CsrSegment> {
+        self.ensure_csr_all();
+        let csr = self.csr.lock().unwrap();
+        csr.out.clone()
     }
-    pub fn in_csr_raw(&self) -> &HashMap<String, CsrSegment> {
-        &self.in_csr
+    pub fn in_csr_raw(&self) -> HashMap<String, CsrSegment> {
+        self.ensure_csr_all();
+        let csr = self.csr.lock().unwrap();
+        csr.in_.clone()
     }
 
     /// Known schema labels.
@@ -1058,62 +1128,100 @@ impl MutableCsrStore {
         eid
     }
 
-    /// Rebuild CSR segments — incremental if only specific labels are dirty.
+    /// Rebuild CSR segments for all dirty labels (eager rebuild).
+    /// Used by force_rebuild_csr() after batch operations.
     fn rebuild_csr(&mut self) {
-        let dirty = &self.dirty_edge_labels;
+        let mut csr = self.csr.lock().unwrap();
         let max_vid = self.vertex_count;
         if max_vid == 0 {
-            self.out_csr.clear();
-            self.in_csr.clear();
-            self.pending_edges.clear();
+            csr.out.clear();
+            csr.in_.clear();
             return;
         }
 
-        // Incremental: only rebuild dirty label segments (or all if no tracking)
-        let rebuild_all = dirty.is_empty() && !self.pending_edges.is_empty();
-
-        // Collect edges for labels that need rebuild
+        // Rebuild all: collect all alive edges by label
         let mut edges_by_label: HashMap<String, Vec<(u32, u32, u32)>> = HashMap::new();
         for eid in 0..self.edge_count as usize {
-            if eid >= self.edge_labels.len() {
+            if eid >= self.edge_labels.len() || !self.edge_alive[eid] {
                 continue;
             }
-            if !self.edge_alive[eid] {
-                continue;
-            }
-            let label = &self.edge_labels[eid];
-            if rebuild_all || dirty.contains(label) {
-                edges_by_label.entry(label.clone()).or_default().push((
-                    self.edge_src[eid],
-                    self.edge_dst[eid],
-                    eid as u32,
-                ));
-            }
+            edges_by_label
+                .entry(self.edge_labels[eid].clone())
+                .or_default()
+                .push((self.edge_src[eid], self.edge_dst[eid], eid as u32));
         }
 
-        // Remove dirty labels that now have zero edges
-        if !rebuild_all {
-            for label in dirty.iter() {
-                if !edges_by_label.contains_key(label) {
-                    self.out_csr.remove(label);
-                    self.in_csr.remove(label);
-                }
-            }
-        } else {
-            self.out_csr.clear();
-            self.in_csr.clear();
-        }
+        csr.out.clear();
+        csr.in_.clear();
 
-        // Build CSR for each label
         for (label, edges) in &edges_by_label {
-            self.build_csr_segment(label, edges, max_vid);
+            let (out_seg, in_seg) = Self::build_csr_segment_static(edges, max_vid);
+            csr.out.insert(label.clone(), out_seg);
+            csr.in_.insert(label.clone(), in_seg);
+        }
+    }
+
+    /// Lazily ensure CSR is fresh for a given edge label.
+    /// Called from Topology trait methods (takes &self via Mutex interior mutability).
+    fn ensure_csr_for_label(&self, label: &str) {
+        let mut csr = self.csr.lock().unwrap();
+        if !csr.is_stale(label) {
+            return;
+        }
+        let max_vid = self.vertex_count;
+        if max_vid == 0 {
+            csr.out.remove(label);
+            csr.in_.remove(label);
+            csr.mark_fresh(label);
+            return;
         }
 
-        self.pending_edges.clear();
+        // Collect alive edges for this label only
+        let mut edges: Vec<(u32, u32, u32)> = Vec::new();
+        for eid in 0..self.edge_count as usize {
+            if eid >= self.edge_labels.len() || !self.edge_alive[eid] {
+                continue;
+            }
+            if self.edge_labels[eid] == label {
+                edges.push((self.edge_src[eid], self.edge_dst[eid], eid as u32));
+            }
+        }
+
+        if edges.is_empty() {
+            csr.out.remove(label);
+            csr.in_.remove(label);
+        } else {
+            let (out_seg, in_seg) = Self::build_csr_segment_static(&edges, max_vid);
+            csr.out.insert(label.to_string(), out_seg);
+            csr.in_.insert(label.to_string(), in_seg);
+        }
+        csr.mark_fresh(label);
+    }
+
+    /// Ensure CSR is fresh for all known edge labels. Called from methods
+    /// that iterate all labels (out_neighbors, out_degree, etc.).
+    fn ensure_csr_all(&self) {
+        // Quick check: if nothing stale, skip
+        {
+            let csr = self.csr.lock().unwrap();
+            if !csr.all_stale && csr.stale.is_empty() {
+                return;
+            }
+        }
+        for label in &self.known_edge_labels {
+            self.ensure_csr_for_label(label);
+        }
+        // Clear all_stale flag now that all known labels are fresh
+        let mut csr = self.csr.lock().unwrap();
+        csr.all_stale = false;
     }
 
     /// Build a single label's outgoing + incoming CSR segments via prefix-sum.
-    fn build_csr_segment(&mut self, label: &str, edges: &[(u32, u32, u32)], max_vid: u32) {
+    /// Static method: does not access self, returns segments.
+    fn build_csr_segment_static(
+        edges: &[(u32, u32, u32)],
+        max_vid: u32,
+    ) -> (CsrSegment, CsrSegment) {
         let n = max_vid as usize + 2;
 
         // Outgoing CSR
@@ -1135,13 +1243,10 @@ impl MutableCsrStore {
                 cursor[src as usize] += 1;
             }
         }
-        self.out_csr.insert(
-            label.to_string(),
-            CsrSegment {
-                offsets: out_offsets,
-                edge_ids: out_edge_ids,
-            },
-        );
+        let out_seg = CsrSegment {
+            offsets: out_offsets,
+            edge_ids: out_edge_ids,
+        };
 
         // Incoming CSR
         let mut in_offsets = vec![0u32; n];
@@ -1162,13 +1267,12 @@ impl MutableCsrStore {
                 cursor[dst as usize] += 1;
             }
         }
-        self.in_csr.insert(
-            label.to_string(),
-            CsrSegment {
-                offsets: in_offsets,
-                edge_ids: in_edge_ids,
-            },
-        );
+        let in_seg = CsrSegment {
+            offsets: in_offsets,
+            edge_ids: in_edge_ids,
+        };
+
+        (out_seg, in_seg)
     }
 
     /// Check if a predicate matches a vertex's properties.
@@ -1466,8 +1570,7 @@ impl Clone for MutableCsrStore {
             vertex_count: self.vertex_count,
             vid_alloc: AtomicU32::new(self.vid_alloc.load(Ordering::Relaxed)),
             global_to_local_vid: self.global_to_local_vid.clone(),
-            out_csr: self.out_csr.clone(),
-            in_csr: self.in_csr.clone(),
+            csr: Mutex::new(self.csr.lock().unwrap().clone()),
             edge_props: self.edge_props.clone(),
             edge_labels: self.edge_labels.clone(),
             edge_src: self.edge_src.clone(),
@@ -1761,6 +1864,10 @@ pub fn prop_to_cypher(v: &PropValue) -> yata_cypher::types::Value {
         PropValue::Int(i) => yata_cypher::types::Value::Int(*i),
         PropValue::Float(f) => yata_cypher::types::Value::Float(*f),
         PropValue::Str(s) => yata_cypher::types::Value::Str(s.clone()),
+        PropValue::Binary(b) => {
+            // Binary is opaque in Cypher — expose length as metadata string.
+            yata_cypher::types::Value::Str(format!("<binary:{} bytes>", b.len()))
+        }
     }
 }
 
@@ -1816,29 +1923,29 @@ impl Topology for MutableCsrStore {
         if !self.has_vertex(vid) {
             return 0;
         }
-        self.out_csr
-            .values()
-            .map(|csr| csr.neighbors(vid).len())
-            .sum()
+        self.ensure_csr_all();
+        let csr = self.csr.lock().unwrap();
+        csr.out.values().map(|seg| seg.neighbors(vid).len()).sum()
     }
 
     fn in_degree(&self, vid: u32) -> usize {
         if !self.has_vertex(vid) {
             return 0;
         }
-        self.in_csr
-            .values()
-            .map(|csr| csr.neighbors(vid).len())
-            .sum()
+        self.ensure_csr_all();
+        let csr = self.csr.lock().unwrap();
+        csr.in_.values().map(|seg| seg.neighbors(vid).len()).sum()
     }
 
     fn out_neighbors(&self, vid: u32) -> Vec<Neighbor> {
         if !self.has_vertex(vid) {
             return Vec::new();
         }
+        self.ensure_csr_all();
+        let csr = self.csr.lock().unwrap();
         let mut result = Vec::new();
-        for (label, csr) in &self.out_csr {
-            for &eid in csr.neighbors(vid) {
+        for (label, seg) in &csr.out {
+            for &eid in seg.neighbors(vid) {
                 let eid_usize = eid as usize;
                 if eid_usize < self.edge_dst.len() && self.edge_alive[eid_usize] {
                     result.push(Neighbor {
@@ -1856,9 +1963,11 @@ impl Topology for MutableCsrStore {
         if !self.has_vertex(vid) {
             return Vec::new();
         }
+        self.ensure_csr_all();
+        let csr = self.csr.lock().unwrap();
         let mut result = Vec::new();
-        for (label, csr) in &self.in_csr {
-            for &eid in csr.neighbors(vid) {
+        for (label, seg) in &csr.in_ {
+            for &eid in seg.neighbors(vid) {
                 let eid_usize = eid as usize;
                 if eid_usize < self.edge_src.len() && self.edge_alive[eid_usize] {
                     result.push(Neighbor {
@@ -1876,12 +1985,14 @@ impl Topology for MutableCsrStore {
         if !self.has_vertex(vid) {
             return Vec::new();
         }
-        let csr = match self.out_csr.get(edge_label) {
+        self.ensure_csr_for_label(edge_label);
+        let csr = self.csr.lock().unwrap();
+        let seg = match csr.out.get(edge_label) {
             Some(c) => c,
             None => return Vec::new(),
         };
         let mut result = Vec::new();
-        for &eid in csr.neighbors(vid) {
+        for &eid in seg.neighbors(vid) {
             let eid_usize = eid as usize;
             if eid_usize < self.edge_dst.len() && self.edge_alive[eid_usize] {
                 result.push(Neighbor {
@@ -1898,12 +2009,14 @@ impl Topology for MutableCsrStore {
         if !self.has_vertex(vid) {
             return Vec::new();
         }
-        let csr = match self.in_csr.get(edge_label) {
+        self.ensure_csr_for_label(edge_label);
+        let csr = self.csr.lock().unwrap();
+        let seg = match csr.in_.get(edge_label) {
             Some(c) => c,
             None => return Vec::new(),
         };
         let mut result = Vec::new();
-        for &eid in csr.neighbors(vid) {
+        for &eid in seg.neighbors(vid) {
             let eid_usize = eid as usize;
             if eid_usize < self.edge_src.len() && self.edge_alive[eid_usize] {
                 result.push(Neighbor {
@@ -2198,13 +2311,26 @@ impl Mutable for MutableCsrStore {
     }
 
     fn commit(&mut self) -> u64 {
-        self.rebuild_csr();
+        // Mark dirty edge labels as CSR-stale (lazy rebuild on next read)
+        {
+            let mut csr = self.csr.lock().unwrap();
+            if !self.pending_edges.is_empty() {
+                csr.mark_all_stale();
+            } else {
+                for label in &self.dirty_edge_labels {
+                    csr.mark_stale(label);
+                }
+            }
+        }
+        // CSR is NOT rebuilt here — lazy rebuild on Topology access.
+        // Property indexes are rebuilt eagerly (needed for merge_by_pk O(1)).
         self.rebuild_label_index();
         self.rebuild_prop_indexes();
         self.rebuild_columnar_cache();
         self.rebuild_label_bitmap();
         self.rebuild_btree_indexes();
-        // Reset dirty tracking after rebuild
+        self.pending_edges.clear();
+        // Reset dirty tracking after index rebuild
         self.dirty_vertex_labels.clear();
         self.dirty_edge_labels.clear();
         let ver = self.version.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2213,6 +2339,15 @@ impl Mutable for MutableCsrStore {
             wal.append(WalEntry::Commit { version: ver });
         }
         ver
+    }
+
+    /// Force immediate CSR rebuild for all stale labels.
+    /// Use after batch operations (cold start, bulk import) where
+    /// you want CSR ready before read queries arrive.
+    pub fn force_rebuild_csr(&mut self) {
+        self.rebuild_csr();
+        let mut csr = self.csr.lock().unwrap();
+        csr.mark_all_fresh();
     }
 }
 

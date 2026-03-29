@@ -347,6 +347,7 @@ pub fn execute_step(
                 PropValue::Int(n) => n.to_string(),
                 PropValue::Float(f) => f.to_string(),
                 PropValue::Str(s) => s.clone(),
+                PropValue::Binary(b) => format!("<binary:{} bytes>", b.len()),
             };
             (col, val)
         }).collect()

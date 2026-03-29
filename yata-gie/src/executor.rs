@@ -1538,6 +1538,7 @@ fn prop_value_to_json(v: &PropValue) -> String {
                 serde_json::to_string(s).unwrap_or_else(|_| format!("\"{s}\""))
             }
         }
+        PropValue::Binary(b) => format!("\"<binary:{} bytes>\"", b.len()),
     }
 }
 

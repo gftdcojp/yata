@@ -3265,6 +3265,7 @@ name = "yata-engine"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "base64",
  "blake3",
  "bytes",
  "chrono",
@@ -3422,6 +3423,7 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-schema",
+ "base64",
  "bytes",
  "chrono",
  "memmap2",

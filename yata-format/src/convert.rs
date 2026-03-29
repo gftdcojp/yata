@@ -229,6 +229,7 @@ fn prop_value_to_arrow_type(v: &PropValue) -> DataType {
         PropValue::Float(_) => DataType::Float64,
         PropValue::Str(_) => DataType::Utf8,
         PropValue::Bool(_) => DataType::Boolean,
+        PropValue::Binary(_) => DataType::LargeBinary,
         PropValue::Null => DataType::Utf8,
     }
 }
@@ -280,6 +281,16 @@ fn prop_values_to_arrow(name: &str, vals: &[PropValue]) -> (Field, ArrayRef) {
                 .collect();
             Arc::new(BooleanArray::from(arr))
         }
+        DataType::LargeBinary => {
+            let arr: Vec<Option<&[u8]>> = vals
+                .iter()
+                .map(|v| match v {
+                    PropValue::Binary(b) => Some(b.as_slice()),
+                    _ => None,
+                })
+                .collect();
+            Arc::new(arrow::array::LargeBinaryArray::from_opt_vec(arr))
+        }
         _ => {
             // Fallback: everything as string
             let arr: Vec<Option<String>> = vals
@@ -290,6 +301,7 @@ fn prop_values_to_arrow(name: &str, vals: &[PropValue]) -> (Field, ArrayRef) {
                     PropValue::Float(f) => Some(f.to_string()),
                     PropValue::Bool(b) => Some(b.to_string()),
                     PropValue::Null => None,
+                    PropValue::Binary(_) => None,
                 })
                 .collect();
             Arc::new(StringArray::from(arr))

@@ -10,6 +10,7 @@
 //! Phase 1: props stored as Vec<(String, PropValue)> — zero JSON overhead on write/apply.
 //! NDJSON backward compat via custom serde (flat JSON map format).
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,6 +50,7 @@ pub struct WalEntry {
 /// Custom serde for Vec<(String, PropValue)> ↔ flat JSON object.
 /// Maintains backward compatibility with existing NDJSON segments that use serde_json::Map.
 mod props_serde {
+    use base64::Engine as _;
     use serde::{Deserializer, Serializer, Deserialize};
     use serde::ser::SerializeMap;
     use yata_grin::PropValue;
@@ -67,7 +69,7 @@ mod props_serde {
                 PropValue::Str(s) => map.serialize_entry(k, s)?,
                 PropValue::Binary(bytes) => {
                     // Encode as base64 with "b64:" prefix to distinguish from plain strings.
-                    let encoded = format!("b64:{}", base64_engine().encode(bytes));
+                    let encoded = format!("b64:{}", base64::engine::general_purpose::STANDARD.encode(bytes));
                     map.serialize_entry(k, &encoded)?;
                 }
             }
@@ -93,7 +95,7 @@ mod props_serde {
             serde_json::Value::String(s) => {
                 // Detect base64-encoded binary with "b64:" prefix.
                 if let Some(encoded) = s.strip_prefix("b64:") {
-                    if let Ok(bytes) = base64_engine().decode(encoded) {
+                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) {
                         return PropValue::Binary(bytes);
                     }
                 }
@@ -113,11 +115,6 @@ mod props_serde {
     }
 }
 
-/// Base64 engine for Binary PropValue serialization (standard, no padding).
-fn base64_engine() -> base64::engine::GeneralPurpose {
-    use base64::engine::general_purpose::STANDARD;
-    STANDARD
-}
 
 /// Convert PropValue slice to serde_json::Map (for legacy callers during migration).
 pub fn props_to_json_map(props: &[(String, PropValue)]) -> serde_json::Map<String, serde_json::Value> {
@@ -130,7 +127,7 @@ pub fn props_to_json_map(props: &[(String, PropValue)]) -> serde_json::Map<Strin
             PropValue::Bool(b) => serde_json::Value::Bool(*b),
             PropValue::Null => serde_json::Value::Null,
             PropValue::Binary(bytes) => {
-                serde_json::Value::String(format!("b64:{}", base64_engine().encode(bytes)))
+                serde_json::Value::String(format!("b64:{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
             }
         };
         m.insert(k.clone(), jv);

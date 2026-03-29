@@ -644,7 +644,7 @@ fn apply_batch_properties(
 
 /// Extract a PropValue from an Arrow column at a given row.
 fn extract_arrow_value(col: &dyn arrow::array::Array, row: usize) -> PropValue {
-    use arrow::array::{Int64Array, Float64Array, StringArray, BooleanArray};
+    use arrow::array::{Int64Array, Float64Array, StringArray, BooleanArray, LargeBinaryArray};
     if col.is_null(row) {
         PropValue::Null
     } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
@@ -655,6 +655,8 @@ fn extract_arrow_value(col: &dyn arrow::array::Array, row: usize) -> PropValue {
         PropValue::Float(arr.value(row))
     } else if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
         PropValue::Bool(arr.value(row))
+    } else if let Some(arr) = col.as_any().downcast_ref::<LargeBinaryArray>() {
+        PropValue::Binary(arr.value(row).to_vec())
     } else {
         PropValue::Null
     }

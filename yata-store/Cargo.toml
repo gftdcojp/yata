@@ -19,6 +19,7 @@ arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 thiserror = { workspace = true }
 memmap2 = "0.9"
+base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
