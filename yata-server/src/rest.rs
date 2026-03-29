@@ -1,8 +1,8 @@
 //! yata XRPC API — Cypher query endpoint for Workers RPC.
 //!
 //! XRPC-only: `/xrpc/ai.gftd.yata.cypher` (unified read+write).
-//! All queries are RLS-scoped via X-Magatama-Verified headers.
-//! Auth: X-Magatama-Verified: true (Workers RPC internal) or x-gftd-app-secret.
+//! Design E: yata-native JWT auth + SecurityScope lazy compile from CSR policy vertices.
+//! Auth: X-Magatama-Verified: true (internal bypass) or Authorization: Bearer {ES256 JWT}.
 
 use axum::{
     Json, Router,

@@ -97,7 +97,7 @@ fn build_gie_security_scope(rls: &rls::RlsScope) -> yata_gie::ir::SecurityScope 
 
     // RBAC: extract collection scope prefixes from _rls_* params
     // (injected by PDS as rbac_roles → collection prefix patterns)
-    let collection_scopes = Vec::new(); // TODO: pass from PDS rbac_roles
+    let collection_scopes = Vec::new(); // Legacy path: RBAC not wired. Design E uses compile_security_scope().
 
     // Consent: hash grantor DIDs for O(1) lookup during CSR traversal
     let allowed_owner_hashes: Vec<u32> = rls.consent_grants
