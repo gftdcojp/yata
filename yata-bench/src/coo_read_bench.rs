@@ -315,8 +315,9 @@ async fn main() -> Result<()> {
         }
 
         let mut lat = Lat::new();
+        let range = per_label_results.len().saturating_sub(2 + batch_size).max(1);
         for trial in 0..20 {
-            let start_idx = 2 + (trial % (per_label_results.len().saturating_sub(2 + batch_size)));
+            let start_idx = 2 + (trial % range);
             let t = Instant::now();
             for r in per_label_results.iter().skip(start_idx).take(batch_size) {
                 std::thread::sleep(std::time::Duration::from_millis(r2_latency_ms as u64));

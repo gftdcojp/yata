@@ -98,7 +98,7 @@ env.YATA.stats()                        // → all partition CpmStats (K3a)
 | `yata-gie` | GIE push-based executor, IR (Exchange/Receive/Gather, serde-serializable), distributed planner, `execute_step()` (Phase 5: stateless per-round fragment execution), `MaterializedRecord` (rkey-based cross-partition exchange), `ExchangePayload` (HTTP transport) |
 | `yata-s3` | R2 persistence (sync ureq+rustls S3 client, SigV4)。`trigger_compaction()` → R2 PUT、page-in → R2 GET |
 | `yata-vex` | Vector index (IVF_PQ + DiskANN) |
-| `yata-bench` | Benchmarks + trillion-scale test |
+| `yata-bench` | Benchmarks: `coo-read-bench` (COO read + R2 page-in), `tiered-bench`, `cypher-bench`, `trillion-scale-test` |
 | `yata-server` | XRPC API server (`/xrpc/ai.gftd.yata.cypher` + `compact`)。GraphQueryExecutor trait |
 
 ## GraphScope Parity
@@ -191,9 +191,9 @@ Production: PARTITION_COUNT=1, per-label sorted COO Arrow IPC, segment-level pag
 
 ### Key behaviors
 
-- **Query** (sparse index, <10us): Cypher → parse → ensure_labels (segment page-in) → sparse index binary search → sorted segment scan。GIE push-based for multi-hop。No MemoryGraph fallback (failure = error)
+- **Query** (warm 0.2-0.3µs, 3.3-3.8M QPS): Cypher → parse → ensure_labels (segment page-in) → GIE on CSR。Cold start = R2 page-in 支配 (4ms/label)、compute 0.2ms deser + 0.6ms apply per label。No MemoryGraph fallback (failure = error)
 - **Mutation** (O(1) append, no rebuild): L0 buffer append + WAL ring append。merge_by_pk = prop_eq_index O(1)。Edge deletion = tombstone in L0 (compacted out in L1)。CpmStats: cypher_read/mutation/mergeRecord counts + mutation_avg_us。**No commit() rebuild** — CSR rebuild 排除
-- **Storage**: RAM (L0 buffer + sparse index) → disk cache (sorted segments ~100us) → R2 source of truth (~3-5ms)
+- **Storage**: RAM (L0 buffer + sparse index) → disk cache (sorted segments ~100us) → R2 source of truth (~3-5ms)。Arrow IPC segment: ~115 bytes/entry
 - **Cold start**: **segment-level page-in** (label × src_range 単位)。3-tier blob fetch (disk → R2 → write-through)。後続 query で on-demand segment load
 - **Chunk**: Arrow row-group 32 MB/chunk byte-based。1B vertices でも ~数十 chunks
 - **Partition fan-out**: 1x standard-1 = ~20M nodes (production)。4x standard-1 = ~100M (E2E verified)
@@ -213,24 +213,62 @@ Production: PARTITION_COUNT=1, per-label sorted COO Arrow IPC, segment-level pag
 
 1,060 Rust unit tests + 68 e2e, 0 failures. E2E: 8 tests (docker-compose + MinIO, 2-partition). 6-node distributed: 6 tests (10K records, label routing, cold put/pull). Phase 3 load test: 8 tests (chunk snapshot, 2-hop traversal, label-selective reads, mixed load). WAL cold start recovery: 14 tests (flush safety, apply roundtrip, PK dedup, Arrow serialize, dirty-only compaction, Blake3 checksum roundtrip+tamper, gap detection 5 scenarios, empty buffer, dirty_labels drain, v1/v2 manifest backward compat). YataFragment snapshot roundtrip verified. R2 persistence verified (2026-03-29): 964 vertices, 33 labels, 1.58 MB snapshot, full property columns (rkey/collection/repo/value_b64/owner_hash/updated_at/_app_id/_org_id).
 
-## Benchmark (measured, release build, 10K records)
+## Benchmark (measured, release build)
+
+**COO Read Container (measured 2026-03-29, 5K nodes, 15K edges, 10 labels):**
+
+| Operation | In-Process (warm) | Notes |
+|---|---|---|
+| **Full scan count(*)** | **3.8M QPS (0.2µs)** | GIE on CSR after COO page-in |
+| **Label scan count** | **3.6M QPS (0.3µs)** | Single label |
+| **Point read (rkey)** | **3.6M QPS (0.3µs)** | PK lookup |
+| **Filter (score>500)** | **3.4M QPS (0.3µs)** | Property filter on label |
+| **1-hop traversal** | **3.5M QPS (0.3µs)** | FOLLOWS edge |
+| **2-hop traversal** | **3.3M QPS (0.3µs)** | FOLLOWS→OWNS |
+
+**COO Cold Start Cost Breakdown (5K entries, 10 labels):**
+
+| Stage | Disk (mmap) | R2 (4ms/label) |
+|---|---|---|
+| **Total** | **8ms** | **57ms** |
+| Arrow IPC deserialize | 1.6ms (0.2ms/label) | 1.6ms |
+| wal_apply (CSR merge) | 6.5ms (0.6ms/label) | 6.5ms |
+| R2 GET overhead | — | **40ms** (支配的, 70%) |
+
+**Arrow IPC Segment Throughput:**
+
+| Metric | Result |
+|---|---|
+| Serialize 5K entries | 1ms → 576 KB |
+| Deserialize 5K entries | **1.5ms** (661 ops/s) |
+| Per-label segment size | ~59 KB (500 entries) |
+| Per-label compaction (10 labels) | 6ms |
+
+**Incremental Label Page-In (R2 4ms/label):**
+
+| Labels | Total | R2 overhead | Compute |
+|---|---|---|---|
+| 1 label | 5.7ms | 4ms | 1.7ms |
+| 3 labels | 16.8ms | 12ms | 4.8ms |
+| 10 labels | 45ms | 40ms | 5ms |
+
+**Scale Projection (COO cold start):**
+
+| Nodes | Segment KB | Deser µs | Apply µs | Cold (disk) | Cold (R2 4ms) | Point QPS |
+|---|---|---|---|---|---|---|
+| 1K | 113 | 315 | 1,301 | 1.6ms | 5.6ms | 7,178 |
+| 5K | 576 | 1,595 | 7,080 | 8.7ms | 12.7ms | 1,467 |
+
+**Key insight**: R2 latency が cold start の支配項。compute (deser+apply) は 5K entries で 8ms。Production 33 labels → ~33×4ms R2 + ~20ms compute ≈ **152ms** (Container wake 2.8s はコンテナ起動コスト込み)。page-in 後の query は warm CSR と同一 (COO overhead = cold start のみ)。
+
+bench: `cargo run -p yata-bench --bin coo-read-bench --release`
+
+**Write path (10K records):**
 
 | Operation | In-Process | Via HTTP | Notes |
 |---|---|---|---|
-| **Write (mergeRecord)** | 63,715/sec | 70/sec (docker) | append-only, no page-in |
+| **mergeRecord** | 63,715/sec | 70/sec (docker) | append-only, no page-in |
 | **Edge create** | 77,092/sec | — | Cypher MATCH+CREATE |
-| **Point read** | 205,539 QPS (4.9µs) | 103 QPS (6-node) | coordinator overhead 2ms |
-| **1-hop traversal** | 165,397 QPS (6.0µs) | — | NbrUnit zero-copy |
-| **Full scan** | 1,686,597 QPS | — | COUNT aggregate |
-| **Snapshot serialize** | 15ms (10K) | 33ms (6-node total) | ArrowFragment, 2000x vs legacy |
-
-**ArrowFragment vs Legacy (10K vertices + 20K edges):**
-| | Legacy SnapshotBundle | ArrowFragment | Speedup |
-|---|---|---|---|
-| Serialize | 34,661ms | 15ms | **2,311x** |
-| Deserialize | 57ms | <1ms | **>57x** |
-| Neighbor traversal | 76ns/iter | 3ns/iter | **25.3x** |
-| Blob size | 3.8MB | 1.8MB | **53% smaller** |
 
 **6-node distributed (docker-compose, 10K records):**
 | Metric | Result |
@@ -239,30 +277,16 @@ Production: PARTITION_COUNT=1, per-label sorted COO Arrow IPC, segment-level pag
 | Snapshot 6 nodes | 33ms total |
 | Cold pull recovery | 10,000/10,000 records |
 | Distributed reads | 103 QPS |
-| Partition isolation | 0 violations |
 
-**Phase 3 load test (docker-compose, 1-partition, 1,250 vertices + 300 edges, 5 labels):**
-| Metric | Result |
-|---|---|
-| Seed (mergeRecord via HTTP) | 178 nodes/sec |
-| 2-hop traversal (Person→KNOWS→Person→WORKS_AT→Company) | **541 QPS** |
-| Label-selective point reads (Person/Company) | **1,126 QPS** |
-| Mixed read/write (300R + 100W) | 260 ops/sec |
-| Full scan (50x) | 1,416 QPS |
-| Label scan (50x) | **1,837 QPS** (30% faster than full scan) |
-| Chunked snapshot (1,250 vertices) | 73-111ms |
-| test: `yata-server/tests/e2e_phase3_loadtest.rs` (8 tests pass) |
-
-**Production E2E (pds.gftd.ai → YataRPC → Container, 2026-03-25, image `20260325-1015`):**
+**Production E2E (pds.gftd.ai → YataRPC → Container, 2026-03-25):**
 | Metric | Result | Notes |
 |---|---|---|
 | Cold start (container wake) | **2.8s** | Container sleep → wake + R2 page-in |
-| searchActors (warm, 20x avg) | **424ms** | PDS → YataRPC → Container → Cypher → edge cache |
+| searchActors (warm, 20x avg) | **424ms** | PDS → YataRPC → Container → Cypher |
 | getTimeline (2-hop) | **271ms** | Graph traversal through PDS |
 | listRecords (label-specific) | **371ms** | Label-selective page-in path |
-| createRecord | 63ms (auth required) | External write blocked — correct security |
 
-**Trillion scale projection (from 10K benchmark):**
+**Trillion scale projection:**
 | Scale | Partitions | Write/sec | Point QPS | Scan QPS | Cost/月 |
 |---|---|---|---|---|---|
 | 1M | 1 | 63,715 | 499 | 2,000 | $60 |
@@ -279,12 +303,17 @@ Production: PARTITION_COUNT=1, per-label sorted COO Arrow IPC, segment-level pag
 ```bash
 # macOS → linux/amd64 cross-compile (標準パス)
 RUSTC_WRAPPER="" cargo zigbuild --manifest-path packages/server/yata/Cargo.toml \
-  --release --target x86_64-unknown-linux-gnu -p yata-server  # ~1m24s
+  --release --target x86_64-unknown-linux-gnu -p yata-server  # ~5s (incremental) / ~1m24s (clean)
+
+# バイナリは共有 target dir: .cargo-target/x86_64-unknown-linux-gnu/release/ai-gftd-yata-server
+# (旧パス packages/server/yata/.cargo-target は不正)
 ```
 
+- **バイナリ名**: `ai-gftd-yata-server` (Cargo.toml の `[[bin]]` name)。`.cargo-target/x86_64-unknown-linux-gnu/release/ai-gftd-yata-server` に出力
 - **TLS**: `ureq` + `rustls` (ring backend)。`aws-lc-sys` / `reqwest` は除去済み (cross-compile 障害)
 - **sccache 禁止**: `RUSTC_WRAPPER=""` 必須 (cc-rs が sccache 経由で C compiler を探して失敗)
 - **rest.rs 変更後は必ず rebuild** → バイナリが古いと `/xrpc/ai.gftd.yata.cypher` が 404
+- **Deploy 手順**: `infra/cloudflare/container/yata/CLAUDE.md` §yata-server Build & Deploy を参照。`wrangler containers build` + `push` が必須 (`wrangler deploy` だけでは image push されない)
 
 ## PDS Dispatch Fixes (2026-03-25)
 
