@@ -4,8 +4,8 @@
 //! on MutableCsrStore via GRIN traits — zero MemoryGraph copy.
 //!
 //! Only read-only queries are supported. Mutations (CREATE/MERGE/SET/DELETE)
-//! return `TranspileError::UnsupportedClause` and fall through to the
-//! MemoryGraph path in yata-engine.
+//! return `TranspileError::UnsupportedClause`; the engine routes mutations
+//! through the dedicated mutation path (CSR copy → mutate → rebuild).
 
 use yata_cypher::ast::*;
 use yata_grin::{Direction, Predicate, PropValue};
@@ -25,7 +25,7 @@ pub enum TranspileError {
 }
 
 /// Transpile a parsed Cypher query into a GIE IR plan.
-/// Returns `Err` for mutations or unsupported constructs (caller falls back to MemoryGraph).
+/// Returns `Err` for mutations or unsupported constructs.
 pub fn transpile(query: &yata_cypher::Query) -> Result<QueryPlan, TranspileError> {
     let mut builder = PlanBuilder::new();
     for clause in &query.clauses {
@@ -80,7 +80,7 @@ fn transpile_clause(builder: PlanBuilder, clause: &Clause) -> Result<PlanBuilder
             limit,
             skip,
         } => transpile_return(builder, items, *distinct, order_by, limit, skip),
-        // Mutations → unsupported (fall through to MemoryGraph path)
+        // Mutations → unsupported (engine routes to dedicated mutation path)
         Clause::Create { .. } => Err(TranspileError::UnsupportedClause("CREATE".into())),
         Clause::Merge { .. } => Err(TranspileError::UnsupportedClause("MERGE".into())),
         Clause::Set { .. } => Err(TranspileError::UnsupportedClause("SET".into())),

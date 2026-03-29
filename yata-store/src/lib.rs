@@ -689,10 +689,18 @@ impl MutableCsrStore {
             self.dirty_vertex_labels.insert(label.to_string());
             vid
         } else {
-            // CREATE: add new vertex
+            // CREATE: add new vertex + register PK index for future lookups
             let mut all_props: Vec<(&str, PropValue)> = vec![(pk_key, pk_value.clone())];
             all_props.extend(props.iter().map(|(k, v)| (*k, v.clone())));
             let vid = self.add_vertex_with_labels(&[label.to_string()], &all_props);
+            // Eagerly register (label, pk_key) in prop_eq_index so commit() rebuilds it
+            let lookup_key = format!("{:?}", pk_value);
+            self.prop_eq_index
+                .entry((label.to_string(), pk_key.to_string()))
+                .or_default()
+                .entry(lookup_key)
+                .or_default()
+                .push(vid);
             vid
         }
     }

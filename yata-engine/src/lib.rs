@@ -18,9 +18,11 @@ pub mod rls;
 pub mod router;
 pub mod sharded_coordinator;
 pub mod snapshot;
+pub mod wal;
 
-pub use config::{PersistenceMode, TieredEngineConfig};
+pub use config::TieredEngineConfig;
 pub use engine::{MutationContext, TieredGraphEngine};
 pub use partition_query::PartitionQueryMetrics;
 pub use partition_router::{PartitionHints, PartitionScope, extract_partition_hints, route};
 pub use snapshot::SnapshotManifest;
+pub use wal::{WalEntry, WalOp, WalRingBuffer};

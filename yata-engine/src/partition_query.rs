@@ -257,13 +257,8 @@ fn execute_on_partition(
         }
     }
 
-    // Fallback: MemoryGraph path
-    let label_hints: Vec<String> = hints.node_labels.clone();
-    let rel_hints: Vec<String> = hints.rel_types.clone();
-    let g = store.to_filtered_memory_graph(&label_hints, &rel_hints);
-    let mut qg = yata_graph::QueryableGraph(g);
-    qg.query(cypher, params)
-        .map_err(|e| format!("cypher error: {e}"))
+    // GIE is the sole read path; no MemoryGraph fallback.
+    Err(format!("GIE transpile failed for partition read query: {cypher}"))
 }
 
 /// Execute a mutation on a single partition's MutableCsrStore.

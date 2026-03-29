@@ -36,6 +36,50 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
     fn export_snapshot_blobs(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
         Err("export_snapshot_blobs not implemented".to_string())
     }
+
+    // ── WAL Projection API ──
+
+    /// Read WAL tail entries after a given sequence number.
+    fn wal_tail(&self, after_seq: u64, limit: usize) -> Result<Vec<yata_engine::wal::WalEntry>, String> {
+        let _ = (after_seq, limit);
+        Err("wal_tail not implemented".to_string())
+    }
+
+    /// Apply WAL entries to the CSR (read container).
+    fn wal_apply(&self, entries: &[yata_engine::wal::WalEntry]) -> Result<u64, String> {
+        let _ = entries;
+        Err("wal_apply not implemented".to_string())
+    }
+
+    /// Flush WAL to R2 segment (write container).
+    fn wal_flush_segment(&self) -> Result<(u64, u64, usize), String> {
+        Err("wal_flush_segment not implemented".to_string())
+    }
+
+    /// Create a checkpoint (ArrowFragment + WAL metadata) for cold start recovery.
+    fn wal_checkpoint(&self) -> Result<(u64, u64), String> {
+        Err("wal_checkpoint not implemented".to_string())
+    }
+
+    /// Cold start from R2 checkpoint + WAL segment replay.
+    fn wal_cold_start(&self) -> Result<u64, String> {
+        Err("wal_cold_start not implemented".to_string())
+    }
+
+    /// Current WAL head sequence number.
+    fn wal_head_seq(&self) -> u64 { 0 }
+
+    /// Merge record and return the WAL entry for pushing to read replicas.
+    fn merge_record_with_wal(
+        &self,
+        label: &str,
+        pk_key: &str,
+        pk_value: &str,
+        props: &[(&str, yata_grin::PropValue)],
+    ) -> Result<(u32, Option<yata_engine::wal::WalEntry>), String> {
+        let _ = (label, pk_key, pk_value, props);
+        Err("merge_record_with_wal not implemented".to_string())
+    }
 }
 
 pub struct YataRestState<G: GraphQueryExecutor> {
@@ -63,10 +107,15 @@ pub fn router<G: GraphQueryExecutor>(state: YataRestState<G>) -> Router {
         .route("/readyz", get(health))
         // XRPC — primary API (Workers RPC only)
         .route("/xrpc/ai.gftd.yata.cypher", post(xrpc_cypher::<G>))
-        .route("/xrpc/ai.gftd.yata.mergeRecord", post(merge_record_handler::<G>))
         .route("/xrpc/ai.gftd.yata.triggerSnapshot", post(trigger_snapshot_handler::<G>))
-        .route("/xrpc/ai.gftd.yata.exportSnapshot", post(export_snapshot_handler::<G>))
         .route("/internal/snapshot/rebuild", post(rebuild_from_snapshot::<G>))
+        // WAL Projection API
+        .route("/xrpc/ai.gftd.yata.walTail", post(wal_tail_handler::<G>))
+        .route("/xrpc/ai.gftd.yata.walApply", post(wal_apply_handler::<G>))
+        .route("/xrpc/ai.gftd.yata.walFlushSegment", post(wal_flush_segment_handler::<G>))
+        .route("/xrpc/ai.gftd.yata.walCheckpoint", post(wal_checkpoint_handler::<G>))
+        .route("/xrpc/ai.gftd.yata.walColdStart", post(wal_cold_start_handler::<G>))
+        .route("/xrpc/ai.gftd.yata.mergeRecordWal", post(merge_record_wal_handler::<G>))
         .with_state(state)
 }
 
@@ -396,6 +445,157 @@ async fn export_snapshot_handler<G: GraphQueryExecutor>(
 // Legacy snapshot import/export/diag endpoints removed.
 // ArrowFragment format: snapshot → R2 PUT (trigger_snapshot), page-in → R2 GET (ensure_labels).
 
+// ── WAL Projection handlers ────────────────────────────────────────────
+
+/// POST /xrpc/ai.gftd.yata.walTail — Read WAL entries after a given sequence.
+/// Write Container only. Used by coordinator to fetch entries for pushing to read replicas.
+async fn wal_tail_handler<G: GraphQueryExecutor>(
+    State(state): State<YataRestState<G>>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let after_seq = req.get("after_seq").and_then(|v| v.as_u64()).unwrap_or(0);
+    let limit = req.get("limit").and_then(|v| v.as_u64()).unwrap_or(1000) as usize;
+    let graph = state.graph.clone();
+    let result = tokio::task::spawn_blocking(move || graph.wal_tail(after_seq, limit)).await;
+    match result {
+        Ok(Ok(entries)) => {
+            let head_seq = state.graph.wal_head_seq();
+            (StatusCode::OK, Json(serde_json::json!({
+                "entries": entries,
+                "head_seq": head_seq,
+                "count": entries.len(),
+            })))
+        }
+        Ok(Err(e)) => (StatusCode::CONFLICT, Json(serde_json::json!({"error": e}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
+/// POST /xrpc/ai.gftd.yata.walApply — Apply WAL entries to CSR (incremental merge).
+/// Read Container only.
+async fn wal_apply_handler<G: GraphQueryExecutor>(
+    State(state): State<YataRestState<G>>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let entries: Vec<yata_engine::wal::WalEntry> = req.get("entries")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    if entries.is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!({"applied": 0})));
+    }
+    let graph = state.graph.clone();
+    let result = tokio::task::spawn_blocking(move || graph.wal_apply(&entries)).await;
+    match result {
+        Ok(Ok(applied)) => (StatusCode::OK, Json(serde_json::json!({"applied": applied}))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
+/// POST /xrpc/ai.gftd.yata.walFlushSegment — Flush WAL to R2 segment.
+/// Write Container only.
+async fn wal_flush_segment_handler<G: GraphQueryExecutor>(
+    State(state): State<YataRestState<G>>,
+) -> impl IntoResponse {
+    if state.readonly {
+        return (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"error": "read-only container"})));
+    }
+    let graph = state.graph.clone();
+    let result = tokio::task::spawn_blocking(move || graph.wal_flush_segment()).await;
+    match result {
+        Ok(Ok((start, end, bytes))) => (StatusCode::OK, Json(serde_json::json!({
+            "seq_start": start, "seq_end": end, "bytes": bytes
+        }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
+/// POST /xrpc/ai.gftd.yata.walCheckpoint — Create ArrowFragment checkpoint + WAL metadata.
+/// Write Container only.
+async fn wal_checkpoint_handler<G: GraphQueryExecutor>(
+    State(state): State<YataRestState<G>>,
+) -> impl IntoResponse {
+    if state.readonly {
+        return (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"error": "read-only container"})));
+    }
+    let graph = state.graph.clone();
+    let result = tokio::task::spawn_blocking(move || graph.wal_checkpoint()).await;
+    match result {
+        Ok(Ok((v, e))) => (StatusCode::OK, Json(serde_json::json!({"vertices": v, "edges": e}))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
+/// POST /xrpc/ai.gftd.yata.walColdStart — Cold start from R2 checkpoint + WAL replay.
+/// Read Container only.
+async fn wal_cold_start_handler<G: GraphQueryExecutor>(
+    State(state): State<YataRestState<G>>,
+) -> impl IntoResponse {
+    let graph = state.graph.clone();
+    let result = tokio::task::spawn_blocking(move || graph.wal_cold_start()).await;
+    match result {
+        Ok(Ok(checkpoint_seq)) => (StatusCode::OK, Json(serde_json::json!({"checkpoint_seq": checkpoint_seq}))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
+/// POST /xrpc/ai.gftd.yata.mergeRecordWal — Merge record AND return WAL entry.
+/// Write Container only. Coordinator uses this to get the WAL entry for pushing to read replicas.
+async fn merge_record_wal_handler<G: GraphQueryExecutor>(
+    State(state): State<YataRestState<G>>,
+    headers: HeaderMap,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if state.readonly {
+        return (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"error": "read-only container"})));
+    }
+    let (_, _) = match authorize(&headers, &state) {
+        Ok(a) => a,
+        Err(s) => return (s, Json(serde_json::json!({"error": "unauthorized"}))),
+    };
+
+    let label = req.get("label").and_then(|v| v.as_str()).unwrap_or("");
+    let pk_key = req.get("pk_key").and_then(|v| v.as_str()).unwrap_or("rkey");
+    let pk_value = req.get("pk_value").and_then(|v| v.as_str()).unwrap_or("");
+    let props_val = req.get("props").cloned().unwrap_or(serde_json::Value::Object(Default::default()));
+
+    if label.is_empty() || pk_value.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "label and pk_value required"})));
+    }
+
+    // Convert JSON props to PropValue pairs
+    let mut prop_pairs: Vec<(String, yata_grin::PropValue)> = Vec::new();
+    if let Some(obj) = props_val.as_object() {
+        for (k, v) in obj {
+            let pv = match v {
+                serde_json::Value::String(s) => yata_grin::PropValue::Str(s.clone()),
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        yata_grin::PropValue::Int(i)
+                    } else {
+                        yata_grin::PropValue::Float(n.as_f64().unwrap_or(0.0))
+                    }
+                }
+                serde_json::Value::Bool(b) => yata_grin::PropValue::Bool(*b),
+                _ => yata_grin::PropValue::Str(v.to_string()),
+            };
+            prop_pairs.push((k.clone(), pv));
+        }
+    }
+    let props_ref: Vec<(&str, yata_grin::PropValue)> = prop_pairs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+
+    match state.graph.merge_record_with_wal(label, pk_key, pk_value, &props_ref) {
+        Ok((vid, wal_entry)) => (StatusCode::OK, Json(serde_json::json!({
+            "ok": true,
+            "vid": vid,
+            "wal_entry": wal_entry,
+        }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
+    }
+}
 
 
 // ── TieredGraphEngine GraphQueryExecutor impl (standalone yata-server, no magatama-engine) ──
@@ -424,6 +624,42 @@ impl GraphQueryExecutor for yata_engine::TieredGraphEngine {
 
     fn export_snapshot_blobs(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
         self.export_snapshot_blobs()
+    }
+
+    // ── WAL Projection ──
+
+    fn wal_tail(&self, after_seq: u64, limit: usize) -> Result<Vec<yata_engine::wal::WalEntry>, String> {
+        self.wal_tail(after_seq, limit)
+    }
+
+    fn wal_apply(&self, entries: &[yata_engine::wal::WalEntry]) -> Result<u64, String> {
+        self.wal_apply(entries)
+    }
+
+    fn wal_flush_segment(&self) -> Result<(u64, u64, usize), String> {
+        self.wal_flush_segment()
+    }
+
+    fn wal_checkpoint(&self) -> Result<(u64, u64), String> {
+        self.wal_checkpoint()
+    }
+
+    fn wal_cold_start(&self) -> Result<u64, String> {
+        self.wal_cold_start()
+    }
+
+    fn wal_head_seq(&self) -> u64 {
+        self.wal_head_seq()
+    }
+
+    fn merge_record_with_wal(
+        &self,
+        label: &str,
+        pk_key: &str,
+        pk_value: &str,
+        props: &[(&str, yata_grin::PropValue)],
+    ) -> Result<(u32, Option<yata_engine::wal::WalEntry>), String> {
+        self.merge_record_with_wal(label, pk_key, pk_value, props)
     }
 }
 
@@ -466,6 +702,48 @@ mod tests {
         fn rebuild_from_r2(&self) {}
 
         fn force_snapshot_flush(&self) {}
+
+        fn trigger_snapshot(&self) -> Result<(u64, u64), String> {
+            self.engine.trigger_snapshot()
+        }
+
+        fn export_snapshot_blobs(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+            self.engine.export_snapshot_blobs()
+        }
+
+        fn wal_tail(&self, after_seq: u64, limit: usize) -> Result<Vec<yata_engine::wal::WalEntry>, String> {
+            self.engine.wal_tail(after_seq, limit)
+        }
+
+        fn wal_apply(&self, entries: &[yata_engine::wal::WalEntry]) -> Result<u64, String> {
+            self.engine.wal_apply(entries)
+        }
+
+        fn wal_flush_segment(&self) -> Result<(u64, u64, usize), String> {
+            self.engine.wal_flush_segment()
+        }
+
+        fn wal_checkpoint(&self) -> Result<(u64, u64), String> {
+            self.engine.wal_checkpoint()
+        }
+
+        fn wal_cold_start(&self) -> Result<u64, String> {
+            self.engine.wal_cold_start()
+        }
+
+        fn wal_head_seq(&self) -> u64 {
+            self.engine.wal_head_seq()
+        }
+
+        fn merge_record_with_wal(
+            &self,
+            label: &str,
+            pk_key: &str,
+            pk_value: &str,
+            props: &[(&str, yata_grin::PropValue)],
+        ) -> Result<(u32, Option<yata_engine::wal::WalEntry>), String> {
+            self.engine.merge_record_with_wal(label, pk_key, pk_value, props)
+        }
     }
 
     fn test_state() -> YataRestState<TestGraphExecutor> {

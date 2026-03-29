@@ -214,8 +214,7 @@ Production: PARTITION_COUNT=1, per-label Arrow IPC, full page-in (3-tier: disk�
 
 ### Key behaviors
 
-- **Query fast path** (GIE, <1us): Cypher → parse → ensure_labels (selective page-in) → GIE transpile → CSR push-based execute
-- **Query fallback** (~1-200ms): GIE fails → MemoryGraph copy → Cypher execute
+- **Query** (GIE, <1us): Cypher → parse → ensure_labels (selective page-in) → GIE transpile → CSR push-based execute. No MemoryGraph fallback (GIE transpile failure = error)
 - **Mutation** (~500ms): MemoryGraph copy → mutate → CSR rebuild。merge_by_pk = prop_eq_index O(1)。Edge deletion = tombstone HashSet (O(1) lookup in neighbor iteration)
 - **Storage**: RAM (CSR <1us) → disk cache (~100us) → R2 source of truth (~3-5ms)
 - **Cold start**: **label-selective page-in** (topology + query-needed labels only)。3-tier blob fetch (disk → R2 → write-through)。後続 query で on-demand enrich (enrich_new_labels)
