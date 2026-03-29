@@ -1533,23 +1533,71 @@ impl TieredGraphEngine {
         did: &str,
     ) -> Result<Vec<Vec<(String, String)>>, String> {
         let scope = self.compile_security_scope(did);
-        // Delegate to existing query path with the compiled SecurityScope
         self.query_with_security_scope(cypher, params, scope)
     }
 
-    /// Resolve DID's P-256 public key from DIDDocument vertex in CSR.
-    /// Returns uncompressed P-256 key (65 bytes) or None.
-    pub fn resolve_did_pubkey(&self, did: &str) -> Option<Vec<u8>> {
+    /// Query with an explicit SecurityScope. GIE transpile_secured path only.
+    fn query_with_security_scope(
+        &self,
+        cypher: &str,
+        params: &[(String, String)],
+        scope: yata_gie::ir::SecurityScope,
+    ) -> Result<Vec<Vec<(String, String)>>, String> {
+        let is_mutation = router::is_cypher_mutation(cypher);
+        if is_mutation {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+
+        // Cache lookup (reads only, scope-aware key)
+        let cache_did = if scope.bypass { "internal" } else { "" };
+        if !is_mutation {
+            let k = cache_key(cypher, params, Some(cache_did));
+            if let Ok(c) = self.cache.lock() {
+                if let Some(rows) = c.get(&k) {
+                    return Ok(rows.clone());
+                }
+            }
+        }
+
+        if !is_mutation {
+            self.ensure_hot();
+            let (hints_labels, _) = router::extract_pushdown_hints(cypher).unwrap_or_default();
+            let vl_refs: Vec<&str> = hints_labels.iter().map(|s| s.as_str()).collect();
+            self.ensure_labels(&vl_refs);
+
+            if let Ok(csr) = self.hot.read() {
+                if let Some(single_csr) = csr.as_single() {
+                    if let Ok(ast) = yata_cypher::parse(cypher) {
+                        let plan = yata_gie::transpile::transpile_secured(&ast, scope)
+                            .map_err(|e| format!("GIE transpile: {}", e))?;
+                        let records = yata_gie::executor::execute(&plan, single_csr);
+                        let rows = yata_gie::executor::result_to_rows(&records, &plan);
+                        let k = cache_key(cypher, params, Some(cache_did));
+                        if let Ok(mut c) = self.cache.lock() {
+                            c.put(k, rows.clone());
+                        }
+                        return Ok(rows);
+                    }
+                }
+            }
+        }
+
+        // Mutation path: delegate to existing query()
+        self.query(cypher, params, None)
+    }
+
+    /// Resolve DID's P-256 public key multibase string from DIDDocument vertex in CSR.
+    /// Returns the raw multibase string (z-prefix base58btc) or None.
+    pub fn resolve_did_pubkey_multibase(&self, did: &str) -> Option<String> {
         let hot = self.hot.read().ok()?;
         let single = hot.as_single()?;
-        let did_val = yata_grin::PropValue::Str(did.to_string());
-        let vids = single.find_by_prop("DIDDocument", "did", &did_val);
-        let vid = vids.into_iter().next()?;
-        let multibase = match single.vertex_prop(vid, "public_key_multibase") {
-            Some(yata_grin::PropValue::Str(s)) => s.clone(),
-            _ => return None,
-        };
-        yata_server_jwt::resolve_multibase_p256_key(&multibase)
+        let did_val = PropValue::Str(did.to_string());
+        let vids = single.scan_vertices("DIDDocument", &Predicate::Eq("did".to_string(), did_val));
+        let vid = *vids.first()?;
+        match single.vertex_prop(vid, "public_key_multibase") {
+            Some(PropValue::Str(s)) => Some(s.clone()),
+            _ => None,
+        }
     }
 }
 

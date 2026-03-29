@@ -458,6 +458,20 @@ impl GraphQueryExecutor for yata_engine::TieredGraphEngine {
         self.query(cypher, params, rls_org_id)
     }
 
+    fn query_with_did(
+        &self,
+        cypher: &str,
+        params: &[(String, String)],
+        did: &str,
+    ) -> Result<Vec<Vec<(String, String)>>, String> {
+        self.query_with_did(cypher, params, did)
+    }
+
+    fn resolve_did_pubkey(&self, did: &str) -> Option<Vec<u8>> {
+        let multibase = self.resolve_did_pubkey_multibase(did)?;
+        crate::jwt::resolve_multibase_p256_key(&multibase)
+    }
+
     // ── WAL Projection ──
 
     fn wal_tail(&self, after_seq: u64, limit: usize) -> Result<Vec<yata_engine::wal::WalEntry>, String> {
