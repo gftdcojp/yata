@@ -24,6 +24,24 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
         rls_org_id: Option<&str>,
     ) -> Result<Vec<Vec<(String, String)>>, String>;
 
+    /// Query with DID-based SecurityScope (Design E path).
+    /// Compiles SecurityScope from policy vertices in CSR, then applies GIE SecurityFilter.
+    fn query_with_did(
+        &self,
+        cypher: &str,
+        params: &[(String, String)],
+        did: &str,
+    ) -> Result<Vec<Vec<(String, String)>>, String> {
+        // Default: fall back to public query (no RLS)
+        self.query(cypher, params, None)
+    }
+
+    /// Resolve a DID's P-256 public key from CSR DIDDocument vertex.
+    /// Returns uncompressed P-256 key (65 bytes) or None.
+    fn resolve_did_pubkey(&self, _did: &str) -> Option<Vec<u8>> {
+        None
+    }
+
     // ── WAL Projection API ──
 
     /// Read WAL tail entries after a given sequence number.
@@ -71,7 +89,6 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
 
 pub struct YataRestState<G: GraphQueryExecutor> {
     pub graph: Arc<G>,
-    pub api_secret: String,
     /// When true, reject write operations (mergeRecord, triggerSnapshot, mutation cypher).
     /// Set via YATA_READONLY env var for read replica containers.
     pub readonly: bool,
@@ -81,7 +98,6 @@ impl<G: GraphQueryExecutor> Clone for YataRestState<G> {
     fn clone(&self) -> Self {
         Self {
             graph: self.graph.clone(),
-            api_secret: self.api_secret.clone(),
             readonly: self.readonly,
         }
     }
@@ -112,53 +128,53 @@ pub async fn serve<G: GraphQueryExecutor + Clone>(state: YataRestState<G>, port:
     Ok(())
 }
 
-/// Authorize via X-Magatama-Verified (Workers RPC internal) or x-gftd-app-secret.
-/// Returns (org_id, rls_scope_json).
-fn authorize<G: GraphQueryExecutor>(headers: &HeaderMap, state: &YataRestState<G>) -> Result<(String, Option<serde_json::Value>), StatusCode> {
-    // Workers RPC internal: X-Magatama-Verified: true
+/// Authentication result from authorize().
+/// Design E: yata-native JWT verification with 3 auth levels.
+enum AuthResult {
+    /// Workers RPC internal (X-Magatama-Verified: true) — bypass all security filtering.
+    Internal,
+    /// JWT verified — DID extracted for SecurityScope compilation.
+    Authenticated { did: String },
+    /// No authentication — public data only (sensitivity_ord = 0).
+    Public,
+}
+
+/// Authorize request. Design E: yata-native JWT + graph-based security.
+///
+/// Priority:
+/// 1. X-Magatama-Verified: true → Internal (bypass, Workers RPC trust)
+/// 2. Authorization: Bearer {jwt} → JWT verify → Authenticated { did }
+/// 3. No auth → Public
+fn authorize<G: GraphQueryExecutor>(headers: &HeaderMap, state: &YataRestState<G>) -> Result<AuthResult, StatusCode> {
+    // 1. Workers RPC internal trust (coordinator sets this header)
     if let Some(verified) = headers.get("X-Magatama-Verified") {
         if verified.to_str().unwrap_or("") == "true" {
-            let org_id = headers
-                .get("X-Magatama-Verified-Org")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("anon")
-                .to_string();
-            let rls_scope = headers
-                .get("X-RLS-Scope")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-            return Ok((org_id, rls_scope));
+            return Ok(AuthResult::Internal);
         }
     }
-    // Fallback: internal token
-    if let Some(token_hdr) = headers.get("X-Magatama-Internal-Token") {
-        let token = token_hdr.to_str().unwrap_or("");
-        if !state.api_secret.is_empty() && token == state.api_secret {
-            let org_id = headers
-                .get("X-Magatama-Org-Id")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("anon")
-                .to_string();
-            return Ok((org_id, None));
+
+    // 2. JWT verification (Design E: yata-native ES256 verify)
+    if let Some(auth_header) = headers.get("Authorization") {
+        let auth_str = auth_header.to_str().unwrap_or("");
+        if let Some(token) = auth_str.strip_prefix("Bearer ") {
+            let resolve_key = |did: &str| -> Option<Vec<u8>> {
+                // Resolve P-256 public key from CSR DIDDocument vertex
+                let pubkey_multibase = state.graph.resolve_did_pubkey(did)?;
+                // pubkey_multibase is already uncompressed P-256 (65 bytes)
+                Some(pubkey_multibase)
+            };
+            match crate::jwt::verify_es256_jwt(token, "did:web:pds.gftd.ai", resolve_key) {
+                Ok(claims) => return Ok(AuthResult::Authenticated { did: claims.iss }),
+                Err(e) => {
+                    tracing::warn!("JWT verification failed: {}", e);
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+            }
         }
     }
-    // Legacy: x-gftd-app-secret
-    if !state.api_secret.is_empty() {
-        let secret = headers
-            .get("x-gftd-app-secret")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if secret != state.api_secret {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
-    }
-    let org_id = headers
-        .get("x-gftd-org-id")
-        .or_else(|| headers.get("X-Magatama-Verified-Org"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("anon")
-        .to_string();
-    Ok((org_id, None))
+
+    // 3. No auth → public access
+    Ok(AuthResult::Public)
 }
 
 #[derive(Serialize)]
@@ -196,12 +212,13 @@ fn xrpc_parse_params(
 }
 
 /// POST /xrpc/ai.gftd.yata.cypher — unified Cypher read+write.
+/// Design E: auth dispatches to 3 paths (Internal/Authenticated/Public).
 async fn xrpc_cypher<G: GraphQueryExecutor>(
     State(state): State<YataRestState<G>>,
     headers: HeaderMap,
     Json(req): Json<XrpcCypherReq>,
 ) -> impl IntoResponse {
-    let (org_id, rls_scope) = match authorize(&headers, &state) {
+    let auth = match authorize(&headers, &state) {
         Ok(a) => a,
         Err(_) => {
             return (
@@ -210,32 +227,25 @@ async fn xrpc_cypher<G: GraphQueryExecutor>(
             );
         }
     };
-    let mut params = xrpc_parse_params(&req.parameters);
-    if !org_id.is_empty() && org_id != "anon" {
-        params.push(("_rls_org_id".to_string(), format!("\"{}\"", org_id)));
-    }
-    // Inject RLS scope metadata for governance-aware filtering
-    if let Some(ref scope) = rls_scope {
-        if let Some(ud) = scope.get("user_did").and_then(|v| v.as_str()) {
-            params.push(("_rls_user_did".to_string(), format!("\"{}\"", ud)));
-        }
-        if let Some(ad) = scope.get("actor_did").and_then(|v| v.as_str()) {
-            params.push(("_rls_actor_did".to_string(), format!("\"{}\"", ad)));
-        }
-        if let Some(cl) = scope.get("clearance").and_then(|v| v.as_str()) {
-            params.push(("_rls_clearance".to_string(), format!("\"{}\"", cl)));
-        }
-        if let Some(grants) = scope.get("consent_grants") {
-            if let Ok(json) = serde_json::to_string(grants) {
-                params.push(("_rls_consent_grants".to_string(), json));
-            }
-        }
-    }
 
+    let params = xrpc_parse_params(&req.parameters);
     let stmt = req.statement;
-    let org = org_id.clone();
     let graph = state.graph.clone();
-    let result = tokio::task::spawn_blocking(move || graph.query(&stmt, &params, Some(&org))).await;
+
+    let result = match auth {
+        AuthResult::Internal => {
+            // Bypass: internal requests (coordinator, PDS) skip SecurityFilter
+            tokio::task::spawn_blocking(move || graph.query(&stmt, &params, None)).await
+        }
+        AuthResult::Authenticated { did } => {
+            // Design E: DID-based SecurityScope compiled from policy vertices
+            tokio::task::spawn_blocking(move || graph.query_with_did(&stmt, &params, &did)).await
+        }
+        AuthResult::Public => {
+            // Public: only sensitivity_ord=0 data visible
+            tokio::task::spawn_blocking(move || graph.query_with_did(&stmt, &params, "")).await
+        }
+    };
 
     match result {
         Ok(Ok(raw_rows)) => {
@@ -244,19 +254,9 @@ async fn xrpc_cypher<G: GraphQueryExecutor>(
             } else {
                 Vec::new()
             };
-            let filtered_rows: Vec<Vec<serde_json::Value>> = raw_rows
+            // No post-filter: GIE SecurityFilter handles all governance inline
+            let rows: Vec<Vec<serde_json::Value>> = raw_rows
                 .into_iter()
-                .filter(|row| {
-                    for (k, v) in row {
-                        if k == "org_id" {
-                            let s: String = serde_json::from_str(v).unwrap_or_default();
-                            if !s.is_empty() && s != org_id && s != "anon" {
-                                return false;
-                            }
-                        }
-                    }
-                    true
-                })
                 .map(|row| {
                     row.into_iter()
                         .map(|(_, json_str)| {
@@ -270,8 +270,7 @@ async fn xrpc_cypher<G: GraphQueryExecutor>(
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "columns": columns,
-                    "rows": filtered_rows,
-                    "org_id": org_id,
+                    "rows": rows,
                 })),
             )
         }
@@ -400,9 +399,10 @@ async fn merge_record_wal_handler<G: GraphQueryExecutor>(
     if state.readonly {
         return (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"error": "read-only container"})));
     }
-    let (_, _) = match authorize(&headers, &state) {
-        Ok(a) => a,
-        Err(s) => return (s, Json(serde_json::json!({"error": "unauthorized"}))),
+    match authorize(&headers, &state) {
+        Ok(AuthResult::Internal) => {} // allow
+        Ok(AuthResult::Authenticated { .. }) => {} // allow authenticated writes
+        _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "unauthorized"}))),
     };
 
     let label = req.get("label").and_then(|v| v.as_str()).unwrap_or("");
@@ -570,7 +570,6 @@ mod tests {
         let graph = Arc::new(TestGraphExecutor::new());
         YataRestState {
             graph,
-            api_secret: "test-secret".to_string(),
             readonly: false,
         }
     }

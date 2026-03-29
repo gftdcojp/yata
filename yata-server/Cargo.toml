@@ -38,6 +38,7 @@ chrono.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 axum.workspace = true
+ring.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

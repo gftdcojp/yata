@@ -29,9 +29,6 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(%data_dir, "TieredGraphEngine initialized");
 
     // REST API server
-    let api_secret = std::env::var("YATA_API_SECRET")
-        .or_else(|_| std::env::var("SPIN_VARIABLE_MAGATAMA_INTERNAL_TOKEN"))
-        .unwrap_or_default();
     let rest_port: u16 = std::env::var("YATA_REST_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -44,7 +41,6 @@ async fn main() -> anyhow::Result<()> {
 
     let state = rest::YataRestState {
         graph: engine.clone(),
-        api_secret,
         readonly,
     };
     let router = rest::router(state);

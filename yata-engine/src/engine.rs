@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use yata_cypher::Graph;
 use yata_graph::{GraphStore, QueryableGraph};
-use yata_grin::{Mutable, PropValue, Topology};
+use yata_grin::{Mutable, Predicate, PropValue, Property, Scannable, Topology};
 use yata_vineyard::BlobStore;
 use yata_store::vineyard::{
     DiskVineyard, EdgeVineyard, FragmentManifest, MmapVineyard, VineyardStore,
@@ -195,6 +195,8 @@ pub struct TieredGraphEngine {
     pending_writes: Arc<AtomicUsize>,
     wal: Arc<Mutex<crate::wal::WalRingBuffer>>,
     wal_last_flushed_seq: Arc<AtomicU64>,
+    /// SecurityScope cache: DID → (SecurityScope, compiled_at). Design E.
+    security_scope_cache: Arc<Mutex<HashMap<String, (yata_gie::ir::SecurityScope, std::time::Instant)>>>,
 }
 
 impl TieredGraphEngine {
@@ -286,6 +288,7 @@ impl TieredGraphEngine {
             pending_writes: Arc::new(AtomicUsize::new(0)),
             wal: Arc::new(Mutex::new(crate::wal::WalRingBuffer::new(wal_ring_capacity))),
             wal_last_flushed_seq: Arc::new(AtomicU64::new(0)),
+            security_scope_cache: Arc::new(Mutex::new(HashMap::new())),
         }
         // No startup restore — labels are lazy-loaded from R2 on first query (page-in).
         // Write path: Pipeline.send() + mergeRecord() (PDS Worker).
@@ -817,6 +820,7 @@ impl TieredGraphEngine {
         if let Ok(mut dl) = self.dirty_labels.lock() {
             dl.insert(label.to_string());
         }
+        self.invalidate_security_cache_if_policy(label, props);
 
         // WAL append
         if let Ok(mut wal) = self.wal.lock() {
@@ -891,6 +895,7 @@ impl TieredGraphEngine {
         if let Ok(mut dl) = self.dirty_labels.lock() {
             dl.insert(label.to_string());
         }
+        self.invalidate_security_cache_if_policy(label, props);
 
         if let Ok(mut hot) = self.hot.write() {
             if let Some(single) = hot.as_single_mut() {
@@ -1356,6 +1361,141 @@ impl TieredGraphEngine {
 
         tracing::info!(checkpoint_seq, replayed, "WAL cold start complete");
         Ok(checkpoint_seq)
+    }
+
+    // ── Design E: SecurityScope compilation from graph policy vertices ──
+
+    const POLICY_LABELS: [&'static str; 5] = [
+        "ClearanceAssignment", "RBACAssignment", "ConsentGrant",
+        "RACIAssignment", "PreKeyBundle",
+    ];
+    const SCOPE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    const SCOPE_CACHE_MAX: usize = 10_000;
+
+    /// Invalidate SecurityScope cache when a policy vertex is written.
+    fn invalidate_security_cache_if_policy(&self, label: &str, props: &[(&str, yata_grin::PropValue)]) {
+        if !Self::POLICY_LABELS.contains(&label) {
+            return;
+        }
+        let did = props.iter()
+            .find(|(k, _)| *k == "did" || *k == "grantee_did")
+            .and_then(|(_, v)| match v {
+                yata_grin::PropValue::Str(s) => Some(s.as_str()),
+                _ => None,
+            });
+        if let Some(did) = did {
+            if let Ok(mut cache) = self.security_scope_cache.lock() {
+                cache.remove(did);
+            }
+        }
+    }
+
+    /// Compile SecurityScope from policy vertices in CSR for a given DID.
+    /// Uses prop_eq_index for O(1) lookup per policy label.
+    /// Results are cached with TTL.
+    pub fn compile_security_scope(&self, did: &str) -> yata_gie::ir::SecurityScope {
+        // Empty DID = public access
+        if did.is_empty() {
+            return yata_gie::ir::SecurityScope {
+                max_sensitivity_ord: 0,
+                collection_scopes: Vec::new(),
+                allowed_owner_hashes: Vec::new(),
+                bypass: false,
+            };
+        }
+
+        // Check cache
+        if let Ok(cache) = self.security_scope_cache.lock() {
+            if let Some((scope, at)) = cache.get(did) {
+                if at.elapsed() < Self::SCOPE_CACHE_TTL {
+                    return scope.clone();
+                }
+            }
+        }
+
+        // Compile from CSR policy vertices
+        let mut max_sensitivity_ord: u8 = 0;
+        let mut collection_scopes: Vec<String> = Vec::new();
+        let mut allowed_owner_hashes: Vec<u32> = Vec::new();
+
+        if let Ok(hot) = self.hot.read() {
+            if let Some(single) = hot.as_single() {
+                let did_val = PropValue::Str(did.to_string());
+
+                // ClearanceAssignment: scan by did → extract level
+                for vid in single.scan_vertices("ClearanceAssignment", &Predicate::Eq("did".to_string(), did_val.clone())) {
+                    if let Some(PropValue::Str(level)) = single.vertex_prop(vid, "level") {
+                        max_sensitivity_ord = match level.as_str() {
+                            "restricted" => 3,
+                            "confidential" => 2,
+                            "internal" => 1,
+                            _ => 0,
+                        };
+                    }
+                }
+
+                // RBACAssignment: scan by did → extract scope (collection prefix)
+                for vid in single.scan_vertices("RBACAssignment", &Predicate::Eq("did".to_string(), did_val.clone())) {
+                    if let Some(PropValue::Str(scope)) = single.vertex_prop(vid, "scope") {
+                        if scope != "*" {
+                            collection_scopes.push(scope.clone());
+                        }
+                    }
+                }
+
+                // ConsentGrant: scan by grantee_did → extract grantor_did → hash
+                for vid in single.scan_vertices("ConsentGrant", &Predicate::Eq("grantee_did".to_string(), did_val.clone())) {
+                    if let Some(PropValue::Str(grantor)) = single.vertex_prop(vid, "grantor_did") {
+                        allowed_owner_hashes.push(fnv1a_32(grantor.as_bytes()));
+                    }
+                }
+            }
+        }
+
+        let scope = yata_gie::ir::SecurityScope {
+            max_sensitivity_ord,
+            collection_scopes,
+            allowed_owner_hashes,
+            bypass: false,
+        };
+
+        // Cache result
+        if let Ok(mut cache) = self.security_scope_cache.lock() {
+            if cache.len() >= Self::SCOPE_CACHE_MAX {
+                cache.retain(|_, (_, at)| at.elapsed() < Self::SCOPE_CACHE_TTL);
+            }
+            cache.insert(did.to_string(), (scope.clone(), std::time::Instant::now()));
+        }
+
+        scope
+    }
+
+    /// Query with DID-based SecurityScope (Design E).
+    /// Compiles SecurityScope from policy vertices, then runs GIE with SecurityFilter.
+    pub fn query_with_did(
+        &self,
+        cypher: &str,
+        params: &[(String, String)],
+        did: &str,
+    ) -> Result<Vec<Vec<(String, String)>>, String> {
+        let scope = self.compile_security_scope(did);
+        // Delegate to existing query path with the compiled SecurityScope
+        self.query_with_security_scope(cypher, params, scope)
+    }
+
+    /// Resolve DID's P-256 public key from DIDDocument vertex in CSR.
+    /// Returns uncompressed P-256 key (65 bytes) or None.
+    pub fn resolve_did_pubkey(&self, did: &str) -> Option<Vec<u8>> {
+        let hot = self.hot.read().ok()?;
+        let single = hot.as_single()?;
+        let did_val = yata_grin::PropValue::Str(did.to_string());
+        let vids = single.find_by_prop("DIDDocument", "did", &did_val);
+        let vid = vids.into_iter().next()?;
+        let multibase = match single.vertex_prop(vid, "public_key_multibase") {
+            Some(yata_grin::PropValue::Str(s)) => s.clone(),
+            _ => return None,
+        };
+        yata_server_jwt::resolve_multibase_p256_key(&multibase)
     }
 }
 

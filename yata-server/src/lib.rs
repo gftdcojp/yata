@@ -6,6 +6,7 @@
 //! Per-app single-writer. MDAG commit chain is the replication mechanism.
 //! No consensus protocol — R2 is the source of truth for durability.
 
+pub mod jwt;
 pub mod metrics;
 pub mod rest;
 

@@ -105,8 +105,9 @@ chrono = { version = "0.4", features = ["serde"] }
 smallvec = "1"
 indexmap = { version = "2", features = ["serde"] }
 
-# Crypto (bench signing)
+# Crypto (bench signing + JWT verify)
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+ring = "0.17"
 rand = "0.8"
 
 # Parallelism
