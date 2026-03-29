@@ -14,7 +14,7 @@ import type {
   WalColdStartResult,
   YataRPC,
 } from "./types.js";
-import { collectionToLabel, buildMergeProps } from "./helpers.js";
+import { collectionToLabel, buildMergeProps, generateTid } from "./helpers.js";
 
 /**
  * Build a WAL record for Pipeline.send().
@@ -35,7 +35,7 @@ export function buildWalRecord(
   created: number;
   records: string;
 } {
-  const rev = rkey; // simplified — caller can override
+  const rev = action === "create" ? rkey : generateTid();
   return {
     seq: 0,
     rev,

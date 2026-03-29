@@ -6,6 +6,31 @@
 
 import type { MergeProps } from "./types.js";
 
+// ── AT Protocol TID (Timestamp ID) generation ──
+
+const TID_CHARSET = "234567abcdefghijklmnopqrstuvwxyz";
+let _lastTid = 0n;
+
+/**
+ * Generate an AT Protocol TID (timestamp-based, base32-sortable, 13 chars).
+ * Guaranteed monotonically increasing within this instance.
+ */
+export function generateTid(): string {
+  const micros = BigInt(Date.now()) * 1000n;
+  const clockId = BigInt(Math.floor(Math.random() * 1024));
+  let tidVal = (micros << 10n) | clockId;
+  if (tidVal <= _lastTid) {
+    tidVal = _lastTid + 1n;
+  }
+  _lastTid = tidVal;
+  const chars: string[] = new Array(13);
+  for (let i = 12; i >= 0; i--) {
+    chars[i] = TID_CHARSET[Number(tidVal & 0x1fn)];
+    tidVal >>= 5n;
+  }
+  return chars.join("");
+}
+
 // ── Cypher escaping ──
 
 /** Escape a string for safe use in Cypher string literals. */
@@ -113,13 +138,13 @@ export function buildMergeProps(
  *  → [{ name: "Alice", age: 30 }]
  */
 export function mapCypherRows(
-  columns: string[],
-  rows: unknown[][]
+  result: { columns: string[]; rows: unknown[][] }
 ): Record<string, unknown>[] {
-  return rows.map((row) => {
+  const cols = result.columns || [];
+  return (result.rows || []).map((row) => {
     const obj: Record<string, unknown> = {};
-    for (let i = 0; i < columns.length; i++) {
-      obj[columns[i]] = row[i];
+    for (let i = 0; i < cols.length; i++) {
+      obj[cols[i]] = row[i];
     }
     return obj;
   });

@@ -32,6 +32,7 @@ export type { CypherQuery } from "./cypher.js";
 
 // Helpers
 export {
+  generateTid,
   esc,
   multiDidFilter,
   collectionToLabel,
