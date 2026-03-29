@@ -234,9 +234,18 @@ pub fn detect_segment_format(key: &str) -> WalSegmentFormat {
 
 /// Deserialize WAL entries from either NDJSON or Arrow IPC bytes, auto-detecting format.
 /// Uses the R2 key (or filename) to determine format.
+///
+/// On Arrow deserialization failure, logs the error and falls back to NDJSON parsing
+/// (handles mixed-format segments during migration).
 pub fn deserialize_segment_auto(key: &str, data: &[u8]) -> Vec<WalEntry> {
     match detect_segment_format(key) {
-        WalSegmentFormat::Arrow => deserialize_segment_arrow(data).unwrap_or_default(),
+        WalSegmentFormat::Arrow => match deserialize_segment_arrow(data) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::error!(key, error = %e, bytes = data.len(), "Arrow IPC deser failed, falling back to NDJSON");
+                crate::wal::deserialize_segment(data)
+            }
+        },
         WalSegmentFormat::Ndjson => crate::wal::deserialize_segment(data),
     }
 }

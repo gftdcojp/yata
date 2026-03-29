@@ -13,6 +13,7 @@ use yata_cypher::Graph;
 
 use crate::MutableCsrStore;
 use crate::arrow_store::ArrowGraphStore;
+use crate::mmap_wal_store::MmapWalStore;
 use crate::partitioned::PartitionedGraphStore;
 
 /// Memory budget for OOM protection. Tracks estimated bytes used.
@@ -99,6 +100,8 @@ pub enum GraphStoreEnum {
     Partitioned(PartitionedGraphStore),
     /// Vineyard-native Arrow store (replaces CSR for primary query path).
     Arrow(ArrowGraphStore),
+    /// Zero-copy mmap'd WAL store (Phase 3: vertex properties from compacted segment).
+    MmapWal(MmapWalStore),
 }
 
 impl GraphStoreEnum {
@@ -169,12 +172,21 @@ impl GraphStoreEnum {
         }
     }
 
+    /// Get as MmapWalStore.
+    pub fn as_mmap_wal(&self) -> Option<&MmapWalStore> {
+        match self {
+            GraphStoreEnum::MmapWal(m) => Some(m),
+            _ => None,
+        }
+    }
+
     /// Get partition count.
     pub fn partition_count(&self) -> u32 {
         match self {
             GraphStoreEnum::Single(_) => 1,
             GraphStoreEnum::Partitioned(p) => p.partition_count(),
             GraphStoreEnum::Arrow(_) => 1,
+            GraphStoreEnum::MmapWal(_) => 1,
         }
     }
 }
@@ -187,6 +199,7 @@ impl Topology for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.vertex_count(),
             GraphStoreEnum::Partitioned(p) => p.vertex_count(),
             GraphStoreEnum::Arrow(a) => a.vertex_count(),
+            GraphStoreEnum::MmapWal(m) => m.vertex_count(),
         }
     }
     fn edge_count(&self) -> usize {
@@ -194,6 +207,7 @@ impl Topology for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.edge_count(),
             GraphStoreEnum::Partitioned(p) => p.edge_count(),
             GraphStoreEnum::Arrow(a) => a.edge_count(),
+            GraphStoreEnum::MmapWal(m) => m.edge_count(),
         }
     }
     fn has_vertex(&self, vid: u32) -> bool {
@@ -201,6 +215,7 @@ impl Topology for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.has_vertex(vid),
             GraphStoreEnum::Partitioned(p) => p.has_vertex(vid),
             GraphStoreEnum::Arrow(a) => a.has_vertex(vid),
+            GraphStoreEnum::MmapWal(m) => m.has_vertex(vid),
         }
     }
     fn out_degree(&self, vid: u32) -> usize {
@@ -208,6 +223,7 @@ impl Topology for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.out_degree(vid),
             GraphStoreEnum::Partitioned(p) => p.out_degree(vid),
             GraphStoreEnum::Arrow(a) => a.out_degree(vid),
+            GraphStoreEnum::MmapWal(m) => m.out_degree(vid),
         }
     }
     fn in_degree(&self, vid: u32) -> usize {
@@ -215,6 +231,7 @@ impl Topology for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.in_degree(vid),
             GraphStoreEnum::Partitioned(p) => p.in_degree(vid),
             GraphStoreEnum::Arrow(a) => a.in_degree(vid),
+            GraphStoreEnum::MmapWal(m) => m.in_degree(vid),
         }
     }
     fn out_neighbors(&self, vid: u32) -> Vec<Neighbor> {
@@ -222,6 +239,7 @@ impl Topology for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.out_neighbors(vid),
             GraphStoreEnum::Partitioned(p) => p.out_neighbors(vid),
             GraphStoreEnum::Arrow(a) => a.out_neighbors(vid),
+            GraphStoreEnum::MmapWal(m) => m.out_neighbors(vid),
         }
     }
     fn in_neighbors(&self, vid: u32) -> Vec<Neighbor> {
@@ -229,6 +247,7 @@ impl Topology for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.in_neighbors(vid),
             GraphStoreEnum::Partitioned(p) => p.in_neighbors(vid),
             GraphStoreEnum::Arrow(a) => a.in_neighbors(vid),
+            GraphStoreEnum::MmapWal(m) => m.in_neighbors(vid),
         }
     }
     fn out_neighbors_by_label(&self, vid: u32, edge_label: &str) -> Vec<Neighbor> {
@@ -236,6 +255,7 @@ impl Topology for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.out_neighbors_by_label(vid, edge_label),
             GraphStoreEnum::Partitioned(p) => p.out_neighbors_by_label(vid, edge_label),
             GraphStoreEnum::Arrow(a) => a.out_neighbors_by_label(vid, edge_label),
+            GraphStoreEnum::MmapWal(m) => m.out_neighbors_by_label(vid, edge_label),
         }
     }
     fn in_neighbors_by_label(&self, vid: u32, edge_label: &str) -> Vec<Neighbor> {
@@ -243,6 +263,7 @@ impl Topology for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.in_neighbors_by_label(vid, edge_label),
             GraphStoreEnum::Partitioned(p) => p.in_neighbors_by_label(vid, edge_label),
             GraphStoreEnum::Arrow(a) => a.in_neighbors_by_label(vid, edge_label),
+            GraphStoreEnum::MmapWal(m) => m.in_neighbors_by_label(vid, edge_label),
         }
     }
 }
@@ -252,7 +273,8 @@ impl Property for GraphStoreEnum {
         match self {
             GraphStoreEnum::Single(s) => Property::vertex_labels(s, vid),
             GraphStoreEnum::Partitioned(p) => Property::vertex_labels(p, vid),
-            GraphStoreEnum::Arrow(a) => Property::vertex_labels(a, vid)
+            GraphStoreEnum::Arrow(a) => Property::vertex_labels(a, vid),
+            GraphStoreEnum::MmapWal(m) => Property::vertex_labels(m, vid),
         }
     }
     fn vertex_prop(&self, vid: u32, key: &str) -> Option<PropValue> {
@@ -260,6 +282,7 @@ impl Property for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.vertex_prop(vid, key),
             GraphStoreEnum::Partitioned(p) => p.vertex_prop(vid, key),
             GraphStoreEnum::Arrow(a) => a.vertex_prop(vid, key),
+            GraphStoreEnum::MmapWal(m) => m.vertex_prop(vid, key),
         }
     }
     fn edge_prop(&self, edge_id: u32, key: &str) -> Option<PropValue> {
@@ -267,6 +290,7 @@ impl Property for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.edge_prop(edge_id, key),
             GraphStoreEnum::Partitioned(p) => p.edge_prop(edge_id, key),
             GraphStoreEnum::Arrow(a) => a.edge_prop(edge_id, key),
+            GraphStoreEnum::MmapWal(m) => m.edge_prop(edge_id, key),
         }
     }
     fn vertex_prop_keys(&self, label: &str) -> Vec<String> {
@@ -274,6 +298,7 @@ impl Property for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.vertex_prop_keys(label),
             GraphStoreEnum::Partitioned(p) => p.vertex_prop_keys(label),
             GraphStoreEnum::Arrow(a) => a.vertex_prop_keys(label),
+            GraphStoreEnum::MmapWal(m) => m.vertex_prop_keys(label),
         }
     }
     fn edge_prop_keys(&self, label: &str) -> Vec<String> {
@@ -281,6 +306,7 @@ impl Property for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.edge_prop_keys(label),
             GraphStoreEnum::Partitioned(p) => p.edge_prop_keys(label),
             GraphStoreEnum::Arrow(a) => a.edge_prop_keys(label),
+            GraphStoreEnum::MmapWal(m) => m.edge_prop_keys(label),
         }
     }
     fn vertex_all_props(&self, vid: u32) -> HashMap<String, PropValue> {
@@ -288,6 +314,7 @@ impl Property for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.vertex_all_props(vid),
             GraphStoreEnum::Partitioned(p) => p.vertex_all_props(vid),
             GraphStoreEnum::Arrow(a) => a.vertex_all_props(vid),
+            GraphStoreEnum::MmapWal(m) => m.vertex_all_props(vid),
         }
     }
 }
@@ -297,14 +324,16 @@ impl Schema for GraphStoreEnum {
         match self {
             GraphStoreEnum::Single(s) => Schema::vertex_labels(s),
             GraphStoreEnum::Partitioned(p) => Schema::vertex_labels(p),
-            GraphStoreEnum::Arrow(a) => Schema::vertex_labels(a)
+            GraphStoreEnum::Arrow(a) => Schema::vertex_labels(a),
+            GraphStoreEnum::MmapWal(m) => Schema::vertex_labels(m),
         }
     }
     fn edge_labels(&self) -> Vec<String> {
         match self {
             GraphStoreEnum::Single(s) => Schema::edge_labels(s),
             GraphStoreEnum::Partitioned(p) => Schema::edge_labels(p),
-            GraphStoreEnum::Arrow(a) => Schema::edge_labels(a)
+            GraphStoreEnum::Arrow(a) => Schema::edge_labels(a),
+            GraphStoreEnum::MmapWal(m) => Schema::edge_labels(m),
         }
     }
     fn vertex_primary_key(&self, label: &str) -> Option<String> {
@@ -312,6 +341,7 @@ impl Schema for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.vertex_primary_key(label),
             GraphStoreEnum::Partitioned(p) => p.vertex_primary_key(label),
             GraphStoreEnum::Arrow(a) => a.vertex_primary_key(label),
+            GraphStoreEnum::MmapWal(m) => m.vertex_primary_key(label),
         }
     }
 }
@@ -322,6 +352,7 @@ impl Scannable for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.scan_vertices(label, predicate),
             GraphStoreEnum::Partitioned(p) => p.scan_vertices(label, predicate),
             GraphStoreEnum::Arrow(a) => a.scan_vertices(label, predicate),
+            GraphStoreEnum::MmapWal(m) => m.scan_vertices(label, predicate),
         }
     }
     fn scan_vertices_by_label(&self, label: &str) -> Vec<u32> {
@@ -329,6 +360,7 @@ impl Scannable for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.scan_vertices_by_label(label),
             GraphStoreEnum::Partitioned(p) => p.scan_vertices_by_label(label),
             GraphStoreEnum::Arrow(a) => a.scan_vertices_by_label(label),
+            GraphStoreEnum::MmapWal(m) => m.scan_vertices_by_label(label),
         }
     }
     fn scan_all_vertices(&self) -> Vec<u32> {
@@ -336,6 +368,7 @@ impl Scannable for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.scan_all_vertices(),
             GraphStoreEnum::Partitioned(p) => p.scan_all_vertices(),
             GraphStoreEnum::Arrow(a) => a.scan_all_vertices(),
+            GraphStoreEnum::MmapWal(m) => m.scan_all_vertices(),
         }
     }
 }
@@ -346,6 +379,7 @@ impl Mutable for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.add_vertex(label, props),
             GraphStoreEnum::Partitioned(p) => p.add_vertex(label, props),
             GraphStoreEnum::Arrow(a) => a.add_vertex(label, props),
+            GraphStoreEnum::MmapWal(m) => m.add_vertex(label, props),
         }
     }
     fn add_edge(&mut self, src: u32, dst: u32, label: &str, props: &[(&str, PropValue)]) -> u32 {
@@ -353,6 +387,7 @@ impl Mutable for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.add_edge(src, dst, label, props),
             GraphStoreEnum::Partitioned(p) => p.add_edge(src, dst, label, props),
             GraphStoreEnum::Arrow(a) => a.add_edge(src, dst, label, props),
+            GraphStoreEnum::MmapWal(m) => m.add_edge(src, dst, label, props),
         }
     }
     fn set_vertex_prop(&mut self, vid: u32, key: &str, value: PropValue) {
@@ -360,6 +395,7 @@ impl Mutable for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.set_vertex_prop(vid, key, value),
             GraphStoreEnum::Partitioned(p) => p.set_vertex_prop(vid, key, value),
             GraphStoreEnum::Arrow(a) => a.set_vertex_prop(vid, key, value),
+            GraphStoreEnum::MmapWal(m) => m.set_vertex_prop(vid, key, value),
         }
     }
     fn delete_vertex(&mut self, vid: u32) {
@@ -367,6 +403,7 @@ impl Mutable for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.delete_vertex(vid),
             GraphStoreEnum::Partitioned(p) => p.delete_vertex(vid),
             GraphStoreEnum::Arrow(a) => a.delete_vertex(vid),
+            GraphStoreEnum::MmapWal(m) => m.delete_vertex(vid),
         }
     }
     fn delete_edge(&mut self, edge_id: u32) {
@@ -374,6 +411,7 @@ impl Mutable for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.delete_edge(edge_id),
             GraphStoreEnum::Partitioned(p) => p.delete_edge(edge_id),
             GraphStoreEnum::Arrow(a) => a.delete_edge(edge_id),
+            GraphStoreEnum::MmapWal(m) => m.delete_edge(edge_id),
         }
     }
     fn commit(&mut self) -> u64 {
@@ -381,6 +419,7 @@ impl Mutable for GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.commit(),
             GraphStoreEnum::Partitioned(p) => p.commit(),
             GraphStoreEnum::Arrow(a) => Mutable::commit(a),
+            GraphStoreEnum::MmapWal(m) => Mutable::commit(m),
         }
     }
 }
@@ -397,6 +436,7 @@ impl GraphStoreEnum {
         match self {
             GraphStoreEnum::Single(s) => s.to_filtered_memory_graph(labels, rel_types),
             GraphStoreEnum::Arrow(_) => yata_cypher::MemoryGraph::new(),
+            GraphStoreEnum::MmapWal(_) => yata_cypher::MemoryGraph::new(),
             GraphStoreEnum::Partitioned(p) => {
                 // For partitioned mode, build from first partition that has data
                 // TODO: merge across partitions for full graph
@@ -439,6 +479,7 @@ impl GraphStoreEnum {
                 g
             }
             GraphStoreEnum::Arrow(_) => yata_cypher::MemoryGraph::new(),
+            GraphStoreEnum::MmapWal(_) => yata_cypher::MemoryGraph::new(),
         }
     }
 
@@ -454,6 +495,7 @@ impl GraphStoreEnum {
                 let label = labels.first().map(|s| s.as_str()).unwrap_or("_default");
                 a.add_vertex(label, props)
             }
+            GraphStoreEnum::MmapWal(_) => Default::default(),
             GraphStoreEnum::Partitioned(p) => {
                 let label = labels.first().map(|s| s.as_str()).unwrap_or("_default");
                 p.add_vertex(label, props)
@@ -476,6 +518,7 @@ impl GraphStoreEnum {
                 let label = labels.first().map(|s| s.as_str()).unwrap_or("_default");
                 a.add_vertex(label, props)
             }
+            GraphStoreEnum::MmapWal(_) => Default::default(),
             GraphStoreEnum::Partitioned(p) => {
                 let label = labels.first().map(|s| s.as_str()).unwrap_or("_default");
                 p.add_vertex(label, props)
@@ -498,6 +541,7 @@ impl GraphStoreEnum {
             }
             GraphStoreEnum::Partitioned(p) => p.add_edge(src, dst, label, props),
             GraphStoreEnum::Arrow(a) => a.add_edge(src, dst, label, props),
+            GraphStoreEnum::MmapWal(m) => m.add_edge(src, dst, label, props),
         }
     }
 
@@ -506,6 +550,7 @@ impl GraphStoreEnum {
         match self {
             GraphStoreEnum::Single(s) => s.remove_vertices_by_label(label),
             GraphStoreEnum::Arrow(_) => {} // Arrow store: no LRU eviction
+            GraphStoreEnum::MmapWal(_) => {} // Arrow store: no LRU eviction
             GraphStoreEnum::Partitioned(p) => {
                 for part in p.partitions_mut() {
                     part.remove_vertices_by_label(label);
@@ -519,6 +564,7 @@ impl GraphStoreEnum {
         match self {
             GraphStoreEnum::Single(s) => s.remove_edges_by_label(rel_type),
             GraphStoreEnum::Arrow(_) => {}
+            GraphStoreEnum::MmapWal(_) => {}
             GraphStoreEnum::Partitioned(p) => {
                 for part in p.partitions_mut() {
                     part.remove_edges_by_label(rel_type);
@@ -532,6 +578,7 @@ impl GraphStoreEnum {
         match self {
             GraphStoreEnum::Single(s) => s.set_vertex_primary_key(label, key),
             GraphStoreEnum::Arrow(_) => {} // Arrow: PK is always "rkey"
+            GraphStoreEnum::MmapWal(_) => {} // Arrow: PK is always "rkey"
             GraphStoreEnum::Partitioned(p) => {
                 for part in p.partitions_mut() {
                     part.set_vertex_primary_key(label, key);
@@ -546,6 +593,7 @@ impl GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.vertex_count_raw(),
             GraphStoreEnum::Partitioned(p) => p.vertex_count() as u32,
             GraphStoreEnum::Arrow(a) => a.vertex_count() as u32,
+            GraphStoreEnum::MmapWal(m) => m.vertex_count() as u32,
         }
     }
 
@@ -554,6 +602,7 @@ impl GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.edge_count_raw(),
             GraphStoreEnum::Partitioned(p) => p.edge_count() as u32,
             GraphStoreEnum::Arrow(a) => a.edge_count() as u32,
+            GraphStoreEnum::MmapWal(m) => m.edge_count() as u32,
         }
     }
 
@@ -562,6 +611,7 @@ impl GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.vertex_alive_raw(),
             GraphStoreEnum::Partitioned(_) => &[], // Not applicable for partitioned
             GraphStoreEnum::Arrow(_) => &[], // Not applicable for partitioned
+            GraphStoreEnum::MmapWal(_) => &[], // Not applicable for partitioned
         }
     }
 
@@ -570,6 +620,7 @@ impl GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.edge_alive_raw(),
             GraphStoreEnum::Partitioned(_) => &[],
             GraphStoreEnum::Arrow(_) => &[],
+            GraphStoreEnum::MmapWal(_) => &[],
         }
     }
 
@@ -578,6 +629,7 @@ impl GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.edge_labels_raw(),
             GraphStoreEnum::Partitioned(_) => &[],
             GraphStoreEnum::Arrow(_) => &[],
+            GraphStoreEnum::MmapWal(_) => &[],
         }
     }
 
@@ -586,6 +638,7 @@ impl GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.edge_src_raw(),
             GraphStoreEnum::Partitioned(_) => &[],
             GraphStoreEnum::Arrow(_) => &[],
+            GraphStoreEnum::MmapWal(_) => &[],
         }
     }
 
@@ -594,6 +647,7 @@ impl GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.edge_dst_raw(),
             GraphStoreEnum::Partitioned(_) => &[],
             GraphStoreEnum::Arrow(_) => &[],
+            GraphStoreEnum::MmapWal(_) => &[],
         }
     }
 
@@ -602,6 +656,7 @@ impl GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.edge_props_raw(),
             GraphStoreEnum::Partitioned(_) => &[],
             GraphStoreEnum::Arrow(_) => &[],
+            GraphStoreEnum::MmapWal(_) => &[],
         }
     }
 
@@ -612,6 +667,7 @@ impl GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.out_csr_raw(),
             GraphStoreEnum::Partitioned(_) => &EMPTY,
             GraphStoreEnum::Arrow(_) => &EMPTY,
+            GraphStoreEnum::MmapWal(_) => &EMPTY,
         }
     }
 
@@ -622,6 +678,7 @@ impl GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.in_csr_raw(),
             GraphStoreEnum::Partitioned(_) => &EMPTY,
             GraphStoreEnum::Arrow(_) => &EMPTY,
+            GraphStoreEnum::MmapWal(_) => &EMPTY,
         }
     }
 
@@ -632,6 +689,7 @@ impl GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.vertex_pk_raw(),
             GraphStoreEnum::Partitioned(_) => &EMPTY,
             GraphStoreEnum::Arrow(_) => &EMPTY,
+            GraphStoreEnum::MmapWal(_) => &EMPTY,
         }
     }
 
@@ -640,6 +698,7 @@ impl GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.partition_id_raw(),
             GraphStoreEnum::Partitioned(_) => PartitionId::new(0),
             GraphStoreEnum::Arrow(_) => PartitionId::new(0),
+            GraphStoreEnum::MmapWal(_) => PartitionId::new(0),
         }
     }
 
@@ -650,6 +709,7 @@ impl GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.global_map(),
             GraphStoreEnum::Partitioned(_) => &EMPTY,
             GraphStoreEnum::Arrow(_) => &EMPTY,
+            GraphStoreEnum::MmapWal(_) => &EMPTY,
         }
     }
 
@@ -658,6 +718,7 @@ impl GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.global_vid(local),
             GraphStoreEnum::Partitioned(_) => None,
             GraphStoreEnum::Arrow(_) => None,
+            GraphStoreEnum::MmapWal(_) => None,
         }
     }
 
@@ -666,6 +727,7 @@ impl GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.global_eid(local),
             GraphStoreEnum::Partitioned(_) => None,
             GraphStoreEnum::Arrow(_) => None,
+            GraphStoreEnum::MmapWal(_) => None,
         }
     }
 
@@ -674,6 +736,7 @@ impl GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.version(),
             GraphStoreEnum::Partitioned(_) => 0,
             GraphStoreEnum::Arrow(_) => 0,
+            GraphStoreEnum::MmapWal(_) => 0,
         }
     }
 
@@ -683,6 +746,7 @@ impl GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.drain_dirty_vertex_labels(),
             GraphStoreEnum::Partitioned(_) => Vec::new(),
             GraphStoreEnum::Arrow(_) => Vec::new(),
+            GraphStoreEnum::MmapWal(_) => Vec::new(),
         }
     }
 
@@ -692,6 +756,7 @@ impl GraphStoreEnum {
             GraphStoreEnum::Single(s) => s.drain_dirty_edge_labels(),
             GraphStoreEnum::Partitioned(_) => Vec::new(),
             GraphStoreEnum::Arrow(_) => Vec::new(),
+            GraphStoreEnum::MmapWal(_) => Vec::new(),
         }
     }
 }
