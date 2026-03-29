@@ -65,6 +65,11 @@ mod props_serde {
                 PropValue::Int(n) => map.serialize_entry(k, n)?,
                 PropValue::Float(f) => map.serialize_entry(k, f)?,
                 PropValue::Str(s) => map.serialize_entry(k, s)?,
+                PropValue::Binary(bytes) => {
+                    // Encode as base64 with "b64:" prefix to distinguish from plain strings.
+                    let encoded = format!("b64:{}", base64_engine().encode(bytes));
+                    map.serialize_entry(k, &encoded)?;
+                }
             }
         }
         map.end()
@@ -85,7 +90,15 @@ mod props_serde {
 
     fn json_value_to_prop_value(v: &serde_json::Value) -> PropValue {
         match v {
-            serde_json::Value::String(s) => PropValue::Str(s.clone()),
+            serde_json::Value::String(s) => {
+                // Detect base64-encoded binary with "b64:" prefix.
+                if let Some(encoded) = s.strip_prefix("b64:") {
+                    if let Ok(bytes) = base64_engine().decode(encoded) {
+                        return PropValue::Binary(bytes);
+                    }
+                }
+                PropValue::Str(s.clone())
+            }
             serde_json::Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
                     PropValue::Int(i)
@@ -100,6 +113,12 @@ mod props_serde {
     }
 }
 
+/// Base64 engine for Binary PropValue serialization (standard, no padding).
+fn base64_engine() -> base64::engine::GeneralPurpose {
+    use base64::engine::general_purpose::STANDARD;
+    STANDARD
+}
+
 /// Convert PropValue slice to serde_json::Map (for legacy callers during migration).
 pub fn props_to_json_map(props: &[(String, PropValue)]) -> serde_json::Map<String, serde_json::Value> {
     let mut m = serde_json::Map::new();
@@ -110,6 +129,9 @@ pub fn props_to_json_map(props: &[(String, PropValue)]) -> serde_json::Map<Strin
             PropValue::Float(f) => serde_json::json!(*f),
             PropValue::Bool(b) => serde_json::Value::Bool(*b),
             PropValue::Null => serde_json::Value::Null,
+            PropValue::Binary(bytes) => {
+                serde_json::Value::String(format!("b64:{}", base64_engine().encode(bytes)))
+            }
         };
         m.insert(k.clone(), jv);
     }

@@ -715,6 +715,8 @@ pub mod durable_wal_types {
         Int(i64),
         Float(f64),
         Str(String),
+        /// Raw binary data (vector weights, safetensors, etc.).
+        Binary(Vec<u8>),
     }
 
     /// Durable WAL operation — mirrors graph mutations for crash recovery.

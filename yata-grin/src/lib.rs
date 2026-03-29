@@ -11,6 +11,9 @@ pub enum PropValue {
     Int(i64),
     Float(f64),
     Str(String),
+    /// Raw binary data (little-endian packed f32/f64 vectors, safetensors, etc.).
+    /// Arrow type: LargeBinary. Cypher: opaque bytes, accessible via UDF.
+    Binary(Vec<u8>),
 }
 
 /// Direction for edge traversal.

@@ -79,6 +79,7 @@ env.YATA.cypher(cypher, appId)          // unified Cypher path → /xrpc/ai.gftd
 env.YATA.cypherBatch(stmts[], appId)    // N statements in 1 HTTP round-trip (K3b)
 env.YATA.query(cypher, appId)           // read-only alias → read replicas
 env.YATA.mutate(cypher, appId)          // CREATE → random partition, DELETE → broadcast
+env.YATA.compact()                      // per-label L1 compaction (v1→v2 migration, dirty labels only)
 env.YATA.health()                       // → partition-0 Container
 env.YATA.ping()                         // "pong" (no wake)
 env.YATA.stats()                        // → all partition CpmStats (K3a)
@@ -130,7 +131,7 @@ R2 = source of truth。**Per-label sorted COO segments**: `log/coo/{pid}/label/{
 
 ## Shannon Analysis
 
-WAL + query storage schema の Shannon 情報効率比較。**Sorted COO = 82.5% vs CSR = 45.1%** (Write Amplification + Snapshot 軸追加後)。旧分析 (`docs/260329-yata-arrow-ipc-shannon-analysis.md`) は CSR の write-path 非効率を隠蔽 → COO 設計 (`docs/260329-yata-coo-sorted-design.md`) で修正。
+9-format 7-axis 比較: `docs/260329-yata-9format-shannon-comparison.md`。**COO Sorted = 62.1%, COO + Lazy CSR hybrid = 74.3%** (9 format 中で最高)。CSR 単体 = 46.1%。全 weight 配分で COO + Lazy CSR が最高。旧 5-axis 分析は superseded。
 
 ## Persistence Model — Sorted COO Segments + Arrow IPC WAL
 
