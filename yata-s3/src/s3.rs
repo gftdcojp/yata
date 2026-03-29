@@ -94,6 +94,35 @@ impl S3Client {
         }
     }
 
+    /// GET a byte range of an object (sync). Returns None if 404.
+    /// Uses HTTP Range header: `bytes={offset}-{offset+length-1}`.
+    /// R2/S3 returns 206 Partial Content on success.
+    pub fn get_range_sync(&self, key: &str, offset: u64, length: u64) -> Result<Option<Bytes>, S3Error> {
+        let now = chrono::Utc::now();
+        let range_value = format!("bytes={}-{}", offset, offset + length - 1);
+        let headers = self.sign_headers_with_range("GET", key, &now, EMPTY_SHA256, None, Some(&range_value))?;
+
+        let mut req = ureq::get(&self.url(key));
+        for (k, v) in &headers {
+            req = req.set(k, v);
+        }
+        req = req.set("range", &range_value);
+        match req.call() {
+            Ok(resp) => {
+                let mut buf = Vec::with_capacity(length as usize);
+                resp.into_reader().read_to_end(&mut buf)
+                    .map_err(|e| S3Error::Remote(e.to_string()))?;
+                Ok(Some(Bytes::from(buf)))
+            }
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                Err(S3Error::Remote(format!("GET_RANGE {key}: {code} {body}")))
+            }
+            Err(e) => Err(S3Error::Remote(e.to_string())),
+        }
+    }
+
     /// HEAD (sync).
     pub fn head_sync(&self, key: &str) -> Result<bool, S3Error> {
         let now = chrono::Utc::now();
@@ -135,6 +164,7 @@ impl S3Client {
 
     pub async fn put(&self, key: &str, data: Bytes) -> Result<(), S3Error> { self.put_sync(key, data) }
     pub async fn get(&self, key: &str) -> Result<Option<Bytes>, S3Error> { self.get_sync(key) }
+    pub async fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Bytes>, S3Error> { self.get_range_sync(key, offset, length) }
     pub async fn head(&self, key: &str) -> Result<bool, S3Error> { self.head_sync(key) }
     pub async fn list(&self, prefix: &str) -> Result<Vec<S3Object>, S3Error> { self.list_sync(prefix) }
 
@@ -156,6 +186,49 @@ impl S3Client {
         let canonical_querystring = query_string.unwrap_or("");
         let canonical_headers = format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
         let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+        let canonical_request = format!("{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+        let credential_scope = format!("{date_stamp}/{}/s3/aws4_request", self.region);
+        let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+            hex::encode(Sha256::digest(canonical_request.as_bytes())));
+        let signing_key = self.derive_signing_key(&date_stamp);
+        let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
+            self.key_id);
+        Ok(vec![
+            ("host".into(), host.into()),
+            ("x-amz-date".into(), amz_date),
+            ("x-amz-content-sha256".into(), payload_hash.into()),
+            ("authorization".into(), authorization),
+        ])
+    }
+
+    /// SigV4 signing with optional Range header included in canonical request.
+    fn sign_headers_with_range(
+        &self, method: &str, key: &str, now: &chrono::DateTime<chrono::Utc>,
+        payload_hash: &str, query_string: Option<&str>, range: Option<&str>,
+    ) -> Result<Vec<(String, String)>, S3Error> {
+        let date_stamp = now.format("%Y%m%d").to_string();
+        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let host = self.host();
+        let canonical_uri = if key.is_empty() {
+            format!("/{}/", self.bucket)
+        } else {
+            format!("/{}/{}", self.bucket,
+                key.split('/').map(|s| urlencoding::encode(s).into_owned()).collect::<Vec<_>>().join("/"))
+        };
+        let canonical_querystring = query_string.unwrap_or("");
+        let (canonical_headers, signed_headers) = if let Some(range_val) = range {
+            (
+                format!("host:{host}\nrange:{range_val}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"),
+                "host;range;x-amz-content-sha256;x-amz-date",
+            )
+        } else {
+            (
+                format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"),
+                "host;x-amz-content-sha256;x-amz-date",
+            )
+        };
         let canonical_request = format!("{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
         let credential_scope = format!("{date_stamp}/{}/s3/aws4_request", self.region);
         let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
@@ -492,6 +565,41 @@ mod tests {
         let (objects, _) = parse_list_response(xml);
         assert_eq!(objects.len(), 1);
         assert_eq!(objects[0].size, 0);
+    }
+
+    // ── sign_headers_with_range ───────────────────────────────────────────
+
+    #[test]
+    fn sign_headers_with_range_includes_range_in_signed_headers() {
+        let c = test_client();
+        let now = chrono::Utc::now();
+        let headers = c
+            .sign_headers_with_range("GET", "key", &now, EMPTY_SHA256, None, Some("bytes=0-1023"))
+            .unwrap();
+        let auth = headers.iter().find(|(k, _)| k == "authorization").unwrap();
+        assert!(auth.1.contains("SignedHeaders=host;range;x-amz-content-sha256;x-amz-date"));
+    }
+
+    #[test]
+    fn sign_headers_with_range_none_matches_original() {
+        let c = test_client();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-03-30T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let original = c.sign_headers("GET", "key", &now, EMPTY_SHA256, None).unwrap();
+        let with_none = c.sign_headers_with_range("GET", "key", &now, EMPTY_SHA256, None, None).unwrap();
+        assert_eq!(original, with_none);
+    }
+
+    #[test]
+    fn sign_headers_with_range_different_from_without() {
+        let c = test_client();
+        let now = chrono::Utc::now();
+        let without = c.sign_headers("GET", "key", &now, EMPTY_SHA256, None).unwrap();
+        let with = c.sign_headers_with_range("GET", "key", &now, EMPTY_SHA256, None, Some("bytes=0-99")).unwrap();
+        let auth_without = &without.iter().find(|(k, _)| k == "authorization").unwrap().1;
+        let auth_with = &with.iter().find(|(k, _)| k == "authorization").unwrap().1;
+        assert_ne!(auth_without, auth_with, "Range header must change the signature");
     }
 
     // ── S3Error ─────────────────────────────────────────────────────────

@@ -276,9 +276,51 @@ pub fn verify_blake3(data: &[u8], expected_hex: &str, label: &str) -> Result<(),
     Ok(())
 }
 
-/// Build R2 key for the compaction manifest.
+/// Build R2 key for the compaction manifest (mutable, legacy).
 pub fn manifest_r2_key(prefix: &str, partition_id: u32) -> String {
     format!("{prefix}log/compacted/{partition_id}/manifest.json")
+}
+
+/// Build R2 key for an immutable versioned manifest.
+/// Uses inverted version number (u64::MAX - version) for O(1) latest lookup
+/// via lexicographic listing on object stores (LanceDB pattern).
+pub fn manifest_versioned_r2_key(prefix: &str, partition_id: u32, manifest_version: u64) -> String {
+    let inverted = u64::MAX - manifest_version;
+    format!("{prefix}log/compacted/{partition_id}/manifest-{inverted:020}.json")
+}
+
+/// Find the latest versioned manifest by listing R2 objects.
+/// Returns (manifest_version, raw_bytes) or None.
+/// Fallback: if no versioned manifests exist, reads legacy `manifest.json`.
+pub fn find_latest_manifest(
+    s3: &yata_s3::s3::S3Client,
+    prefix: &str,
+    partition_id: u32,
+) -> Option<(u64, Vec<u8>)> {
+    let versioned_prefix = format!("{prefix}log/compacted/{partition_id}/manifest-");
+    if let Ok(objects) = s3.list_sync(&versioned_prefix) {
+        if let Some(first) = objects.first() {
+            // First listed = smallest inverted version = latest actual version
+            if let Some(ver_str) = first.key.rsplit('/').next()
+                .and_then(|f| f.strip_prefix("manifest-"))
+                .and_then(|f| f.strip_suffix(".json"))
+            {
+                if let Ok(inverted) = ver_str.parse::<u64>() {
+                    let version = u64::MAX - inverted;
+                    if let Ok(Some(data)) = s3.get_sync(&first.key) {
+                        return Some((version, data.to_vec()));
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: legacy manifest.json
+    let legacy_key = manifest_r2_key(prefix, partition_id);
+    if let Ok(Some(data)) = s3.get_sync(&legacy_key) {
+        Some((0, data.to_vec()))
+    } else {
+        None
+    }
 }
 
 /// Build R2 key for a compacted segment (v1 monolithic).

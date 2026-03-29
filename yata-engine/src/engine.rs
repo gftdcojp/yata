@@ -107,6 +107,7 @@ pub struct TieredGraphEngine {
     warm: GraphStore,
     cache: Arc<Mutex<QueryCache>>,
     hot_initialized: Arc<AtomicBool>,
+    cold_starting: Arc<AtomicBool>,
     loaded_labels: Arc<Mutex<HashSet<String>>>,
     blob_cache: Arc<dyn BlobCache>,
     s3_client: Arc<Mutex<Option<Arc<yata_s3::s3::S3Client>>>>,
@@ -205,6 +206,7 @@ impl TieredGraphEngine {
             warm,
             cache: Arc::new(Mutex::new(cache)),
             hot_initialized: Arc::new(AtomicBool::new(false)),
+            cold_starting: Arc::new(AtomicBool::new(false)),
             loaded_labels: Arc::new(Mutex::new(HashSet::new())),
             blob_cache,
             s3_client,
@@ -324,8 +326,20 @@ impl TieredGraphEngine {
     /// via enrich_label_from_r2 (zero-copy for already-loaded labels).
     fn ensure_labels(&self, vertex_labels: &[&str]) {
         if !self.hot_initialized.load(Ordering::SeqCst) {
-            // Cold start: load from L1 compacted segment + WAL tail
-            let _ = self.wal_cold_start();
+            // Prevent concurrent cold starts (399MB R2 download × N threads = OOM).
+            // Only one thread does the cold start; others spin-wait until done.
+            if self.cold_starting.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                let _ = self.wal_cold_start();
+                self.cold_starting.store(false, Ordering::SeqCst);
+            } else {
+                // Another thread is doing cold start — spin-wait with backoff
+                let mut wait_ms = 10;
+                for _ in 0..200 {
+                    if self.hot_initialized.load(Ordering::SeqCst) { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                    wait_ms = (wait_ms * 2).min(500);
+                }
+            }
             return;
         }
 
@@ -1432,8 +1446,13 @@ impl TieredGraphEngine {
             .collect();
         let manifest = crate::compaction::build_manifest_v2(pid, prefix, global_max_seq, &uploaded_label_results, existing_label_segments);
         let manifest_json = serde_json::to_vec(&manifest).unwrap_or_default();
-        s3.put_sync(manifest_key, bytes::Bytes::from(manifest_json))
+        // Write legacy manifest.json (backward compat)
+        s3.put_sync(manifest_key, bytes::Bytes::from(manifest_json.clone()))
             .map_err(|e| format!("R2 compaction manifest upload failed: {e}"))?;
+        // Write versioned manifest (immutable, LanceDB-style inverted naming for O(1) latest lookup)
+        let versioned_key = crate::compaction::manifest_versioned_r2_key(prefix, pid, global_max_seq);
+        let _ = s3.put_sync(&versioned_key, bytes::Bytes::from(manifest_json));
+        tracing::info!(versioned_key, "wrote versioned manifest");
 
         let dirty_count = label_results.len();
         let all_labels: Vec<String> = manifest.labels.clone();
@@ -1465,10 +1484,12 @@ impl TieredGraphEngine {
         let prefix = &self.s3_prefix;
         let pid = self.config.hot_partition_id.get();
 
-        // Load compacted segment(s) (mmap disk cache → R2 GET)
-        let manifest_key = crate::compaction::manifest_r2_key(prefix, pid);
-        let checkpoint_seq = match s3.get_sync(&manifest_key) {
-            Ok(Some(data)) => {
+        // Load compacted segment(s) — try versioned manifest first, fallback to legacy
+        let checkpoint_seq = match crate::compaction::find_latest_manifest(&s3, prefix, pid) {
+            Some((manifest_ver, data)) => {
+                if manifest_ver > 0 {
+                    tracing::info!(manifest_ver, "cold start: loaded versioned manifest");
+                }
                 match serde_json::from_slice::<crate::compaction::CompactionManifest>(&data) {
                     Ok(manifest) if manifest.version >= 2 && !manifest.label_segments.is_empty() => {
                         // v2: load per-label compacted segments
@@ -1563,7 +1584,7 @@ impl TieredGraphEngine {
                     Err(_) => 0,
                 }
             }
-            _ => {
+            None => {
                 tracing::info!("cold start: no compaction manifest (run gftd yata migrate)");
                 self.hot_initialized.store(true, Ordering::SeqCst);
                 0
