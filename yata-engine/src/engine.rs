@@ -16,6 +16,19 @@ use crate::loader;
 use crate::rls;
 use crate::router;
 
+/// CPM metrics: CP5 mutation frequency + read/write ratio.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CpmStats {
+    pub cypher_read_count: u64,
+    pub cypher_mutation_count: u64,
+    pub cypher_mutation_avg_us: u64,
+    pub cypher_mutation_us_total: u64,
+    pub merge_record_count: u64,
+    pub mutation_ratio: f64,
+    pub vertex_count: u64,
+    pub edge_count: u64,
+}
+
 /// Shared tokio runtime for all engine instances (avoids nested runtime issues).
 static ENGINE_RT: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
@@ -95,9 +108,7 @@ fn build_gie_security_scope(rls: &rls::RlsScope) -> yata_gie::ir::SecurityScope 
         _ => 0, // public only
     };
 
-    // RBAC: extract collection scope prefixes from _rls_* params
-    // (injected by PDS as rbac_roles → collection prefix patterns)
-    let collection_scopes = Vec::new(); // Legacy path: RBAC not wired. Design E uses compile_security_scope().
+    let collection_scopes = Vec::new();
 
     // Consent: hash grantor DIDs for O(1) lookup during CSR traversal
     let allowed_owner_hashes: Vec<u32> = rls.consent_grants
@@ -768,6 +779,12 @@ impl TieredGraphEngine {
                 c.invalidate();
             }
 
+            // Record mutation elapsed time for CPM metrics
+            if is_mutation {
+                let elapsed_us = query_start.elapsed().as_micros() as u64;
+                self.cypher_mutation_us_total.fetch_add(elapsed_us, Ordering::Relaxed);
+            }
+
             Ok(rows)
         })
     }
@@ -856,6 +873,7 @@ impl TieredGraphEngine {
         props: &[(&str, yata_grin::PropValue)],
     ) -> Result<u32, String> {
         self.dirty.store(true, Ordering::Relaxed);
+        self.merge_record_count.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut dl) = self.dirty_labels.lock() {
             dl.insert(label.to_string());
         }
@@ -1030,6 +1048,33 @@ impl TieredGraphEngine {
             }
         }
         Err("failed to acquire hot store lock".into())
+    }
+
+    /// CPM metrics: read/mutation/mergeRecord counters + mutation latency.
+    pub fn cpm_stats(&self) -> CpmStats {
+        let reads = self.cypher_read_count.load(Ordering::Relaxed);
+        let mutations = self.cypher_mutation_count.load(Ordering::Relaxed);
+        let mutation_us = self.cypher_mutation_us_total.load(Ordering::Relaxed);
+        let merges = self.merge_record_count.load(Ordering::Relaxed);
+        let (v_count, e_count) = if let Ok(csr) = self.hot.read() {
+            (csr.vertex_count() as u64, csr.edge_count() as u64)
+        } else {
+            (0, 0)
+        };
+        CpmStats {
+            cypher_read_count: reads,
+            cypher_mutation_count: mutations,
+            cypher_mutation_avg_us: if mutations > 0 { mutation_us / mutations } else { 0 },
+            cypher_mutation_us_total: mutation_us,
+            merge_record_count: merges,
+            mutation_ratio: if reads + mutations > 0 {
+                mutations as f64 / (reads + mutations) as f64
+            } else {
+                0.0
+            },
+            vertex_count: v_count,
+            edge_count: e_count,
+        }
     }
 
     /// Trigger R2 checkpoint: serialize CSR → ArrowFragment → R2 PUT.
