@@ -1009,7 +1009,7 @@ impl TieredGraphEngine {
         let lance_ok = ENGINE_RT.block_on(async {
             let mut ds_guard = lance_ds.lock().await;
             if let Some(ref mut ds) = *ds_guard {
-                match ds.append(vec![batch.clone()], schema.clone()).await {
+                match ds.add(batch.clone()).await {
                     Ok(()) => true,
                     Err(e) => {
                         tracing::warn!(error = %e, "Lance Dataset append failed, falling back to R2 segment");
@@ -1100,13 +1100,15 @@ impl TieredGraphEngine {
             if let Some(ref mut ds) = *ds_guard {
                 let version_before = ds.version().await;
                 match ds.compact().await {
-                    Ok(metrics) => {
+                    Ok(stats) => {
                         let version_after = ds.version().await;
+                        let removed = stats.compaction.as_ref().map(|c| c.fragments_removed).unwrap_or(0);
+                        let added = stats.compaction.as_ref().map(|c| c.fragments_added).unwrap_or(0);
                         tracing::info!(
                             version_before,
                             version_after,
-                            files_removed = metrics.fragments_removed,
-                            files_added = metrics.fragments_added,
+                            files_removed = removed,
+                            files_added = added,
                             dirty_labels = dirty_labels.len(),
                             "Lance compaction complete"
                         );
@@ -1114,8 +1116,8 @@ impl TieredGraphEngine {
                             data: bytes::Bytes::new(),
                             min_seq: 0,
                             max_seq: version_after,
-                            input_entries: metrics.fragments_removed,
-                            output_entries: metrics.fragments_added,
+                            input_entries: removed,
+                            output_entries: added,
                             labels: dirty_labels,
                         })
                     }
@@ -1240,27 +1242,34 @@ impl TieredGraphEngine {
             .map_err(|e| format!("batch conversion failed: {e}"))?;
         let schema = crate::arrow_wal::wal_arrow_schema();
         let lance_uri = format!("{prefix}lance/vertices/{pid}");
-        let lance_ds = self.lance_table.clone();
-
+        let lance_tbl = self.lance_table.clone();
+        let lance_db = self.lance_db.clone();
         let prefix_owned = prefix.to_string();
+
         let lance_version = ENGINE_RT.block_on(async {
-            let mut ds_guard = lance_ds.lock().await;
-            if let Some(ref mut ds) = *ds_guard {
-                ds.overwrite(vec![batch], schema).await
-                    .map_err(|e| format!("Lance overwrite failed: {e}"))?;
-                Ok::<u64, String>(ds.version().await)
-            } else {
-                let ds = match yata_lance::YataDataset::create_with_store(
-                    &lance_uri, vec![batch], schema.clone(), &prefix_owned,
-                ).await {
-                    Ok(ds) => ds,
-                    Err(_) => yata_lance::YataDataset::create(&lance_uri, vec![], schema).await
-                        .map_err(|e| format!("Lance create failed: {e}"))?,
-                };
-                let version = ds.version().await;
-                *ds_guard = Some(ds);
-                Ok(version)
+            let mut tbl_guard = lance_tbl.lock().await;
+            // Connect to DB if needed
+            {
+                let mut db_guard = lance_db.lock().await;
+                if db_guard.is_none() {
+                    let new_db = if let Some(db) = yata_lance::YataDb::connect_from_env(&prefix_owned).await {
+                        db
+                    } else {
+                        yata_lance::YataDb::connect_local(&prefix_owned).await
+                            .map_err(|e| format!("LanceDB connect failed: {e}"))?
+                    };
+                    *db_guard = Some(new_db);
+                }
             }
+            let db_guard = lance_db.lock().await;
+            let db = db_guard.as_ref().ok_or("LanceDB not connected")?;
+
+            // Create/recreate table with migrated data
+            let tbl = db.create_table("vertices", batch).await
+                .map_err(|e| format!("LanceDB create_table failed: {e}"))?;
+            let version = tbl.version().await.unwrap_or(0);
+            *tbl_guard = Some(tbl);
+            Ok::<u64, String>(version)
         })?;
 
         tracing::info!(lance_version, deduplicated_entries, "migrate_to_lance complete");
@@ -1284,30 +1293,48 @@ impl TieredGraphEngine {
         let prefix = &self.s3_prefix;
         let pid = self.config.hot_partition_id.get();
 
-        // Open Lance Dataset from R2 via UreqObjectStore
-        let lance_uri = format!("{}lance/vertices/{}", prefix, pid);
-        let lance_ds = self.lance_table.clone();
+        // Open LanceDB from R2 or local
+        let lance_tbl = self.lance_table.clone();
+        let lance_db = self.lance_db.clone();
         let prefix_owned = prefix.to_string();
-        let lance_uri_owned = lance_uri.clone();
         let checkpoint_seq = ENGINE_RT.block_on(async {
-            // Try S3/R2 first, fallback to local
-            let result = match yata_lance::YataDataset::open_from_env(&prefix_owned).await {
-                Some(ds) => Ok(ds),
-                None => yata_lance::YataDataset::open(&lance_uri_owned).await,
+            // Connect to DB (S3/R2 first, fallback to local)
+            let db = {
+                let mut db_guard = lance_db.lock().await;
+                if db_guard.is_none() {
+                    let new_db = if let Some(db) = yata_lance::YataDb::connect_from_env(&prefix_owned).await {
+                        db
+                    } else {
+                        match yata_lance::YataDb::connect_local(&prefix_owned).await {
+                            Ok(db) => db,
+                            Err(e) => {
+                                tracing::info!(error = %e, "LanceDB connect failed (new database)");
+                                return 0u64;
+                            }
+                        }
+                    };
+                    *db_guard = Some(new_db);
+                }
+                db_guard.clone()
             };
-            match result {
-                Ok(ds) => {
-                    let version = ds.version().await;
-                    let rows = ds.count_rows(None).await.unwrap_or(0);
-                    tracing::info!(version, rows, "Lance cold start: Dataset opened");
-                    let mut guard = lance_ds.lock().await;
-                    *guard = Some(ds);
-                    version
+            // Open vertices table
+            if let Some(ref db) = db {
+                match db.open_table("vertices").await {
+                    Ok(tbl) => {
+                        let version = tbl.version().await.unwrap_or(0);
+                        let rows = tbl.count_rows(None).await.unwrap_or(0);
+                        tracing::info!(version, rows, "LanceDB cold start: table opened");
+                        let mut guard = lance_tbl.lock().await;
+                        *guard = Some(tbl);
+                        version
+                    }
+                    Err(e) => {
+                        tracing::info!(error = %e, "no LanceDB vertices table found (new database)");
+                        0
+                    }
                 }
-                Err(e) => {
-                    tracing::info!(error = %e, "no Lance Dataset found (new database)");
-                    0
-                }
+            } else {
+                0
             }
         });
 
