@@ -18,11 +18,13 @@ pub use dataset::{
 };
 pub use manifest::{
     GraphManifest,
+    GraphManifestKeyLayout,
     GraphManifestSeqRange,
     GraphManifestTableRef,
     GraphManifestTables,
     ManifestStore,
     OpenedGraphDatasets,
+    S3ManifestStore,
     load_manifest,
     parse_manifest_json,
     save_manifest,

@@ -62,6 +62,8 @@ export {
 export {
   createGraphManifest,
   createFetchManifestStore,
+  createManifestKeyLayout,
+  createR2ManifestStore,
   loadManifest,
   makeManifestTableRef,
   parseManifest,
@@ -70,10 +72,12 @@ export {
 } from "./manifest.js";
 export type {
   GraphManifest,
+  GraphManifestKeyLayout,
   GraphManifestSeqRange,
   GraphManifestTableRef,
   GraphManifestTables,
   ManifestStore,
+  R2BucketLike,
 } from "./manifest.js";
 
 // Cypher builder

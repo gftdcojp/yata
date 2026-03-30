@@ -33,15 +33,35 @@ export interface GraphManifest {
   contract_version: number;
   partition_id: number;
   version: number;
+  key_layout: GraphManifestKeyLayout;
   tables: GraphManifestTables;
   seq: GraphManifestSeqRange;
   dirty_labels?: string[];
   generated_at_ms?: number;
 }
 
+export interface GraphManifestKeyLayout {
+  manifest_prefix: string;
+  latest_key: string;
+  versioned_key: string;
+}
+
 export interface ManifestStore {
   get(key: string): Promise<string | null>;
   put(key: string, value: string): Promise<void>;
+}
+
+export interface R2BucketLike {
+  get(key: string): Promise<{ text(): Promise<string> } | null>;
+  put(
+    key: string,
+    value: string,
+    options?: {
+      httpMetadata?: {
+        contentType?: string;
+      };
+    },
+  ): Promise<unknown>;
 }
 
 export function makeManifestTableRef(table_name: string, uri: string): GraphManifestTableRef {
@@ -61,6 +81,7 @@ export function createGraphManifest(
     contract_version: 1,
     partition_id: partitionId,
     version,
+    key_layout: createManifestKeyLayout(partitionId, version),
     tables: {
       vertex_log: makeManifestTableRef(VERTEX_LOG_TABLE, `${base}/${VERTEX_LOG_TABLE}`),
       edge_log: makeManifestTableRef(EDGE_LOG_TABLE, `${base}/${EDGE_LOG_TABLE}`),
@@ -69,6 +90,18 @@ export function createGraphManifest(
       edge_live_in: makeManifestTableRef(EDGE_LIVE_IN_TABLE, `${base}/${EDGE_LIVE_IN_TABLE}`),
     },
     seq,
+  };
+}
+
+export function createManifestKeyLayout(
+  partitionId: number,
+  version: number,
+): GraphManifestKeyLayout {
+  const manifest_prefix = `manifests/partitions/${partitionId}`;
+  return {
+    manifest_prefix,
+    latest_key: `${manifest_prefix}/latest.json`,
+    versioned_key: `${manifest_prefix}/manifest-${String(version).padStart(20, "0")}.json`,
   };
 }
 
@@ -111,6 +144,29 @@ export function createFetchManifestStore(fetchImpl: typeof fetch = fetch): Manif
         body: value,
       });
       if (!res.ok) throw new Error(`manifest PUT failed: ${res.status}`);
+    },
+  };
+}
+
+export function createR2ManifestStore(
+  bucket: R2BucketLike,
+  prefix = "",
+): ManifestStore {
+  const normalizedPrefix = prefix.replace(/\/+$/, "");
+  const objectKey = (key: string) => {
+    const trimmed = key.replace(/^\/+/, "");
+    return normalizedPrefix ? `${normalizedPrefix}/${trimmed}` : trimmed;
+  };
+
+  return {
+    async get(key: string): Promise<string | null> {
+      const obj = await bucket.get(objectKey(key));
+      return obj ? obj.text() : null;
+    },
+    async put(key: string, value: string): Promise<void> {
+      await bucket.put(objectKey(key), value, {
+        httpMetadata: { contentType: "application/json" },
+      });
     },
   };
 }

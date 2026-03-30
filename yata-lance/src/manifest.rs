@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use yata_s3::s3::{S3Client, S3Error};
 
 use crate::schema::{
     EDGE_LIVE_IN_TABLE,
@@ -42,12 +43,20 @@ pub struct GraphManifest {
     pub contract_version: u32,
     pub partition_id: u32,
     pub version: u64,
+    pub key_layout: GraphManifestKeyLayout,
     pub tables: GraphManifestTables,
     pub seq: GraphManifestSeqRange,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dirty_labels: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraphManifestKeyLayout {
+    pub manifest_prefix: String,
+    pub latest_key: String,
+    pub versioned_key: String,
 }
 
 pub struct OpenedGraphDatasets {
@@ -65,15 +74,57 @@ pub trait ManifestStore {
     fn put(&self, key: &str, value: &[u8]) -> Result<(), Self::Error>;
 }
 
+pub struct S3ManifestStore {
+    client: S3Client,
+    prefix: String,
+}
+
+impl S3ManifestStore {
+    pub fn new(client: S3Client, prefix: impl Into<String>) -> Self {
+        Self {
+            client,
+            prefix: prefix.into().trim_end_matches('/').to_string(),
+        }
+    }
+
+    fn object_key(&self, key: &str) -> String {
+        let key = key.trim_start_matches('/');
+        if self.prefix.is_empty() {
+            key.to_string()
+        } else {
+            format!("{}/{}", self.prefix, key)
+        }
+    }
+}
+
+impl ManifestStore for S3ManifestStore {
+    type Error = S3Error;
+
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Self::Error> {
+        let key = self.object_key(key);
+        self.client
+            .get_sync(&key)
+            .map(|opt| opt.map(|b| b.to_vec()))
+    }
+
+    fn put(&self, key: &str, value: &[u8]) -> Result<(), Self::Error> {
+        let key = self.object_key(key);
+        self.client
+            .put_sync(&key, bytes::Bytes::copy_from_slice(value))
+    }
+}
+
 impl GraphManifest {
     pub fn new(partition_id: u32, version: u64, seq_min: u64, seq_max: u64, base_uri: &str) -> Self {
         let base_uri = base_uri.trim_end_matches('/');
+        let key_layout = GraphManifestKeyLayout::for_partition(partition_id, version);
         Self {
             manifest_version: 1,
             graph_format: GRAPH_FORMAT.to_string(),
             contract_version: 1,
             partition_id,
             version,
+            key_layout,
             tables: GraphManifestTables {
                 vertex_log: GraphManifestTableRef::new(VERTEX_LOG_TABLE, format!("{base_uri}/{VERTEX_LOG_TABLE}")),
                 edge_log: GraphManifestTableRef::new(EDGE_LOG_TABLE, format!("{base_uri}/{EDGE_LOG_TABLE}")),
@@ -84,6 +135,19 @@ impl GraphManifest {
             seq: GraphManifestSeqRange { min: seq_min, max: seq_max },
             dirty_labels: Vec::new(),
             generated_at_ms: None,
+        }
+    }
+}
+
+impl GraphManifestKeyLayout {
+    pub fn for_partition(partition_id: u32, version: u64) -> Self {
+        let manifest_prefix = format!("manifests/partitions/{partition_id}");
+        let latest_key = format!("{manifest_prefix}/latest.json");
+        let versioned_key = format!("{manifest_prefix}/manifest-{version:020}.json");
+        Self {
+            manifest_prefix,
+            latest_key,
+            versioned_key,
         }
     }
 }
