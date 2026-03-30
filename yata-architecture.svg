@@ -191,7 +191,7 @@
   <text x="80" y="532" fill="#475569" font-size="9">deps: serde_json, indexmap, regex</text>
 
   <rect x="400" y="445" width="340" height="100" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
-  <text x="420" y="468" fill="#e2e8f0" font-size="13" font-weight="bold">yata-store</text>
+  <text x="420" y="468" fill="#e2e8f0" font-size="13" font-weight="bold">yata-lance</text>
   <text x="620" y="468" fill="#64748b" font-size="9">~2,000 LOC</text>
   <text x="420" y="487" fill="#94a3b8" font-size="10">Sorted COO Store (in-memory, GRIN impl)</text>
   <text x="420" y="502" fill="#94a3b8" font-size="10">DiskBlobCache/MmapBlobCache (LRU cache)</text>
@@ -791,7 +791,7 @@
   <rect x="100" y="3293" width="1400" height="26" fill="#0a1a0a"/>
   <text x="140" y="3311" fill="#22c55e" font-size="11" font-weight="bold">K1</text>
   <text x="200" y="3311" fill="#86efac" font-size="9">S1</text>
-  <text x="250" y="3311" fill="#94a3b8" font-size="9">yata-store commit()</text>
+  <text x="250" y="3311" fill="#94a3b8" font-size="9">read_store commit()</text>
   <text x="460" y="3311" fill="#94a3b8" font-size="9">4/6 rebuild dirty-aware: prop_indexes, columnar_cache, label_bitmap, btree_indexes skip clean labels</text>
   <text x="820" y="3311" fill="#22c55e" font-size="9">200MB/commit → 20MB (dirty label only). 999 tests pass.</text>
   <text x="1100" y="3311" fill="#94a3b8" font-size="9">done</text>
@@ -1608,7 +1608,7 @@
   <line x1="140" y1="7262" x2="410" y2="7390" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
 
   <rect x="230" y="7230" width="120" height="32" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
-  <text x="290" y="7251" text-anchor="middle" fill="#e2e8f0" font-size="10">yata-store</text>
+  <text x="290" y="7251" text-anchor="middle" fill="#e2e8f0" font-size="10">yata-lance</text>
   <text x="290" y="7263" text-anchor="middle" fill="#64748b" font-size="8">8,863 LOC</text>
   <line x1="270" y1="7262" x2="195" y2="7310" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
   <line x1="290" y1="7262" x2="560" y2="7310" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>

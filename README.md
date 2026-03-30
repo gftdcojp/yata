@@ -49,7 +49,7 @@ Lance-backed graph database and event store with Raft consensus.
 | **yata-s3** | S3/R2 adapter (sync ureq+rustls, SigV4) |
 | **yata-vex** | Vector index (IVF_PQ + DiskANN) |
 | **yata-server** | XRPC API server (Cypher, mergeRecord, triggerSnapshot) |
-| **yata-bench** | Benchmarks + trillion-scale test |
+| **yata-bench** | Benchmarks |
 | **yata-bolt** | Bolt v4 wire protocol (Neo4j driver compatible) |
 | **yata-coordinator** | Label-based graph partitioning with Rayon parallel execution |
 | **yata-at** | AT Protocol types, Firehose client, bridge |

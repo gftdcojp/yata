@@ -603,11 +603,11 @@ fn compute_aggregate(
 mod tests {
     use super::*;
     use crate::planner::PlanBuilder;
-    use yata_lance::LanceReadStore as MutableCsrStore;
+    use yata_lance::LanceReadStore as TestStore;
 
     /// Helper: create a test store with Person/Company graph.
-    fn test_store() -> MutableCsrStore {
-        let mut store = MutableCsrStore::new();
+    fn test_store() -> TestStore {
+        let mut store = TestStore::new();
         // vid=0: Alice (Person, age=30)
         store.add_vertex(
             "Person",
@@ -979,7 +979,7 @@ mod tests {
     #[test]
     fn test_path_expand_self_loop() {
         // Graph with self-loop: A→A (should not infinite loop)
-        let mut store = MutableCsrStore::new();
+        let mut store = TestStore::new();
         store.add_vertex("Node", &[("name".into(), PropValue::Str("A".into()))]);
         store.add_edge(0, 0, "LOOP", &[]); // self-loop
         store.commit();
@@ -1000,7 +1000,7 @@ mod tests {
     #[test]
     fn test_path_expand_cycle() {
         // A→B→C→A cycle
-        let mut store = MutableCsrStore::new();
+        let mut store = TestStore::new();
         store.add_vertex("N", &[("id".into(), PropValue::Str("A".into()))]);
         store.add_vertex("N", &[("id".into(), PropValue::Str("B".into()))]);
         store.add_vertex("N", &[("id".into(), PropValue::Str("C".into()))]);
@@ -1032,7 +1032,7 @@ mod tests {
     #[test]
     fn test_path_expand_disconnected() {
         // D is disconnected — should not be reachable
-        let mut store = MutableCsrStore::new();
+        let mut store = TestStore::new();
         store.add_vertex("N", &[("id".into(), PropValue::Str("A".into()))]);
         store.add_vertex("N", &[("id".into(), PropValue::Str("B".into()))]);
         store.add_vertex("N", &[("id".into(), PropValue::Str("D".into()))]); // disconnected
@@ -1129,7 +1129,7 @@ mod tests {
 
     #[test]
     fn test_execute_group_by_aggregate() {
-        let mut store = MutableCsrStore::new();
+        let mut store = TestStore::new();
         store.add_vertex(
             "Person",
             &[
@@ -1271,7 +1271,7 @@ mod tests {
 
     #[test]
     fn test_distinct_dedup() {
-        let mut store = MutableCsrStore::new();
+        let mut store = TestStore::new();
         store.add_vertex("Item", &[("cat".into(), PropValue::Str("A".into()))]);
         store.add_vertex("Item", &[("cat".into(), PropValue::Str("A".into()))]);
         store.add_vertex("Item", &[("cat".into(), PropValue::Str("B".into()))]);
@@ -1453,7 +1453,7 @@ mod tests {
     #[test]
     fn test_return_node_empty_props() {
         // Node with no properties except label — should still return valid JSON.
-        let mut store = MutableCsrStore::new();
+        let mut store = TestStore::new();
         store.add_vertex("Empty", &[]);
         store.commit();
 
@@ -1546,11 +1546,11 @@ fn prop_value_to_json(v: &PropValue) -> String {
 mod untyped_edge_tests {
     use super::*;
     use crate::planner::PlanBuilder;
-    use yata_lance::LanceReadStore as MutableCsrStore;
+    use yata_lance::LanceReadStore as TestStore;
 
     #[test]
     fn test_untyped_edge_traversal() {
-        let mut store = MutableCsrStore::new();
+        let mut store = TestStore::new();
         let a = store.add_vertex("Person", &[("name", PropValue::Str("Alice".into()))]);
         let b = store.add_vertex("Person", &[("name", PropValue::Str("Bob".into()))]);
         let c = store.add_vertex("Company", &[("name", PropValue::Str("GFTD".into()))]);
@@ -1588,7 +1588,7 @@ mod untyped_edge_tests {
 
     #[test]
     fn test_untyped_scan_all_vertices() {
-        let mut store = MutableCsrStore::new();
+        let mut store = TestStore::new();
         store.add_vertex("Person", &[("name", PropValue::Str("Alice".into()))]);
         store.add_vertex("Company", &[("name", PropValue::Str("GFTD".into()))]);
         store.commit();
@@ -1609,7 +1609,7 @@ mod untyped_edge_tests {
 
     #[test]
     fn test_untyped_variable_hop() {
-        let mut store = MutableCsrStore::new();
+        let mut store = TestStore::new();
         let a = store.add_vertex("Person", &[("name", PropValue::Str("A".into()))]);
         let b = store.add_vertex("Person", &[("name", PropValue::Str("B".into()))]);
         let c = store.add_vertex("Person", &[("name", PropValue::Str("C".into()))]);
@@ -1641,11 +1641,11 @@ mod coverage_tests {
     use super::*;
     use crate::planner::PlanBuilder;
     use std::collections::HashSet;
-    use yata_lance::LanceReadStore as MutableCsrStore;
+    use yata_lance::LanceReadStore as TestStore;
 
     /// Helper: create the standard test store (same as tests::test_store).
-    fn test_store() -> MutableCsrStore {
-        let mut store = MutableCsrStore::new();
+    fn test_store() -> TestStore {
+        let mut store = TestStore::new();
         store.add_vertex(
             "Person",
             &[
@@ -1703,7 +1703,7 @@ mod coverage_tests {
     #[test]
     fn test_aggregate_with_nulls() {
         // Mix of vertices: some have "score", some don't
-        let mut store = MutableCsrStore::new();
+        let mut store = TestStore::new();
         store.add_vertex(
             "Item",
             &[
@@ -1805,7 +1805,7 @@ mod coverage_tests {
 
     #[test]
     fn test_empty_graph_operations() {
-        let mut store = MutableCsrStore::new();
+        let mut store = TestStore::new();
         store.commit();
 
         // Scan on empty graph
@@ -1962,11 +1962,11 @@ mod security_filter_tests {
     use super::*;
     use crate::ir::SecurityScope;
     use crate::planner::PlanBuilder;
-    use yata_lance::LanceReadStore as MutableCsrStore;
+    use yata_lance::LanceReadStore as TestStore;
 
     /// Build a store with security properties (sensitivity_ord, owner_hash, collection).
-    fn security_store() -> MutableCsrStore {
-        let mut store = MutableCsrStore::new();
+    fn security_store() -> TestStore {
+        let mut store = TestStore::new();
         // vid=0: public post
         store.add_vertex("Post", &[
             ("rkey", PropValue::Str("post1".into())),
@@ -2113,7 +2113,7 @@ mod security_filter_tests {
 
     #[test]
     fn test_security_filter_no_sensitivity_property_defaults_public() {
-        let mut store = MutableCsrStore::new();
+        let mut store = TestStore::new();
         // Vertex without sensitivity_ord → defaults to 0 (public)
         store.add_vertex("Item", &[("name", PropValue::Str("test".into()))]);
         store.commit();
@@ -2211,10 +2211,10 @@ mod security_filter_tests {
 mod eval_expr_tests {
     use super::*;
     use crate::ir::Expr;
-    use yata_lance::LanceReadStore as MutableCsrStore;
+    use yata_lance::LanceReadStore as TestStore;
 
-    fn test_store() -> MutableCsrStore {
-        let mut store = MutableCsrStore::new();
+    fn test_store() -> TestStore {
+        let mut store = TestStore::new();
         store.add_vertex(
             "Person",
             &[
@@ -2353,10 +2353,10 @@ mod eval_expr_tests {
 mod predicate_match_tests {
     use super::*;
     use crate::planner::PlanBuilder;
-    use yata_lance::LanceReadStore as MutableCsrStore;
+    use yata_lance::LanceReadStore as TestStore;
 
-    fn test_store() -> MutableCsrStore {
-        let mut store = MutableCsrStore::new();
+    fn test_store() -> TestStore {
+        let mut store = TestStore::new();
         store.add_vertex(
             "Person",
             &[
@@ -2469,10 +2469,10 @@ mod result_to_rows_tests {
     use super::*;
     use crate::ir::{AggOp, Expr};
     use crate::planner::PlanBuilder;
-    use yata_lance::LanceReadStore as MutableCsrStore;
+    use yata_lance::LanceReadStore as TestStore;
 
-    fn test_store() -> MutableCsrStore {
-        let mut store = MutableCsrStore::new();
+    fn test_store() -> TestStore {
+        let mut store = TestStore::new();
         store.add_vertex(
             "Person",
             &[
@@ -2688,10 +2688,10 @@ mod prop_value_cmp_tests {
 mod exchange_passthrough_tests {
     use super::*;
     use crate::ir::{ExchangeKind, Expr, LogicalOp};
-    use yata_lance::LanceReadStore as MutableCsrStore;
+    use yata_lance::LanceReadStore as TestStore;
 
-    fn test_store() -> MutableCsrStore {
-        let mut store = MutableCsrStore::new();
+    fn test_store() -> TestStore {
+        let mut store = TestStore::new();
         store.add_vertex("Person", &[("name", PropValue::Str("Alice".into()))]);
         store.add_vertex("Person", &[("name", PropValue::Str("Bob".into()))]);
         store.commit();
@@ -2733,11 +2733,11 @@ mod collect_aggregate_tests {
     use super::*;
     use crate::ir::{AggOp, Expr};
     use crate::planner::PlanBuilder;
-    use yata_lance::LanceReadStore as MutableCsrStore;
+    use yata_lance::LanceReadStore as TestStore;
 
     #[test]
     fn test_collect_returns_count_fallback() {
-        let mut store = MutableCsrStore::new();
+        let mut store = TestStore::new();
         store.add_vertex("Item", &[("name", PropValue::Str("A".into()))]);
         store.add_vertex("Item", &[("name", PropValue::Str("B".into()))]);
         store.add_vertex("Item", &[("name", PropValue::Str("C".into()))]);
@@ -2762,7 +2762,7 @@ mod collect_aggregate_tests {
 
     #[test]
     fn test_avg_empty_returns_null() {
-        let mut store = MutableCsrStore::new();
+        let mut store = TestStore::new();
         store.commit();
 
         let plan = PlanBuilder::new()
@@ -2783,7 +2783,7 @@ mod collect_aggregate_tests {
 
     #[test]
     fn test_min_empty_returns_null() {
-        let mut store = MutableCsrStore::new();
+        let mut store = TestStore::new();
         store.commit();
 
         let plan = PlanBuilder::new()
@@ -2804,7 +2804,7 @@ mod collect_aggregate_tests {
 
     #[test]
     fn test_max_empty_returns_null() {
-        let mut store = MutableCsrStore::new();
+        let mut store = TestStore::new();
         store.commit();
 
         let plan = PlanBuilder::new()

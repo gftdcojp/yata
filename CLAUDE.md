@@ -76,7 +76,7 @@ Read (cold start: Lance manifest → fragment-level demand page-in):
     → ensure_labels(vertex_labels) → hot_initialized == false?
       → cold_start(): Lance TableManifest load (R2 list O(1)) → hot_initialized = true → WAL tail replay
     → ensure_labels(["Post"]) → Lance manifest → matching fragments → 3-tier (disk → R2 → Blake3 verify → cache)
-    → wal_apply(entries) → MutableCsrStore → sparse index binary search + scan
+    → wal_apply(entries) → LanceReadStore → sparse index binary search + scan
 
 PDS Container (Rust) は不要 — 全て TS Worker + Pipeline + YATA_RPC。
 ```
@@ -104,7 +104,6 @@ env.YATA.stats()                        // → all partition CpmStats (K3a)
 |---|---|
 | `yata-core` | GlobalVid, LocalVid, PartitionId |
 | `yata-grin` | GRIN trait (Topology, Property, Schema, Scannable, Mutable) |
-| `yata-store` | **CooStore** (sorted COO, L0 append buffer + L1 sorted segments, sparse index), MutableCsrStore (legacy CSR, Phase 3 removal), DiskBlobCache/MmapBlobCache/MemoryBlobCache (BlobCache trait impls), PartitionStoreSet, GraphStoreEnum |
 | `yata-engine` | TieredGraphEngine, CpmStats (K3a), **Lance compaction** (`compaction.rs`: L0 + existing Lance fragments merge-sort, PK-dedup, dirty_labels drain → Lance fragment R2 PUT + `TableManifest` R2 PUT), **Arrow IPC WAL** (`arrow_wal.rs`: serialize/deserialize/auto-detect, default format), **Lance cold start** (`lance_manifest_cache` → `ensure_labels()` fragment demand page-in, **`cold_starting` AtomicBool** concurrent guard), engine-local query hints / memory bridge, Frontier BFS, ShardedCoordinator, WAL Projection (ring buffer + segment flush)。Design E SecurityScope (`query_with_did` → policy vertex lookup) |
 | `yata-cypher` | Full Cypher parser + executor (incl. untyped edge traversal) |
 | `yata-gie` | GIE push-based executor, IR (Exchange/Receive/Gather, serde-serializable), distributed planner, `execute_step()` (Phase 5: stateless per-round fragment execution), `MaterializedRecord` (rkey-based cross-partition exchange), `ExchangePayload` (HTTP transport) |

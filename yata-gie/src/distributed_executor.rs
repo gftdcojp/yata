@@ -377,10 +377,10 @@ mod tests {
     use crate::executor::execute;
     use crate::planner::PlanBuilder;
     use yata_grin::{Direction, Mutable};
-    use yata_lance::LanceReadStore as MutableCsrStore;
+    use yata_lance::LanceReadStore as TestStore;
 
-    fn make_store_with_persons(names: &[(&str, i64)]) -> MutableCsrStore {
-        let mut store = MutableCsrStore::new();
+    fn make_store_with_persons(names: &[(&str, i64)]) -> TestStore {
+        let mut store = TestStore::new();
         for (name, age) in names {
             store.add_vertex(
                 "Person",
@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn test_fragment_with_hash_shuffle() {
         // Partition 0: Alice(0), Partition 1: Bob(0)
-        let mut store0 = MutableCsrStore::new();
+        let mut store0 = TestStore::new();
         store0.add_vertex(
             "Person",
             &[
@@ -433,7 +433,7 @@ mod tests {
         store0.add_edge(0, bob_vid, "KNOWS", &[]);
         store0.commit();
 
-        let mut store1 = MutableCsrStore::new();
+        let mut store1 = TestStore::new();
         store1.add_vertex(
             "Person",
             &[
@@ -468,7 +468,7 @@ mod tests {
     fn test_fragment_with_gather() {
         // 4 partitions, each has 1 Person. Gather to partition 0.
         let names = [("Alice", 30), ("Bob", 25), ("Charlie", 35), ("Diana", 28)];
-        let stores: Vec<MutableCsrStore> = names
+        let stores: Vec<TestStore> = names
             .iter()
             .map(|(name, age)| make_store_with_persons(&[(*name, *age)]))
             .collect();
@@ -673,7 +673,7 @@ mod tests {
         // End-to-end: 2 partitions with different data.
         // Partition 0: Alice, Bob. Alice->Bob (KNOWS).
         // Partition 1: Charlie, Diana. Charlie->Diana (KNOWS).
-        let mut store0 = MutableCsrStore::new();
+        let mut store0 = TestStore::new();
         store0.add_vertex(
             "Person",
             &[
@@ -691,7 +691,7 @@ mod tests {
         store0.add_edge(0, 1, "KNOWS", &[]);
         store0.commit();
 
-        let mut store1 = MutableCsrStore::new();
+        let mut store1 = TestStore::new();
         store1.add_vertex(
             "Person",
             &[
@@ -747,7 +747,7 @@ mod tests {
 
     #[test]
     fn test_eval_routing_key_var() {
-        let store = MutableCsrStore::new();
+        let store = TestStore::new();
         let record = Record {
             bindings: {
                 let mut m = HashMap::new();
@@ -762,7 +762,7 @@ mod tests {
 
     #[test]
     fn test_eval_routing_key_lit() {
-        let store = MutableCsrStore::new();
+        let store = TestStore::new();
         let record = Record {
             bindings: HashMap::new(),
             values: vec![],
@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn test_eval_routing_key_missing_var() {
-        let store = MutableCsrStore::new();
+        let store = TestStore::new();
         let record = Record {
             bindings: HashMap::new(),
             values: vec![],

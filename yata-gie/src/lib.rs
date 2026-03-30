@@ -5,7 +5,7 @@
 //!
 //! Pipeline: IR LogicalOps -> Optimizer -> Executor
 //!
-//! Depends only on `yata-grin` traits at runtime. Tests still use `yata-store`.
+//! Depends only on `yata-grin` traits at runtime.
 
 pub mod distributed_executor;
 pub mod distributed_planner;

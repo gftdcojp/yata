@@ -1,7 +1,7 @@
 //! Cypher AST → GIE IR Plan transpiler.
 //!
 //! Converts parsed Cypher queries into GIE logical plans that execute directly
-//! on MutableCsrStore via GRIN traits — zero MemoryGraph copy.
+//! on a GRIN-compatible graph store — zero MemoryGraph copy.
 //!
 //! Only read-only queries are supported. Mutations (CREATE/MERGE/SET/DELETE)
 //! return `TranspileError::UnsupportedClause`; the engine routes mutations

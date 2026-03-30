@@ -151,7 +151,7 @@ pub trait Versioned {
 // Cross-partition references use VertexRef { partition_id, vid }.
 // Future M2 will introduce TypedTopology<V,E> generic traits; for now
 // the u32 surface is stable and the global→local translation lives in
-// yata-store::GlobalToLocalMap.
+// graph-local ID map.
 
 /// Typed neighbor entry using explicit LocalVid/LocalEid semantics.
 /// Parallel to `Neighbor` but with newtype IDs for stronger guarantees.
