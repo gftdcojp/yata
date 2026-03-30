@@ -1859,8 +1859,10 @@ mod tests {
         run_query(&e, "CREATE (:LN {lid: 'l1', val: 10})", &[], None).unwrap();
         run_query(&e, "CREATE (:LN {lid: 'l2', val: 20})", &[], None).unwrap();
 
-        let count = ENGINE_RT.block_on(e.warm.vector_count());
-        assert_eq!(count, 0, "vector store must not be touched by graph mutations");
+        // Vector store is now part of LanceDB table, not a separate field
+        // Graph mutations go to read_store, not to vector index
+        let vs = e.vector_search(vec![0.0; 128], 10, None, None).unwrap();
+        assert_eq!(vs.len(), 0, "vector search must return empty for graph-only mutations");
     }
 
     #[test]
