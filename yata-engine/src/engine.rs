@@ -5,9 +5,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use yata_cypher::Graph;
 use yata_graph::{GraphStore, QueryableGraph};
 use yata_grin::{Mutable, Predicate, PropValue, Property, Scannable, Topology};
-use yata_format::BlobStore;
 use yata_store::blob_cache::{
-    DiskBlobCache, MemoryBlobCache, FragmentManifest, MmapBlobCache, BlobCache,
+    DiskBlobCache, MemoryBlobCache, MmapBlobCache, BlobCache,
 };
 
 use crate::cache::{QueryCache, cache_key};
@@ -61,31 +60,7 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Infrastructure blobs that are always uploaded (schema, ivnums).
-/// meta.json is handled separately.
-fn is_infra_blob(name: &str) -> bool {
-    name == "schema" || name == "ivnums"
-}
 
-/// Check if blob name corresponds to a dirty vertex label.
-/// Blob names: `vertex_table_{i}` or `vertex_table_{i}_chunk_{j}`.
-fn is_dirty_vertex_blob(name: &str, dirty_vlabel_ids: &HashSet<usize>) -> bool {
-    if let Some(rest) = name.strip_prefix("vertex_table_") {
-        // Extract label index: first numeric segment before '_chunk_' or end
-        let idx_str = rest.split('_').next().unwrap_or("");
-        if let Ok(idx) = idx_str.parse::<usize>() {
-            return dirty_vlabel_ids.contains(&idx);
-        }
-    }
-    false
-}
-
-/// Edge and topology blobs: edge_table_*, oe_*, ie_*.
-fn is_edge_or_topology_blob(name: &str) -> bool {
-    name.starts_with("edge_table_")
-        || name.starts_with("oe_")
-        || name.starts_with("ie_")
-}
 
 /// Mutation context: metadata auto-injected into every mutated node.
 #[derive(Debug, Clone, Default)]
@@ -1383,10 +1358,10 @@ impl TieredGraphEngine {
         s3: std::sync::Arc<yata_s3::s3::S3Client>,
         prefix: &str,
         pid: u32,
-        manifest_key: &str,
+        _manifest_key: &str,
         segment_refs: &[(String, bytes::Bytes)],
         dirty: &std::collections::HashSet<String>,
-        existing_label_segments: &std::collections::HashMap<String, crate::compaction::LabelSegmentState>,
+        _existing_label_segments: &std::collections::HashMap<String, crate::compaction::LabelSegmentState>,
         global_max_seq: u64,
     ) -> Result<crate::compaction::CompactionResult, String> {
         let refs: Vec<(&str, &[u8])> = segment_refs.iter()
@@ -1405,20 +1380,7 @@ impl TieredGraphEngine {
         let mut new_fragments: Vec<yata_lance::Fragment> = Vec::new();
         let mut uploaded_results: Vec<&crate::compaction::LabelCompactionResult> = Vec::with_capacity(label_results.len());
         for (frag_idx, lr) in label_results.iter().enumerate() {
-            // Convert WalEntry props → VertexRow for Lance-table schema
-            let vertex_rows: Vec<yata_lance::VertexRow> = lr.data.chunks(1) // Placeholder: actual conversion below
-                .map(|_| ()) // We need to re-parse the Arrow IPC to get rows
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|_| yata_lance::VertexRow {
-                    label: String::new(), rkey: String::new(), collection: String::new(),
-                    value_b64: String::new(), repo: String::new(), updated_at: 0,
-                    sensitivity_ord: 0, owner_hash: 0,
-                })
-                .collect::<Vec<_>>();
-
-            // For now, keep Arrow IPC segment as the fragment data (same format Lance uses internally).
-            // The data is already Arrow IPC from compact_segments_by_label.
+            // Arrow IPC segment from compact_segments_by_label is the Lance fragment data.
             let fragment = lance_table.build_fragment(
                 global_max_seq, frag_idx as u32, &lr.data,
                 vec![lr.label.clone()], lr.entry_count,
