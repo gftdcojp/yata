@@ -1,11 +1,11 @@
 //! yata-gie: Graph Interactive Engine
 //!
-//! Push-based streaming query executor for graph data stored in MutableCsrStore.
+//! Push-based streaming query executor over any `yata-grin::GraphStore`.
 //! Inspired by GraphScope Flex's GIE architecture.
 //!
 //! Pipeline: IR LogicalOps -> Optimizer -> Executor
 //!
-//! Depends only on yata-grin (traits) and yata-store (storage).
+//! Depends only on `yata-grin` traits at runtime. Tests still use `yata-store`.
 
 pub mod distributed_executor;
 pub mod distributed_planner;

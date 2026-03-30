@@ -74,7 +74,6 @@ pub struct MutationContext {
 /// Graph engine: Sorted COO in-memory + WAL Projection (R2 segments + L1 compaction).
 pub struct TieredGraphEngine {
     config: TieredEngineConfig,
-    hot: Arc<RwLock<yata_store::GraphStoreEnum>>,
     read_store: Arc<RwLock<Option<yata_lance::LanceReadStore>>>,
     warm: Arc<yata_lance::YataVectorStore>,
     cache: Arc<Mutex<QueryCache>>,
@@ -115,7 +114,6 @@ impl TieredGraphEngine {
 
         let cache = QueryCache::new(config.cache_max_entries, config.cache_ttl_secs);
 
-        let hot_partition_id = config.hot_partition_id;
         let partition_count = config.partition_count;
         if partition_count > 1 {
             tracing::info!(partition_count, "partitioned graph store enabled");
@@ -124,13 +122,10 @@ impl TieredGraphEngine {
         let s3_prefix = std::env::var("YATA_S3_PREFIX").unwrap_or_default();
         let s3_client = Arc::new(Mutex::new(None));
 
-        // Sorted COO store (GIE query path needs as_single()).
-        let hot_store = yata_store::GraphStoreEnum::new(partition_count, hot_partition_id);
-        tracing::info!("using Sorted COO store (WAL Projection)");
+        tracing::info!("using Lance read store (WAL Projection)");
         let wal_ring_capacity = config.wal_ring_capacity;
         Self {
             config,
-            hot: Arc::new(RwLock::new(hot_store)),
             read_store: Arc::new(RwLock::new(Some(yata_lance::LanceReadStore::default()))),
             warm,
             cache: Arc::new(Mutex::new(cache)),
@@ -547,27 +542,16 @@ impl TieredGraphEngine {
             let vl_refs: Vec<&str> = hints_labels.iter().map(|s| s.as_str()).collect();
             self.ensure_labels(&vl_refs);
 
-            // GIE path: Cypher → IR Plan → execute directly on CSR (zero MemoryGraph copy).
-            // Design E: SecurityScope is compiled from CSR policy vertices via query_with_did().
+            // GIE path: Cypher → IR Plan → execute directly on the read store.
+            // Design E: SecurityScope is compiled from policy vertices via query_with_did().
             // This path (query_inner) is Internal-only (no SecurityFilter needed).
-            if let Ok(csr) = self.hot.read() {
-                if let Some(single_csr) = csr.as_single() {
-                    if let Ok(ast) = yata_cypher::parse(cypher) {
-                        let plan_result = yata_gie::transpile::transpile(&ast);
+            if let Ok(ast) = yata_cypher::parse(cypher) {
+                let plan_result = yata_gie::transpile::transpile(&ast);
 
-                        if let Ok(plan) = plan_result {
-                            if let Ok(rs) = self.read_store.read() {
-                                if let Some(ref read_store) = *rs {
-                                    let records = yata_gie::executor::execute(&plan, read_store);
-                                    let rows = yata_gie::executor::result_to_rows(&records, &plan);
-                                    let k = cache_key(cypher, params, rls_org_id);
-                                    if let Ok(mut c) = self.cache.lock() {
-                                        c.put(k, rows.clone());
-                                    }
-                                    return Ok(rows);
-                                }
-                            }
-                            let records = yata_gie::executor::execute(&plan, single_csr);
+                if let Ok(plan) = plan_result {
+                    if let Ok(rs) = self.read_store.read() {
+                        if let Some(ref read_store) = *rs {
+                            let records = yata_gie::executor::execute(&plan, read_store);
                             let rows = yata_gie::executor::result_to_rows(&records, &plan);
 
                             let k = cache_key(cypher, params, rls_org_id);
@@ -576,9 +560,10 @@ impl TieredGraphEngine {
                             }
                             return Ok(rows);
                         }
-                        // GIE transpile failed (CONTAINS, UNION, UNWIND, etc.) → fall through to MemoryGraph
                     }
+                    return Err("no read store available for query execution".to_string());
                 }
+                // GIE transpile failed (CONTAINS, UNION, UNWIND, etc.) → fall through to MemoryGraph
             }
         }
 
@@ -756,6 +741,7 @@ impl TieredGraphEngine {
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     ll.insert(label.to_string());
                 }
+                self.hot_initialized.store(true, Ordering::SeqCst);
                 let pw = self.pending_writes.fetch_add(1, Ordering::Relaxed) + 1;
                 if pw >= Self::L0_COMPACT_THRESHOLD {
                     self.pending_writes.store(0, Ordering::Relaxed);
@@ -804,6 +790,7 @@ impl TieredGraphEngine {
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     ll.insert(label.to_string());
                 }
+                self.hot_initialized.store(true, Ordering::SeqCst);
                 let pw = self.pending_writes.fetch_add(1, Ordering::Relaxed) + 1;
                 if pw >= Self::L0_COMPACT_THRESHOLD {
                     self.pending_writes.store(0, Ordering::Relaxed);
@@ -841,6 +828,7 @@ impl TieredGraphEngine {
             if let Some(ref mut store) = *read_store {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
                 let deleted = store.delete_vertex_by_pk(label, pk_key, &pk);
+                self.hot_initialized.store(true, Ordering::SeqCst);
                 return Ok(deleted);
             }
         }
@@ -878,6 +866,7 @@ impl TieredGraphEngine {
             if let Some(ref mut store) = *read_store {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
                 let deleted = store.delete_vertex_by_pk(label, pk_key, &pk);
+                self.hot_initialized.store(true, Ordering::SeqCst);
                 return Ok((deleted, wal_entry));
             }
         }
@@ -1334,8 +1323,7 @@ impl TieredGraphEngine {
         }
     }
 
-    /// Compile SecurityScope from policy vertices in CSR for a given DID.
-    /// Uses prop_eq_index for O(1) lookup per policy label.
+    /// Compile SecurityScope from policy vertices in the read store for a given DID.
     /// Results are cached with TTL.
     pub fn compile_security_scope(&self, did: &str) -> yata_gie::ir::SecurityScope {
         // Empty DID = public access
@@ -1357,18 +1345,18 @@ impl TieredGraphEngine {
             }
         }
 
-        // Compile from CSR policy vertices
+        // Compile from read-store policy vertices
         let mut max_sensitivity_ord: u8 = 0;
         let mut collection_scopes: Vec<String> = Vec::new();
         let mut allowed_owner_hashes: Vec<u32> = Vec::new();
 
-        if let Ok(hot) = self.hot.read() {
-            if let Some(single) = hot.as_single() {
+        if let Ok(read_store) = self.read_store.read() {
+            if let Some(ref store) = *read_store {
                 let did_val = PropValue::Str(did.to_string());
 
                 // ClearanceAssignment: scan by did → extract level
-                for vid in single.scan_vertices("ClearanceAssignment", &Predicate::Eq("did".to_string(), did_val.clone())) {
-                    if let Some(PropValue::Str(level)) = single.vertex_prop(vid, "level") {
+                for vid in store.scan_vertices("ClearanceAssignment", &Predicate::Eq("did".to_string(), did_val.clone())) {
+                    if let Some(PropValue::Str(level)) = store.vertex_prop(vid, "level") {
                         max_sensitivity_ord = match level.as_str() {
                             "restricted" => 3,
                             "confidential" => 2,
@@ -1379,8 +1367,8 @@ impl TieredGraphEngine {
                 }
 
                 // RBACAssignment: scan by did → extract scope (collection prefix)
-                for vid in single.scan_vertices("RBACAssignment", &Predicate::Eq("did".to_string(), did_val.clone())) {
-                    if let Some(PropValue::Str(scope)) = single.vertex_prop(vid, "scope") {
+                for vid in store.scan_vertices("RBACAssignment", &Predicate::Eq("did".to_string(), did_val.clone())) {
+                    if let Some(PropValue::Str(scope)) = store.vertex_prop(vid, "scope") {
                         if scope != "*" {
                             collection_scopes.push(scope.clone());
                         }
@@ -1388,8 +1376,8 @@ impl TieredGraphEngine {
                 }
 
                 // ConsentGrant: scan by grantee_did → extract grantor_did → hash
-                for vid in single.scan_vertices("ConsentGrant", &Predicate::Eq("grantee_did".to_string(), did_val.clone())) {
-                    if let Some(PropValue::Str(grantor)) = single.vertex_prop(vid, "grantor_did") {
+                for vid in store.scan_vertices("ConsentGrant", &Predicate::Eq("grantee_did".to_string(), did_val.clone())) {
+                    if let Some(PropValue::Str(grantor)) = store.vertex_prop(vid, "grantor_did") {
                         allowed_owner_hashes.push(fnv1a_32(grantor.as_bytes()));
                     }
                 }

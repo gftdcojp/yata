@@ -15,8 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::executor::{execute_op, eval_expr, MaterializedRecord, Record};
 use crate::ir::*;
-use yata_grin::PropValue;
-use yata_store::MutableCsrStore;
+use yata_grin::{GraphStore, PropValue};
 
 /// Trait for exchange data transport between partitions.
 /// Implementations: MemoryExchangeTransport (testing), R2ExchangeTransport (production).
@@ -126,9 +125,9 @@ impl ExchangeTransport for MemoryExchangeTransport {
 }
 
 /// Execute a distributed plan fragment on a single partition.
-pub fn execute_fragment(
+pub fn execute_fragment<S: GraphStore>(
     fragment: &PartitionPlanFragment,
-    store: &MutableCsrStore,
+    store: &S,
     transport: &dyn ExchangeTransport,
     query_id: u64,
     partition_count: u32,
@@ -239,9 +238,9 @@ pub struct ExchangePayload {
 /// - `inbound`: materialized records received from other partitions for each round < target_round.
 ///
 /// Returns ExchangePayload with outbound data or final results.
-pub fn execute_step(
+pub fn execute_step<S: GraphStore>(
     cypher: &str,
-    store: &MutableCsrStore,
+    store: &S,
     partition_id: u32,
     partition_count: u32,
     target_round: u32,
@@ -357,12 +356,12 @@ pub fn execute_step(
 }
 
 /// Evaluate routing key expression to a u64 for partition routing.
-fn eval_routing_key(expr: &Expr, record: &Record, _store: &MutableCsrStore) -> u64 {
+fn eval_routing_key<S: GraphStore>(expr: &Expr, record: &Record, store: &S) -> u64 {
     match expr {
         Expr::Var(name) => record.bindings.get(name.as_str()).copied().unwrap_or(0) as u64,
         Expr::Lit(PropValue::Int(n)) => *n as u64,
         _ => {
-            let val = eval_expr(expr, record, _store);
+            let val = eval_expr(expr, record, store);
             match val {
                 PropValue::Int(n) => n as u64,
                 _ => 0,
