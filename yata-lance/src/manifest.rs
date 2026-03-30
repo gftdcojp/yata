@@ -56,7 +56,21 @@ pub struct GraphManifest {
 pub struct GraphManifestKeyLayout {
     pub manifest_prefix: String,
     pub latest_key: String,
+    pub pointer_key: String,
     pub versioned_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraphManifestLatestPointer {
+    pub graph_format: String,
+    pub contract_version: u32,
+    pub partition_id: u32,
+    pub version: u64,
+    pub versioned_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_ms: Option<u64>,
 }
 
 pub struct OpenedGraphDatasets {
@@ -143,11 +157,32 @@ impl GraphManifestKeyLayout {
     pub fn for_partition(partition_id: u32, version: u64) -> Self {
         let manifest_prefix = format!("manifests/partitions/{partition_id}");
         let latest_key = format!("{manifest_prefix}/latest.json");
+        let pointer_key = latest_key.clone();
         let versioned_key = format!("{manifest_prefix}/manifest-{version:020}.json");
         Self {
             manifest_prefix,
             latest_key,
+            pointer_key,
             versioned_key,
+        }
+    }
+}
+
+impl GraphManifestLatestPointer {
+    pub fn from_manifest(manifest: &GraphManifest) -> Self {
+        Self {
+            graph_format: manifest.graph_format.clone(),
+            contract_version: manifest.contract_version,
+            partition_id: manifest.partition_id,
+            version: manifest.version,
+            versioned_key: manifest.key_layout.versioned_key.clone(),
+            etag: manifest
+                .tables
+                .vertex_live
+                .etag
+                .clone()
+                .or_else(|| manifest.tables.edge_live_out.etag.clone()),
+            updated_at_ms: manifest.generated_at_ms,
         }
     }
 }
@@ -171,6 +206,14 @@ pub fn parse_manifest_json(data: &[u8]) -> Result<GraphManifest, serde_json::Err
     serde_json::from_slice(data)
 }
 
+pub fn render_latest_pointer_json(ptr: &GraphManifestLatestPointer) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec_pretty(ptr)
+}
+
+pub fn parse_latest_pointer_json(data: &[u8]) -> Result<GraphManifestLatestPointer, serde_json::Error> {
+    serde_json::from_slice(data)
+}
+
 pub fn save_manifest<S: ManifestStore>(
     store: &S,
     key: &str,
@@ -188,6 +231,43 @@ pub fn load_manifest<S: ManifestStore>(store: &S, key: &str) -> Result<Option<Gr
     parse_manifest_json(&bytes)
         .map(Some)
         .map_err(|e| e.to_string())
+}
+
+pub fn load_latest_pointer<S: ManifestStore>(
+    store: &S,
+    key: &str,
+) -> Result<Option<GraphManifestLatestPointer>, String> {
+    let bytes = match store.get(key).map_err(|_| "latest pointer get failed".to_string())? {
+        Some(bytes) => bytes,
+        None => return Ok(None),
+    };
+    parse_latest_pointer_json(&bytes)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+pub fn load_manifest_via_latest<S: ManifestStore>(
+    store: &S,
+    latest_key: &str,
+) -> Result<Option<GraphManifest>, String> {
+    let pointer = match load_latest_pointer(store, latest_key)? {
+        Some(pointer) => pointer,
+        None => return Ok(None),
+    };
+    load_manifest(store, &pointer.versioned_key)
+}
+
+pub fn publish_manifest<S: ManifestStore>(
+    store: &S,
+    manifest: &GraphManifest,
+) -> Result<(), String> {
+    save_manifest(store, &manifest.key_layout.versioned_key, manifest)?;
+    let ptr = GraphManifestLatestPointer::from_manifest(manifest);
+    let bytes = render_latest_pointer_json(&ptr).map_err(|e| e.to_string())?;
+    store
+        .put(&manifest.key_layout.pointer_key, &bytes)
+        .map_err(|_| "manifest pointer put failed".to_string())?;
+    Ok(())
 }
 
 #[cfg(test)]

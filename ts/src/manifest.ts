@@ -43,7 +43,18 @@ export interface GraphManifest {
 export interface GraphManifestKeyLayout {
   manifest_prefix: string;
   latest_key: string;
+  pointer_key: string;
   versioned_key: string;
+}
+
+export interface GraphManifestLatestPointer {
+  graph_format: typeof GRAPH_FORMAT;
+  contract_version: number;
+  partition_id: number;
+  version: number;
+  versioned_key: string;
+  etag?: string | null;
+  updated_at_ms?: number;
 }
 
 export interface ManifestStore {
@@ -101,6 +112,7 @@ export function createManifestKeyLayout(
   return {
     manifest_prefix,
     latest_key: `${manifest_prefix}/latest.json`,
+    pointer_key: `${manifest_prefix}/latest.json`,
     versioned_key: `${manifest_prefix}/manifest-${String(version).padStart(20, "0")}.json`,
   };
 }
@@ -127,6 +139,55 @@ export async function loadManifest(
 ): Promise<GraphManifest | null> {
   const json = await store.get(key);
   return json == null ? null : parseManifest(json);
+}
+
+export async function loadLatestPointer(
+  store: ManifestStore,
+  key: string,
+): Promise<GraphManifestLatestPointer | null> {
+  const json = await store.get(key);
+  return json == null ? null : parseLatestPointer(json);
+}
+
+export async function loadManifestViaLatest(
+  store: ManifestStore,
+  latestKey: string,
+): Promise<GraphManifest | null> {
+  const pointer = await loadLatestPointer(store, latestKey);
+  return pointer == null ? null : loadManifest(store, pointer.versioned_key);
+}
+
+export async function publishManifest(
+  store: ManifestStore,
+  manifest: GraphManifest,
+): Promise<void> {
+  await saveManifest(store, manifest.key_layout.versioned_key, manifest);
+  await store.put(
+    manifest.key_layout.pointer_key,
+    stringifyLatestPointer(createLatestPointer(manifest)),
+  );
+}
+
+export function createLatestPointer(
+  manifest: GraphManifest,
+): GraphManifestLatestPointer {
+  return {
+    graph_format: GRAPH_FORMAT,
+    contract_version: manifest.contract_version,
+    partition_id: manifest.partition_id,
+    version: manifest.version,
+    versioned_key: manifest.key_layout.versioned_key,
+    etag: manifest.tables.vertex_live.etag ?? manifest.tables.edge_live_out.etag,
+    updated_at_ms: manifest.generated_at_ms,
+  };
+}
+
+export function stringifyLatestPointer(pointer: GraphManifestLatestPointer): string {
+  return JSON.stringify(pointer, null, 2);
+}
+
+export function parseLatestPointer(json: string): GraphManifestLatestPointer {
+  return JSON.parse(json) as GraphManifestLatestPointer;
 }
 
 export function createFetchManifestStore(fetchImpl: typeof fetch = fetch): ManifestStore {

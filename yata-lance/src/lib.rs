@@ -19,6 +19,7 @@ pub use dataset::{
 pub use manifest::{
     GraphManifest,
     GraphManifestKeyLayout,
+    GraphManifestLatestPointer,
     GraphManifestSeqRange,
     GraphManifestTableRef,
     GraphManifestTables,
@@ -26,7 +27,12 @@ pub use manifest::{
     OpenedGraphDatasets,
     S3ManifestStore,
     load_manifest,
+    load_manifest_via_latest,
+    load_latest_pointer,
+    parse_latest_pointer_json,
     parse_manifest_json,
+    publish_manifest,
+    render_latest_pointer_json,
     save_manifest,
     render_manifest_json,
 };
