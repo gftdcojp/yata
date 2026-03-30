@@ -86,6 +86,17 @@ export type {
   ManifestStore,
   R2BucketLike,
 } from "./manifest.js";
+export { GraphCatalog } from "./catalog.js";
+export {
+  applyEdgeMutation,
+  applyVertexMutation,
+} from "./writer.js";
+export type {
+  EdgeMutation,
+  LanceWritableTableLike,
+  VertexMutation,
+  YataWritableTables,
+} from "./writer.js";
 
 // Cypher builder
 export { G, buildLabelCypher } from "./cypher.js";

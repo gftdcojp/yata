@@ -3,11 +3,14 @@
 //! Thin wrapper around `lance::Dataset` for COO sorted graph data.
 //! All manifest, fragment, compaction, and MVCC management is delegated to Lance.
 
+pub mod catalog;
 pub mod dataset;
 pub mod manifest;
 pub mod schema;
 pub mod vector;
+pub mod writer;
 
+pub use catalog::GraphCatalog;
 pub use dataset::YataDataset;
 pub use dataset::{
     create_edge_live_in_dataset,
@@ -50,3 +53,4 @@ pub use schema::{
     vertex_log_schema,
 };
 pub use vector::YataVectorStore;
+pub use writer::{EdgeMutation, VertexMutation, apply_edge_mutation, apply_vertex_mutation};
