@@ -187,6 +187,11 @@ pub fn compact_segments_by_label(
     for (label, entries) in by_label {
         let max_seq = entries.iter().map(|e| e.seq).max().unwrap_or(0);
         let entry_count = entries.len();
+        // Use Lance v2 native format when available (bitpacking, FSST, dictionary encoding).
+        // Falls back to Arrow IPC when native-lance feature is disabled.
+        #[cfg(feature = "native-lance")]
+        let data = crate::arrow_wal::serialize_segment_lance(&entries)?;
+        #[cfg(not(feature = "native-lance"))]
         let data = crate::arrow_wal::serialize_segment_arrow(&entries)?;
         results.push(LabelCompactionResult { label, data, max_seq, entry_count });
     }

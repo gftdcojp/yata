@@ -82,19 +82,16 @@ fn json_to_prop_value(v: &serde_json::Value) -> yata_grin::PropValue {
 }
 
 
-/// Serialize WAL entries to Arrow IPC File format bytes.
+/// Convert WAL entries to an Arrow RecordBatch (WAL schema).
 ///
-/// File format (not Stream) enables seekable mmap reads.
-/// Returns empty Bytes if entries is empty.
-pub fn serialize_segment_arrow(entries: &[WalEntry]) -> Result<Bytes, String> {
+/// Public so that the compaction path can build a batch and serialize it
+/// in either Arrow IPC or Lance format.
+pub fn wal_entries_to_batch(entries: &[WalEntry]) -> Result<RecordBatch, String> {
     if entries.is_empty() {
-        return Ok(Bytes::new());
+        return Err("empty entries".into());
     }
-
-    let n = entries.len();
     let schema = wal_arrow_schema();
 
-    // Build columnar arrays from row-oriented WalEntry slice.
     let seq_values: Vec<u64> = entries.iter().map(|e| e.seq).collect();
     let op_values: Vec<u8> = entries.iter().map(|e| op_to_u8(e.op)).collect();
     let label_values: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
@@ -120,10 +117,100 @@ pub fn serialize_segment_arrow(entries: &[WalEntry]) -> Result<Bytes, String> {
         Arc::new(StringArray::from(props_refs)),
     ];
 
-    let batch = RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| format!("Arrow RecordBatch build failed: {e}"))?;
+    RecordBatch::try_new(schema, columns)
+        .map_err(|e| format!("Arrow RecordBatch build failed: {e}"))
+}
 
-    debug_assert_eq!(batch.num_rows(), n);
+/// Convert an Arrow RecordBatch (WAL schema) back to WalEntry vector.
+pub fn batch_to_wal_entries(batch: &RecordBatch) -> Result<Vec<WalEntry>, String> {
+    let n = batch.num_rows();
+    let seq_col = batch
+        .column_by_name("seq")
+        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+        .ok_or("missing or invalid 'seq' column")?;
+    let op_col = batch
+        .column_by_name("op")
+        .and_then(|c| c.as_any().downcast_ref::<UInt8Array>())
+        .ok_or("missing or invalid 'op' column")?;
+    let label_col = batch
+        .column_by_name("label")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or("missing or invalid 'label' column")?;
+    let pk_key_col = batch
+        .column_by_name("pk_key")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or("missing or invalid 'pk_key' column")?;
+    let pk_value_col = batch
+        .column_by_name("pk_value")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or("missing or invalid 'pk_value' column")?;
+    let ts_col = batch
+        .column_by_name("timestamp_ms")
+        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+        .ok_or("missing or invalid 'timestamp_ms' column")?;
+    let props_col = batch
+        .column_by_name("props_json")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or("missing or invalid 'props_json' column")?;
+
+    let mut entries = Vec::with_capacity(n);
+    for i in 0..n {
+        let props: Vec<(String, yata_grin::PropValue)> = if props_col.is_null(i) {
+            Vec::new()
+        } else {
+            let json_map: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(props_col.value(i)).unwrap_or_default();
+            json_map.into_iter().map(|(k, v)| (k, json_to_prop_value(&v))).collect()
+        };
+        entries.push(WalEntry {
+            seq: seq_col.value(i),
+            op: u8_to_op(op_col.value(i)),
+            label: label_col.value(i).to_string(),
+            pk_key: pk_key_col.value(i).to_string(),
+            pk_value: pk_value_col.value(i).to_string(),
+            timestamp_ms: ts_col.value(i),
+            props,
+        });
+    }
+    Ok(entries)
+}
+
+/// Serialize WAL entries to Lance v2 native format bytes (async).
+///
+/// Uses lance-file crate for columnar encoding (bitpacking, FSST, dictionary).
+#[cfg(feature = "native-lance")]
+pub fn serialize_segment_lance(entries: &[WalEntry]) -> Result<Bytes, String> {
+    if entries.is_empty() {
+        return Ok(Bytes::new());
+    }
+    let batch = wal_entries_to_batch(entries)?;
+    crate::engine::ENGINE_RT.block_on(yata_lance::native::serialize_batch_lance(&batch))
+}
+
+/// Deserialize Lance v2 native format bytes back to WalEntry vector.
+#[cfg(feature = "native-lance")]
+pub fn deserialize_segment_lance(data: &[u8]) -> Result<Vec<WalEntry>, String> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    let batch = crate::engine::ENGINE_RT.block_on(
+        yata_lance::native::deserialize_batch_lance(Bytes::copy_from_slice(data))
+    )?;
+    batch_to_wal_entries(&batch)
+}
+
+/// Serialize WAL entries to Arrow IPC File format bytes.
+///
+/// File format (not Stream) enables seekable mmap reads.
+/// Returns empty Bytes if entries is empty.
+pub fn serialize_segment_arrow(entries: &[WalEntry]) -> Result<Bytes, String> {
+    if entries.is_empty() {
+        return Ok(Bytes::new());
+    }
+
+    let batch = wal_entries_to_batch(entries)?;
+    let n = batch.num_rows();
+    let schema = wal_arrow_schema();
 
     // Serialize to Arrow IPC File format (seekable, mmap-compatible).
     let buf = std::io::Cursor::new(Vec::with_capacity(n * 128));

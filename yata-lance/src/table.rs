@@ -125,7 +125,7 @@ impl LanceTable {
         Fragment {
             id: fragment_id,
             version,
-            r2_key: format!("{}fragments/{:020}-{:06}.arrow", self.prefix, version, fragment_id),
+            r2_key: format!("{}fragments/{:020}-{:06}.lance", self.prefix, version, fragment_id),
             row_count,
             byte_size: data.len(),
             blake3_hex,

@@ -29,7 +29,7 @@ pub struct CpmStats {
 }
 
 /// Shared tokio runtime for all engine instances (avoids nested runtime issues).
-static ENGINE_RT: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+pub(crate) static ENGINE_RT: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -364,8 +364,9 @@ impl TieredGraphEngine {
                     .collect();
                 if matching_fragments.is_empty() { continue; }
                 for frag in matching_fragments {
+                    let ext = if frag.r2_key.ends_with(".lance") { "lance" } else { "arrow" };
                     let disk_path = vineyard_dir.as_ref()
-                        .map(|d| format!("{d}/lance/vertices/{pid}/fragments/{:020}-{:06}.arrow", frag.version, frag.id));
+                        .map(|d| format!("{d}/lance/vertices/{pid}/fragments/{:020}-{:06}.{ext}", frag.version, frag.id));
                     // Tier 1: disk cache
                     let data = if let Some(ref path) = disk_path {
                         if std::path::Path::new(path).exists() {
@@ -393,7 +394,21 @@ impl TieredGraphEngine {
                             _ => { continue; }
                         }
                     };
-                    let entries = crate::arrow_wal::deserialize_segment_auto(&frag.r2_key, &data);
+                    // Dual-format: Lance native (.lance) or Arrow IPC (.arrow)
+                    let entries = if frag.r2_key.ends_with(".lance") {
+                        #[cfg(feature = "native-lance")]
+                        {
+                            crate::arrow_wal::deserialize_segment_lance(&data)
+                                .unwrap_or_default()
+                        }
+                        #[cfg(not(feature = "native-lance"))]
+                        {
+                            tracing::error!(label, "Lance fragment but native-lance disabled");
+                            continue;
+                        }
+                    } else {
+                        crate::arrow_wal::deserialize_segment_auto(&frag.r2_key, &data)
+                    };
                     if !entries.is_empty() {
                         let _ = self.wal_apply(&entries);
                     }
@@ -1394,7 +1409,8 @@ impl TieredGraphEngine {
                     if let Some(ref dir) = vineyard_dir {
                         let frag_dir = format!("{dir}/lance/vertices/{pid}/fragments");
                         let _ = std::fs::create_dir_all(&frag_dir);
-                        let _ = std::fs::write(format!("{frag_dir}/{:020}-{:06}.arrow", global_max_seq, frag_idx), &lr.data);
+                        let ext = if cfg!(feature = "native-lance") { "lance" } else { "arrow" };
+                        let _ = std::fs::write(format!("{frag_dir}/{:020}-{:06}.{ext}", global_max_seq, frag_idx), &lr.data);
                     }
                     new_fragments.push(fragment);
                     uploaded_results.push(lr);
