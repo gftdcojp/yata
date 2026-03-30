@@ -1,4 +1,4 @@
-//! Compare local CSR scans against direct Lance scans on the same synthetic dataset.
+//! Compare local CSR scans against multiple Lance query modes on the same synthetic dataset.
 //!
 //! Usage:
 //!   cargo run -p yata-bench --bin csr-vs-lance-bench --release
@@ -7,12 +7,13 @@
 //!   NODES  (default: 100000)
 //!   LABELS (default: 10)
 //!   ITERS  (default: 200)
+//!   COLD_ITERS (default: 20)
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use arrow::array::{BooleanArray, StringArray, UInt32Array, UInt64Array};
+use arrow::array::{Array, BooleanArray, StringArray, UInt32Array, UInt64Array};
 use arrow::record_batch::RecordBatch;
 use yata_grin::{Mutable, Predicate, PropValue, Scannable};
 use yata_lance::YataDataset;
@@ -44,6 +45,54 @@ fn env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+fn batch_str_col<'a>(batch: &'a RecordBatch, idx: usize) -> &'a StringArray {
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("string column")
+}
+
+fn batch_bool_col<'a>(batch: &'a RecordBatch, idx: usize) -> &'a BooleanArray {
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("bool column")
+}
+
+fn count_label_in_batches(batches: &[RecordBatch], target_label: &str) -> usize {
+    let mut total = 0usize;
+    for batch in batches {
+        let labels = batch_str_col(batch, 1);
+        let alive = batch_bool_col(batch, 5);
+        for row in 0..batch.num_rows() {
+            if alive.value(row) && labels.value(row) == target_label {
+                total += 1;
+            }
+        }
+    }
+    total
+}
+
+fn count_point_in_batches(batches: &[RecordBatch], target_label: &str, target_rkey: &str) -> usize {
+    let mut total = 0usize;
+    for batch in batches {
+        let labels = batch_str_col(batch, 1);
+        let pk_values = batch_str_col(batch, 3);
+        let alive = batch_bool_col(batch, 5);
+        for row in 0..batch.num_rows() {
+            if alive.value(row)
+                && labels.value(row) == target_label
+                && pk_values.value(row) == target_rkey
+            {
+                total += 1;
+            }
+        }
+    }
+    total
 }
 
 fn build_csr(nodes: usize, labels: usize) -> MutableCsrStore {
@@ -109,6 +158,7 @@ async fn main() -> Result<()> {
     let nodes = env_usize("NODES", 100_000);
     let labels = env_usize("LABELS", 10);
     let iters = env_usize("ITERS", 200);
+    let cold_iters = env_usize("COLD_ITERS", 20);
     let target_label = "Label0";
     let target_rkey = format!("n{}", nodes / 2);
 
@@ -116,6 +166,7 @@ async fn main() -> Result<()> {
     println!("  nodes  : {nodes}");
     println!("  labels : {labels}");
     println!("  iters  : {iters}");
+    println!("  cold   : {cold_iters}");
 
     let t0 = Instant::now();
     let csr = build_csr(nodes, labels);
@@ -125,9 +176,14 @@ async fn main() -> Result<()> {
     let t1 = Instant::now();
     let lance = build_lance(tmp.path(), nodes, labels).await?;
     let lance_build_ms = t1.elapsed().as_millis();
+    let lance_uri = tmp.path().to_str().unwrap().to_string();
+    let t2 = Instant::now();
+    let lance_batches = lance.scan_all().await?;
+    let lance_preload_ms = t2.elapsed().as_millis();
 
     println!("  build csr   : {} ms", csr_build_ms);
     println!("  build lance : {} ms", lance_build_ms);
+    println!("  preload rb  : {} ms", lance_preload_ms);
 
     let mut csr_label = Lat::new();
     for _ in 0..iters {
@@ -136,13 +192,13 @@ async fn main() -> Result<()> {
         csr_label.push_ns(t.elapsed().as_nanos() as u64);
     }
 
-    let mut lance_label = Lat::new();
+    let mut lance_warm_label = Lat::new();
     for _ in 0..iters {
         let t = Instant::now();
         let _ = lance
             .count_rows(Some(&format!("label = '{target_label}'")))
             .await?;
-        lance_label.push_ns(t.elapsed().as_nanos() as u64);
+        lance_warm_label.push_ns(t.elapsed().as_nanos() as u64);
     }
 
     let mut csr_point = Lat::new();
@@ -155,7 +211,7 @@ async fn main() -> Result<()> {
         csr_point.push_ns(t.elapsed().as_nanos() as u64);
     }
 
-    let mut lance_point = Lat::new();
+    let mut lance_warm_point = Lat::new();
     for _ in 0..iters {
         let t = Instant::now();
         let _ = lance
@@ -163,23 +219,65 @@ async fn main() -> Result<()> {
                 "label = '{target_label}' AND pk_value = '{target_rkey}'"
             )))
             .await?;
-        lance_point.push_ns(t.elapsed().as_nanos() as u64);
+        lance_warm_point.push_ns(t.elapsed().as_nanos() as u64);
+    }
+
+    let mut lance_mem_label = Lat::new();
+    for _ in 0..iters {
+        let t = Instant::now();
+        let _ = count_label_in_batches(&lance_batches, target_label);
+        lance_mem_label.push_ns(t.elapsed().as_nanos() as u64);
+    }
+
+    let mut lance_mem_point = Lat::new();
+    for _ in 0..iters {
+        let t = Instant::now();
+        let _ = count_point_in_batches(&lance_batches, target_label, &target_rkey);
+        lance_mem_point.push_ns(t.elapsed().as_nanos() as u64);
+    }
+
+    let mut lance_cold_label = Lat::new();
+    for _ in 0..cold_iters {
+        let t = Instant::now();
+        let ds = YataDataset::open(&lance_uri).await?;
+        let _ = ds.count_rows(Some(&format!("label = '{target_label}'"))).await?;
+        lance_cold_label.push_ns(t.elapsed().as_nanos() as u64);
+    }
+
+    let mut lance_cold_point = Lat::new();
+    for _ in 0..cold_iters {
+        let t = Instant::now();
+        let ds = YataDataset::open(&lance_uri).await?;
+        let _ = ds
+            .count_rows(Some(&format!(
+                "label = '{target_label}' AND pk_value = '{target_rkey}'"
+            )))
+            .await?;
+        lance_cold_point.push_ns(t.elapsed().as_nanos() as u64);
     }
 
     println!();
     println!(
-        "label scan  : csr mean {:.1}us p95 {:.1}us | lance mean {:.1}us p95 {:.1}us",
+        "label scan  : csr resident mean {:.1}us p95 {:.1}us | lance warm mean {:.1}us p95 {:.1}us | lance batches mean {:.1}us p95 {:.1}us | lance reopen mean {:.1}us p95 {:.1}us",
         csr_label.mean_us(),
         csr_label.p95_us(),
-        lance_label.mean_us(),
-        lance_label.p95_us()
+        lance_warm_label.mean_us(),
+        lance_warm_label.p95_us(),
+        lance_mem_label.mean_us(),
+        lance_mem_label.p95_us(),
+        lance_cold_label.mean_us(),
+        lance_cold_label.p95_us()
     );
     println!(
-        "point lookup: csr mean {:.1}us p95 {:.1}us | lance mean {:.1}us p95 {:.1}us",
+        "point lookup: csr resident mean {:.1}us p95 {:.1}us | lance warm mean {:.1}us p95 {:.1}us | lance batches mean {:.1}us p95 {:.1}us | lance reopen mean {:.1}us p95 {:.1}us",
         csr_point.mean_us(),
         csr_point.p95_us(),
-        lance_point.mean_us(),
-        lance_point.p95_us()
+        lance_warm_point.mean_us(),
+        lance_warm_point.p95_us(),
+        lance_mem_point.mean_us(),
+        lance_mem_point.p95_us(),
+        lance_cold_point.mean_us(),
+        lance_cold_point.p95_us()
     );
 
     Ok(())
