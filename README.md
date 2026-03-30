@@ -24,7 +24,7 @@ Lance-backed graph database and event store with Raft consensus.
 │  yata-engine  yata-gie  yata-vex  yata-s3                   │
 ├─────────────────────────────────────────────────────────────┤
 │                   Layer 2: Graph                             │
-│  yata-store (MutableCSR)  yata-graph  yata-cypher           │
+│  yata-store (MutableCSR)  yata-cypher                       │
 ├─────────────────────────────────────────────────────────────┤
 │                 Layer 1: Core Primitives                     │
 │  yata-arrow  yata-object                                    │
@@ -44,10 +44,9 @@ Lance-backed graph database and event store with Raft consensus.
 | **yata-object** | Object storage abstraction (CAS + S3 write-through) |
 | **yata-cypher** | Pure-Rust Cypher parser and execution engine |
 | **yata-store** | MutableCSR in-memory graph, partitioned facade, blob cache primitives |
-| **yata-graph** | Graph store with CSR cache, yata-vex vector search |
 | **yata-gie** | Graph Interactive Engine (IR operators, push-based executor) |
 | **yata-engine** | TieredGraphEngine — Lance-backed cold start, WAL projection, partition routing |
-| **yata-lance** | Lance-table-compatible persistence (fragments, manifests, typed Arrow schema) |
+| **yata-lance** | Lance-table-compatible persistence and vector store (fragments, manifests, typed Arrow schema) |
 | **yata-s3** | S3/R2 adapter (sync ureq+rustls, SigV4) |
 | **yata-vex** | Vector index (IVF_PQ + DiskANN) |
 | **yata-server** | XRPC API server (Cypher, mergeRecord, triggerSnapshot) |

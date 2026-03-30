@@ -15,6 +15,17 @@ pub struct YataDataset {
 }
 
 impl YataDataset {
+    /// Create a new empty dataset with the given schema.
+    pub async fn create_empty(
+        uri: &str,
+        schema: Arc<arrow::datatypes::Schema>,
+    ) -> Result<Self, lance::Error> {
+        let empty = RecordBatch::new_empty(schema.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(empty)].into_iter(), schema);
+        let ds = Dataset::write(reader, uri, Some(WriteParams::default())).await?;
+        Ok(Self { ds })
+    }
+
     /// Open an existing dataset at the given URI.
     ///
     /// URI can be:
@@ -116,6 +127,58 @@ impl YataDataset {
     pub fn inner(&self) -> &Dataset {
         &self.ds
     }
+}
+
+pub async fn create_vertex_log_dataset(uri: &str) -> Result<YataDataset, lance::Error> {
+    YataDataset::create_empty(
+        uri,
+        Arc::new(crate::schema::vertex_log_schema().clone()),
+    )
+    .await
+}
+
+pub async fn create_edge_log_dataset(uri: &str) -> Result<YataDataset, lance::Error> {
+    YataDataset::create_empty(
+        uri,
+        Arc::new(crate::schema::edge_log_schema().clone()),
+    )
+    .await
+}
+
+pub async fn create_vertex_live_dataset(uri: &str) -> Result<YataDataset, lance::Error> {
+    YataDataset::create_empty(
+        uri,
+        Arc::new(crate::schema::vertex_live_schema().clone()),
+    )
+    .await
+}
+
+pub async fn create_edge_live_out_dataset(uri: &str) -> Result<YataDataset, lance::Error> {
+    YataDataset::create_empty(
+        uri,
+        Arc::new(crate::schema::edge_live_out_schema().clone()),
+    )
+    .await
+}
+
+pub async fn create_edge_live_in_dataset(uri: &str) -> Result<YataDataset, lance::Error> {
+    YataDataset::create_empty(
+        uri,
+        Arc::new(crate::schema::edge_live_in_schema().clone()),
+    )
+    .await
+}
+
+pub async fn open_datasets_from_manifest(
+    manifest: &crate::manifest::GraphManifest,
+) -> Result<crate::manifest::OpenedGraphDatasets, lance::Error> {
+    Ok(crate::manifest::OpenedGraphDatasets {
+        vertex_log: YataDataset::open(&manifest.tables.vertex_log.uri).await?,
+        edge_log: YataDataset::open(&manifest.tables.edge_log.uri).await?,
+        vertex_live: YataDataset::open(&manifest.tables.vertex_live.uri).await?,
+        edge_live_out: YataDataset::open(&manifest.tables.edge_live_out.uri).await?,
+        edge_live_in: YataDataset::open(&manifest.tables.edge_live_in.uri).await?,
+    })
 }
 
 #[cfg(test)]

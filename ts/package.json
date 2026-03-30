@@ -7,6 +7,10 @@
   "types": "src/index.ts",
   "exports": {
     ".": "./src/index.ts",
+    "./lance": "./src/lance.ts",
+    "./lance-arrow": "./src/lance-arrow.ts",
+    "./manifest": "./src/manifest.ts",
+    "./schema": "./src/schema.ts",
     "./types": "./src/types.ts",
     "./cypher": "./src/cypher.ts",
     "./wal": "./src/wal.ts",
@@ -14,7 +18,9 @@
   },
   "files": ["src"],
   "dependencies": {
-    "@gftd/xrpc": "file:../../../runtime/magatama/xrpc"
+    "@gftd/xrpc": "file:../../../runtime/magatama/xrpc",
+    "@lancedb/lancedb": "^0.18.2",
+    "apache-arrow": "^21.1.0"
   },
   "license": "UNLICENSED"
 }

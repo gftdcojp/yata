@@ -12,6 +12,7 @@ pub mod config;
 pub mod distributed;
 pub mod engine;
 pub mod frontier;
+pub mod hints;
 pub mod memory_bridge;
 pub mod partition_query;
 pub mod partition_router;

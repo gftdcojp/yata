@@ -136,7 +136,7 @@ pub fn extract_partition_hints(cypher: &str) -> PartitionHints {
 
     // Try to parse and extract hints
     if let Ok(query) = yata_cypher::parse(cypher) {
-        let qh = yata_graph::hints::QueryHints::extract(&query);
+        let qh = crate::hints::QueryHints::extract(&query);
         hints.node_labels = qh.node_labels;
         hints.rel_types = qh.rel_types;
         hints.is_read_only = qh.is_read_only;

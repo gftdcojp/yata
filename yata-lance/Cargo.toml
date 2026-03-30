@@ -24,6 +24,11 @@ rustls = { version = "0.23", default-features = false, features = ["logging", "r
 # Serialization / IO
 tracing.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+yata-cypher = { path = "../yata-cypher" }
+yata-vex = { path = "../yata-vex" }
 
 [dev-dependencies]
 tempfile = "3"

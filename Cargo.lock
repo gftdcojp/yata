@@ -5960,6 +5960,7 @@ dependencies = [
  "yata-engine",
  "yata-gie",
  "yata-grin",
+ "yata-lance",
  "yata-object",
  "yata-store",
 ]
@@ -6011,7 +6012,6 @@ dependencies = [
  "yata-core",
  "yata-cypher",
  "yata-gie",
- "yata-graph",
  "yata-grin",
  "yata-lance",
  "yata-s3",
@@ -6031,24 +6031,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "yata-graph"
-version = "0.1.0"
-dependencies = [
- "arrow-array",
- "arrow-schema",
- "blake3",
- "indexmap",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "yata-cypher",
- "yata-vex",
-]
-
-[[package]]
 name = "yata-grin"
 version = "0.1.0"
 dependencies = [
@@ -6064,12 +6046,17 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "futures",
+ "indexmap",
  "lance",
  "rustls",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "yata-cypher",
+ "yata-vex",
 ]
 
 [[package]]

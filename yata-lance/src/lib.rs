@@ -4,5 +4,41 @@
 //! All manifest, fragment, compaction, and MVCC management is delegated to Lance.
 
 pub mod dataset;
+pub mod manifest;
+pub mod schema;
+pub mod vector;
 
 pub use dataset::YataDataset;
+pub use dataset::{
+    create_edge_live_in_dataset,
+    create_edge_live_out_dataset,
+    create_edge_log_dataset,
+    create_vertex_live_dataset,
+    create_vertex_log_dataset,
+};
+pub use manifest::{
+    GraphManifest,
+    GraphManifestSeqRange,
+    GraphManifestTableRef,
+    GraphManifestTables,
+    ManifestStore,
+    OpenedGraphDatasets,
+    load_manifest,
+    parse_manifest_json,
+    save_manifest,
+    render_manifest_json,
+};
+pub use schema::{
+    EDGE_LIVE_IN_TABLE,
+    EDGE_LIVE_OUT_TABLE,
+    EDGE_LOG_TABLE,
+    GRAPH_FORMAT,
+    VERTEX_LIVE_TABLE,
+    VERTEX_LOG_TABLE,
+    edge_live_in_schema,
+    edge_live_out_schema,
+    edge_log_schema,
+    vertex_live_schema,
+    vertex_log_schema,
+};
+pub use vector::YataVectorStore;

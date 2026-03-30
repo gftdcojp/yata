@@ -199,12 +199,12 @@
   <text x="420" y="532" fill="#475569" font-size="9">deps: grin, cypher, lance, core, memmap2</text>
 
   <rect x="780" y="445" width="300" height="100" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
-  <text x="800" y="468" fill="#e2e8f0" font-size="13" font-weight="bold">yata-graph</text>
+  <text x="800" y="468" fill="#e2e8f0" font-size="13" font-weight="bold">yata-lance</text>
   <text x="960" y="468" fill="#64748b" font-size="9">~800 LOC</text>
-  <text x="800" y="487" fill="#94a3b8" font-size="10">GraphStore (in-memory + vector idx)</text>
-  <text x="800" y="502" fill="#94a3b8" font-size="10">LRU QueryCache, coordinator</text>
-  <text x="800" y="517" fill="#94a3b8" font-size="10">Pipeline, per-label operations</text>
-  <text x="800" y="532" fill="#475569" font-size="9">deps: cypher, vex, arrow, tokio</text>
+  <text x="800" y="487" fill="#94a3b8" font-size="10">Lance persistence + vector idx</text>
+  <text x="800" y="502" fill="#94a3b8" font-size="10">Fragments, manifests, embedding index</text>
+  <text x="800" y="517" fill="#94a3b8" font-size="10">Cold-start source of truth</text>
+  <text x="800" y="532" fill="#475569" font-size="9">deps: lance, vex, arrow, tokio</text>
 
   <line x1="210" y1="390" x2="210" y2="443" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
   <line x1="550" y1="390" x2="570" y2="443" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
@@ -1615,8 +1615,8 @@
   <line x1="290" y1="7262" x2="590" y2="7390" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
 
   <rect x="400" y="7230" width="120" height="32" rx="6" fill="#1e293b" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="4,3"/>
-  <text x="460" y="7251" text-anchor="middle" fill="#f59e0b" font-size="10">yata-graph</text>
-  <text x="460" y="7263" text-anchor="middle" fill="#f59e0b" font-size="8">⚠ 800 LOC</text>
+  <text x="460" y="7251" text-anchor="middle" fill="#f59e0b" font-size="10">vector layer</text>
+  <text x="460" y="7263" text-anchor="middle" fill="#f59e0b" font-size="8">merged into yata-lance</text>
   <line x1="440" y1="7262" x2="140" y2="7262" stroke="#334155" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
   <line x1="460" y1="7262" x2="195" y2="7310" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
 
@@ -1665,10 +1665,10 @@
   <!-- Shannon redundancy annotations -->
   <rect x="750" y="7100" width="380" height="145" rx="8" fill="#1e293b" stroke="#f59e0b" stroke-width="1" stroke-opacity="0.5"/>
   <text x="770" y="7125" fill="#fcd34d" font-size="12" font-weight="bold">Shannon Redundancy Candidates (⚠)</text>
-  <text x="770" y="7145" fill="#f59e0b" font-size="10">yata-graph → merge into yata-engine</text>
-  <text x="770" y="7160" fill="#94a3b8" font-size="9">GraphStore wraps MemoryGraph; engine-specific, 2 consumers</text>
+  <text x="770" y="7145" fill="#f59e0b" font-size="10">vector layer → merged into yata-lance</text>
+  <text x="770" y="7160" fill="#94a3b8" font-size="9">separate vector crate removed from workspace</text>
   <text x="770" y="7180" fill="#f59e0b" font-size="10">yata-vex → merge into yata-engine</text>
-  <text x="770" y="7195" fill="#94a3b8" font-size="9">IVF_PQ + DiskANN; single consumer (yata-graph only)</text>
+  <text x="770" y="7195" fill="#94a3b8" font-size="9">IVF_PQ + DiskANN; single consumer (yata-lance only)</text>
   <text x="770" y="7215" fill="#f59e0b" font-size="10">yata-object → merge into yata-s3</text>
   <text x="770" y="7230" fill="#94a3b8" font-size="9">LocalObjectStore (CAS); used by S3 sync only</text>
 

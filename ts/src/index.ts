@@ -23,6 +23,58 @@ export type {
 } from "./types.js";
 
 export { CROSS_PARTITION } from "./types.js";
+export {
+  GRAPH_FORMAT,
+  VERTEX_LOG_TABLE,
+  EDGE_LOG_TABLE,
+  VERTEX_LIVE_TABLE,
+  EDGE_LIVE_OUT_TABLE,
+  EDGE_LIVE_IN_TABLE,
+  vertexLogSchema,
+  edgeLogSchema,
+  vertexLiveSchema,
+  edgeLiveOutSchema,
+  edgeLiveInSchema,
+  yataGraphSchemas,
+} from "./schema.js";
+export type { YataScalarType, YataField, YataTableSchema } from "./schema.js";
+export {
+  toArrowField,
+  toArrowSchema,
+  yataGraphArrowSchemas,
+  createEmptyYataGraphTables,
+  openYataGraphTables,
+  openYataGraphTablesFromManifest,
+} from "./lance.js";
+export type {
+  ArrowSchemaFactory,
+  LanceConnectionLike,
+  LanceCreateTableOptionsLike,
+  YataCreatedTables,
+  YataGraphTableName,
+  YataOpenedTables,
+} from "./lance.js";
+export {
+  arrowJsFactory,
+  createArrowSchema,
+  createEmptyYataGraphTablesWithArrow,
+} from "./lance-arrow.js";
+export {
+  createGraphManifest,
+  createFetchManifestStore,
+  loadManifest,
+  makeManifestTableRef,
+  parseManifest,
+  saveManifest,
+  stringifyManifest,
+} from "./manifest.js";
+export type {
+  GraphManifest,
+  GraphManifestSeqRange,
+  GraphManifestTableRef,
+  GraphManifestTables,
+  ManifestStore,
+} from "./manifest.js";
 
 // Cypher builder
 export { G, buildLabelCypher } from "./cypher.js";

@@ -1,23 +1,16 @@
 //! Query hint extraction from parsed Cypher AST.
-//!
-//! Walks MATCH clause patterns to collect node labels, relationship types,
-//! and inline property equality filters. Used by `GraphStore` for
-//! query optimization.
 
 use yata_cypher::ast::*;
 
-/// Hints extracted from a parsed Cypher query for query pushdown.
+/// Hints extracted from a parsed Cypher query for routing and pushdown.
 pub struct QueryHints {
     pub node_labels: Vec<String>,
     pub rel_types: Vec<String>,
-    /// Equality filters from inline property maps, e.g. `{name: 'Alice'}`.
-    /// Each entry is `(property_key, json_encoded_value)`.
     pub prop_eq_filters: Vec<(String, String)>,
     pub is_read_only: bool,
 }
 
 impl QueryHints {
-    /// Extract hints by walking the AST of a parsed Cypher query.
     pub fn extract(query: &Query) -> Self {
         let mut node_labels = Vec::new();
         let mut rel_types = Vec::new();
@@ -34,7 +27,6 @@ impl QueryHints {
             );
         }
 
-        // Dedup while preserving order.
         node_labels.dedup();
         rel_types.dedup();
 
@@ -46,7 +38,6 @@ impl QueryHints {
         }
     }
 
-    /// Returns true if there are any label or property filters to push down.
     pub fn has_filters(&self) -> bool {
         !self.node_labels.is_empty() || !self.prop_eq_filters.is_empty()
     }
@@ -119,8 +110,6 @@ impl QueryHints {
         }
     }
 
-    /// Extract equality filters from inline property maps like `{name: 'Alice'}`.
-    /// Only literal values (string, int, float, bool) are captured.
     fn extract_prop_eq(props: &[(String, Expr)], out: &mut Vec<(String, String)>) {
         for (key, expr) in props {
             if let Expr::Lit(lit) = expr {

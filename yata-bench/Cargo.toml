@@ -25,12 +25,17 @@ path = "src/cypher_transport_bench.rs"
 name = "trillion-scale-test"
 path = "src/trillion_scale_test.rs"
 
+[[bin]]
+name = "csr-vs-lance-bench"
+path = "src/csr_vs_lance_bench.rs"
+
 [dependencies]
 yata-core.workspace = true
 yata-arrow.workspace = true
 yata-object.workspace = true
 yata-cypher.workspace = true
 yata-engine.workspace = true
+yata-lance.workspace = true
 yata-store.workspace = true
 yata-grin.workspace = true
 yata-gie.workspace = true

@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use yata_cypher::Graph;
-use yata_graph::GraphStore;
 use yata_grin::{Mutable, Predicate, PropValue, Property, Scannable, Topology};
 
 use crate::cache::{QueryCache, cache_key};
@@ -76,7 +75,7 @@ pub struct MutationContext {
 pub struct TieredGraphEngine {
     config: TieredEngineConfig,
     hot: Arc<RwLock<yata_store::GraphStoreEnum>>,
-    warm: GraphStore,
+    warm: Arc<yata_lance::YataVectorStore>,
     cache: Arc<Mutex<QueryCache>>,
     hot_initialized: Arc<AtomicBool>,
     cold_starting: Arc<AtomicBool>,
@@ -154,10 +153,8 @@ impl TieredGraphEngine {
         // Write path: Pipeline.send() + mergeRecord() (PDS Worker).
     }
 
-    async fn init_async(data_dir: &str) -> GraphStore {
-        GraphStore::new(data_dir)
-            .await
-            .expect("failed to init graph store")
+    async fn init_async(data_dir: &str) -> Arc<yata_lance::YataVectorStore> {
+        Arc::new(yata_lance::YataVectorStore::new(data_dir).await)
     }
 
     /// Run an async future, handling both inside-runtime and outside-runtime contexts.
@@ -728,10 +725,7 @@ impl TieredGraphEngine {
         dim: usize,
     ) -> Result<usize, String> {
         let count = nodes.len();
-        self.block_on(
-            self.warm
-                .write_vertices_with_embeddings(nodes, embedding_key, dim),
-        )
+        self.block_on(self.warm.write_vertices_with_embeddings(nodes, embedding_key, dim))
         .map_err(|e| format!("write embeddings: {e}"))?;
         Ok(count)
     }
@@ -1818,20 +1812,8 @@ mod tests {
         run_query(&e, "CREATE (:LN {lid: 'l1', val: 10})", &[], None).unwrap();
         run_query(&e, "CREATE (:LN {lid: 'l2', val: 20})", &[], None).unwrap();
 
-        // GraphStore should have NO graph data (vector-search only)
-        let vertices = ENGINE_RT.block_on(e.warm.load_vertices()).unwrap();
-        assert_eq!(
-            vertices.len(),
-            0,
-            "GraphStore must not have graph vertices (vector-search only)"
-        );
-
-        let edges = ENGINE_RT.block_on(e.warm.load_edges()).unwrap();
-        assert_eq!(
-            edges.len(),
-            0,
-            "GraphStore must not have graph edges (vector-search only)"
-        );
+        let count = ENGINE_RT.block_on(e.warm.vector_count());
+        assert_eq!(count, 0, "vector store must not be touched by graph mutations");
     }
 
     #[test]

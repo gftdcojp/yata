@@ -102,7 +102,7 @@ fn generate_dataset(n_nodes: usize, n_edges: usize, seed: u64) -> Dataset {
 
 // ── yata-cypher backend ──────────────────────────────────────────────────────
 
-fn build_yata_graph(ds: &Dataset) -> MemoryGraph {
+fn build_memory_graph(ds: &Dataset) -> MemoryGraph {
     let mut g = MemoryGraph::new();
     for n in &ds.nodes {
         let props = [
@@ -137,7 +137,7 @@ struct YataBenchmark {
 impl YataBenchmark {
     fn new(ds: &Dataset) -> Self {
         Self {
-            graph: build_yata_graph(ds),
+            graph: build_memory_graph(ds),
             exec: Executor::new(),
         }
     }
