@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use yata_cypher::Graph;
-use yata_grin::{Mutable, Predicate, PropValue, Property, Scannable, Topology};
+use yata_grin::{Predicate, PropValue, Property, Scannable, Topology};
 
 use crate::cache::{QueryCache, cache_key};
 use crate::config::TieredEngineConfig;
@@ -375,11 +375,15 @@ impl TieredGraphEngine {
         self.block_on(async {
             self.ensure_hot();
 
-            // Single MemoryGraph copy from CSR.
-            let mut g = if let Ok(csr) = self.hot.read() {
-                csr.to_filtered_memory_graph(&[], &[])
+            // Single MemoryGraph copy from read store.
+            let mut g = if let Ok(read_store) = self.read_store.read() {
+                if let Some(ref store) = *read_store {
+                    memory_bridge::memory_graph_from_store(store)
+                } else {
+                    yata_cypher::MemoryGraph::new()
+                }
             } else {
-                return Err("failed to acquire CSR lock".to_string());
+                return Err("failed to acquire read store lock".to_string());
             };
 
             // Track initial state once.
@@ -433,14 +437,9 @@ impl TieredGraphEngine {
             let has_changes = initial_vids != after_vids || initial_eids != after_eids;
 
             if has_changes {
-                // Single CSR rebuild.
-                let new_csr = memory_bridge::rebuild_csr_from_memory_graph_with_partition(
-                    &g,
-                    self.config.hot_partition_id,
-                );
-
-                if let Ok(mut hot) = self.hot.write() {
-                    *hot = yata_store::GraphStoreEnum::Single(new_csr);
+                let new_store = memory_bridge::rebuild_read_store_from_memory_graph(&g);
+                if let Ok(mut read_store) = self.read_store.write() {
+                    *read_store = Some(new_store);
                     self.hot_initialized.store(true, Ordering::SeqCst);
                 }
 
@@ -593,10 +592,14 @@ impl TieredGraphEngine {
 
         self.block_on(async {
             self.ensure_hot();
-            let mut g = if let Ok(csr) = self.hot.read() {
-                csr.to_filtered_memory_graph(&[], &[])
+            let mut g = if let Ok(read_store) = self.read_store.read() {
+                if let Some(ref store) = *read_store {
+                    memory_bridge::memory_graph_from_store(store)
+                } else {
+                    yata_cypher::MemoryGraph::new()
+                }
             } else {
-                return Err("failed to acquire CSR lock".to_string());
+                return Err("failed to acquire read store lock".to_string());
             };
 
             // Lightweight mutation tracking: only track IDs (O(n) ID clones, no format! serialization)
@@ -648,87 +651,18 @@ impl TieredGraphEngine {
                 || router::is_cypher_mutation(cypher);
 
             if has_changes {
-                // CP5 incremental CSR delta-apply: O(delta) instead of O(V+E) rebuild.
-                // Compute delta between before/after MemoryGraph, apply to existing CSR.
-                let new_vids: Vec<&String> = after_vids.difference(&before_vids).collect();
-                let del_vids: Vec<&String> = before_vids.difference(&after_vids).collect();
-                let new_eids: Vec<&String> = after_eids.difference(&before_eids).collect();
-                let del_eids: Vec<&String> = before_eids.difference(&after_eids).collect();
-
-                let delta_size = new_vids.len() + del_vids.len() + new_eids.len() + del_eids.len();
-                let total_size = after_vids.len() + after_eids.len();
-
-                // Use incremental apply when delta is small relative to total graph.
-                // Fallback to full rebuild when delta > 50% (e.g., DETACH DELETE all).
-                if delta_size > 0 && delta_size * 2 < total_size {
-                    // Incremental path: apply delta to existing CSR
-                    if let Ok(mut hot) = self.hot.write() {
-                        if let Some(single) = hot.as_single_mut() {
-                            // Delete removed vertices (by _vid property)
-                            for vid_str in &del_vids {
-                                single.delete_by_pk_any_label("_vid", &PropValue::Str((*vid_str).clone()));
-                            }
-                            // Add new vertices
-                            for vid_str in &new_vids {
-                                if let Some(node) = g.nodes().iter().find(|n| &n.id == *vid_str) {
-                                    let props: Vec<(&str, PropValue)> = node.props.iter()
-                                        .map(|(k, v)| (k.as_str(), memory_bridge::cypher_to_prop(v)))
-                                        .chain(std::iter::once(("_vid", PropValue::Str(node.id.clone()))))
-                                        .collect();
-                                    single.add_vertex_with_labels(
-                                        &node.labels,
-                                        &props,
-                                    );
-                                }
-                            }
-                            // Add new edges
-                            for eid_str in &new_eids {
-                                if let Some(rel) = g.rels().iter().find(|r| &r.id == *eid_str) {
-                                    // Look up src/dst vids by _vid property
-                                    let src_vid = single.find_vid_by_prop("_vid", &PropValue::Str(rel.src.clone()));
-                                    let dst_vid = single.find_vid_by_prop("_vid", &PropValue::Str(rel.dst.clone()));
-                                    if let (Some(s), Some(d)) = (src_vid, dst_vid) {
-                                        let props: Vec<(&str, PropValue)> = rel.props.iter()
-                                            .map(|(k, v)| (k.as_str(), memory_bridge::cypher_to_prop(v)))
-                                            .collect();
-                                        single.add_edge(s, d, &rel.rel_type, &props);
-                                    }
-                                }
-                            }
-                            single.commit();
-
-                            if let Ok(mut ll) = self.loaded_labels.lock() {
-                                for label in <yata_store::MutableCsrStore as yata_grin::Schema>::vertex_labels(single) {
-                                    ll.insert(label);
-                                }
-                                for label in <yata_store::MutableCsrStore as yata_grin::Schema>::edge_labels(single) {
-                                    ll.insert(label);
-                                }
-                            }
-                        }
-                        self.hot_initialized.store(true, Ordering::SeqCst);
+                let new_store = memory_bridge::rebuild_read_store_from_memory_graph(&g);
+                if let Ok(mut ll) = self.loaded_labels.lock() {
+                    for label in yata_grin::Schema::vertex_labels(&new_store) {
+                        ll.insert(label);
                     }
-                    tracing::debug!(delta = delta_size, total = total_size, "incremental CSR delta-apply");
-                } else {
-                    // Full rebuild fallback (large delta or empty graph)
-                    let new_csr = memory_bridge::rebuild_csr_from_memory_graph_with_partition(
-                        &g,
-                        self.config.hot_partition_id,
-                    );
-                    if let Ok(mut ll) = self.loaded_labels.lock() {
-                        for label in <yata_store::MutableCsrStore as yata_grin::Schema>::vertex_labels(&new_csr) {
-                            ll.insert(label);
-                        }
-                        for label in <yata_store::MutableCsrStore as yata_grin::Schema>::edge_labels(&new_csr) {
-                            ll.insert(label);
-                        }
+                    for label in yata_grin::Schema::edge_labels(&new_store) {
+                        ll.insert(label);
                     }
-                    if let Ok(mut hot) = self.hot.write() {
-                        *hot = yata_store::GraphStoreEnum::Single(new_csr);
-                        self.hot_initialized.store(true, Ordering::SeqCst);
-                    }
-                    self.refresh_read_store();
-                    tracing::debug!(delta = delta_size, total = total_size, "full CSR rebuild (large delta)");
+                }
+                if let Ok(mut read_store) = self.read_store.write() {
+                    *read_store = Some(new_store);
+                    self.hot_initialized.store(true, Ordering::SeqCst);
                 }
             }
 

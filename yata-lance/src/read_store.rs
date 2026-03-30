@@ -187,6 +187,41 @@ impl LanceReadStore {
         true
     }
 
+    pub fn add_edge_cache_entry(
+        &mut self,
+        src: u32,
+        dst: u32,
+        edge_id: u32,
+        edge_label: String,
+        props: HashMap<String, PropValue>,
+    ) {
+        if self.out_adj.len() <= src as usize {
+            self.out_adj.resize(src as usize + 1, Vec::new());
+        }
+        if self.in_adj.len() <= dst as usize {
+            self.in_adj.resize(dst as usize + 1, Vec::new());
+        }
+        if self.edge_labels.len() <= edge_id as usize {
+            self.edge_labels.resize(edge_id as usize + 1, String::new());
+            self.edge_props.resize(edge_id as usize + 1, HashMap::new());
+        }
+        self.edge_labels[edge_id as usize] = edge_label.clone();
+        self.edge_props[edge_id as usize] = props;
+        if !self.known_edge_labels.contains(&edge_label) {
+            self.known_edge_labels.push(edge_label.clone());
+        }
+        self.out_adj[src as usize].push(Neighbor {
+            vid: dst,
+            edge_id,
+            edge_label: edge_label.clone(),
+        });
+        self.in_adj[dst as usize].push(Neighbor {
+            vid: src,
+            edge_id,
+            edge_label,
+        });
+    }
+
     fn find_vertex_by_pk(&self, label: &str, pk_key: &str, pk_value: &PropValue) -> Option<u32> {
         self.label_index.get(label)?.iter().copied().find(|&vid| {
             self.vertex_alive.get(vid as usize).copied().unwrap_or(false)

@@ -1,9 +1,10 @@
+use base64::Engine;
 use std::collections::HashMap;
 
 use indexmap::IndexMap;
 use yata_core::PartitionId;
-use yata_cypher::{Executor, Graph, MemoryGraph};
-use yata_grin::{Mutable, PropValue};
+use yata_cypher::{Executor, Graph, MemoryGraph, NodeRef, RelRef};
+use yata_grin::{GraphStore, Mutable, PropValue, Property, Topology};
 use yata_store::MutableCsrStore;
 
 pub fn cypher_to_prop(v: &yata_cypher::types::Value) -> PropValue {
@@ -14,6 +15,19 @@ pub fn cypher_to_prop(v: &yata_cypher::types::Value) -> PropValue {
         yata_cypher::types::Value::Float(f) => PropValue::Float(*f),
         yata_cypher::types::Value::Str(s) => PropValue::Str(s.clone()),
         other => PropValue::Str(format!("{}", other)),
+    }
+}
+
+pub fn prop_to_cypher(v: &PropValue) -> yata_cypher::types::Value {
+    match v {
+        PropValue::Null => yata_cypher::types::Value::Null,
+        PropValue::Bool(b) => yata_cypher::types::Value::Bool(*b),
+        PropValue::Int(i) => yata_cypher::types::Value::Int(*i),
+        PropValue::Float(f) => yata_cypher::types::Value::Float(*f),
+        PropValue::Str(s) => yata_cypher::types::Value::Str(s.clone()),
+        PropValue::Binary(bytes) => {
+            yata_cypher::types::Value::Str(format!("b64:{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
+        }
     }
 }
 
@@ -158,4 +172,101 @@ pub fn rebuild_csr_from_memory_graph_with_partition(
 
     csr.commit();
     csr
+}
+
+pub fn rebuild_read_store_from_memory_graph(graph: &MemoryGraph) -> yata_lance::LanceReadStore {
+    let nodes = graph.nodes();
+    let rels = graph.rels();
+    let mut store = yata_lance::LanceReadStore::default();
+    let mut vid_map: HashMap<String, u32> = HashMap::new();
+
+    for node in &nodes {
+        let props: Vec<(&str, PropValue)> = node
+            .props
+            .iter()
+            .map(|(k, v)| (k.as_str(), cypher_to_prop(v)))
+            .collect();
+        let label = node.labels.first().map(String::as_str).unwrap_or("Node");
+        let pk_key = if node.props.contains_key("rkey") { "rkey" } else { "_vid" };
+        let pk_value = node
+            .props
+            .get(pk_key)
+            .map(cypher_to_prop)
+            .unwrap_or_else(|| PropValue::Str(node.id.clone()));
+        let vid = store.merge_vertex_by_pk(label, pk_key, &pk_value, &props);
+        vid_map.insert(node.id.clone(), vid);
+    }
+
+    for rel in &rels {
+        let (Some(&src), Some(&dst)) = (vid_map.get(&rel.src), vid_map.get(&rel.dst)) else {
+            continue;
+        };
+        let edge_id = store.edge_count() as u32;
+        let props: HashMap<String, PropValue> = rel
+            .props
+            .iter()
+            .map(|(k, v)| (k.clone(), cypher_to_prop(v)))
+            .collect();
+        store.add_edge_cache_entry(
+            src,
+            dst,
+            edge_id,
+            rel.rel_type.clone(),
+            props,
+        );
+    }
+
+    store
+}
+
+pub fn memory_graph_from_store<S: GraphStore>(store: &S) -> MemoryGraph {
+    let mut graph = MemoryGraph::new();
+    let mut ids = HashMap::<u32, String>::new();
+
+    for vid in store.scan_all_vertices() {
+        let id = vertex_identity(store, vid);
+        let labels = Property::vertex_labels(store, vid);
+        let props = store
+            .vertex_all_props(vid)
+            .into_iter()
+            .map(|(k, v)| (k, prop_to_cypher(&v)))
+            .collect();
+        graph.add_node(NodeRef { id: id.clone(), labels, props });
+        ids.insert(vid, id);
+    }
+
+    for src in store.scan_all_vertices() {
+        for neighbor in Topology::out_neighbors(store, src) {
+            let Some(src_id) = ids.get(&src).cloned() else { continue };
+            let Some(dst_id) = ids.get(&neighbor.vid).cloned() else { continue };
+            let edge_id = match store.edge_prop(neighbor.edge_id, "eid") {
+                Some(PropValue::Str(s)) => s,
+                _ => format!("e{}", neighbor.edge_id),
+            };
+            let mut props = IndexMap::new();
+            for key in store.edge_prop_keys(&neighbor.edge_label) {
+                if let Some(v) = store.edge_prop(neighbor.edge_id, &key) {
+                    props.insert(key, prop_to_cypher(&v));
+                }
+            }
+            graph.add_rel(RelRef {
+                id: edge_id,
+                rel_type: neighbor.edge_label,
+                src: src_id,
+                dst: dst_id,
+                props,
+            });
+        }
+    }
+
+    graph
+}
+
+fn vertex_identity<S: GraphStore>(store: &S, vid: u32) -> String {
+    for key in ["_vid", "rkey", "pk_value", "did"] {
+        if let Some(PropValue::Str(s)) = store.vertex_prop(vid, key) {
+            return s;
+        }
+    }
+    format!("v{vid}")
 }
