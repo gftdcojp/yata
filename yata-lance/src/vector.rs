@@ -1,8 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::record_batch::{RecordBatch, RecordBatchIterator};
-use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch as _, StringArray, UInt64Array};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use indexmap::IndexMap;
 use lance::Dataset;
@@ -316,7 +316,12 @@ fn build_batch(
             .flat_map(|entry| entry.embedding.iter().copied())
             .collect::<Vec<_>>(),
     );
-    let vectors = FixedSizeListArray::try_new_from_values(flat, dim as i32)
+    let vectors = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        dim as i32,
+        Arc::new(flat) as ArrayRef,
+        None,
+    )
         .map_err(|e| VectorStoreError::Storage(format!("build embedding array: {e}")))?;
     RecordBatch::try_new(
         schema,

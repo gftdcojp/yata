@@ -2382,7 +2382,7 @@ mod tests {
 
     #[test]
     fn test_vector_search() {
-        // TieredGraphEngine::vector_search → YataVectorStore brute-force index
+        // TieredGraphEngine::vector_search → YataVectorStore on Lance vector index
         let dir = tempfile::tempdir().unwrap();
         let e = make_engine(&dir);
 
