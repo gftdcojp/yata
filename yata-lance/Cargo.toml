@@ -11,7 +11,7 @@ arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 
-# Lance Dataset API
+# Lance Dataset API (no cloud features — yata uses local/S3 via object_store directly)
 lance = { version = "3.0", default-features = false }
 
 # Async

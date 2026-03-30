@@ -115,3 +115,4 @@ rayon = "1.10"
 
 # rkyv zero-copy serialization (yata-core DurableWalOp types)
 rkyv = { version = "0.8", features = ["bytecheck"] }
+
