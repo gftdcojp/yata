@@ -3,10 +3,10 @@ name = "yata-lance"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Lance-table-compatible persistence for yata graph (COO sorted tables, Arrow IPC)"
+description = "Lance persistence for yata graph (native Lance v2 format + legacy Arrow IPC)"
 
 [dependencies]
-# Arrow (workspace-aligned — Lance format = Arrow columnar + typed schema)
+# Arrow (workspace-aligned — Lance 3.0.1 requires Arrow ^57)
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
@@ -24,3 +24,24 @@ tracing.workspace = true
 thiserror.workspace = true
 blake3.workspace = true
 once_cell.workspace = true
+
+# Lance native format (feature-gated)
+lance-file = { version = "3.0", default-features = false, optional = true }
+lance-core = { version = "3.0", default-features = false, optional = true }
+lance-io = { version = "3.0", default-features = false, optional = true }
+lance-encoding = { version = "3.0", default-features = false, optional = true }
+object_store = { version = "0.12", default-features = false, optional = true }
+tokio = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+
+[features]
+default = ["native-lance"]
+native-lance = [
+    "dep:lance-file",
+    "dep:lance-core",
+    "dep:lance-io",
+    "dep:lance-encoding",
+    "dep:object_store",
+    "dep:tokio",
+    "dep:futures",
+]

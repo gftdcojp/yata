@@ -60,12 +60,12 @@ yata-format = { path = "yata-format" }
 yata-lance = { path = "yata-lance" }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
-# Arrow
-arrow = { version = "53", features = ["ipc"] }
-arrow-array = "53"
-arrow-schema = "53"
-arrow-ipc = "53"
-arrow-cast = "53"
+# Arrow (aligned with lance 3.0.1)
+arrow = { version = "57", features = ["ipc"] }
+arrow-array = "57"
+arrow-schema = "57"
+arrow-ipc = "57"
+arrow-cast = "57"
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "io-util", "fs", "sync", "time"] }

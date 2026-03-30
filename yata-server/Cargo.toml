@@ -45,9 +45,9 @@ tempfile = "3"
 yata-format = { path = "../yata-format" }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 serde_json = "1"
-arrow = { version = "53", features = ["ipc"] }
-arrow-array = "53"
-arrow-schema = "53"
+arrow = { version = "57", features = ["ipc"] }
+arrow-array = "57"
+arrow-schema = "57"
 tower = "0.5"
 http-body-util = "0.1"
 
