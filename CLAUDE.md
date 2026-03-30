@@ -1,6 +1,6 @@
 # packages/rust/yata
 
-yata — Rust Cypher graph engine. `[PRODUCTION]` Container × N partition (**multi-container/multi-node 前提 CRITICAL**)。Workers RPC coordinator。GraphScope parity 21/25 (14 PRODUCTION + 7 IMPLEMENTED)。GIE push-based + Design E SecurityScope + **LanceDB-style demand-paged cold start** (manifest-only → per-label on-demand page-in, cold start 2.2s) + per-label delta compaction (dirty labels only) + adaptive √N fan-out + CpmStats + cypherBatch + **immutable versioned manifest** (`manifest-{inverted:020}.json`) + **Range GET** (`get_range_sync`) + **concurrent cold start guard** (`cold_starting` AtomicBool)。設計: `docs/260329-yata-coo-sorted-design.md`
+yata — Rust Cypher graph engine. `[PRODUCTION]` Container × N partition (**multi-container/multi-node 前提 CRITICAL**)。Workers RPC coordinator。GraphScope parity 21/25 (14 PRODUCTION + 7 IMPLEMENTED)。GIE push-based + Design E SecurityScope + **LanceDB-style append-only write** (tombstone old + append new, per-write `commit_labels_only`, full commit deferred to compaction) + **LanceDB-style demand-paged cold start** (manifest-only → per-label on-demand page-in, cold start 2.2s) + per-label delta compaction (dirty labels only) + adaptive √N fan-out + CpmStats + cypherBatch + **immutable versioned manifest** (`manifest-{inverted:020}.json`) + **Range GET** (`get_range_sync`) + **concurrent cold start guard** (`cold_starting` AtomicBool)。設計: `docs/260329-yata-coo-sorted-design.md`
 
 ## CRITICAL: Multi-Container/Multi-Node 前提 (MUST)
 
@@ -16,9 +16,11 @@ yata — Rust Cypher graph engine. `[PRODUCTION]` Container × N partition (**mu
 ## Architecture (CRITICAL)
 
 ```
-Write model: Pipeline.send() (durable) + YATA_RPC.mergeRecord() (instant projection)
+Write model: Pipeline.send() (durable) + YATA_RPC.mergeRecord() (LanceDB-style append-only)
   → Pipeline: AT Protocol commit chain + MST (durable, 0 data loss)
-  → mergeRecord: COO L0 buffer append (O(1), no rebuild) + WAL ring append
+  → mergeRecord: tombstone old vertex + append new vertex (immutable write, O(1))
+  → commit_labels_only(): label_index + label_bitmap + btree rebuild (lightweight, O(V_l log V_l))
+  → full commit() deferred to L0_COMPACT_THRESHOLD (10,000 writes)
   → dirty_labels.insert(label)
 
 Read model: yata Container (pure read)
@@ -48,13 +50,16 @@ Deploy/config/ops details: `infra/cloudflare/container/yata/CLAUDE.md`
 ## Data Flow
 
 ```
-Write (append-only, NO page-in, NO rebuild):
+Write (LanceDB-style append-only, NO page-in):
   App → PDS_RPC.createRecord(repo, collection, record)
     → Pipeline.send(): AT commit + MST update → ACK (~1ms, durable)
-    → YATA_RPC.mergeRecord(): L0 buffer append (O(1)) + WAL ring append (PK dedup in-memory only, NO R2 read)
+    → YATA_RPC.mergeRecord(): tombstone old vertex + append new vertex (immutable, O(1))
+    → commit_labels_only(): label_index + label_bitmap + btree rebuild (O(V_l log V_l))
+    → full commit() (columnar/prop_eq) deferred to L0_COMPACT_THRESHOLD (10,000 writes)
     → dirty_labels.insert(label)
 
   yata への直接 mutate は mergeRecord からのみ (app 直接禁止)
+  既存 vertex の in-place props 上書きは禁止 (LanceDB: immutable data + deletion vector)
 
 Per-label LSM Compaction (cron 1min, dirty_labels gated, two-phase PUT):
   trigger_compaction():
@@ -122,19 +127,19 @@ R2 = source of truth。**Per-label compacted segments**: `log/compacted/{pid}/la
 
 ## Concurrency Model (CRITICAL)
 
-**COO: Read-Write 並列化** — L0 buffer (write) と L1 sorted segments (read) は分離構造。CSR の commit() rebuild ロック不要。
+**LanceDB-style append-only: Read-Write 並列化** — Write = tombstone + append (immutable)。既存 vertex data は不変。commit_labels_only() で label scan 即時反映。
 
 | 操作 | Lock | 並列性 |
 |---|---|---|
 | Read × Read | immutable sorted segments | **concurrent** (lock-free) |
-| Read × Write | L0 buffer ≠ L1 segments | **concurrent** (分離構造) |
+| Read × Write | tombstone + append (immutable data) | **concurrent** (既存 data 不変) |
 | Write × Write | L0 buffer mutex (~ns) | sequential (brief) |
 | Read × Compaction | atomic segment swap | **concurrent** |
 | Compaction × Write | L0 continues appending | **concurrent** |
 
 **Cross-partition**: 各 partition = 独立 Container → **partition 間は完全並列**。YataRPC が `hash(label) % N` で routing。
 
-**COO write safety**: mergeRecord = L0 buffer append O(1) → mutex scope ~ns (CSR は commit() rebuild で ~µs–ms ロック保持だった)。Compaction は新 segment を atomic に swap → read は中断なし。
+**LanceDB-style write safety**: mergeRecord = tombstone old O(1) + append new O(1) + commit_labels_only O(V_l log V_l)。既存 vertex の in-place mutation 禁止。Compaction = tombstone GC + PK dedup → new immutable segment。
 
 **`hot_initialized` AtomicBool**: `Ordering::SeqCst` (全 load/store)。`Relaxed` は concurrent cold start 重複実行リスクがあったため昇格。
 
@@ -143,6 +148,37 @@ R2 = source of truth。**Per-label compacted segments**: `log/compacted/{pid}/la
 ## Shannon Analysis
 
 9-format 7-axis 比較: `docs/260329-yata-9format-shannon-comparison.md`。**COO Sorted = 62.1%, COO + Lazy CSR hybrid = 74.3%** (9 format 中で最高)。CSR 単体 = 46.1%。全 weight 配分で COO + Lazy CSR が最高。旧 5-axis 分析は superseded。
+
+### LanceDB-style Append-Only Shannon Efficiency (measured 2026-03-30)
+
+**Overall η = 48%** (before: 52%, write η 10x 改善 + read η 維持)
+
+| Path | η | Bottleneck | LanceDB 対応 |
+|---|---|---|---|
+| **Write (per-op)** | ~5% | commit_labels_only O(V_l log V_l) | Fragment append + manifest update |
+| **Write (amortized @ 10K batch)** | ~50% | full commit at compaction | Background compaction |
+| **Read: PK lookup** | 100% | — | Point read |
+| **Read: Timeline (ORDER BY)** | ~71% | btree scan O(log V_l + limit) | Indexed scan |
+| **Read: Label scan** | ~95% | bitmap O(V_l/64) | Fragment scan |
+| **Storage** | ~99% | Tombstone overhead u≈1% | Deletion vector |
+| **Compaction** | ~10% | dirty labels only | Background rewrite + GC |
+| **Cold start** | ~80% | R2 latency 支配 | Demand-paged manifest |
+
+**Key trade-off**: Write η 0.001% → 5% (5000x↑) at cost of per-write btree rebuild O(V_l log V_l)。Timeline read η maintained at 71% (btree index in commit_labels_only)。
+
+**LanceDB 対応関係**:
+
+| LanceDB | yata | 一致度 |
+|---|---|---|
+| Fragment (Arrow IPC) | L1 sorted COO segment (Arrow IPC) | **高** |
+| Append write | Tombstone old + append new vertex | **高** |
+| Deletion vector | `vertex_alive = false` | **高** |
+| Immutable manifest chain | `manifest-{inverted}.json` versioned | **高** |
+| Background compaction | Size-based LSM (L0→L1, PK dedup, tombstone GC) | **中** (label 単位) |
+| Per-write commit 不要 | `commit_labels_only()` (lightweight) | **中** (label/bitmap/btree のみ) |
+| MVCC | WAL seq ordering (single-writer) | **低** |
+
+**禁止**: 既存 vertex の in-place props 上書き (LanceDB immutable 原則違反)。per-write full commit() (Shannon 冗長 η=0.001%)。
 
 ## Persistence Model — Sorted COO Segments + Arrow IPC WAL
 
@@ -378,5 +414,7 @@ python3 -c "import json; [print(e['label']) for e in json.load(open('/tmp/schema
 - **lite instance 禁止** — standard-1 以上
 - **CSR offsets rebuild 新規導入禁止** — Sorted COO に移行。commit() → offsets rebuild は Shannon 非効率 (η = O(log E / V) → 0)
 - **mutable snapshot 新規導入禁止** — sorted segments が persistent format。別途 serialize → R2 PUT の snapshot パス不要
+- **既存 vertex の in-place props 上書き禁止 (CRITICAL)** — LanceDB immutable 原則。update = tombstone old + append new。`merge_by_pk` は既に append-only 実装
+- **per-write full commit() 禁止** — `commit_labels_only()` (label_index + label_bitmap + btree) を使用。full commit (columnar/prop_eq) は compaction 時のみ。Shannon: per-write full commit η=0.001%
 - **`reqwest` crate 再追加禁止** — `aws-lc-sys` (OpenSSL/BoringSSL C cross-compile) を引き込む。`ureq` + `rustls` を使用
 - **`RUSTC_WRAPPER=sccache` での cross-compile 禁止** — `cargo zigbuild` を使用

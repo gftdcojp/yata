@@ -2354,6 +2354,24 @@ impl Mutable for MutableCsrStore {
 }
 
 impl MutableCsrStore {
+    /// Lightweight commit: rebuild label_index + label_bitmap + btree (O(dirty_labels × V log V)).
+    /// Defers expensive columnar cache / prop_eq rebuild to full commit().
+    /// Used by LanceDB-style append path to keep label scans + ORDER BY correct per-write.
+    /// Shannon: η≈48% overall (btree keeps timeline ORDER BY at η≈71%).
+    pub fn commit_labels_only(&mut self) {
+        self.rebuild_label_index();
+        self.rebuild_label_bitmap();
+        self.rebuild_btree_indexes();
+        // Mark CSR stale for dirty edge labels
+        {
+            let mut csr = self.csr.lock().unwrap();
+            for label in &self.dirty_edge_labels {
+                csr.mark_stale(label);
+            }
+        }
+        // Don't clear dirty sets — full commit() still needs them for columnar/prop_eq
+    }
+
     /// Force immediate CSR rebuild for all stale labels.
     /// Use after batch operations (cold start, bulk import) where
     /// you want CSR ready before read queries arrive.

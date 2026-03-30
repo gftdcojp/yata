@@ -943,16 +943,16 @@ impl TieredGraphEngine {
             if let Some(single) = hot.as_single_mut() {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
                 let vid = single.merge_by_pk(label, pk_key, &pk, props);
-                // Deferred commit: only rebuild indexes when L0 threshold reached.
-                // PK index is eagerly updated by merge_by_pk for query correctness.
-                // Full index rebuild (columnar cache, label bitmap, btree) deferred.
+                // Lightweight commit: rebuild label_index + label_bitmap only
+                // (keeps label scans correct). Expensive columnar/btree deferred.
+                single.commit_labels_only();
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     ll.insert(label.to_string());
                 }
                 let pw = self.pending_writes.fetch_add(1, Ordering::Relaxed) + 1;
                 if pw >= Self::L0_COMPACT_THRESHOLD {
                     self.pending_writes.store(0, Ordering::Relaxed);
-                    // Batch commit before compaction (rebuild all deferred indexes)
+                    // Full commit at compaction (rebuild columnar cache, btree, prop indexes)
                     single.commit();
                     let _ = self.trigger_compaction();
                 }
@@ -996,7 +996,8 @@ impl TieredGraphEngine {
             if let Some(single) = hot.as_single_mut() {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
                 let vid = single.merge_by_pk(label, pk_key, &pk, props);
-                // Deferred commit: PK index updated eagerly, full rebuild at compaction
+                // Lightweight commit: label_index + label_bitmap only
+                single.commit_labels_only();
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     ll.insert(label.to_string());
                 }
