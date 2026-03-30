@@ -412,6 +412,7 @@ pub fn build_manifest_v2(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yata_grin::PropValue;
 
     fn make(seq: u64, label: &str, pk: &str, op: WalOp, name: &str) -> WalEntry {
         WalEntry {

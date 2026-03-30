@@ -75,6 +75,7 @@ pub struct MutationContext {
 pub struct TieredGraphEngine {
     config: TieredEngineConfig,
     hot: Arc<RwLock<yata_store::GraphStoreEnum>>,
+    read_store: Arc<RwLock<Option<yata_lance::LanceReadStore>>>,
     warm: Arc<yata_lance::YataVectorStore>,
     cache: Arc<Mutex<QueryCache>>,
     hot_initialized: Arc<AtomicBool>,
@@ -130,6 +131,7 @@ impl TieredGraphEngine {
         Self {
             config,
             hot: Arc::new(RwLock::new(hot_store)),
+            read_store: Arc::new(RwLock::new(None)),
             warm,
             cache: Arc::new(Mutex::new(cache)),
             hot_initialized: Arc::new(AtomicBool::new(false)),
@@ -236,6 +238,22 @@ impl TieredGraphEngine {
         // HOT is initialized lazily from Lance on first read.
     }
 
+    fn refresh_read_store(&self) {
+        let lance_ds = self.lance_dataset.clone();
+        let read_store = self.read_store.clone();
+        let maybe_store = self.block_on(async {
+            let ds_guard = lance_ds.lock().await;
+            let Some(ds) = ds_guard.as_ref() else {
+                return None;
+            };
+            let vertex_batches = ds.scan_all().await.ok()?;
+            yata_lance::LanceReadStore::from_live_batches(&vertex_batches, &[]).ok()
+        });
+        if let Ok(mut guard) = read_store.write() {
+            *guard = maybe_store;
+        }
+    }
+
     /// Ensure specific labels are loaded into HOT CSR (lazy mode).
     ///
     /// If `labels` is empty, loads ALL labels (mutation path fallback).
@@ -307,6 +325,7 @@ impl TieredGraphEngine {
                 tracing::info!(label, "demand page-in: loaded from Lance Dataset");
             }
         }
+        self.refresh_read_store();
     }
 
 
@@ -538,6 +557,17 @@ impl TieredGraphEngine {
                         let plan_result = yata_gie::transpile::transpile(&ast);
 
                         if let Ok(plan) = plan_result {
+                            if let Ok(rs) = self.read_store.read() {
+                                if let Some(ref read_store) = *rs {
+                                    let records = yata_gie::executor::execute(&plan, read_store);
+                                    let rows = yata_gie::executor::result_to_rows(&records, &plan);
+                                    let k = cache_key(cypher, params, rls_org_id);
+                                    if let Ok(mut c) = self.cache.lock() {
+                                        c.put(k, rows.clone());
+                                    }
+                                    return Ok(rows);
+                                }
+                            }
                             let records = yata_gie::executor::execute(&plan, single_csr);
                             let rows = yata_gie::executor::result_to_rows(&records, &plan);
 
@@ -697,6 +727,7 @@ impl TieredGraphEngine {
                         *hot = yata_store::GraphStoreEnum::Single(new_csr);
                         self.hot_initialized.store(true, Ordering::SeqCst);
                     }
+                    self.refresh_read_store();
                     tracing::debug!(delta = delta_size, total = total_size, "full CSR rebuild (large delta)");
                 }
             }
@@ -794,6 +825,7 @@ impl TieredGraphEngine {
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     ll.insert(label.to_string());
                 }
+                self.refresh_read_store();
                 let pw = self.pending_writes.fetch_add(1, Ordering::Relaxed) + 1;
                 if pw >= Self::L0_COMPACT_THRESHOLD {
                     self.pending_writes.store(0, Ordering::Relaxed);
@@ -846,6 +878,7 @@ impl TieredGraphEngine {
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     ll.insert(label.to_string());
                 }
+                self.refresh_read_store();
                 let pw = self.pending_writes.fetch_add(1, Ordering::Relaxed) + 1;
                 if pw >= Self::L0_COMPACT_THRESHOLD {
                     self.pending_writes.store(0, Ordering::Relaxed);
@@ -884,7 +917,10 @@ impl TieredGraphEngine {
             if let Some(single) = hot.as_single_mut() {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
                 let deleted = single.delete_by_pk(label, pk_key, &pk);
-                if deleted { single.commit(); }
+                if deleted {
+                    single.commit();
+                    self.refresh_read_store();
+                }
                 return Ok(deleted);
             }
         }
@@ -922,7 +958,10 @@ impl TieredGraphEngine {
             if let Some(single) = hot.as_single_mut() {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
                 let deleted = single.delete_by_pk(label, pk_key, &pk);
-                if deleted { single.commit(); }
+                if deleted {
+                    single.commit();
+                    self.refresh_read_store();
+                }
                 return Ok((deleted, wal_entry));
             }
         }
@@ -1026,6 +1065,7 @@ impl TieredGraphEngine {
                 }
                 // Mark HOT as initialized (read container is now live)
                 self.hot_initialized.store(true, Ordering::SeqCst);
+                self.refresh_read_store();
                 // Invalidate query cache
                 if let Ok(mut c) = self.cache.lock() {
                     c.invalidate();
@@ -1510,8 +1550,18 @@ impl TieredGraphEngine {
                     if let Ok(ast) = yata_cypher::parse(cypher) {
                         let plan = yata_gie::transpile::transpile_secured(&ast, scope)
                             .map_err(|e| format!("GIE transpile: {}", e))?;
-                        let records = yata_gie::executor::execute(&plan, single_csr);
-                        let rows = yata_gie::executor::result_to_rows(&records, &plan);
+                        let rows = if let Ok(rs) = self.read_store.read() {
+                            if let Some(ref read_store) = *rs {
+                                let records = yata_gie::executor::execute(&plan, read_store);
+                                yata_gie::executor::result_to_rows(&records, &plan)
+                            } else {
+                                let records = yata_gie::executor::execute(&plan, single_csr);
+                                yata_gie::executor::result_to_rows(&records, &plan)
+                            }
+                        } else {
+                            let records = yata_gie::executor::execute(&plan, single_csr);
+                            yata_gie::executor::result_to_rows(&records, &plan)
+                        };
                         let k = cache_key(cypher, params, Some(cache_did));
                         if let Ok(mut c) = self.cache.lock() {
                             c.put(k, rows.clone());
@@ -1529,6 +1579,17 @@ impl TieredGraphEngine {
     /// Resolve DID's P-256 public key multibase string from DIDDocument vertex in CSR.
     /// Returns the raw multibase string (z-prefix base58btc) or None.
     pub fn resolve_did_pubkey_multibase(&self, did: &str) -> Option<String> {
+        if let Ok(read_store) = self.read_store.read() {
+            if let Some(ref store) = *read_store {
+                let did_val = PropValue::Str(did.to_string());
+                let vids = store.scan_vertices("DIDDocument", &Predicate::Eq("did".to_string(), did_val));
+                let vid = *vids.first()?;
+                match store.vertex_prop(vid, "public_key_multibase") {
+                    Some(PropValue::Str(s)) => return Some(s.clone()),
+                    _ => {}
+                }
+            }
+        }
         let hot = self.hot.read().ok()?;
         let single = hot.as_single()?;
         let did_val = PropValue::Str(did.to_string());
