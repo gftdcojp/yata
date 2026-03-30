@@ -6054,7 +6054,6 @@ dependencies = [
  "yata-cypher",
  "yata-grin",
  "yata-s3",
- "yata-vex",
 ]
 
 [[package]]
@@ -6122,25 +6121,6 @@ dependencies = [
  "yata-engine",
  "yata-gie",
  "yata-grin",
-]
-
-[[package]]
-name = "yata-vex"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "arrow-array",
- "arrow-schema",
- "bytes",
- "memmap2",
- "rand 0.8.5",
- "rayon",
- "serde",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "yata-arrow",
- "yata-core",
 ]
 
 [[package]]

@@ -25,12 +25,11 @@ COPY yata-cypher/Cargo.toml     yata-cypher/Cargo.toml
 COPY yata-grin/Cargo.toml       yata-grin/Cargo.toml
 COPY yata-engine/Cargo.toml     yata-engine/Cargo.toml
 COPY yata-gie/Cargo.toml        yata-gie/Cargo.toml
-COPY yata-vex/Cargo.toml        yata-vex/Cargo.toml
 COPY yata-lance/Cargo.toml      yata-lance/Cargo.toml
 # Stub src for dep caching
 RUN for d in yata-core yata-arrow yata-object yata-s3 \
              yata-cypher yata-grin yata-engine \
-             yata-gie yata-vex yata-lance; do \
+             yata-gie yata-lance; do \
       mkdir -p $d/src && echo '' > $d/src/lib.rs; \
     done && \
     mkdir -p yata-server/src && \

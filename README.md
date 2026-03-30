@@ -21,7 +21,7 @@ Lance-backed graph database and event store with Raft consensus.
 │  yata-server                                                │
 ├─────────────────────────────────────────────────────────────┤
 │                   Layer 3: Engine                            │
-│  yata-engine  yata-gie  yata-vex  yata-s3                   │
+│  yata-engine  yata-gie  yata-s3                          │
 ├─────────────────────────────────────────────────────────────┤
 │                   Layer 2: Graph                             │
 │  yata-cypher             yata-lance                        │
@@ -47,7 +47,6 @@ Lance-backed graph database and event store with Raft consensus.
 | **yata-engine** | TieredGraphEngine — Lance-backed cold start and WAL projection |
 | **yata-lance** | Lance-table-compatible persistence and vector store (fragments, manifests, typed Arrow schema) |
 | **yata-s3** | S3/R2 adapter (sync ureq+rustls, SigV4) |
-| **yata-vex** | Vector index (IVF_PQ + DiskANN) |
 | **yata-server** | XRPC API server (Cypher, mergeRecord, triggerSnapshot) |
 | **yata-bench** | Benchmarks |
 | **yata-bolt** | Bolt v4 wire protocol (Neo4j driver compatible) |

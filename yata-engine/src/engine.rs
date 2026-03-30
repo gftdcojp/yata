@@ -665,7 +665,7 @@ impl TieredGraphEngine {
         })
     }
 
-    // ── Vector search (yata-vex) ────────────────────────────────────────
+    // ── Vector search ───────────────────────────────────────────────────
 
     /// Write vertices with embeddings for vector search.
     pub fn write_embeddings(
@@ -697,7 +697,7 @@ impl TieredGraphEngine {
         .map_err(|e| format!("vector search: {e}"))
     }
 
-    /// Create IVF_PQ vector index.
+    /// Prepare the vector store for search.
     pub fn create_embedding_index(&self) -> Result<(), String> {
         self.block_on(self.warm.create_embedding_index())
             .map_err(|e| format!("create index: {e}"))
@@ -1758,7 +1758,7 @@ mod tests {
         assert_eq!(store.edge_count(), 1, "read_store: 1 edge");
     }
 
-    // ── Vector search (yata-vex only, not in graph write path) ─────────
+    // ── Vector search only, not in graph write path ────────────────────
 
     #[test]
     fn test_graph_store_not_written_by_graph_mutations() {
@@ -2381,12 +2381,12 @@ mod tests {
     }
 
     #[test]
-    fn test_vex_vector_search() {
-        // TieredGraphEngine::vector_search → yata-vex IVF_PQ index
+    fn test_vector_search() {
+        // TieredGraphEngine::vector_search → YataVectorStore brute-force index
         let dir = tempfile::tempdir().unwrap();
         let e = make_engine(&dir);
 
-        // Write embeddings via yata-vex path
+        // Write embeddings via vector store path
         let nodes: Vec<yata_cypher::NodeRef> = (0..100)
             .map(|i| {
                 let mut props = indexmap::IndexMap::new();

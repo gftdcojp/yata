@@ -234,9 +234,9 @@
   <text x="440" y="702" fill="#475569" font-size="9">deps: core,grin,store,cypher,gie,graph,s3,lance</text>
 
   <rect x="860" y="600" width="300" height="55" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
-  <text x="880" y="623" fill="#e2e8f0" font-size="13" font-weight="bold">yata-vex</text>
+  <text x="880" y="623" fill="#e2e8f0" font-size="13" font-weight="bold">YataVectorStore</text>
   <text x="1040" y="623" fill="#64748b" font-size="9">~1,500 LOC</text>
-  <text x="880" y="642" fill="#94a3b8" font-size="10">IVF_PQ + DiskANN (Vamana) vector index</text>
+  <text x="880" y="642" fill="#94a3b8" font-size="10">brute-force vector search cache</text>
 
   <rect x="860" y="665" width="300" height="55" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
   <text x="880" y="688" fill="#e2e8f0" font-size="13" font-weight="bold">yata-s3</text>
@@ -1638,7 +1638,7 @@
   <line x1="330" y1="7182" x2="560" y2="7310" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
 
   <rect x="430" y="7150" width="110" height="32" rx="6" fill="#1e293b" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="4,3"/>
-  <text x="485" y="7171" text-anchor="middle" fill="#f59e0b" font-size="10">yata-vex</text>
+  <text x="485" y="7171" text-anchor="middle" fill="#f59e0b" font-size="10">YataVectorStore</text>
   <text x="485" y="7183" text-anchor="middle" fill="#f59e0b" font-size="8">⚠ 1,500 LOC</text>
   <line x1="485" y1="7182" x2="195" y2="7310" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
 
@@ -1667,8 +1667,8 @@
   <text x="770" y="7125" fill="#fcd34d" font-size="12" font-weight="bold">Shannon Redundancy Candidates (⚠)</text>
   <text x="770" y="7145" fill="#f59e0b" font-size="10">vector layer → merged into yata-lance</text>
   <text x="770" y="7160" fill="#94a3b8" font-size="9">separate vector crate removed from workspace</text>
-  <text x="770" y="7180" fill="#f59e0b" font-size="10">yata-vex → merge into yata-engine</text>
-  <text x="770" y="7195" fill="#94a3b8" font-size="9">IVF_PQ + DiskANN; single consumer (yata-lance only)</text>
+  <text x="770" y="7180" fill="#f59e0b" font-size="10">YataVectorStore -> merge into yata-lance</text>
+  <text x="770" y="7195" fill="#94a3b8" font-size="9">brute-force vector search; single consumer (yata-lance only)</text>
   <text x="770" y="7215" fill="#f59e0b" font-size="10">yata-object → merge into yata-s3</text>
   <text x="770" y="7230" fill="#94a3b8" font-size="9">LocalObjectStore (CAS); used by S3 sync only</text>
 

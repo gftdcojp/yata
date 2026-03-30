@@ -109,7 +109,6 @@ env.YATA.stats()                        // → all partition CpmStats (K3a)
 | `yata-gie` | GIE push-based executor, IR (Exchange/Receive/Gather, serde-serializable), distributed planner, `execute_step()` (Phase 5: stateless per-round fragment execution), `MaterializedRecord` (rkey-based cross-partition exchange), `ExchangePayload` (HTTP transport) |
 | `yata-s3` | R2 persistence (sync ureq+rustls S3 client, SigV4)。`get_sync` (full GET) + **`get_range_sync` (HTTP Range GET, SigV4 signed)**。`trigger_compaction()` → R2 PUT、page-in → R2 GET/Range GET |
 | `yata-lance` | **Lance-table-compatible persistence + vector store** — typed Arrow schema (VERTICES_SCHEMA/EDGES_SCHEMA), Arrow IPC fragment serialize/deserialize, versioned TableManifest, deletion info, embedding index。`yata-engine` compaction + cold start + vector search の persistence layer |
-| `yata-vex` | Vector index (IVF_PQ + DiskANN) |
 | `yata-bench` | Benchmarks: `cypher-bench`, `cypher-transport-bench` |
 | `yata-server` | XRPC API server (`/xrpc/ai.gftd.yata.cypher` + `compact`)。GraphQueryExecutor trait |
 
