@@ -1002,40 +1002,50 @@ impl TieredGraphEngine {
         let batch = crate::arrow_wal::wal_entries_to_batch(&entries)
             .map_err(|e| format!("WAL batch conversion failed: {e}"))?;
         let schema = crate::arrow_wal::wal_arrow_schema();
-        let lance_ds = self.lance_table.clone();
+        let lance_tbl = self.lance_table.clone();
+        let lance_db = self.lance_db.clone();
         let prefix = &self.s3_prefix;
         let pid = self.config.hot_partition_id.get();
-        let lance_uri = format!("{}lance/vertices/{}", prefix, pid);
+        let prefix_owned = prefix.to_string();
+
         let lance_ok = ENGINE_RT.block_on(async {
-            let mut ds_guard = lance_ds.lock().await;
-            if let Some(ref mut ds) = *ds_guard {
-                match ds.add(batch.clone()).await {
+            let mut tbl_guard = lance_tbl.lock().await;
+            if let Some(ref tbl) = *tbl_guard {
+                match tbl.add(batch.clone()).await {
                     Ok(()) => true,
                     Err(e) => {
-                        tracing::warn!(error = %e, "Lance Dataset append failed, falling back to R2 segment");
+                        tracing::warn!(error = %e, "LanceDB add failed, falling back to R2 segment");
                         false
                     }
                 }
             } else {
-                // Create new Dataset — try S3/R2 env first, fallback to local
-                let result = match yata_lance::YataDataset::create_with_store(
-                    &lance_uri, vec![batch.clone()], schema.clone(), prefix,
-                ).await {
-                    Ok(ds) => Ok(ds),
-                    Err(_) => yata_lance::YataDataset::create(&lance_uri, vec![batch.clone()], schema.clone()).await,
-                };
-                match result {
-                    Ok(ds) => {
-                        let v = ds.version().await;
-                        tracing::info!(version = v, "Lance Dataset created from WAL flush");
-                        *ds_guard = Some(ds);
-                        true
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Lance Dataset create failed, falling back to R2 segment");
-                        false
-                    }
+                // Connect + create table
+                let mut db_guard = lance_db.lock().await;
+                if db_guard.is_none() {
+                    let new_db = if let Some(db) = yata_lance::YataDb::connect_from_env(&prefix_owned).await {
+                        db
+                    } else {
+                        match yata_lance::YataDb::connect_local(&prefix_owned).await {
+                            Ok(db) => db,
+                            Err(e) => { tracing::warn!(error = %e, "LanceDB connect failed"); return false; }
+                        }
+                    };
+                    *db_guard = Some(new_db);
                 }
+                if let Some(ref db) = *db_guard {
+                    match db.create_table("vertices", batch.clone()).await {
+                        Ok(tbl) => {
+                            let v = tbl.version().await.unwrap_or(0);
+                            tracing::info!(version = v, "LanceDB table created from WAL flush");
+                            *tbl_guard = Some(tbl);
+                            true
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "LanceDB create_table failed");
+                            false
+                        }
+                    }
+                } else { false }
             }
         });
 
@@ -1097,11 +1107,11 @@ impl TieredGraphEngine {
         // Primary: use Lance built-in compaction to merge fragments
         let result = ENGINE_RT.block_on(async {
             let mut ds_guard = lance_ds.lock().await;
-            if let Some(ref mut ds) = *ds_guard {
-                let version_before = ds.version().await;
+            if let Some(ref ds) = *ds_guard {
+                let version_before = ds.version().await.unwrap_or(0);
                 match ds.compact().await {
                     Ok(stats) => {
-                        let version_after = ds.version().await;
+                        let version_after = ds.version().await.unwrap_or(version_before);
                         let removed = stats.compaction.as_ref().map(|c| c.fragments_removed).unwrap_or(0);
                         let added = stats.compaction.as_ref().map(|c| c.fragments_added).unwrap_or(0);
                         tracing::info!(
@@ -1298,27 +1308,23 @@ impl TieredGraphEngine {
         let lance_db = self.lance_db.clone();
         let prefix_owned = prefix.to_string();
         let checkpoint_seq = ENGINE_RT.block_on(async {
-            // Connect to DB (S3/R2 first, fallback to local)
-            let db = {
-                let mut db_guard = lance_db.lock().await;
-                if db_guard.is_none() {
-                    let new_db = if let Some(db) = yata_lance::YataDb::connect_from_env(&prefix_owned).await {
-                        db
-                    } else {
-                        match yata_lance::YataDb::connect_local(&prefix_owned).await {
-                            Ok(db) => db,
-                            Err(e) => {
-                                tracing::info!(error = %e, "LanceDB connect failed (new database)");
-                                return 0u64;
-                            }
+            // Connect to DB + open table (S3/R2 first, fallback to local)
+            let mut db_guard = lance_db.lock().await;
+            if db_guard.is_none() {
+                let new_db = if let Some(db) = yata_lance::YataDb::connect_from_env(&prefix_owned).await {
+                    db
+                } else {
+                    match yata_lance::YataDb::connect_local(&prefix_owned).await {
+                        Ok(db) => db,
+                        Err(e) => {
+                            tracing::info!(error = %e, "LanceDB connect failed (new database)");
+                            return 0u64;
                         }
-                    };
-                    *db_guard = Some(new_db);
-                }
-                db_guard.clone()
-            };
-            // Open vertices table
-            if let Some(ref db) = db {
+                    }
+                };
+                *db_guard = Some(new_db);
+            }
+            if let Some(ref db) = *db_guard {
                 match db.open_table("vertices").await {
                     Ok(tbl) => {
                         let version = tbl.version().await.unwrap_or(0);
