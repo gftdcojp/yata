@@ -8,6 +8,7 @@ pub mod dataset;
 pub mod manifest;
 pub mod read_store;
 pub mod schema;
+pub mod store;
 pub mod vector;
 pub mod writer;
 
@@ -28,6 +29,7 @@ pub use manifest::{
     GraphManifestTableRef,
     GraphManifestTables,
     ManifestStore,
+    ObjectStoreManifestStore,
     OpenedGraphDatasets,
     S3ManifestStore,
     load_manifest,
@@ -55,4 +57,5 @@ pub use schema::{
     vertex_log_schema,
 };
 pub use vector::YataVectorStore;
+pub use store::UreqObjectStore;
 pub use writer::{EdgeMutation, VertexMutation, apply_edge_mutation, apply_vertex_mutation};

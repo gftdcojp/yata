@@ -16,13 +16,22 @@
     "./cypher": "./src/cypher.ts",
     "./wal": "./src/wal.ts",
     "./writer": "./src/writer.ts",
-    "./helpers": "./src/helpers.ts"
+    "./helpers": "./src/helpers.ts",
+    "./cypher-parse": "./src/cypher-parse.ts",
+    "./cypher-exec": "./src/cypher-exec.ts",
+    "./r2-reader": "./src/r2-reader.ts",
+    "./workers-read": "./src/workers-read.ts"
   },
-  "files": ["src"],
+  "files": [
+    "src"
+  ],
   "dependencies": {
     "@gftd/xrpc": "file:../../../runtime/magatama/xrpc",
     "@lancedb/lancedb": "^0.18.2",
     "apache-arrow": "^21.1.0"
   },
-  "license": "UNLICENSED"
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "vitest": "^4.1.2"
+  }
 }

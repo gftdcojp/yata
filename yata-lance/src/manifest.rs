@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use yata_s3::s3::{S3Client, S3Error};
 
+use crate::store::UreqObjectStore;
+
 use crate::schema::{
     EDGE_LIVE_IN_TABLE,
     EDGE_LIVE_OUT_TABLE,
@@ -125,6 +127,56 @@ impl ManifestStore for S3ManifestStore {
         let key = self.object_key(key);
         self.client
             .put_sync(&key, bytes::Bytes::copy_from_slice(value))
+    }
+}
+
+/// ManifestStore backed by UreqObjectStore (object_store::ObjectStore trait).
+/// Provides the same interface as S3ManifestStore but using the standardized ObjectStore API.
+pub struct ObjectStoreManifestStore {
+    store: std::sync::Arc<UreqObjectStore>,
+    prefix: String,
+}
+
+impl ObjectStoreManifestStore {
+    pub fn new(store: std::sync::Arc<UreqObjectStore>, prefix: impl Into<String>) -> Self {
+        Self {
+            store,
+            prefix: prefix.into().trim_end_matches('/').to_string(),
+        }
+    }
+
+    fn object_key(&self, key: &str) -> String {
+        let key = key.trim_start_matches('/');
+        if self.prefix.is_empty() {
+            key.to_string()
+        } else {
+            format!("{}/{}", self.prefix, key)
+        }
+    }
+
+    pub fn store(&self) -> &std::sync::Arc<UreqObjectStore> {
+        &self.store
+    }
+}
+
+impl ManifestStore for ObjectStoreManifestStore {
+    type Error = String;
+
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Self::Error> {
+        let key = self.object_key(key);
+        self.store
+            .client()
+            .get_sync(&key)
+            .map(|opt| opt.map(|b| b.to_vec()))
+            .map_err(|e| e.to_string())
+    }
+
+    fn put(&self, key: &str, value: &[u8]) -> Result<(), Self::Error> {
+        let key = self.object_key(key);
+        self.store
+            .client()
+            .put_sync(&key, bytes::Bytes::copy_from_slice(value))
+            .map_err(|e| e.to_string())
     }
 }
 

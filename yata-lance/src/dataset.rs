@@ -7,7 +7,10 @@
 use arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use futures::TryStreamExt;
 use lance::dataset::{Dataset, WriteMode, WriteParams};
+use lance::io::ObjectStoreParams;
+use object_store::ObjectStore as DynObjectStore;
 use std::sync::Arc;
+use url::Url;
 
 /// Wrapper around a Lance Dataset for yata graph vertices.
 pub struct YataDataset {
@@ -26,17 +29,32 @@ impl YataDataset {
         Ok(Self { ds })
     }
 
-    /// Open an existing dataset at the given URI.
-    ///
-    /// URI can be:
-    /// - Local: `/path/to/dataset`
-    /// - S3/R2: `s3://bucket/prefix/dataset`
+    /// Open an existing dataset at the given URI (local filesystem only).
     pub async fn open(uri: &str) -> Result<Self, lance::Error> {
         let ds = Dataset::open(uri).await?;
         Ok(Self { ds })
     }
 
-    /// Create a new dataset (or overwrite) with initial batches.
+    /// Open an existing dataset backed by a custom ObjectStore (e.g. UreqObjectStore for R2).
+    ///
+    /// `base_url` should be a well-formed URL like `r2://ai-gftd-graph/yata/lance/vertices/0`.
+    /// The `store` provides the actual I/O (get/put/list) to R2 via ureq.
+    #[allow(deprecated)]
+    pub async fn open_with_store(
+        uri: &str,
+        store: Arc<dyn DynObjectStore>,
+        base_url: Url,
+    ) -> Result<Self, lance::Error> {
+        use lance::dataset::builder::DatasetBuilder;
+        let commit_handler = Arc::new(lance_table::io::commit::RenameCommitHandler);
+        let ds = DatasetBuilder::from_uri(uri)
+            .with_object_store(store, base_url, commit_handler)
+            .load()
+            .await?;
+        Ok(Self { ds })
+    }
+
+    /// Create a new dataset (or overwrite) with initial batches (local filesystem only).
     pub async fn create(
         uri: &str,
         batches: Vec<RecordBatch>,
@@ -44,6 +62,27 @@ impl YataDataset {
     ) -> Result<Self, lance::Error> {
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
         let ds = Dataset::write(reader, uri, Some(WriteParams::default())).await?;
+        Ok(Self { ds })
+    }
+
+    /// Create a new dataset backed by a custom ObjectStore (e.g. UreqObjectStore for R2).
+    #[allow(deprecated)]
+    pub async fn create_with_store(
+        uri: &str,
+        batches: Vec<RecordBatch>,
+        schema: Arc<arrow::datatypes::Schema>,
+        store: Arc<dyn DynObjectStore>,
+        base_url: Url,
+    ) -> Result<Self, lance::Error> {
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store: Some((store, base_url)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let ds = Dataset::write(reader, uri, Some(params)).await?;
         Ok(Self { ds })
     }
 

@@ -134,6 +134,44 @@ export type {
 export { G, buildLabelCypher } from "./cypher.js";
 export type { CypherQuery } from "./cypher.js";
 
+// Cypher parser (Workers-side subset)
+export { parseCypher, tryParseCypher, CypherParseError } from "./cypher-parse.js";
+export type {
+  CypherAST,
+  CypherValue,
+  MatchNode,
+  MatchEdge,
+  MatchPattern,
+  WhereClause,
+  ReturnColumn,
+  PropRef,
+  ParamRef,
+  LiteralVal,
+  Expr,
+} from "./cypher-parse.js";
+
+// Cypher executor (Workers-side Arrow execution)
+export { execCypher } from "./cypher-exec.js";
+export type { ExecContext } from "./cypher-exec.js";
+
+// R2 fragment reader (Workers-side Arrow IPC)
+export {
+  createR2FragmentStore,
+  createFetchFragmentStore,
+  loadLabels,
+  loadAllLabels,
+} from "./r2-reader.js";
+export type {
+  CompactionManifest,
+  LabelSegmentState,
+  FragmentStore,
+  LabelData,
+} from "./r2-reader.js";
+
+// Workers read path (unified router)
+export { WorkersReader, createWorkersReader } from "./workers-read.js";
+export type { WorkersReadConfig, WorkersReadStats } from "./workers-read.js";
+
 // Helpers
 export {
   generateTid,

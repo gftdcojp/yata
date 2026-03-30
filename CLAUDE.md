@@ -61,14 +61,19 @@ Write (LanceDB-style append-only, NO page-in):
   yata への直接 mutate は mergeRecord からのみ (app 直接禁止)
   既存 vertex の in-place props 上書きは禁止 (LanceDB: immutable data + deletion vector)
 
+Lance WAL Flush (wal_flush_segment, primary path = Lance Dataset::append):
+  wal_flush_segment():
+    → WAL ring entries → RecordBatch (Arrow columnar)
+    → Lance Dataset::append(batch) — Lance handles versioning + fragment management
+    → Fallback: if Lance unavailable → raw Arrow IPC segment → R2 PUT (legacy path)
+
 Lance Compaction (size-based L0_COMPACT_THRESHOLD, dirty_labels gated):
   trigger_compaction():
-    → wal_flush_segment(): WAL ring → Arrow IPC segment → R2 PUT
+    → wal_flush_segment() (Lance append)
     → drain_dirty_labels() → dirty set
-    → dirty empty? → skip (zero R2 I/O)
-    → Phase 1: per dirty label: L0 + existing Lance fragments → merge-sort → PK-dedup → Blake3 → R2 PUT as Lance fragment
-    → Phase 2: Lance TableManifest built from successfully uploaded fragments → R2 PUT (immutable versioned)
-    → clean labels: untouched (zero R2 I/O)
+    → dirty empty? → skip
+    → Lance Dataset::compact() — built-in fragment merge (replaces custom PK-dedup pipeline)
+    → Lance handles manifest versioning internally
 
 Read (cold start: Lance manifest → fragment-level demand page-in):
   PDS_RPC.query / listRecords / getTimeline
@@ -104,11 +109,11 @@ env.YATA.stats()                        // → all partition CpmStats (K3a)
 |---|---|
 | `yata-core` | GlobalVid, LocalVid, PartitionId |
 | `yata-grin` | GRIN trait (Topology, Property, Schema, Scannable, Mutable) |
-| `yata-engine` | TieredGraphEngine, CpmStats (K3a), **Lance compaction** (`compaction.rs`: L0 + existing Lance fragments merge-sort, PK-dedup, dirty_labels drain → Lance fragment R2 PUT + `TableManifest` R2 PUT), **Arrow IPC WAL** (`arrow_wal.rs`: serialize/deserialize/auto-detect, default format), **Lance cold start** (`lance_manifest_cache` → `ensure_labels()` fragment demand page-in, **`cold_starting` AtomicBool** concurrent guard), engine-local query hints / memory bridge, Frontier BFS, ShardedCoordinator, WAL Projection (ring buffer + segment flush)。Design E SecurityScope (`query_with_did` → policy vertex lookup) |
+| `yata-engine` | TieredGraphEngine, CpmStats (K3a), **Lance-native WAL flush** (`wal_flush_segment`: WAL ring → RecordBatch → `Lance Dataset::append()`, fallback to R2 raw segment), **Lance-native compaction** (`trigger_compaction`: `Lance Dataset::compact()` built-in fragment merge), **Arrow IPC WAL** (`arrow_wal.rs`: serialize/deserialize/auto-detect, default format), **Lance cold start** (`lance_manifest_cache` → `ensure_labels()` fragment demand page-in, **`cold_starting` AtomicBool** concurrent guard), **`UreqObjectStore`** (`object_store::ObjectStore` over ureq S3Client, `get_object_store()`), engine-local query hints / memory bridge, Frontier BFS, ShardedCoordinator, WAL Projection (ring buffer)。Design E SecurityScope (`query_with_did` → policy vertex lookup) |
 | `yata-cypher` | Full Cypher parser + executor (incl. untyped edge traversal) |
 | `yata-gie` | GIE push-based executor, IR (Exchange/Receive/Gather, serde-serializable), distributed planner, `execute_step()` (Phase 5: stateless per-round fragment execution), `MaterializedRecord` (rkey-based cross-partition exchange), `ExchangePayload` (HTTP transport) |
-| `yata-s3` | R2 persistence (sync ureq+rustls S3 client, SigV4)。`get_sync` (full GET) + **`get_range_sync` (HTTP Range GET, SigV4 signed)**。`trigger_compaction()` → R2 PUT、page-in → R2 GET/Range GET |
-| `yata-lance` | **Lance-table-compatible persistence + vector store** — typed Arrow schema (VERTICES_SCHEMA/EDGES_SCHEMA), Arrow IPC fragment serialize/deserialize, versioned TableManifest, deletion info, embedding index。`yata-engine` compaction + cold start + vector search の persistence layer |
+| `yata-s3` | R2 persistence (sync ureq+rustls S3 client, SigV4)。`get_sync` (full GET) + **`get_range_sync` (HTTP Range GET, SigV4 signed)**。`UreqObjectStore` の transport 実装。page-in → R2 GET/Range GET |
+| `yata-lance` | **Lance-core persistence + vector store** — `UreqObjectStore` (`object_store::ObjectStore` impl over ureq S3Client, reqwest 不使用), `ObjectStoreManifestStore`, typed Arrow schema (VERTICES_SCHEMA/EDGES_SCHEMA), `YataDataset` (Lance Dataset wrapper: create/open/append/scan/compact), versioned GraphManifest, embedding index。`yata-engine` WAL flush (`Dataset::append`) + compaction (`Dataset::compact`) + cold start + vector search の persistence layer |
 | `yata-bench` | Benchmarks: `cypher-bench`, `cypher-transport-bench` |
 | `yata-server` | XRPC API server (`/xrpc/ai.gftd.yata.cypher` + `compact`)。GraphQueryExecutor trait |
 
@@ -118,7 +123,7 @@ env.YATA.stats()                        // → all partition CpmStats (K3a)
 
 ## R2 Persistence `[PRODUCTION]` — Lance Fragment Format (verified 2026-03-30)
 
-R2 = source of truth。**Lance fragments**: `lance/vertices/{pid}/fragments/{ver}-{frag}.arrow` (Arrow IPC, immutable)。**Lance TableManifest**: `lance/vertices/{pid}/manifest-{inverted:020}.json` (versioned, immutable)。**Append-only write**: mergeRecord = tombstone old + append new (L0 buffer, page-in 不要)。PK dedup は compaction 時。**Dirty tracking**: `drain_dirty_labels()` で dirty set を取得。dirty empty = zero R2 I/O (skip)。**Lance Compaction `[PRODUCTION]`**: L0 + existing Lance fragments → merge-sort → PK-dedup → new Lance fragment R2 PUT → `TableManifest` R2 PUT。Clean labels = zero R2 I/O。**Blake3 checksum**: `Fragment.blake3_hex`。cold start 時 R2 GET → verify → mismatch で corrupt fragment スキップ。**Two-phase PUT**: Phase 1: per-label Lance fragment upload (失敗 label はスキップ)。Phase 2: 成功 fragments から `TableManifest` 構築 → versioned manifest PUT。**Immutable Manifest Versioning**: `manifest-{u64::MAX - version:020}.json` — inverted naming で S3 ListObjects が O(1) 最新取得。**Fragment demand page-in**: 3-tier (disk cache → R2 GET → Blake3 verify → write-through)。**Range GET `[IMPLEMENTED]`**: `get_range_sync(key, offset, length)` で byte-range R2 GET (SigV4 signed)。**Cold start**: Lance `TableManifest` load (~50ms) → `hot_initialized = true` → labels demand-paged on first query。**Concurrent cold start guard**: `cold_starting` AtomicBool CAS (1 thread のみ実行)。**No snapshot serialize** — Lance fragments ARE the persistent + query format。
+R2 = source of truth。**Lance Dataset = core storage**。`YataDataset` (Lance Dataset wrapper) が versioning + fragment + manifest を内部管理。**Storage access**: `UreqObjectStore` (`object_store::ObjectStore` impl, ureq S3Client transport, reqwest 不使用)。**WAL flush**: `wal_flush_segment()` → `Lance Dataset::append(RecordBatch)` (primary) / raw R2 Arrow IPC segment (fallback)。**Lance Compaction `[PRODUCTION]`**: `trigger_compaction()` → `Lance Dataset::compact()` (built-in fragment merge)。Custom PK-dedup pipeline は legacy fallback path に降格。**Append-only write**: mergeRecord = tombstone old + append new (L0 buffer, page-in 不要)。**Dirty tracking**: `drain_dirty_labels()` で dirty set を取得。dirty empty = skip。**Blake3 checksum**: `Fragment.blake3_hex`。cold start 時 R2 GET → verify → mismatch で corrupt fragment スキップ。**Immutable Manifest Versioning**: Lance Dataset version chain。**Fragment demand page-in**: 3-tier (disk cache → R2 GET → Blake3 verify → write-through)。**Range GET `[IMPLEMENTED]`**: `get_range_sync(key, offset, length)` via `UreqObjectStore`。**Cold start**: Lance `Dataset::open()` (~50ms) → `hot_initialized = true` → labels demand-paged on first query。**Concurrent cold start guard**: `cold_starting` AtomicBool CAS (1 thread のみ実行)。**No snapshot serialize** — Lance fragments ARE the persistent + query format。
 
 ## Concurrency Model (CRITICAL)
 
@@ -175,31 +180,35 @@ R2 = source of truth。**Lance fragments**: `lance/vertices/{pid}/fragments/{ver
 
 **禁止**: 既存 vertex の in-place props 上書き (LanceDB immutable 原則違反)。per-write full commit() (Shannon 冗長 η=0.001%)。
 
-## Persistence Model — Sorted COO Segments + Arrow IPC WAL
+## Persistence Model — Lance Dataset Core + Arrow IPC WAL
 
-**Durability は Pipeline WAL が保証。** Pipeline → R2 JSON (10s flush) が WAL source of truth。**Sorted COO segments が query format = persistent format** (別途 snapshot 不要)。
+**Durability は Pipeline WAL が保証。** Pipeline → R2 JSON (10s flush) が WAL source of truth。**Lance Dataset が persistence + query format** (別途 snapshot 不要)。
 
 | 層 | Format | Trigger | 用途 |
 |---|---|---|---|
 | **Pipeline WAL** | R2 JSON (`pipeline/wal/`) | `Pipeline.send()` 10s flush | source of truth (durable) |
-| **yata WAL segments** | Arrow IPC (`wal/segments/{pid}/`) | cron 10s `walFlushSegment` | Cold start replay |
-| **L0 buffer** | in-memory unsorted COO tuples | mergeRecord append | instant write, pending compaction |
-| **Lance fragments** | Arrow IPC (`lance/vertices/{pid}/fragments/{ver}-{frag}.arrow`) | LSM compaction (dirty labels only) | query + persistence (PK-dedup, P=1.0) |
-| **Lance TableManifest** | JSON (`lance/vertices/{pid}/manifest-{inverted:020}.json`) | `trigger_compaction` | Fragment tracking + immutable version chain |
+| **L0 buffer** | in-memory WAL ring (WalEntry) | mergeRecord append | instant write, pending flush |
+| **Lance Dataset** | Arrow IPC fragments (Lance managed) | `wal_flush_segment` → `Dataset::append()` | query + persistence (Lance versioning) |
+| **Lance Compaction** | Fragment merge (Lance built-in) | `trigger_compaction` → `Dataset::compact()` | Fragment optimization |
+| **R2 WAL segments (fallback)** | Arrow IPC (`wal/segments/{pid}/`) | Lance unavailable fallback | Cold start replay |
 
-**`trigger_compaction()` = `wal_flush_segment` + `drain_dirty_labels` + Lance fragment compaction。** L0 + existing Lance fragments → merge-sort → PK-dedup → new Lance fragment R2 PUT + TableManifest R2 PUT。Clean labels = zero R2 I/O。
+**`wal_flush_segment()` = WAL ring → RecordBatch → `Lance Dataset::append()`。** Lance が versioning + fragment management を内部処理。Lance 不可時は raw Arrow IPC segment → R2 PUT (fallback)。
 
-**Cold start (Lance demand-paged)**: `ensure_labels` → `hot_initialized == false` → `wal_cold_start_manifest_only()` (Lance `TableManifest` load + WAL tail のみ, ~50ms) → `hot_initialized = true` **即座**。Per-label fragment は query 時に on-demand page-in (3-tier: disk cache ~100µs → R2 GET ~4ms → Blake3 verify → write-through)。Multi-node: 各ノードが独立に manifest load + fragment page-in。
+**`trigger_compaction()` = `wal_flush_segment` + `drain_dirty_labels` + `Lance Dataset::compact()`。** Lance built-in fragment merge。Custom PK-dedup pipeline は legacy fallback に降格。
 
-## Arrow IPC WAL + Lance Fragment Compaction `[PRODUCTION]` (verified 2026-03-30)
+**Cold start (Lance demand-paged)**: `ensure_labels` → `hot_initialized == false` → `wal_cold_start_manifest_only()` (Lance `Dataset::open()` ~50ms) → `hot_initialized = true` **即座**。Per-label fragment は query 時に on-demand page-in (3-tier: disk cache ~100µs → R2 GET ~4ms → Blake3 verify → write-through)。Multi-node: 各ノードが独立に Dataset open + fragment page-in。
 
-**Lance-table-compatible architecture.** WAL = Arrow IPC (append-only)。Compaction = Lance fragments (Arrow IPC) + TableManifest (versioned JSON)。CSR rebuild → eliminated。
+## Arrow IPC WAL + Lance-Native Compaction `[PRODUCTION]` (verified 2026-03-30)
 
+**Lance-core architecture.** WAL flush = `Lance Dataset::append()` (primary)。Compaction = `Lance Dataset::compact()` (built-in fragment merge)。Storage = `UreqObjectStore` (`object_store::ObjectStore` over ureq, reqwest 不使用)。CSR rebuild → eliminated。
+
+- **WAL flush (primary)**: WAL ring entries → `wal_entries_to_batch()` → RecordBatch → `Lance Dataset::append()`。Lance が fragment 生成 + version chain を内部管理。`head.json` segment registry 不要
+- **WAL flush (fallback)**: Lance 不可時 → Arrow IPC File → R2 PUT (legacy path)
 - **WAL format**: Arrow IPC File (default `YATA_WAL_FORMAT=arrow`)。`WalEntry.props` = `Vec<(String, PropValue)>` (typed, zero JSON overhead)。custom serde で flat JSON map backward compat
-- **Segment registry**: `head.json` の `segments` array に全 segment key を記録。R2 ListObjectsV2 不使用
-- **Lance Compaction (two-phase PUT)**: `trigger_compaction()` が `drain_dirty_labels()` → dirty labels のみ L0 + existing Lance fragments merge-sort → PK-dedup。Phase 1: per-label Lance fragment upload (`lance/vertices/{pid}/fragments/{ver}-{frag}.arrow`, Blake3 checksum、失敗 label はスキップ)。Phase 2: 成功 fragments から `TableManifest` 構築 → `lance/vertices/{pid}/manifest-{inverted:020}.json` PUT。Clean labels = zero R2 I/O
+- **Lance Compaction**: `trigger_compaction()` → `wal_flush_segment()` + `drain_dirty_labels()` → `Lance Dataset::compact()` (built-in fragment merge)。Custom PK-dedup pipeline は legacy fallback に降格
+- **UreqObjectStore**: `object_store::ObjectStore` trait impl backed by `yata_s3::S3Client` (ureq sync HTTP + SigV4)。`reqwest` 不使用 (cross-compile prohibition)。Lance Dataset + engine が統一 storage API で R2 操作。`ObjectStoreManifestStore` で manifest get/put
 - **Blake3 checksum**: Lance `Fragment.blake3_hex`。Cold start 時 R2 GET → verify → mismatch で corrupt fragment スキップ (panic なし)
-- **Cold start**: Lance `TableManifest` load (R2 list `lance/vertices/{pid}/manifest-*`, O(1) latest) → `lance_manifest_cache` → `hot_initialized = true` → WAL tail replay。Labels are demand-paged by `ensure_labels()` from Lance fragments (3-tier: disk → R2 → verify)。**`cold_starting` AtomicBool CAS** で concurrent cold start 防止 (1 thread のみ実行、他は spin-wait)
+- **Cold start**: `Lance Dataset::open()` (~50ms) → `hot_initialized = true`。Labels are demand-paged by `ensure_labels()` from Lance fragments (3-tier: disk → R2 → verify)。**`cold_starting` AtomicBool CAS** で concurrent cold start 防止 (1 thread のみ実行、他は spin-wait)
 - **WAL flush safety**: pattern match 安全 early return。空 entries でパニックしない
 - **Replica transport**: `/xrpc/ai.gftd.yata.walTailArrow` (Arrow IPC body) + `/xrpc/ai.gftd.yata.walApplyArrow`
 - **Migration CLI**: `gftd yata migrate --from csr --to coo` (CSR→COO forward) / `--from coo --to csr` (rollback)
@@ -348,14 +357,16 @@ Production: PARTITION_COUNT=1, per-label sorted COO Arrow IPC, segment-level pag
 
 **Overall: grade=C, p50=13.5ms, 9/14 S-grade。** v3→v4 改善: v1 monolithic 399MB → v2 per-label 47MB migration。S-grade 2→9 endpoints。v1 cold start 20-30s → v2 cold start 8-13s。
 
-**Lance format migration (2026-03-30):**
-- **yata-lance crate**: Lance-table-compatible persistence (VERTICES_SCHEMA/EDGES_SCHEMA, Arrow IPC fragments, versioned TableManifest)
+**Lance-core migration (2026-03-30):**
+- **yata-lance crate**: Lance-core persistence (VERTICES_SCHEMA/EDGES_SCHEMA, `YataDataset` wrapper, `UreqObjectStore`, `ObjectStoreManifestStore`, versioned GraphManifest)
+- **UreqObjectStore**: `object_store::ObjectStore` trait impl over ureq S3Client (reqwest 不使用)。Lance Dataset + engine が統一 storage API で R2 操作
+- **WAL flush → Lance append**: `wal_flush_segment()` = WAL ring → RecordBatch → `Lance Dataset::append()` (primary)。`head.json` segment registry 不要。Lance 不可時は raw Arrow IPC → R2 PUT (fallback)
+- **Compaction → Lance compact**: `trigger_compaction()` = `Lance Dataset::compact()` (built-in fragment merge)。Custom PK-dedup pipeline は legacy fallback に降格
 - **Append-only write**: `merge_by_pk` = tombstone old + append new (LanceDB immutable pattern)。`commit_labels_only()` per-write
-- **Lance compaction**: dirty labels → new Lance fragments + TableManifest (R2 `lance/vertices/{pid}/`)
-- **Lance cold start**: TableManifest load → `lance_manifest_cache` → fragment demand page-in (3-tier)
-- **Range GET**: `yata-s3` `get_range_sync(key, offset, length)` (HTTP Range, SigV4 signed)
+- **Lance cold start**: `Dataset::open()` → fragment demand page-in (3-tier)
+- **Range GET**: `UreqObjectStore` → `get_range_sync(key, offset, length)` (HTTP Range, SigV4 signed)
 - **Concurrent cold start guard**: `cold_starting` AtomicBool CAS (1 thread 排他実行)
-- **Dead code 除去**: loader.rs 870行除去 (9 legacy page-in functions), engine.rs 100行除去 (5 dead functions)
+- **Dead code 除去**: loader.rs 870行除去 (9 legacy page-in functions), engine.rs 100行除去 (5 dead functions), custom compaction orchestration ~60行削減
 
 **Trillion scale projection:**
 | Scale | Partitions | Write/sec | Point QPS | Scan QPS | Cost/月 |
@@ -411,7 +422,9 @@ npx wrangler r2 object list ai-gftd-graph --prefix "yata/lance/vertices/0/manife
 - **CSR offsets rebuild 新規導入禁止** — Sorted COO に移行
 - **既存 vertex の in-place props 上書き禁止 (CRITICAL)** — LanceDB immutable 原則。update = tombstone old + append new
 - **per-write full commit() 禁止** — `commit_labels_only()` (label_index + label_bitmap + btree) を使用。full commit (columnar/prop_eq) は compaction 時のみ
-- **legacy persistence path 新規追加禁止** — `log/compacted/`, `snap/fragment/`, `CompactionManifest` は除去済み。Lance fragment path (`lance/vertices/`) のみ使用
+- **legacy persistence path 新規追加禁止** — `log/compacted/`, `snap/fragment/`, `CompactionManifest` は除去済み。Lance Dataset path のみ使用
 - **loader.rs に page-in 関数新規追加禁止** — Lance fragment demand page-in は engine.rs `ensure_labels()` が担当
-- **`reqwest` crate 再追加禁止** — `aws-lc-sys` cross-compile 障害。`ureq` + `rustls` を使用
+- **`reqwest` crate 再追加禁止** — `aws-lc-sys` cross-compile 障害。`ureq` + `rustls` + `UreqObjectStore` を使用
+- **S3Client 直接使用の新規追加禁止** — `UreqObjectStore` (`object_store::ObjectStore`) 経由で R2 操作。engine.rs `get_object_store()` が lazy init
+- **custom compaction pipeline 新規追加禁止** — `Lance Dataset::compact()` を使用。custom PK-dedup は legacy fallback のみ
 - **`RUSTC_WRAPPER=sccache` での cross-compile 禁止** — `cargo zigbuild` を使用
