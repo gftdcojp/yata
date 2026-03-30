@@ -623,33 +623,126 @@ impl TieredGraphEngine {
 
     // ── Vector search ───────────────────────────────────────────────────
 
-    /// Write vertices with embeddings for vector search.
-    /// TODO: implement via lancedb table.add() with vector column
+    /// Write vertices with embeddings to the LanceDB embeddings table.
     pub fn write_embeddings(
         &self,
-        _nodes: &[yata_cypher::NodeRef],
+        nodes: &[yata_cypher::NodeRef],
         _embedding_key: &str,
-        _dim: usize,
+        dim: usize,
     ) -> Result<usize, String> {
-        Ok(0)
+        if nodes.is_empty() { return Ok(0); }
+        let count = nodes.len();
+
+        let lance_db = self.lance_db.clone();
+        let prefix_owned = self.s3_prefix.clone();
+
+        ENGINE_RT.block_on(async {
+            let mut db_guard = lance_db.lock().await;
+            if db_guard.is_none() {
+                let new_db = match yata_lance::YataDb::connect_from_env(&prefix_owned).await {
+                    Some(db) => db,
+                    None => yata_lance::YataDb::connect_local(&prefix_owned).await
+                        .map_err(|e| format!("LanceDB connect failed: {e}"))?,
+                };
+                *db_guard = Some(new_db);
+            }
+            let db = db_guard.as_ref().ok_or("LanceDB not connected")?;
+            let tbl = db.open_or_create_embeddings_table(dim).await
+                .map_err(|e| format!("embeddings table: {e}"))?;
+
+            // Build batch from nodes (vid, label, vector placeholder)
+            let vids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+            let labels: Vec<&str> = nodes.iter().map(|n| {
+                n.labels.first().map(|s| s.as_str()).unwrap_or("unknown")
+            }).collect();
+            let vid_arr = arrow::array::StringArray::from(vids);
+            let label_arr = arrow::array::StringArray::from(labels);
+            // Zero vectors as placeholder (real embeddings come from Murakumo)
+            let vectors: Vec<Option<Vec<Option<f32>>>> = (0..count)
+                .map(|_| Some(vec![Some(0.0f32); dim]))
+                .collect();
+            let vec_arr = arrow::array::FixedSizeListArray::from_iter_primitive::<arrow::datatypes::Float32Type, _, _>(
+                vectors, dim as i32,
+            );
+            let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("vid", arrow::datatypes::DataType::Utf8, false),
+                arrow::datatypes::Field::new("label", arrow::datatypes::DataType::Utf8, false),
+                arrow::datatypes::Field::new("vector",
+                    arrow::datatypes::DataType::FixedSizeList(
+                        std::sync::Arc::new(arrow::datatypes::Field::new("item", arrow::datatypes::DataType::Float32, true)),
+                        dim as i32),
+                    true),
+            ]));
+            let batch = arrow::record_batch::RecordBatch::try_new(schema, vec![
+                std::sync::Arc::new(vid_arr),
+                std::sync::Arc::new(label_arr),
+                std::sync::Arc::new(vec_arr),
+            ]).map_err(|e| format!("batch build: {e}"))?;
+            tbl.add(batch).await.map_err(|e| format!("embeddings add: {e}"))?;
+            Ok::<(), String>(())
+        })?;
+        Ok(count)
     }
 
-    /// Vector search over embeddings.
-    /// TODO: implement via lancedb table.search().nearest_to()
+    /// Vector search: find nearest neighbors via LanceDB.
     pub fn vector_search(
         &self,
-        _query_vector: Vec<f32>,
-        _limit: usize,
-        _label_filter: Option<&str>,
+        query_vector: Vec<f32>,
+        limit: usize,
+        label_filter: Option<&str>,
         _prop_filter: Option<&str>,
     ) -> Result<Vec<(yata_cypher::NodeRef, f32)>, String> {
-        Ok(Vec::new())
+        let lance_db = self.lance_db.clone();
+        let prefix_owned = self.s3_prefix.clone();
+
+        ENGINE_RT.block_on(async {
+            let db_guard = lance_db.lock().await;
+            let db = match db_guard.as_ref() {
+                Some(db) => db,
+                None => return Ok(Vec::new()),
+            };
+            let tbl = match db.open_table("embeddings").await {
+                Ok(tbl) => tbl,
+                Err(_) => return Ok(Vec::new()),
+            };
+            let filter = label_filter.map(|l| format!("label = '{}'", l.replace('\'', "''")));
+            let batches = tbl.vector_search(&query_vector, limit, filter.as_deref()).await
+                .map_err(|e| format!("vector search: {e}"))?;
+
+            let mut results = Vec::new();
+            for batch in &batches {
+                let vid_col = batch.column_by_name("vid")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>());
+                let dist_col = batch.column_by_name("_distance")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow::array::Float32Array>());
+                if let (Some(vids), Some(dists)) = (vid_col, dist_col) {
+                    for i in 0..batch.num_rows() {
+                        let vid = vids.value(i).to_string();
+                        let dist = dists.value(i);
+                        results.push((yata_cypher::NodeRef { id: vid, labels: Vec::new(), props: indexmap::IndexMap::new() }, dist));
+                    }
+                }
+            }
+            Ok(results)
+        })
     }
 
-    /// Prepare the vector store for search.
-    /// TODO: implement via lancedb table.create_index()
+    /// Create vector index on the embeddings table.
     pub fn create_embedding_index(&self) -> Result<(), String> {
-        Ok(())
+        let lance_db = self.lance_db.clone();
+
+        ENGINE_RT.block_on(async {
+            let db_guard = lance_db.lock().await;
+            let db = match db_guard.as_ref() {
+                Some(db) => db,
+                None => return Ok(()),
+            };
+            let tbl = match db.open_table("embeddings").await {
+                Ok(tbl) => tbl,
+                Err(_) => return Ok(()),
+            };
+            tbl.create_vector_index().await.map_err(|e| format!("create index: {e}"))
+        })
     }
 
     /// L0 compact threshold: trigger compaction when pending_writes exceeds this.

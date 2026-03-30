@@ -104,6 +104,31 @@ impl YataDb {
     pub fn inner(&self) -> &lancedb::Connection {
         &self.db
     }
+
+    /// Open or create the embeddings table for vector search.
+    pub async fn open_or_create_embeddings_table(
+        &self,
+        dim: usize,
+    ) -> Result<YataTable, lancedb::Error> {
+        match self.open_table("embeddings").await {
+            Ok(tbl) => Ok(tbl),
+            Err(_) => {
+                let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                    arrow::datatypes::Field::new("vid", arrow::datatypes::DataType::Utf8, false),
+                    arrow::datatypes::Field::new("label", arrow::datatypes::DataType::Utf8, false),
+                    arrow::datatypes::Field::new(
+                        "vector",
+                        arrow::datatypes::DataType::FixedSizeList(
+                            Arc::new(arrow::datatypes::Field::new("item", arrow::datatypes::DataType::Float32, true)),
+                            dim as i32,
+                        ),
+                        true,
+                    ),
+                ]));
+                self.create_empty_table("embeddings", schema).await
+            }
+        }
+    }
 }
 
 impl YataTable {
@@ -155,6 +180,31 @@ impl YataTable {
     /// Get table name.
     pub fn name(&self) -> &str {
         self.table.name()
+    }
+
+    /// Vector search: find nearest neighbors by embedding vector.
+    pub async fn vector_search(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: Option<&str>,
+    ) -> Result<Vec<RecordBatch>, lancedb::Error> {
+        let mut q = self.table.query().nearest_to(query)?;
+        q = q.limit(limit);
+        if let Some(f) = filter {
+            q = q.only_if(f);
+        }
+        let stream = q.execute().await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        Ok(batches)
+    }
+
+    /// Create a vector index on the "vector" column.
+    pub async fn create_vector_index(&self) -> Result<(), lancedb::Error> {
+        self.table
+            .create_index(&["vector"], lancedb::index::Index::Auto)
+            .execute()
+            .await
     }
 
     /// Get the underlying LanceDB table.
