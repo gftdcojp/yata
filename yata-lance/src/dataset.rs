@@ -92,11 +92,12 @@ impl YataDataset {
 
     /// Compact fragments (merge small files). Delegates to Lance's built-in compaction.
     pub async fn compact(&mut self) -> Result<lance::dataset::optimize::CompactionMetrics, lance::Error> {
-        let metrics = self
-            .ds
-            .optimize(Default::default())
-            .await?;
-        // Refresh to latest version after optimization
+        let metrics = lance::dataset::optimize::compact_files(
+            &mut self.ds,
+            lance::dataset::optimize::CompactionOptions::default(),
+            None,
+        )
+        .await?;
         self.ds.checkout_latest().await?;
         Ok(metrics)
     }
