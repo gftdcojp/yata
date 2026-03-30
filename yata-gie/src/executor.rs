@@ -1,6 +1,6 @@
 //! Push-based streaming executor for graph query plans.
 //!
-//! Operates on `MutableCsrStore` via GRIN traits.
+//! Operates on any `GraphStore` via GRIN traits.
 //! Each `LogicalOp` is executed sequentially, transforming the record stream.
 
 use std::collections::{HashMap, HashSet};
@@ -603,7 +603,7 @@ fn compute_aggregate(
 mod tests {
     use super::*;
     use crate::planner::PlanBuilder;
-    use yata_store::MutableCsrStore;
+    use yata_lance::LanceReadStore as MutableCsrStore;
 
     /// Helper: create a test store with Person/Company graph.
     fn test_store() -> MutableCsrStore {
@@ -1546,7 +1546,7 @@ fn prop_value_to_json(v: &PropValue) -> String {
 mod untyped_edge_tests {
     use super::*;
     use crate::planner::PlanBuilder;
-    use yata_store::MutableCsrStore;
+    use yata_lance::LanceReadStore as MutableCsrStore;
 
     #[test]
     fn test_untyped_edge_traversal() {
@@ -1641,7 +1641,7 @@ mod coverage_tests {
     use super::*;
     use crate::planner::PlanBuilder;
     use std::collections::HashSet;
-    use yata_store::MutableCsrStore;
+    use yata_lance::LanceReadStore as MutableCsrStore;
 
     /// Helper: create the standard test store (same as tests::test_store).
     fn test_store() -> MutableCsrStore {
@@ -1962,7 +1962,7 @@ mod security_filter_tests {
     use super::*;
     use crate::ir::SecurityScope;
     use crate::planner::PlanBuilder;
-    use yata_store::MutableCsrStore;
+    use yata_lance::LanceReadStore as MutableCsrStore;
 
     /// Build a store with security properties (sensitivity_ord, owner_hash, collection).
     fn security_store() -> MutableCsrStore {
@@ -2211,7 +2211,7 @@ mod security_filter_tests {
 mod eval_expr_tests {
     use super::*;
     use crate::ir::Expr;
-    use yata_store::MutableCsrStore;
+    use yata_lance::LanceReadStore as MutableCsrStore;
 
     fn test_store() -> MutableCsrStore {
         let mut store = MutableCsrStore::new();
@@ -2353,7 +2353,7 @@ mod eval_expr_tests {
 mod predicate_match_tests {
     use super::*;
     use crate::planner::PlanBuilder;
-    use yata_store::MutableCsrStore;
+    use yata_lance::LanceReadStore as MutableCsrStore;
 
     fn test_store() -> MutableCsrStore {
         let mut store = MutableCsrStore::new();
@@ -2469,7 +2469,7 @@ mod result_to_rows_tests {
     use super::*;
     use crate::ir::{AggOp, Expr};
     use crate::planner::PlanBuilder;
-    use yata_store::MutableCsrStore;
+    use yata_lance::LanceReadStore as MutableCsrStore;
 
     fn test_store() -> MutableCsrStore {
         let mut store = MutableCsrStore::new();
@@ -2688,7 +2688,7 @@ mod prop_value_cmp_tests {
 mod exchange_passthrough_tests {
     use super::*;
     use crate::ir::{ExchangeKind, Expr, LogicalOp};
-    use yata_store::MutableCsrStore;
+    use yata_lance::LanceReadStore as MutableCsrStore;
 
     fn test_store() -> MutableCsrStore {
         let mut store = MutableCsrStore::new();
@@ -2733,7 +2733,7 @@ mod collect_aggregate_tests {
     use super::*;
     use crate::ir::{AggOp, Expr};
     use crate::planner::PlanBuilder;
-    use yata_store::MutableCsrStore;
+    use yata_lance::LanceReadStore as MutableCsrStore;
 
     #[test]
     fn test_collect_returns_count_fallback() {

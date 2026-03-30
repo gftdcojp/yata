@@ -13,4 +13,4 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-yata-store = { path = "../yata-store" }
+yata-lance = { path = "../yata-lance" }

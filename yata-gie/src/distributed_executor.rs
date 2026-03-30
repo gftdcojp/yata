@@ -377,7 +377,7 @@ mod tests {
     use crate::executor::execute;
     use crate::planner::PlanBuilder;
     use yata_grin::{Direction, Mutable};
-    use yata_store::MutableCsrStore;
+    use yata_lance::LanceReadStore as MutableCsrStore;
 
     fn make_store_with_persons(names: &[(&str, i64)]) -> MutableCsrStore {
         let mut store = MutableCsrStore::new();

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use arrow::array::{Array, BooleanArray, StringArray};
 use arrow::record_batch::RecordBatch;
-use yata_grin::{GraphStore, Neighbor, Predicate, PropValue, Property, Scannable, Schema, Topology};
+use yata_grin::{GraphStore, Mutable, Neighbor, Predicate, PropValue, Property, Scannable, Schema, Topology};
 
 #[derive(Debug, Clone, Default)]
 pub struct LanceReadStore {
@@ -20,6 +20,10 @@ pub struct LanceReadStore {
 }
 
 impl LanceReadStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub async fn from_datasets(
         vertex_live: &crate::YataDataset,
         edge_live_out: &crate::YataDataset,
@@ -231,6 +235,70 @@ impl LanceReadStore {
                     .and_then(|props| props.get(pk_key))
                     == Some(pk_value)
         })
+    }
+}
+
+impl Mutable for LanceReadStore {
+    fn add_vertex(&mut self, label: &str, props: &[(&str, PropValue)]) -> u32 {
+        let pk_key = props
+            .iter()
+            .find_map(|(k, _)| matches!(*k, "rkey" | "id" | "name").then_some(*k))
+            .unwrap_or("_vid");
+        let fallback = PropValue::Str(format!("v{}", self.vertex_alive.len()));
+        let pk_value = props
+            .iter()
+            .find(|(k, _)| *k == pk_key)
+            .map(|(_, v)| v.clone())
+            .unwrap_or(fallback);
+        self.merge_vertex_by_pk(label, pk_key, &pk_value, props)
+    }
+
+    fn add_edge(&mut self, src: u32, dst: u32, label: &str, props: &[(&str, PropValue)]) -> u32 {
+        let edge_id = self.edge_labels.len() as u32;
+        let mut prop_map: HashMap<String, PropValue> = props
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect();
+        prop_map
+            .entry("eid".to_string())
+            .or_insert_with(|| PropValue::Str(format!("e{edge_id}")));
+        self.add_edge_cache_entry(src, dst, edge_id, label.to_string(), prop_map);
+        edge_id
+    }
+
+    fn set_vertex_prop(&mut self, vid: u32, key: &str, value: PropValue) {
+        if let Some(props) = self.vertex_props.get_mut(vid as usize) {
+            props.insert(key.to_string(), value);
+        }
+    }
+
+    fn delete_vertex(&mut self, vid: u32) {
+        if let Some(alive) = self.vertex_alive.get_mut(vid as usize) {
+            *alive = false;
+        }
+        for vids in self.label_index.values_mut() {
+            vids.retain(|&v| v != vid);
+        }
+    }
+
+    fn delete_edge(&mut self, edge_id: u32) {
+        if let Some(label) = self.edge_labels.get_mut(edge_id as usize) {
+            label.clear();
+        }
+        if let Some(props) = self.edge_props.get_mut(edge_id as usize) {
+            props.clear();
+        }
+        for neighbors in &mut self.out_adj {
+            neighbors.retain(|n| n.edge_id != edge_id);
+        }
+        for neighbors in &mut self.in_adj {
+            neighbors.retain(|n| n.edge_id != edge_id);
+        }
+        self.known_edge_labels.retain(|label| !label.is_empty());
+    }
+
+    fn commit(&mut self) -> u64 {
+        0
     }
 }
 

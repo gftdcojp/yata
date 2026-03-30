@@ -6025,7 +6025,7 @@ dependencies = [
  "thiserror 2.0.18",
  "yata-cypher",
  "yata-grin",
- "yata-store",
+ "yata-lance",
 ]
 
 [[package]]
@@ -6124,28 +6124,6 @@ dependencies = [
  "tracing-subscriber",
  "yata-engine",
  "yata-gie",
- "yata-grin",
-]
-
-[[package]]
-name = "yata-store"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "arrow-array",
- "arrow-schema",
- "base64",
- "bytes",
- "chrono",
- "memmap2",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "yata-arrow",
- "yata-core",
- "yata-cypher",
  "yata-grin",
 ]
 
