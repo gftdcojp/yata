@@ -91,7 +91,8 @@ pub struct TieredGraphEngine {
     cold_starting: Arc<AtomicBool>,
     /// Lance Dataset for demand-paged label loading.
     /// Opened once on first query via Dataset::open(). Labels loaded on-demand by ensure_labels().
-    lance_dataset: Arc<tokio::sync::Mutex<Option<yata_lance::YataDataset>>>,
+    lance_db: Arc<tokio::sync::Mutex<Option<yata_lance::YataDb>>>,
+    lance_table: Arc<tokio::sync::Mutex<Option<yata_lance::YataTable>>>,
     loaded_labels: Arc<Mutex<HashSet<String>>>,
     s3_client: Arc<Mutex<Option<Arc<yata_s3::s3::S3Client>>>>,
     s3_prefix: String,
@@ -115,13 +116,7 @@ impl TieredGraphEngine {
         Self::build(config, data_dir)
     }
 
-    fn build(config: TieredEngineConfig, data_dir: &str) -> Self {
-        let warm = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            tokio::task::block_in_place(|| handle.block_on(Self::init_async(data_dir)))
-        } else {
-            ENGINE_RT.block_on(Self::init_async(data_dir))
-        };
-
+    fn build(config: TieredEngineConfig, _data_dir: &str) -> Self {
         let cache = QueryCache::new(config.cache_max_entries, config.cache_ttl_secs);
 
         let partition_count = config.partition_count;
@@ -137,11 +132,11 @@ impl TieredGraphEngine {
         Self {
             config,
             read_store: Arc::new(RwLock::new(Some(yata_lance::LanceReadStore::default()))),
-            warm,
             cache: Arc::new(Mutex::new(cache)),
             hot_initialized: Arc::new(AtomicBool::new(false)),
             cold_starting: Arc::new(AtomicBool::new(false)),
-            lance_dataset: Arc::new(tokio::sync::Mutex::new(None)),
+            lance_db: Arc::new(tokio::sync::Mutex::new(None)),
+            lance_table: Arc::new(tokio::sync::Mutex::new(None)),
             loaded_labels: Arc::new(Mutex::new(HashSet::new())),
             s3_client,
             s3_prefix,
@@ -158,10 +153,6 @@ impl TieredGraphEngine {
         }
         // No startup restore — labels are lazy-loaded from R2 on first query (page-in).
         // Write path: Pipeline.send() + mergeRecord() (PDS Worker).
-    }
-
-    async fn init_async(data_dir: &str) -> Arc<yata_lance::YataVectorStore> {
-        Arc::new(yata_lance::YataVectorStore::new(data_dir).await)
     }
 
     /// Run an async future, handling both inside-runtime and outside-runtime contexts.
@@ -239,14 +230,14 @@ impl TieredGraphEngine {
     }
 
     fn refresh_read_store(&self) {
-        let lance_ds = self.lance_dataset.clone();
+        let lance_tbl = self.lance_table.clone();
         let read_store = self.read_store.clone();
         let maybe_store = self.block_on(async {
-            let ds_guard = lance_ds.lock().await;
-            let Some(ds) = ds_guard.as_ref() else {
+            let tbl_guard = lance_tbl.lock().await;
+            let Some(tbl) = tbl_guard.as_ref() else {
                 return None;
             };
-            let vertex_batches = ds.scan_all().await.ok()?;
+            let vertex_batches = tbl.scan_all().await.ok()?;
             yata_lance::LanceReadStore::from_live_batches(&vertex_batches, &[]).ok()
         });
         if let Ok(mut guard) = read_store.write() {
@@ -299,7 +290,7 @@ impl TieredGraphEngine {
         };
         if needed.is_empty() { return; }
 
-        let lance_ds = self.lance_dataset.clone();
+        let lance_ds = self.lance_table.clone();
         for label in &needed {
             let label_clone = label.clone();
             let result = ENGINE_RT.block_on(async {
@@ -673,39 +664,32 @@ impl TieredGraphEngine {
     // ── Vector search ───────────────────────────────────────────────────
 
     /// Write vertices with embeddings for vector search.
+    /// TODO: implement via lancedb table.add() with vector column
     pub fn write_embeddings(
         &self,
-        nodes: &[yata_cypher::NodeRef],
-        embedding_key: &str,
-        dim: usize,
+        _nodes: &[yata_cypher::NodeRef],
+        _embedding_key: &str,
+        _dim: usize,
     ) -> Result<usize, String> {
-        let count = nodes.len();
-        self.block_on(self.warm.write_vertices_with_embeddings(nodes, embedding_key, dim))
-        .map_err(|e| format!("write embeddings: {e}"))?;
-        Ok(count)
+        Ok(0)
     }
 
     /// Vector search over embeddings.
+    /// TODO: implement via lancedb table.search().nearest_to()
     pub fn vector_search(
         &self,
-        query_vector: Vec<f32>,
-        limit: usize,
-        label_filter: Option<&str>,
-        prop_filter: Option<&str>,
+        _query_vector: Vec<f32>,
+        _limit: usize,
+        _label_filter: Option<&str>,
+        _prop_filter: Option<&str>,
     ) -> Result<Vec<(yata_cypher::NodeRef, f32)>, String> {
-        self.block_on(self.warm.vector_search_vertices(
-            query_vector,
-            limit,
-            label_filter,
-            prop_filter,
-        ))
-        .map_err(|e| format!("vector search: {e}"))
+        Ok(Vec::new())
     }
 
     /// Prepare the vector store for search.
+    /// TODO: implement via lancedb table.create_index()
     pub fn create_embedding_index(&self) -> Result<(), String> {
-        self.block_on(self.warm.create_embedding_index())
-            .map_err(|e| format!("create index: {e}"))
+        Ok(())
     }
 
     /// L0 compact threshold: trigger compaction when pending_writes exceeds this.
@@ -1018,7 +1002,7 @@ impl TieredGraphEngine {
         let batch = crate::arrow_wal::wal_entries_to_batch(&entries)
             .map_err(|e| format!("WAL batch conversion failed: {e}"))?;
         let schema = crate::arrow_wal::wal_arrow_schema();
-        let lance_ds = self.lance_dataset.clone();
+        let lance_ds = self.lance_table.clone();
         let prefix = &self.s3_prefix;
         let pid = self.config.hot_partition_id.get();
         let lance_uri = format!("{}lance/vertices/{}", prefix, pid);
@@ -1107,7 +1091,7 @@ impl TieredGraphEngine {
             });
         }
 
-        let lance_ds = self.lance_dataset.clone();
+        let lance_ds = self.lance_table.clone();
         let dirty_labels: Vec<String> = dirty.iter().cloned().collect();
 
         // Primary: use Lance built-in compaction to merge fragments
@@ -1256,7 +1240,7 @@ impl TieredGraphEngine {
             .map_err(|e| format!("batch conversion failed: {e}"))?;
         let schema = crate::arrow_wal::wal_arrow_schema();
         let lance_uri = format!("{prefix}lance/vertices/{pid}");
-        let lance_ds = self.lance_dataset.clone();
+        let lance_ds = self.lance_table.clone();
 
         let prefix_owned = prefix.to_string();
         let lance_version = ENGINE_RT.block_on(async {
@@ -1302,7 +1286,7 @@ impl TieredGraphEngine {
 
         // Open Lance Dataset from R2 via UreqObjectStore
         let lance_uri = format!("{}lance/vertices/{}", prefix, pid);
-        let lance_ds = self.lance_dataset.clone();
+        let lance_ds = self.lance_table.clone();
         let prefix_owned = prefix.to_string();
         let lance_uri_owned = lance_uri.clone();
         let checkpoint_seq = ENGINE_RT.block_on(async {
