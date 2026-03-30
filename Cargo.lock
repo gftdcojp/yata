@@ -3282,6 +3282,7 @@ dependencies = [
  "yata-gie",
  "yata-graph",
  "yata-grin",
+ "yata-lance",
  "yata-s3",
  "yata-store",
 ]
