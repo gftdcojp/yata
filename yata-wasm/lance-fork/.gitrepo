@@ -1,0 +1,12 @@
+; DO NOT EDIT (unless you know what you are doing)
+;
+; This subdirectory is a git "subrepo", and this file is maintained by the
+; git-subrepo command. See https://github.com/ingydotnet/git-subrepo#readme
+;
+[subrepo]
+	remote = https://github.com/gftdcojp/lancedb-wasm.git
+	branch = main
+	commit = 2b5d4459b23dfaff50308e1f763b5bfec4ae1b74
+	parent = edfe9df999ee9b8ec54311521b51b25c08744697
+	method = merge
+	cmdver = 0.4.9

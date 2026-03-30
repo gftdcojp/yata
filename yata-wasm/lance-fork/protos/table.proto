@@ -1,0 +1,372 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.table;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/timestamp.proto";
+import "file.proto";
+
+/*
+
+Format:
+
++----------------------------------------+
+|       Encoded Column 0, Chunk 0        |
+           ...
+|       Encoded Column M, Chunk N - 1    |
+|       Encoded Column M, Chunk N        |
+|       Indices ...                      |
+|       Chunk Position (M x N x 8)       |
+|         Manifest (Optional)            |
+|         Metadata                       |
+| i64: metadata position                 |
+| MAJOR_VERSION | MINOR_VERSION | "LANC" |
++----------------------------------------+
+ */
+
+/// UUID type. encoded as 16 bytes.
+message UUID {
+  bytes uuid = 1;
+}
+
+// Manifest is a global section shared between all the files.
+message Manifest {
+  // All fields of the dataset, including the nested fields.
+  repeated lance.file.Field fields = 1;
+
+  // Fragments of the dataset.
+  repeated DataFragment fragments = 2;
+
+  // Snapshot version number.
+  uint64 version = 3;
+
+  // The file position of the version auxiliary data.
+  //  * It is not inheritable between versions.
+  //  * It is not loaded by default during query.
+  uint64 version_aux_data = 4;
+
+  // Schema metadata.
+  map<string, bytes> metadata = 5;
+
+  message WriterVersion {
+    // The name of the library that created this file.
+    string library = 1;
+    // The version of the library that created this file. Because we cannot assume
+    // that the library is semantically versioned, this is a string. However, if it
+    // is semantically versioned, it should be a valid semver string without any 'v'
+    // prefix. For example: `2.0.0`, `2.0.0-rc.1`.
+    string version = 2;
+  }
+
+  // The version of the writer that created this file.
+  //
+  // This information may be used to detect whether the file may have known bugs
+  // associated with that writer.
+  WriterVersion writer_version = 13;
+
+  // If presented, the file position of the index metadata.
+  optional uint64 index_section = 6;
+
+  // Version creation Timestamp, UTC timezone
+  google.protobuf.Timestamp timestamp = 7;
+
+  // Optional version tag
+  string tag = 8;
+
+  // Feature flags for readers.
+  //
+  // A bitmap of flags that indicate which features are required to be able to
+  // read the table. If a reader does not recognize a flag that is set, it
+  // should not attempt to read the dataset.
+  //
+  // Known flags:
+  // * 1: deletion files are present
+  // * 2: move_stable_row_ids: row IDs are tracked and stable after move operations
+  //       (such as compaction), but not updates.
+  // * 4: use v2 format (deprecated)
+  // * 8: table config is present
+  uint64 reader_feature_flags = 9;
+
+  // Feature flags for writers.
+  //
+  // A bitmap of flags that indicate which features are required to be able to
+  // write to the dataset. if a writer does not recognize a flag that is set, it
+  // should not attempt to write to the dataset.
+  //
+  // The flags are the same as for reader_feature_flags, although they will not
+  // always apply to both.
+  uint64 writer_feature_flags = 10;
+
+  // The highest fragment ID that has been used so far.
+  //
+  // This ID is not guaranteed to be present in the current version, but it may
+  // have been used in previous versions.
+  // 
+  // For a single file, will be zero.
+  uint32 max_fragment_id = 11;
+
+  // Path to the transaction file, relative to `{root}/_transactions`
+  //
+  // This contains a serialized Transaction message representing the transaction
+  // that created this version.
+  //
+  // May be empty if no transaction file was written.
+  //
+  // The path format is "{read_version}-{uuid}.txn" where {read_version} is the
+  // version of the table the transaction read from, and {uuid} is a 
+  // hyphen-separated UUID.
+  string transaction_file = 12;
+
+  // The next unused row id. If zero, then the table does not have any rows.
+  //
+  // This is only used if the "move_stable_row_ids" feature flag is set.
+  uint64 next_row_id = 14;
+
+  message DataStorageFormat {
+    // The format of the data files (e.g. "lance")
+    string file_format = 1;
+    // The max format version of the data files.
+    //
+    // This is the maximum version of the file format that the dataset will create.
+    // This may be lower than the maximum version that can be written in order to allow
+    // older readers to read the dataset.
+    string version = 2;
+  }
+
+  // The data storage format
+  //
+  // This specifies what format is used to store the data files.
+  DataStorageFormat data_format = 15;
+  
+  // Table config.
+  //
+  // Keys with the prefix "lance." are reserved for the Lance library. Other
+  // libraries may wish to similarly prefix their configuration keys
+  // appropriately.
+  map<string, string> config = 16;
+
+  // The version of the blob dataset associated with this table.  Changes to
+  // blob fields will modify the blob dataset and update this version in the parent
+  // table.
+  //
+  // If this value is 0 then there are no blob fields.
+  uint64 blob_dataset_version = 17;
+
+} // Manifest
+
+// Auxiliary Data attached to a version.
+// Only load on-demand.
+message VersionAuxData {
+  // key-value metadata.
+  map<string, bytes> metadata = 3;
+}
+
+// Metadata describing the index.
+message IndexMetadata {
+  // Unique ID of an index. It is unique across all the dataset versions.
+  UUID uuid = 1;
+
+  // The columns to build the index.
+  repeated int32 fields = 2;
+
+  // Index name. Must be unique within one dataset version.
+  string name = 3;
+
+  // The version of the dataset this index was built from.
+  uint64 dataset_version = 4;
+
+  /// A bitmap of the included fragment ids.
+  ///
+  /// This may by used to determine how much of the dataset is covered by the
+  /// index. This information can be retrieved from the dataset by looking at
+  /// the dataset at `dataset_version`. However, since the old version may be
+  /// deleted while the index is still in use, this information is also stored
+  /// in the index.
+  /// 
+  /// The bitmap is stored as a 32-bit Roaring bitmap.
+  bytes fragment_bitmap = 5;
+
+  /// Details, specific to the index type, which are needed to load / interpret the index
+  ///
+  /// Indices should avoid putting large amounts of information in this field, as it will
+  /// bloat the manifest.
+  google.protobuf.Any index_details = 6;
+}
+
+// Index Section, containing a list of index metadata for one dataset version.
+message IndexSection {
+  repeated IndexMetadata indices = 1;
+}
+
+// Data fragment. A fragment is a set of files which represent the
+// different columns of the same rows.
+// If column exists in the schema, but the related file does not exist,
+// treat this column as nulls.
+message DataFragment {
+  // Unique ID of each DataFragment
+  uint64 id = 1;
+
+  repeated DataFile files = 2;
+
+  // File that indicates which rows, if any, should be considered deleted.
+  DeletionFile deletion_file = 3;
+
+  // TODO: What's the simplest way we can allow an inline tombstone bitmap?
+
+  // A serialized RowIdSequence message (see rowids.proto).
+  //
+  // These are the row ids for the fragment, in order of the rows as they appear.
+  // That is, if a fragment has 3 rows, and the row ids are [1, 42, 3], then the
+  // first row is row 1, the second row is row 42, and the third row is row 3.
+  oneof row_id_sequence {
+    // If small (< 200KB), the row ids are stored inline.
+    bytes inline_row_ids = 5;
+    // Otherwise, stored as part of a file.
+    ExternalFile external_row_ids = 6;
+  } // row_id_sequence
+
+  // Number of original rows in the fragment, this includes rows that are 
+  // now marked with deletion tombstones. To compute the current number of rows, 
+  // subtract `deletion_file.num_deleted_rows` from this value.
+  uint64 physical_rows = 4;
+}
+
+// Lance Data File
+message DataFile {
+  // Relative path to the root.
+  string path = 1;
+  // The ids of the fields/columns in this file.
+  //
+  // -1 is used for "unassigned" while in memory. It is not meant to be written
+  // to disk. -2 is used for "tombstoned", meaningful a field that is no longer
+  // in use. This is often because the original field id was reassigned to a
+  // different data file.
+  //
+  // In Lance v1 IDs are assigned based on position in the file, offset by the max
+  // existing field id in the table (if any already). So when a fragment is first
+  // created with one file of N columns, the field ids will be 1, 2, ..., N. If a
+  // second, fragment is created with M columns, the field ids will be N+1, N+2,
+  // ..., N+M.
+  //
+  // In Lance v1 there is one field for each field in the input schema, this includes
+  // nested fields (both struct and list).  Fixed size list fields have only a single
+  // field id (these are not considered nested fields in Lance v1).
+  //
+  // This allows column indices to be calculated from field IDs and the input schema.
+  //
+  // In Lance v2 the field IDs generally follow the same pattern but there is no
+  // way to calculate the column index from the field ID.  This is because a given
+  // field could be encoded in many different ways, some of which occupy a different
+  // number of columns.  For example, a struct field could be encoded into N + 1 columns
+  // or it could be encoded into a single packed column.  To determine column indices
+  // the column_indices property should be used instead.
+  //
+  // In Lance v1 these ids must be sorted but might not always be contiguous.
+  repeated int32 fields = 2;
+  // The top-level column indices for each field in the file.
+  //
+  // If the data file is version 1 then this property will be empty
+  //
+  // Otherwise there must be one entry for each field in `fields`.
+  //
+  // Some fields may not correspond to a top-level column in the file.  In these cases
+  // the index will -1.
+  //
+  // For example, consider the schema:
+  //
+  // - dimension: packed-struct (0):
+  //   - x: u32 (1)
+  //   - y: u32 (2)
+  // - path: list<u32> (3)
+  // - embedding: fsl<768> (4)
+  //   - fp64
+  // - borders: fsl<4> (5)
+  //   - simple-struct (6)
+  //     - margin: fp64 (7)
+  //     - padding: fp64 (8)
+  //
+  // One possible column indices array could be:
+  // [0, -1, -1, 1, 3, 4, 5, 6, 7]
+  //
+  // This reflects quite a few phenomenon:
+  // - The packed struct is encoded into a single column and there is no top-level column
+  //   for the x or y fields
+  // - The variable sized list is encoded into two columns
+  // - The embedding is encoded into a single column (common for FSL of primitive) and there
+  //   is not "FSL column"
+  // - The borders field actually does have an "FSL column"
+  //
+  // The column indices table may not have duplicates (other than -1)
+  repeated int32 column_indices = 3;
+  // The major file version used to create the file
+  uint32 file_major_version = 4;
+  // The minor file version used to create the file
+  //
+  // If both `file_major_version` and `file_minor_version` are set to 0,
+  // then this is a version 0.1 or version 0.2 file.
+  uint32 file_minor_version = 5;
+
+  // The known size of the file on disk in bytes.
+  //
+  // This is used to quickly find the footer of the file.
+  //
+  // When this is zero, it should be interpreted as "unknown".
+  uint64 file_size_bytes = 6;
+} // DataFile
+
+// Deletion File
+//
+// The path of the deletion file is constructed as:
+//   {root}/_deletions/{fragment_id}-{read_version}-{id}.{extension}
+// where {extension} is `.arrow` or `.bin` depending on the type of deletion.
+message DeletionFile {
+  // Type of deletion file, which varies depending on what is the most efficient
+  // way to store the deleted row offsets. If none, then will be unspecified. If there are
+  // sparsely deleted rows, then ARROW_ARRAY is the most efficient. If there are
+  // densely deleted rows, then BIT_MAP is the most efficient.
+  enum DeletionFileType {
+    // Deletion file is a single Int32Array of deleted row offsets. This is stored as
+    // an Arrow IPC file with one batch and one column. Has a .arrow extension.
+    ARROW_ARRAY = 0;
+    // Deletion file is a Roaring Bitmap of deleted row offsets. Has a .bin extension.
+    BITMAP = 1;
+  }
+
+  // Type of deletion file. If it is unspecified, then the remaining fields will be missing.
+  DeletionFileType file_type = 1;
+  // The version of the dataset this deletion file was built from.
+  uint64 read_version = 2;
+  // An opaque id used to differentiate this file from others written by concurrent
+  // writers.
+  uint64 id = 3;
+  // The number of rows that are marked as deleted.
+  uint64 num_deleted_rows = 4;
+} // DeletionFile
+
+message ExternalFile {
+  // Path to the file, relative to the root of the table.
+  string path = 1;
+  // The offset in the file where the data starts.
+  uint64 offset = 2;
+  // The size of the data in the file.
+  uint64 size = 3;
+}
+
+/// The following messages are used for the index_details field in IndexMetadata.
+///
+/// This is not an exhaustive set of index types and just lists the index types supported
+/// by a base distribution of Lance.
+
+// Currently these are all empty messages because all needed details are either hard-coded (e.g.
+// filenames) or stored in the index itself.  However, we may want to add more details in the
+// future, in particular we can add details that may be useful for planning queries (e.g. don't
+// force us to load the index until we know we need it)
+message BTreeIndexDetails {}
+message BitmapIndexDetails {}
+message LabelListIndexDetails {}
+message InvertedIndexDetails {}
+message NGramIndexDetails {}
+message VectorIndexDetails {}
