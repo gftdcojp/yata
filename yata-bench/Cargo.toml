@@ -19,8 +19,6 @@ path = "src/cypher_transport_bench.rs"
 
 [dependencies]
 yata-core.workspace = true
-yata-arrow.workspace = true
-yata-object.workspace = true
 yata-cypher.workspace = true
 yata-engine.workspace = true
 yata-lance.workspace = true

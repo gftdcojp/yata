@@ -5954,14 +5954,12 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "yata-arrow",
  "yata-core",
  "yata-cypher",
  "yata-engine",
  "yata-gie",
  "yata-grin",
  "yata-lance",
- "yata-object",
 ]
 
 [[package]]
@@ -6007,7 +6005,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "yata-arrow",
  "yata-core",
  "yata-cypher",
  "yata-gie",
