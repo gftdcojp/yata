@@ -254,7 +254,7 @@ pub fn generate_fragment_path() -> String {
 #[wasm_bindgen]
 pub fn create_manifest(
     fragment_path: &str,
-    num_rows: u64,
+    num_rows: u32,
     field_names: Vec<String>,
     field_ids: Vec<i32>,
 ) -> Result<Vec<u8>, JsValue> {
@@ -282,7 +282,7 @@ pub fn create_manifest(
     let fragment = pbtable::DataFragment {
         id: 0,
         files: vec![data_file],
-        physical_rows: num_rows,
+        physical_rows: num_rows as u64,
         ..Default::default()
     };
 
@@ -312,7 +312,7 @@ pub fn create_manifest(
 pub fn add_fragment_to_manifest(
     manifest_bytes: &[u8],
     fragment_path: &str,
-    num_rows: u64,
+    num_rows: u32,
     field_ids: Vec<i32>,
 ) -> Result<Vec<u8>, JsValue> {
     use prost::Message;
@@ -333,7 +333,7 @@ pub fn add_fragment_to_manifest(
     manifest.fragments.push(pbtable::DataFragment {
         id: new_fragment_id as u64,
         files: vec![data_file],
-        physical_rows: num_rows,
+        physical_rows: num_rows as u64,
         ..Default::default()
     });
 
@@ -342,7 +342,7 @@ pub fn add_fragment_to_manifest(
 
 /// Get the manifest version path (V2 naming scheme: {version:020}.manifest).
 #[wasm_bindgen]
-pub fn manifest_path(version: u64) -> String {
+pub fn manifest_path(version: u32) -> String {
     format!("_versions/{:020}.manifest", version)
 }
 

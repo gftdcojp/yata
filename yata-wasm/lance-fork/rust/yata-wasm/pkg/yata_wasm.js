@@ -234,7 +234,7 @@ function passArray32ToWasm0(arg, malloc) {
  * Create a new manifest (version 1) with a single fragment.
  * Returns serialized protobuf bytes for the manifest.
  * @param {string} fragment_path
- * @param {bigint} num_rows
+ * @param {number} num_rows
  * @param {string[]} field_names
  * @param {Int32Array} field_ids
  * @returns {Uint8Array}
@@ -260,7 +260,7 @@ export function create_manifest(fragment_path, num_rows, field_names, field_ids)
  * Increments version, assigns new fragment ID.
  * @param {Uint8Array} manifest_bytes
  * @param {string} fragment_path
- * @param {bigint} num_rows
+ * @param {number} num_rows
  * @param {Int32Array} field_ids
  * @returns {Uint8Array}
  */
@@ -282,7 +282,7 @@ export function add_fragment_to_manifest(manifest_bytes, fragment_path, num_rows
 
 /**
  * Get the manifest version path (V2 naming scheme: {version:020}.manifest).
- * @param {bigint} version
+ * @param {number} version
  * @returns {string}
  */
 export function manifest_path(version) {

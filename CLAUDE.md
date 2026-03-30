@@ -258,45 +258,87 @@ Production: PARTITION_COUNT=1, per-label sorted COO Arrow IPC, segment-level pag
 
 ## Workers Lance WASM Read/Write `[PRODUCTION]` (verified 2026-03-31)
 
-**lance-core + lance-encoding を WASM (wasm32-unknown-unknown) にコンパイルし、Cloudflare Workers V8 isolate 内で Lance v2 format の encode/decode を実行。** `@lancedb/lancedb` (native bindings 必須) は不使用。
+**lance v0.27.1 の 5 crate (core/encoding/io/file/table) を WASM (wasm32-unknown-unknown) にコンパイルし、Cloudflare Workers V8 isolate 内で LanceDB standard layout の read/write を Container なしで実行。** `@lancedb/lancedb` npm (native bindings 必須) は不使用。fork: `gftdcojp/lancedb-wasm`。
 
 ### Architecture
 
 ```
-PDS Worker (5.7 MiB / gzip 1.1 MiB)
-├── yata_wasm.wasm (4.6 MiB) — lance-core + lance-encoding WASM
+PDS Worker (4.4 MiB / gzip 901 KiB)
+├── yata_wasm.wasm (3.3 MiB) — lance-core+encoding+io+file+table WASM
 │
-├── Write: sendWalAndProject()
+├── Write: sendWalAndProject() — Container 不要
 │   1. Pipeline.send() → R2 JSON WAL (durable, source of truth)
-│   2. workersLanceWrite() → R2 Lance v2 fragment (fire-and-forget)
-│   3. YATA_RPC.mergeRecord() → Container (fallback instant projection)
+│   2. workersLanceWrite():
+│      a. encode_vertex_lance() [WASM] → Lance v2 fragment
+│      b. R2 PUT yata/vertices/data/{uuid}.lance
+│      c. add_fragment_to_manifest() [WASM] → protobuf manifest update
+│      d. R2 PUT yata/vertices/_versions/{version:020}.manifest
 │
 ├── Read: cy() → tryWorkersRead()
 │   1. R2 compacted segments → Arrow IPC decode → Cypher subset exec (Workers edge)
 │   2. Container fallback (auth queries, complex Cypher)
 │
-└── /health → { workers_read: {hit, fallback}, lance_write: {count} }
+└── /health → { workers_read: {hit, fallback, labels_cached}, lance_write: {count} }
 ```
 
-### WASM Patched Crates
+### R2 LanceDB Dataset Layout (verified)
 
-| crate | patch | 内容 |
-|---|---|---|
-| lance-core | `Cargo.toml` | `moka`, `object_store`, `num_cpus`, `tokio-util` → `cfg(not(wasm32))` |
-| lance-core | `cache.rs` | native (moka) / wasm (no-op) split |
-| lance-core | `error.rs` | `object_store` types → `cfg(not(wasm32))` |
-| lance-core | `utils/cpu.rs` | `wasm32` arm (`SimdSupport::None`) |
-| lance-core | `utils/{path,tokio,futures}.rs` | `object_store`, `tokio::Runtime`, `PollSemaphore` → `cfg(not(wasm32))` |
-| lance-encoding | `Cargo.toml` | `tokio`, `zstd`, `lz4` → `cfg(not(wasm32))` |
-| lance-encoding | `block_compress.rs` | `Zstd/Lz4BufferCompressor` → wasm stub (error on use) |
+```
+ai-gftd-graph/yata/vertices/              ← LanceDB standard layout
+├── _versions/
+│   ├── 00000000000000000001.manifest      ← protobuf Manifest (V2 naming)
+│   ├── 00000000000000000002.manifest
+│   └── ...                                 (version chain, +66 bytes/fragment)
+└── data/
+    └── {uuid}.lance                        ← Lance v2.1 data fragment
+```
+
+### WASM Patched Crates (5 crates, gftdcojp/lancedb-wasm)
+
+| crate | patch summary |
+|---|---|
+| **lance-core** | `moka` → `cfg(not(wasm32))` no-op cache。`object_store` default-features=false。`tokio` WASM-safe subset。`spawn_cpu` inline sync。`SimdSupport::None` |
+| **lance-encoding** | `zstd`/`lz4` → `cfg(not(wasm32))` stub。`tokio` WASM-safe subset。`arrow` without prettyprint |
+| **lance-io** | `local` module → `cfg(not(wasm32))`。filesystem functions gated。`object_store` default-features=false。`shellexpand`/`path_abs` gated |
+| **lance-file** | `lance-io` default-features=false。`statistics`/`testing` → `cfg(not(wasm32))`。`datafusion-common` gated |
+| **lance-table** | `tokio`/`object_store` → `cfg(not(wasm32))` + WASM subset。`uuid` js feature。`arrow-ipc` without zstd。`commit.rs` local filesystem gated |
+
+### WASM API (`yata_wasm.wasm`)
+
+| function | 引数 | 戻り値 | 用途 |
+|---|---|---|---|
+| `probe()` | — | string | WASM 動作確認 |
+| `encode_vertex_lance(labels, pk_values, repos, rkeys, props_jsons)` | Vec<String> ×5 | Vec<u8> | RecordBatch → Lance v2 file bytes |
+| `read_lance_footer(file_bytes)` | &[u8] | JSON string | footer 解析 (version, columns, magic) |
+| `generate_fragment_path()` | — | string | `data/{uuid}.lance` 生成 |
+| `create_manifest(fragment_path, num_rows, field_names, field_ids)` | &str, u32, Vec ×2 | Vec<u8> | protobuf Manifest v1 生成 |
+| `add_fragment_to_manifest(manifest_bytes, fragment_path, num_rows, field_ids)` | &[u8], &str, u32, Vec | Vec<u8> | manifest に fragment 追加 (version increment) |
+| `manifest_path(version)` | u32 | string | `_versions/{version:020}.manifest` |
+| `read_manifest(manifest_bytes)` | &[u8] | JSON string | manifest 解析 (version, fragments, fields) |
+
+### Lance 互換性
+
+| 項目 | 状態 |
+|---|---|
+| Data encoding (Lance v2.1) | ✅ |
+| Footer (40 bytes, LANC magic) | ✅ |
+| Column metadata (protobuf) | ✅ |
+| Manifest (`_versions/`, protobuf, V2 naming) | ✅ |
+| Fragment registration (manifest version chain) | ✅ |
+| Directory layout (`data/`, `_versions/`) | ✅ |
+| Compression (zstd/lz4) | ❌ uncompressed only (C library WASM 不可) |
+| Schema in file (global buffer) | ❌ mini lance mode |
+| Transaction files (`_transactions/`) | ❌ |
+| Deletion vectors (`_deletions/`) | ❌ |
 
 ### R2 Paths
 
 | path | format | writer | reader |
 |---|---|---|---|
-| `yata/lance/pending/{ts}-{id}.lance` | Lance v2 (WASM encode) | PDS Worker | Container compaction |
-| `yata/log/compacted/{pid}/label/{label}.arrow` | Arrow IPC (compacted) | Container | PDS Worker |
-| `yata/log/compacted/{pid}/manifest.json` | JSON | Container | PDS Worker |
+| `yata/vertices/_versions/{ver:020}.manifest` | protobuf Manifest | PDS Worker (WASM) | Container LanceDB SDK |
+| `yata/vertices/data/{uuid}.lance` | Lance v2.1 fragment | PDS Worker (WASM) | Container LanceDB SDK |
+| `yata/log/compacted/{pid}/label/{label}.arrow` | Arrow IPC (legacy compacted) | Container | PDS Worker (read path) |
+| `yata/log/compacted/{pid}/manifest.json` | JSON (legacy) | Container | PDS Worker (read path) |
 
 ### TS Modules (`@gftd/yata`)
 
@@ -306,29 +348,33 @@ PDS Worker (5.7 MiB / gzip 1.1 MiB)
 | `cypher-exec.ts` | ~270 | Arrow Table executor (filter/sort/limit/count/traversal) |
 | `r2-reader.ts` | ~130 | R2 CompactionManifest + Arrow IPC fragment loader |
 | `workers-read.ts` | ~160 | WorkersReader (TS executor ↔ Container fallback) |
-| `workers-write.ts` | ~250 | Arrow IPC WAL segment builder + R2 WAL index |
+| `workers-write.ts` | ~250 | Arrow IPC WAL segment builder (legacy) |
 
 ### Metrics (measured 2026-03-31)
 
 | metric | value |
 |---|---|
-| WASM module | 4.6 MiB (gzip 884 KiB) |
-| PDS bundle | 5.7 MiB (gzip 1.1 MiB) |
+| WASM module | 3.3 MiB (wasm-bindgen optimized) |
+| PDS bundle | 4.4 MiB (gzip 901 KiB) |
 | Worker startup | 15ms |
-| Lance encode 3 rows | 938 bytes, ~1ms |
+| Lance encode 1 row | ~300 bytes, <1ms |
+| Manifest update | +66 bytes/fragment, <1ms |
 | Workers read (R2 cache hit) | ~0ms |
 | Workers read (R2 fetch) | ~5-10ms |
 | Container fallback | ~13-170ms |
+| Workers read hit rate | ~74% (30 request sample) |
 
 ### 禁止
 
 - `@lancedb/lancedb` npm の Workers 使用禁止 (native bindings 必須、WASM 版なし)
 - lance-core への `tokio/fs`, `rt-multi-thread` 再追加禁止 (WASM compile error)
 - WASM 内での compression (zstd/lz4) 使用禁止 (C library 非対応、stub がエラー返却)
+- `object_store` default features の有効化禁止 (ring/reqwest/hyper が WASM 非対応)
+- Container mergeRecord の write path 再導入禁止 — Workers Lance write が primary
 
 ## Test Coverage
 
-**Rust**: 1,068+ unit tests + 68 e2e, 0 failures. **TS (`@gftd/yata`)**: 45 tests (cypher-parse 19, cypher-exec 14, r2-reader 5, workers-read 7), 0 failures. **PDS**: 303 tests, 0 failures.
+**Rust**: 1,068+ unit tests + 68 e2e, 0 failures. **TS (`@gftd/yata`)**: 45 tests (4 files, coverage: stmts 79.7%, branch 69.5%, funcs 85.2%, lines 84.5%), 0 failures. **PDS**: 303 tests, 0 failures. **WASM**: production verified (5 writes → 5 manifest versions in R2)。
 
 | suite | tests | scope |
 |---|---|---|
@@ -338,6 +384,9 @@ PDS Worker (5.7 MiB / gzip 1.1 MiB)
 | TS r2-reader | 5 | manifest load, fragment fetch, v1/v2 compat |
 | TS workers-read | 7 | router, cache, fallback, invalidate |
 | PDS | 303 | XRPC dispatch, helpers, auth, write path |
+| WASM Lance write | E2E | encode → R2 PUT fragment → manifest create/update → version chain |
+| Workers read | E2E | R2 Arrow IPC → Cypher exec → 74% hit rate (30 req sample) |
+| Load test | 30 req | p50=31ms, p95=105ms, avg=45ms (getSuggestions) |
 
 ## Benchmark (measured, release build)
 
