@@ -175,30 +175,6 @@ pub fn batch_to_wal_entries(batch: &RecordBatch) -> Result<Vec<WalEntry>, String
     Ok(entries)
 }
 
-/// Serialize WAL entries to Lance v2 native format bytes (async).
-///
-/// Uses lance-file crate for columnar encoding (bitpacking, FSST, dictionary).
-#[cfg(feature = "native-lance")]
-pub fn serialize_segment_lance(entries: &[WalEntry]) -> Result<Bytes, String> {
-    if entries.is_empty() {
-        return Ok(Bytes::new());
-    }
-    let batch = wal_entries_to_batch(entries)?;
-    crate::engine::ENGINE_RT.block_on(yata_lance::native::serialize_batch_lance(&batch))
-}
-
-/// Deserialize Lance v2 native format bytes back to WalEntry vector.
-#[cfg(feature = "native-lance")]
-pub fn deserialize_segment_lance(data: &[u8]) -> Result<Vec<WalEntry>, String> {
-    if data.is_empty() {
-        return Ok(Vec::new());
-    }
-    let batch = crate::engine::ENGINE_RT.block_on(
-        yata_lance::native::deserialize_batch_lance(Bytes::copy_from_slice(data))
-    )?;
-    batch_to_wal_entries(&batch)
-}
-
 /// Serialize WAL entries to Arrow IPC File format bytes.
 ///
 /// File format (not Stream) enables seekable mmap reads.

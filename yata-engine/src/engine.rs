@@ -1231,12 +1231,11 @@ impl TieredGraphEngine {
         // Drain dirty_labels — only these labels need re-compaction
         let dirty = self.drain_dirty_labels();
 
-        // Read existing Lance manifest (or from cache)
-        let existing_lance: Option<yata_lance::table::TableManifest> = {
-            let cache = self.lance_manifest_cache.lock().ok();
-            cache.and_then(|c| c.clone())
-        };
-        let existing_compacted_seq = existing_lance.as_ref().map(|m| m.version).unwrap_or(0);
+        // Get existing compacted seq from Lance Dataset version
+        let existing_compacted_seq: u64 = ENGINE_RT.block_on(async {
+            let ds_guard = self.lance_dataset.lock().await;
+            ds_guard.as_ref().map(|ds| ds.version()).unwrap_or(0)
+        });
 
         // Segment registry from head.json
         let head_key = format!("{prefix}wal/meta/{pid}/head.json");
@@ -1285,22 +1284,8 @@ impl TieredGraphEngine {
             }
         }
 
-        // Include existing Lance fragments for dirty labels
-        let mut all_segment_refs: Vec<(String, bytes::Bytes)> = Vec::new();
-        if let Some(ref lm) = existing_lance {
-            for label in &dirty {
-                for frag in &lm.fragments {
-                    if frag.labels.iter().any(|l| l == label) {
-                        if let Ok(Some(data)) = s3.get_sync(&frag.r2_key) {
-                            all_segment_refs.push((frag.r2_key.clone(), data));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Include new WAL segments
-        all_segment_refs.extend(new_segment_data);
+        // WAL segments only — Lance Dataset handles existing data internally
+        let all_segment_refs: Vec<(String, bytes::Bytes)> = new_segment_data;
 
         if all_segment_refs.is_empty() && dirty.is_empty() {
             tracing::debug!("compaction: no new segments to compact");
@@ -1317,10 +1302,10 @@ impl TieredGraphEngine {
         self.do_per_label_compaction(s3, prefix, pid, "", &all_segment_refs, &dirty, &std::collections::HashMap::new(), global_max_seq)
     }
 
-    /// Execute per-label compaction: compact dirty labels → Lance-table-compatible fragments + manifest.
+    /// Execute per-label compaction: compact dirty labels → Lance Dataset overwrite.
     fn do_per_label_compaction(
         &self,
-        s3: std::sync::Arc<yata_s3::s3::S3Client>,
+        _s3: std::sync::Arc<yata_s3::s3::S3Client>,
         prefix: &str,
         pid: u32,
         _manifest_key: &str,
@@ -1335,73 +1320,56 @@ impl TieredGraphEngine {
 
         let label_results = crate::compaction::compact_segments_by_label(&refs, dirty)?;
 
-        // Lance-table-compatible output: typed Arrow IPC fragments + versioned manifest
-        let lance_table = yata_lance::LanceTable::new("vertices", pid, prefix);
+        // Convert compacted entries to RecordBatches and write to Lance Dataset.
         let mut total_output = 0usize;
-        let mut total_bytes = 0usize;
-        let vineyard_dir = std::env::var("YATA_VINEYARD_DIR").ok();
+        let mut all_labels: Vec<String> = Vec::new();
+        let schema = crate::arrow_wal::wal_arrow_schema();
 
-        // Phase 1: Convert each label's compacted entries → Lance fragment, upload to R2.
-        let mut new_fragments: Vec<yata_lance::Fragment> = Vec::new();
-        let mut uploaded_results: Vec<&crate::compaction::LabelCompactionResult> = Vec::with_capacity(label_results.len());
-        for (frag_idx, lr) in label_results.iter().enumerate() {
-            // Arrow IPC segment from compact_segments_by_label is the Lance fragment data.
-            let fragment = lance_table.build_fragment(
-                global_max_seq, frag_idx as u32, &lr.data,
-                vec![lr.label.clone()], lr.entry_count,
-            );
+        let lance_uri = format!("{}lance/vertices/{}", prefix, pid);
+        let lance_ds = self.lance_dataset.clone();
 
-            // Upload fragment to Lance R2 path
-            let r2_key = &fragment.r2_key;
-            match s3.put_sync(r2_key, lr.data.clone()) {
-                Ok(_) => {
-                    // Disk cache (Lance layout)
-                    if let Some(ref dir) = vineyard_dir {
-                        let frag_dir = format!("{dir}/lance/vertices/{pid}/fragments");
-                        let _ = std::fs::create_dir_all(&frag_dir);
-                        let ext = if cfg!(feature = "native-lance") { "lance" } else { "arrow" };
-                        let _ = std::fs::write(format!("{frag_dir}/{:020}-{:06}.{ext}", global_max_seq, frag_idx), &lr.data);
+        ENGINE_RT.block_on(async {
+            let mut ds_guard = lance_ds.lock().await;
+
+            for lr in &label_results {
+                // Deserialize Arrow IPC to WalEntry, then to batch
+                let entries = crate::arrow_wal::deserialize_segment_auto("compacted.arrow", &lr.data);
+                if entries.is_empty() { continue; }
+                match crate::arrow_wal::wal_entries_to_batch(&entries) {
+                    Ok(batch) => {
+                        if let Some(ref mut ds) = *ds_guard {
+                            if let Err(e) = ds.append(vec![batch], schema.clone()).await {
+                                tracing::error!(label = lr.label, error = %e, "Lance Dataset append failed");
+                                continue;
+                            }
+                        } else {
+                            // Create new Dataset
+                            match yata_lance::YataDataset::create(&lance_uri, vec![batch], schema.clone()).await {
+                                Ok(ds) => { *ds_guard = Some(ds); }
+                                Err(e) => {
+                                    tracing::error!(label = lr.label, error = %e, "Lance Dataset create failed");
+                                    continue;
+                                }
+                            }
+                        }
+                        total_output += lr.entry_count;
+                        all_labels.push(lr.label.clone());
                     }
-                    new_fragments.push(fragment);
-                    uploaded_results.push(lr);
-                    total_output += lr.entry_count;
-                    total_bytes += lr.data.len();
-                }
-                Err(e) => {
-                    tracing::error!(label = lr.label, error = %e, "R2 Lance fragment upload failed, skipping label");
+                    Err(e) => {
+                        tracing::error!(label = lr.label, error = %e, "batch conversion failed");
+                    }
                 }
             }
-        }
+        });
 
-        // Phase 2: Build Lance TableManifest (versioned, immutable). Single manifest path.
-        let existing_lance: Option<yata_lance::table::TableManifest> = {
-            let cache = self.lance_manifest_cache.lock().ok();
-            cache.and_then(|c| c.clone())
-        };
-        let lance_manifest = lance_table.build_manifest(existing_lance.as_ref(), new_fragments);
-        let lance_json = serde_json::to_vec(&lance_manifest).unwrap_or_default();
-        let lance_versioned_key = lance_table.manifest_key(global_max_seq);
-        s3.put_sync(&lance_versioned_key, bytes::Bytes::from(lance_json))
-            .map_err(|e| format!("R2 Lance manifest upload failed: {e}"))?;
-        // Update in-memory cache
-        if let Ok(mut lmc) = self.lance_manifest_cache.lock() {
-            *lmc = Some(lance_manifest.clone());
-        }
-
-        let all_labels: Vec<String> = lance_manifest.fragments.iter()
-            .flat_map(|f| f.labels.iter().cloned())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter().collect();
+        all_labels.sort();
+        all_labels.dedup();
 
         tracing::info!(
             dirty_labels = label_results.len(),
-            total_labels = all_labels.len(),
             output_entries = total_output,
-            lance_version = lance_manifest.version,
-            lance_fragments = lance_manifest.fragments.len(),
             global_max_seq,
-            bytes = total_bytes,
-            "Lance compaction complete"
+            "Lance Dataset compaction complete"
         );
 
         Ok(crate::compaction::CompactionResult {
