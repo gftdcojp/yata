@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use yata_core::PartitionId;
 use yata_cypher::Graph;
 use yata_graph::GraphStore;
-use yata_grin::{Mutable, PropValue, Topology};
+use yata_grin::{Mutable, PropValue};
 use yata_store::MutableCsrStore;
 
 // ── 3-Tier Blob Fetch: Disk Cache → R2 ──────────────────────────────
