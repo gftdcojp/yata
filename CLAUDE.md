@@ -111,7 +111,7 @@ env.YATA.stats()                        // → all partition CpmStats (K3a)
 | `yata-s3` | R2 persistence (sync ureq+rustls S3 client, SigV4)。`get_sync` (full GET) + **`get_range_sync` (HTTP Range GET, SigV4 signed)**。`trigger_compaction()` → R2 PUT、page-in → R2 GET/Range GET |
 | `yata-lance` | **Lance-table-compatible persistence + vector store** — typed Arrow schema (VERTICES_SCHEMA/EDGES_SCHEMA), Arrow IPC fragment serialize/deserialize, versioned TableManifest, deletion info, embedding index。`yata-engine` compaction + cold start + vector search の persistence layer |
 | `yata-vex` | Vector index (IVF_PQ + DiskANN) |
-| `yata-bench` | Benchmarks: `coo-read-bench` (COO read + R2 page-in), `cypher-bench`, `cypher-transport-bench`, `trillion-scale-test` |
+| `yata-bench` | Benchmarks: `coo-read-bench` (COO read + R2 page-in), `cypher-bench`, `cypher-transport-bench`, `csr-vs-lance-bench` |
 | `yata-server` | XRPC API server (`/xrpc/ai.gftd.yata.cypher` + `compact`)。GraphQueryExecutor trait |
 
 ## GraphScope Parity

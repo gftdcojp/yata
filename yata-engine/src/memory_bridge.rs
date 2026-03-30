@@ -2,10 +2,8 @@ use base64::Engine;
 use std::collections::HashMap;
 
 use indexmap::IndexMap;
-use yata_core::PartitionId;
 use yata_cypher::{Executor, Graph, MemoryGraph, NodeRef, RelRef};
-use yata_grin::{GraphStore, Mutable, PropValue, Property, Topology};
-use yata_store::MutableCsrStore;
+use yata_grin::{GraphStore, PropValue, Property, Topology};
 
 pub fn cypher_to_prop(v: &yata_cypher::types::Value) -> PropValue {
     match v {
@@ -134,44 +132,6 @@ pub fn execute_query(
         })
         .collect();
     Ok(rows)
-}
-
-pub fn rebuild_csr_from_memory_graph_with_partition(
-    graph: &MemoryGraph,
-    partition_id: PartitionId,
-) -> MutableCsrStore {
-    let nodes = graph.nodes();
-    let rels = graph.rels();
-    let mut csr = MutableCsrStore::new_with_partition_id(partition_id);
-    let mut vid_map: HashMap<String, u32> = HashMap::new();
-
-    for node in &nodes {
-        let props: Vec<(&str, PropValue)> = node
-            .props
-            .iter()
-            .map(|(k, v): (&String, &yata_cypher::types::Value)| (k.as_str(), cypher_to_prop(v)))
-            .collect();
-        let mut all_props = props;
-        all_props.push(("_vid", PropValue::Str(node.id.clone())));
-        let vid = csr.add_vertex_with_labels(&node.labels, &all_props);
-        vid_map.insert(node.id.clone(), vid);
-    }
-
-    for rel in &rels {
-        if let (Some(&s), Some(&d)) = (vid_map.get(&rel.src), vid_map.get(&rel.dst)) {
-            let props: Vec<(&str, PropValue)> = rel
-                .props
-                .iter()
-                .map(|(k, v): (&String, &yata_cypher::types::Value)| {
-                    (k.as_str(), cypher_to_prop(v))
-                })
-                .collect();
-            csr.add_edge(s, d, &rel.rel_type, &props);
-        }
-    }
-
-    csr.commit();
-    csr
 }
 
 pub fn rebuild_read_store_from_memory_graph(graph: &MemoryGraph) -> yata_lance::LanceReadStore {

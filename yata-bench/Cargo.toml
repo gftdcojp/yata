@@ -22,10 +22,6 @@ name = "cypher-transport-bench"
 path = "src/cypher_transport_bench.rs"
 
 [[bin]]
-name = "trillion-scale-test"
-path = "src/trillion_scale_test.rs"
-
-[[bin]]
 name = "csr-vs-lance-bench"
 path = "src/csr_vs_lance_bench.rs"
 

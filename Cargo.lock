@@ -6015,7 +6015,6 @@ dependencies = [
  "yata-grin",
  "yata-lance",
  "yata-s3",
- "yata-store",
 ]
 
 [[package]]

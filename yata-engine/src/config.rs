@@ -1,6 +1,4 @@
-use std::collections::HashMap;
 use yata_core::PartitionId;
-use yata_store::partition::PartitionAssignment;
 
 /// WAL segment serialization format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,10 +42,6 @@ pub struct TieredEngineConfig {
     pub wal_segment_max_age_secs: u64,
     /// WAL segment format (ndjson or arrow). Arrow enables zero-copy mmap reads.
     pub wal_format: WalFormat,
-    /// Partition assignment strategy (derived from YATA_PARTITION_LABELS env var).
-    /// Format: "Label1=0,Label2=1,Label3=1" (label=partition_id pairs).
-    /// When set, enables label-based partitioning for dedicated label isolation.
-    pub partition_assignment: PartitionAssignment,
 }
 
 impl Default for TieredEngineConfig {
@@ -93,61 +87,6 @@ impl Default for TieredEngineConfig {
             wal_segment_max_age_secs: std::env::var("YATA_WAL_SEGMENT_MAX_AGE_SECS")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(10),
             wal_format: WalFormat::from_env(),
-            partition_assignment: parse_partition_assignment(),
-        }
-    }
-}
-
-/// Parse YATA_PARTITION_LABELS env var into PartitionAssignment.
-///
-/// Format: "Expert=1,Key=1" → Label { label_map: {Expert→1, Key→1}, default_partition: 0 }
-/// Unset or empty → uses YATA_PARTITION_COUNT for Hash or Single.
-fn parse_partition_assignment() -> PartitionAssignment {
-    if let Ok(labels_str) = std::env::var("YATA_PARTITION_LABELS") {
-        let labels_str = labels_str.trim();
-        if labels_str.is_empty() {
-            return fallback_assignment();
-        }
-        let mut label_map = HashMap::new();
-        for pair in labels_str.split(',') {
-            let pair = pair.trim();
-            if let Some((label, pid_str)) = pair.split_once('=') {
-                if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                    label_map.insert(label.trim().to_string(), pid);
-                }
-            }
-        }
-        if label_map.is_empty() {
-            return fallback_assignment();
-        }
-        let default_partition = std::env::var("YATA_PARTITION_DEFAULT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        tracing::info!(
-            labels = ?label_map,
-            default_partition,
-            "label-based partitioning enabled"
-        );
-        PartitionAssignment::Label {
-            label_map,
-            default_partition,
-        }
-    } else {
-        fallback_assignment()
-    }
-}
-
-fn fallback_assignment() -> PartitionAssignment {
-    let count: u32 = std::env::var("YATA_PARTITION_COUNT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-    if count <= 1 {
-        PartitionAssignment::Single
-    } else {
-        PartitionAssignment::Hash {
-            partition_count: count,
         }
     }
 }
@@ -173,33 +112,4 @@ mod tests {
         assert_eq!(cfg.hot_partition_id, PartitionId::from(0));
     }
 
-    #[test]
-    fn test_parse_partition_assignment_single() {
-        // No env vars set → Single
-        let assignment = fallback_assignment();
-        assert!(matches!(assignment, PartitionAssignment::Single));
-    }
-
-    #[test]
-    fn test_parse_partition_labels_format() {
-        // Simulate parsing logic directly
-        let labels_str = "Expert=1,Key=1";
-        let mut label_map = HashMap::new();
-        for pair in labels_str.split(',') {
-            if let Some((label, pid_str)) = pair.split_once('=') {
-                if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                    label_map.insert(label.trim().to_string(), pid);
-                }
-            }
-        }
-        assert_eq!(label_map.len(), 2);
-        assert_eq!(label_map["Expert"], 1);
-        assert_eq!(label_map["Key"], 1);
-
-        let assignment = PartitionAssignment::Label {
-            label_map,
-            default_partition: 0,
-        };
-        assert_eq!(assignment.partition_count(), 2);
-    }
 }
