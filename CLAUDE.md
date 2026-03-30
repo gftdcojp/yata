@@ -61,25 +61,22 @@ Write (LanceDB-style append-only, NO page-in):
   yata への直接 mutate は mergeRecord からのみ (app 直接禁止)
   既存 vertex の in-place props 上書きは禁止 (LanceDB: immutable data + deletion vector)
 
-Per-label LSM Compaction (cron 1min, dirty_labels gated, two-phase PUT):
+Lance Compaction (size-based L0_COMPACT_THRESHOLD, dirty_labels gated):
   trigger_compaction():
-    → wal_flush_segment(): WAL ring → Arrow IPC segment → R2 PUT (safe: empty entries guard)
+    → wal_flush_segment(): WAL ring → Arrow IPC segment → R2 PUT
     → drain_dirty_labels() → dirty set
     → dirty empty? → skip (zero R2 I/O)
-    → Phase 1: per dirty label: L0 + existing L1 sorted segments → merge-sort → PK-dedup → Blake3 → R2 PUT (failed labels skipped)
-    → Phase 2: manifest v2 built from successfully uploaded labels only → R2 PUT
+    → Phase 1: per dirty label: L0 + existing Lance fragments → merge-sort → PK-dedup → Blake3 → R2 PUT as Lance fragment
+    → Phase 2: Lance TableManifest built from successfully uploaded fragments → R2 PUT (immutable versioned)
     → clean labels: untouched (zero R2 I/O)
-    → NO CSR rebuild, NO commit() — sorted segments are the persistent + query format
 
-Read (cold start: per-label segment page-in + Blake3 verification):
+Read (cold start: Lance manifest → fragment-level demand page-in):
   PDS_RPC.query / listRecords / getTimeline
     → YATA_RPC.cypher → TieredGraphEngine
     → ensure_labels(vertex_labels) → hot_initialized == false?
-      → cold_start(): per-label sorted COO segments (mmap/R2) → Blake3 verify → L0 tail replay
-      → sparse index build (every 256th src → offset)
-      → corrupt segment detected? → skip + error log (no panic)
-      → hot_initialized = true
-    → sparse index binary search + segment scan (O(log 256 + degree))
+      → cold_start(): Lance TableManifest load (R2 list O(1)) → hot_initialized = true → WAL tail replay
+    → ensure_labels(["Post"]) → Lance manifest → matching fragments → 3-tier (disk → R2 → Blake3 verify → cache)
+    → wal_apply(entries) → MutableCsrStore → sparse index binary search + scan
 
 PDS Container (Rust) は不要 — 全て TS Worker + Pipeline + YATA_RPC。
 ```
@@ -113,6 +110,7 @@ env.YATA.stats()                        // → all partition CpmStats (K3a)
 | `yata-cypher` | Full Cypher parser + executor (incl. untyped edge traversal) |
 | `yata-gie` | GIE push-based executor, IR (Exchange/Receive/Gather, serde-serializable), distributed planner, `execute_step()` (Phase 5: stateless per-round fragment execution), `MaterializedRecord` (rkey-based cross-partition exchange), `ExchangePayload` (HTTP transport) |
 | `yata-s3` | R2 persistence (sync ureq+rustls S3 client, SigV4)。`get_sync` (full GET) + **`get_range_sync` (HTTP Range GET, SigV4 signed)**。`trigger_compaction()` → R2 PUT、page-in → R2 GET/Range GET |
+| `yata-lance` | **Lance-table-compatible persistence** — typed Arrow schema (VERTICES_SCHEMA/EDGES_SCHEMA), Arrow IPC fragment serialize/deserialize, versioned TableManifest, deletion info。`yata-engine` compaction + cold start の persistence layer |
 | `yata-vex` | Vector index (IVF_PQ + DiskANN) |
 | `yata-bench` | Benchmarks: `coo-read-bench` (COO read + R2 page-in), `tiered-bench`, `cypher-bench`, `trillion-scale-test` |
 | `yata-server` | XRPC API server (`/xrpc/ai.gftd.yata.cypher` + `compact`)。GraphQueryExecutor trait |
@@ -192,19 +190,19 @@ R2 = source of truth。**Per-label compacted segments**: `log/compacted/{pid}/la
 | **Lance fragments** | Arrow IPC (`lance/vertices/{pid}/fragments/{ver}-{frag}.arrow`) | LSM compaction (dirty labels only) | query + persistence (PK-dedup, P=1.0) |
 | **Lance TableManifest** | JSON (`lance/vertices/{pid}/manifest-{inverted:020}.json`) | `trigger_compaction` | Fragment tracking + immutable version chain |
 
-**`trigger_compaction()` = `wal_flush_segment` + `drain_dirty_labels` + per-label LSM merge-sort。** L0 + existing L1 → merge-sort by (label, src, dst) → PK-dedup → R2 PUT。Clean labels = zero R2 I/O。**No commit() rebuild** — compaction 出力がそのまま query 用 sorted segments。
+**`trigger_compaction()` = `wal_flush_segment` + `drain_dirty_labels` + Lance fragment compaction。** L0 + existing Lance fragments → merge-sort → PK-dedup → new Lance fragment R2 PUT + TableManifest R2 PUT。Clean labels = zero R2 I/O。
 
 **Cold start (LanceDB-style demand-paged)**: `ensure_labels` → `hot_initialized == false` → `wal_cold_start_manifest_only()` (manifest + WAL tail のみ, ~50ms) → `hot_initialized = true` **即座**。Per-label segment は query 時に on-demand page-in (`load_label_segment`: disk cache ~100µs → R2 GET ~4ms → Blake3 verify → write-through)。Multi-node: 各ノードが独立に manifest load + label page-in。Cold start 2.2s (manifest + first label) vs 旧 30s (全 label preload)。
 
-## Arrow IPC WAL + LSM Compaction `[PRODUCTION]` (verified 2026-03-29)
+## Arrow IPC WAL + Lance Fragment Compaction `[PRODUCTION]` (verified 2026-03-30)
 
-**Sorted COO + Arrow IPC WAL architecture.** NDJSON → Arrow IPC。JSON intermediary 全除去。CSR rebuild → eliminated。
+**Lance-table-compatible architecture.** WAL = Arrow IPC (append-only)。Compaction = Lance fragments (Arrow IPC) + TableManifest (versioned JSON)。CSR rebuild → eliminated。
 
 - **WAL format**: Arrow IPC File (default `YATA_WAL_FORMAT=arrow`)。`WalEntry.props` = `Vec<(String, PropValue)>` (typed, zero JSON overhead)。custom serde で flat JSON map backward compat
 - **Segment registry**: `head.json` の `segments` array に全 segment key を記録。R2 ListObjectsV2 不使用
-- **LSM Compaction (two-phase PUT)**: `trigger_compaction()` が `drain_dirty_labels()` → dirty labels のみ L0 + L1 merge-sort → PK-dedup。Phase 1: per-label sorted segment upload (Blake3 checksum、失敗 label はスキップ)。Phase 2: 成功 label のみから manifest v2 構築 → legacy `manifest.json` + versioned `manifest-{inverted:020}.json` PUT。R2 key: `log/compacted/{pid}/label/{label}.arrow` + `log/compacted/{pid}/manifest.json`。Clean labels = zero R2 I/O。**No CSR rebuild — compaction 出力 = query 用 sorted segments**
-- **Blake3 checksum**: `LabelSegmentState.blake3_hex`。Cold start 時 R2 GET → verify → mismatch で corrupt segment スキップ (panic なし)
-- **Cold start**: `find_latest_manifest()` (versioned → legacy fallback) → per-label compacted segments (disk cache mmap ~100µs/segment → R2 GET fallback → Blake3 verify) → sparse index build → WAL tail replay → L0 buffer。**`cold_starting` AtomicBool CAS** で concurrent cold start 防止 (1 thread のみ実行、他は spin-wait)。Read replica は初 query で自動 cold start
+- **Lance Compaction (two-phase PUT)**: `trigger_compaction()` が `drain_dirty_labels()` → dirty labels のみ L0 + existing Lance fragments merge-sort → PK-dedup。Phase 1: per-label Lance fragment upload (`lance/vertices/{pid}/fragments/{ver}-{frag}.arrow`, Blake3 checksum、失敗 label はスキップ)。Phase 2: 成功 fragments から `TableManifest` 構築 → `lance/vertices/{pid}/manifest-{inverted:020}.json` PUT。Clean labels = zero R2 I/O
+- **Blake3 checksum**: Lance `Fragment.blake3_hex`。Cold start 時 R2 GET → verify → mismatch で corrupt fragment スキップ (panic なし)
+- **Cold start**: Lance `TableManifest` load (R2 list `lance/vertices/{pid}/manifest-*`, O(1) latest) → `lance_manifest_cache` → `hot_initialized = true` → WAL tail replay。Labels are demand-paged by `ensure_labels()` from Lance fragments (3-tier: disk → R2 → verify)。**`cold_starting` AtomicBool CAS** で concurrent cold start 防止 (1 thread のみ実行、他は spin-wait)
 - **WAL flush safety**: pattern match 安全 early return。空 entries でパニックしない
 - **Replica transport**: `/xrpc/ai.gftd.yata.walTailArrow` (Arrow IPC body) + `/xrpc/ai.gftd.yata.walApplyArrow`
 - **Migration CLI**: `gftd yata migrate --from csr --to coo` (CSR→COO forward) / `--from coo --to csr` (rollback)

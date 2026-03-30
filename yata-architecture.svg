@@ -83,30 +83,30 @@
 
     <!-- Issue 1: Cold Start Blind Spot -->
     <rect x="20" y="40" width="470" height="120" rx="6" fill="#1e1e2e" stroke="#ef4444" stroke-width="1" opacity="0.9"/>
-    <text x="35" y="60" fill="#ef4444" font-size="11" font-weight="bold">P0: Cold Start Blind Spot (12-52s)</text>
-    <text x="35" y="78" fill="#94a3b8" font-size="10">Deploy new image → Container restart → in-memory lost</text>
-    <text x="35" y="93" fill="#94a3b8" font-size="10">→ R2 page-in 12-52s → ALL queries return empty</text>
-    <text x="35" y="108" fill="#94a3b8" font-size="10">Read replicas: on-demand cold start (first query)</text>
-    <text x="35" y="123" fill="#94a3b8" font-size="10">Write partition: on-demand page-in (slow)</text>
-    <text x="35" y="143" fill="#f59e0b" font-size="10" font-weight="bold">Fix: edge cache restored + write fallback</text>
+    <text x="35" y="60" fill="#22c55e" font-size="11" font-weight="bold">P0: Lance Cold Start (~50ms manifest + demand page-in)</text>
+    <text x="35" y="78" fill="#94a3b8" font-size="10">Deploy new image → Container restart → Lance manifest load (~50ms)</text>
+    <text x="35" y="93" fill="#94a3b8" font-size="10">→ hot_initialized = true → labels demand-paged from Lance fragments</text>
+    <text x="35" y="108" fill="#94a3b8" font-size="10">Read replicas: Lance manifest + fragment 3-tier page-in</text>
+    <text x="35" y="123" fill="#94a3b8" font-size="10">Write partition: manifest-only cold start (labels on-demand)</text>
+    <text x="35" y="143" fill="#22c55e" font-size="10" font-weight="bold">FIXED: Lance manifest + PDS stampede protection + cyRetry</text>
 
     <!-- Issue 2: Read Replica Empty -->
     <rect x="510" y="40" width="470" height="120" rx="6" fill="#1e1e2e" stroke="#f59e0b" stroke-width="1" opacity="0.9"/>
-    <text x="525" y="60" fill="#f59e0b" font-size="11" font-weight="bold">P1: Read Replicas Empty After Deploy</text>
-    <text x="525" y="78" fill="#94a3b8" font-size="10">WAL push = fire-and-forget (no ack, no retry)</text>
-    <text x="525" y="93" fill="#94a3b8" font-size="10">Cold start = on-demand (first query triggers page-in)</text>
-    <text x="525" y="108" fill="#94a3b8" font-size="10">Empty response = HTTP 200 (no error signal)</text>
-    <text x="525" y="123" fill="#94a3b8" font-size="10">PDS cannot distinguish empty vs no-data</text>
-    <text x="525" y="143" fill="#f59e0b" font-size="10" font-weight="bold">Fix: fetchStubFast 8s → write fallback</text>
+    <text x="525" y="60" fill="#22c55e" font-size="11" font-weight="bold">P1: Read Replicas — Lance Cold Start</text>
+    <text x="525" y="78" fill="#94a3b8" font-size="10">Lance manifest load (~50ms) → hot_initialized</text>
+    <text x="525" y="93" fill="#94a3b8" font-size="10">Labels demand-paged from Lance fragments (3-tier)</text>
+    <text x="525" y="108" fill="#94a3b8" font-size="10">PDS: stampede protection + cyRetry on empty</text>
+    <text x="525" y="123" fill="#94a3b8" font-size="10">min_instances=1 keeps Container warm</text>
+    <text x="525" y="143" fill="#22c55e" font-size="10" font-weight="bold">FIXED: Lance manifest + min_instances</text>
 
     <!-- Issue 3: Edge Cache Removal -->
     <rect x="1000" y="40" width="470" height="120" rx="6" fill="#1e1e2e" stroke="#06b6d4" stroke-width="1" opacity="0.9"/>
-    <text x="1015" y="60" fill="#06b6d4" font-size="11" font-weight="bold">P2: Edge Cache Removed (stale fear)</text>
-    <text x="1015" y="78" fill="#94a3b8" font-size="10">cyCached → cy() direct (every request to yata)</text>
-    <text x="1015" y="93" fill="#94a3b8" font-size="10">Before: CF Cache API 60s TTL masked cold starts</text>
-    <text x="1015" y="108" fill="#94a3b8" font-size="10">After: zero resilience to yata unavailability</text>
-    <text x="1015" y="123" fill="#94a3b8" font-size="10">Result: feed/search empty during cold start</text>
-    <text x="1015" y="143" fill="#22c55e" font-size="10" font-weight="bold">Fixed: edge cache restored (deployed)</text>
+    <text x="1015" y="60" fill="#22c55e" font-size="11" font-weight="bold">P2: PDS In-Memory Cache + Stampede Protection</text>
+    <text x="1015" y="78" fill="#94a3b8" font-size="10">cyCached: in-memory Map (60s TTL, 500 entries)</text>
+    <text x="1015" y="93" fill="#94a3b8" font-size="10">Stampede: _inflight Map coalesces concurrent calls</text>
+    <text x="1015" y="108" fill="#94a3b8" font-size="10">cyRetry: empty result → 5s retry (cold start defense)</text>
+    <text x="1015" y="123" fill="#94a3b8" font-size="10">Notification TTL 120s, PostThread TTL 10s cached</text>
+    <text x="1015" y="143" fill="#22c55e" font-size="10" font-weight="bold">FIXED: 0 F-grade endpoints (all D or S)</text>
 
     <!-- Architecture Comparison -->
     <rect x="20" y="170" width="1450" height="95" rx="6" fill="#1e1e2e" stroke="#3b82f6" stroke-width="1" opacity="0.8"/>
@@ -167,8 +167,8 @@
   <rect x="740" y="290" width="340" height="100" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="2"/>
   <text x="760" y="313" fill="#22c55e" font-size="13" font-weight="bold">yata-format</text>
   <text x="960" y="313" fill="#64748b" font-size="9">~1,500 LOC</text>
-  <text x="760" y="332" fill="#94a3b8" font-size="10">YataFragment (legacy snapshot, COO segments replace)</text>
-  <text x="760" y="347" fill="#94a3b8" font-size="10">NbrUnit64 (packed CSR, legacy Phase 3 removal)</text>
+  <text x="760" y="332" fill="#94a3b8" font-size="10">Lance TableManifest + fragments (Arrow IPC)</text>
+  <text x="760" y="347" fill="#94a3b8" font-size="10">COO sorted + sparse index (query engine)</text>
   <text x="760" y="362" fill="#94a3b8" font-size="10">COO segment format (sorted Arrow IPC)</text>
   <text x="760" y="377" fill="#475569" font-size="9">deps: core, grin, arrow, bytes</text>
 
@@ -315,7 +315,7 @@
   <text x="995" y="1085" fill="#e2e8f0" font-size="11">lance/vertices/{pid}/manifest-{inv}.json</text>
   <text x="995" y="1100" fill="#94a3b8" font-size="9">v2 per-label state tracking</text>
   <rect x="980" y="1120" width="280" height="45" rx="6" fill="#1e293b" stroke="#3b82f6" stroke-width="1" stroke-opacity="0.4"/>
-  <text x="995" y="1140" fill="#e2e8f0" font-size="11">label/{label}.arrow (per-label)</text>
+  <text x="995" y="1140" fill="#e2e8f0" font-size="11">fragments/{ver}-{frag}.arrow (Lance)</text>
   <text x="995" y="1155" fill="#94a3b8" font-size="9">Arrow IPC, PK-dedup, SigV4</text>
 
   <line x1="520" y1="1110" x2="568" y2="1110" stroke="#f59e0b" stroke-width="2" marker-end="url(#arrowAmber)"/>
@@ -352,13 +352,13 @@
   <text x="95" y="1523" fill="#94a3b8" font-size="9" font-opacity="0.6">1 label change → re-read + re-write entire compacted segment (all labels)</text>
 
   <rect x="80" y="1541" width="670" height="35" rx="6" fill="#1a0a00" stroke="#78350f" stroke-width="1" stroke-opacity="0.3"/>
-  <text x="95" y="1564" fill="#fcd34d" font-size="10" font-opacity="0.5">P4: Cold start full page-in (already mitigated: label-selective + topology-only)</text>
+  <text x="95" y="1564" fill="#22c55e" font-size="10">P4: Lance demand-paged cold start (manifest-only + fragment page-in)</text>
 
   <rect x="80" y="1584" width="670" height="35" rx="6" fill="#001a20" stroke="#155e75" stroke-width="1" stroke-opacity="0.3"/>
   <text x="95" y="1607" fill="#67e8f9" font-size="10" font-opacity="0.5">P5: Coordinator 2ms fan-out overhead (mitigated: adaptive sqrt(N))</text>
 
   <rect x="80" y="1627" width="670" height="20" rx="6" fill="#0f0520" stroke="#581c87" stroke-width="1" stroke-opacity="0.2"/>
-  <text x="95" y="1642" fill="#d8b4fe" font-size="9" font-opacity="0.4">P6: Dual persistence — Pipeline WAL + R2 sorted COO (by design, cold start &lt;5s)</text>
+  <text x="95" y="1642" fill="#22c55e" font-size="9">P6: Pipeline WAL + Lance fragments (cold start &lt;5s)</text>
 
   <!-- AFTER -->
   <rect x="810" y="1395" width="470" height="260" rx="10" fill="#1e293b" stroke="#22c55e" stroke-width="2" filter="url(#greenGlow)"/>
@@ -374,13 +374,13 @@
   <text x="845" y="1533" fill="#86efac" font-size="10">Clean labels = zero R2 I/O (no read, no write)</text>
 
   <rect x="830" y="1548" width="430" height="30" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
-  <text x="845" y="1568" fill="#94a3b8" font-size="10">P4: Already PRODUCTION (selective page-in)</text>
+  <text x="845" y="1568" fill="#22c55e" font-size="10">P4: PRODUCTION — Lance TableManifest + fragment demand page-in</text>
 
   <rect x="830" y="1586" width="430" height="30" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
   <text x="845" y="1606" fill="#94a3b8" font-size="10">P5: Mitigated (adaptive sqrt(N) fan-out)</text>
 
   <rect x="830" y="1624" width="430" height="25" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
-  <text x="845" y="1642" fill="#94a3b8" font-size="9">P6: By design (cold start &lt;5s guarantee)</text>
+  <text x="845" y="1642" fill="#22c55e" font-size="9">P6: PRODUCTION — Lance fragments = persistent + query format</text>
 
   <!-- ======================================================== -->
   <!-- EFFICIENCY TABLE -->
@@ -426,7 +426,7 @@
   <text x="140" y="1895" fill="#94a3b8" font-size="11">PERSISTENCE</text>
   <text x="360" y="1895" fill="#94a3b8" font-size="10">Pipeline WAL + R2 sorted COO</text>
   <text x="680" y="1895" fill="#94a3b8" font-size="10">Delta PUT reduces R2 I/O cost</text>
-  <text x="1020" y="1895" fill="#94a3b8" font-size="10">cold start &lt;5s from sorted COO segments</text>
+  <text x="1020" y="1895" fill="#94a3b8" font-size="10">cold start &lt;5s from Lance manifest + fragment page-in</text>
   <text x="1340" y="1895" fill="#94a3b8" font-size="10">by design</text>
 
   <!-- ======================================================== -->
@@ -608,7 +608,7 @@
   <line x1="514" y1="2424" x2="534" y2="2424" stroke="#22c55e" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
   <rect x="536" y="2406" width="170" height="36" rx="5" fill="#052e16" stroke="#22c55e" stroke-width="1.5"/>
   <text x="548" y="2420" fill="#4ade80" font-size="9">Phase 1: R2 PUT + Blake3</text>
-  <text x="548" y="2432" fill="#22c55e" font-size="7">label/{label}.arrow + checksum</text>
+  <text x="548" y="2432" fill="#22c55e" font-size="7">Lance fragment + Blake3 checksum</text>
   <text x="548" y="2442" fill="#f59e0b" font-size="6">failed labels skipped</text>
   <line x1="706" y1="2424" x2="726" y2="2424" stroke="#4b5563" stroke-width="1" marker-end="url(#arrow)"/>
   <rect x="728" y="2406" width="150" height="36" rx="5" fill="#052e16" stroke="#22c55e" stroke-width="1.5"/>
@@ -663,7 +663,7 @@
   <text x="620" y="2643" fill="#f87171" font-size="9">2,700ms</text>
   <text x="730" y="2643" fill="#ef4444" font-size="9" font-weight="bold">96%</text>
   <text x="800" y="2643" fill="#94a3b8" font-size="9">First request after sleep = 2.8s</text>
-  <text x="1100" y="2643" fill="#94a3b8" font-size="9">Keep-alive heartbeat, label-selective page-in</text>
+  <text x="1100" y="2643" fill="#94a3b8" font-size="9">Keep-alive heartbeat, Lance fragment demand page-in</text>
 
   <rect x="100" y="2652" width="1400" height="24" fill="#0a1a0a"/>
   <text x="130" y="2669" fill="#22c55e" font-size="11" font-weight="bold">2</text>
@@ -689,7 +689,7 @@
   <text x="350" y="2721" fill="#4ade80" font-size="9">Lance fragment compaction (dirty labels → new fragments)</text>
   <text x="620" y="2721" fill="#4ade80" font-size="9">O(dirty)</text>
   <text x="730" y="2721" fill="#22c55e" font-size="9" font-weight="bold">FIXED</text>
-  <text x="800" y="2721" fill="#94a3b8" font-size="9">drain_dirty_labels → per-label PK-dedup → label/{label}.arrow</text>
+  <text x="800" y="2721" fill="#94a3b8" font-size="9">drain_dirty_labels → PK-dedup → Lance fragments/{ver}-{frag}.arrow</text>
   <text x="1100" y="2721" fill="#22c55e" font-size="9" font-weight="bold">PRODUCTION</text>
 
   <rect x="100" y="2730" width="1400" height="24" fill="#1a2332"/>
@@ -960,7 +960,7 @@
   <line x1="620" y1="4071" x2="680" y2="4071" stroke="#3b82f6" stroke-width="1" marker-end="url(#arrow)"/>
   <rect x="682" y="4046" width="200" height="50" rx="6" fill="#1e293b" stroke="#3b82f6" stroke-width="1.5"/>
   <text x="702" y="4066" fill="#3b82f6" font-size="10" font-weight="bold">L1 Compaction (Arrow IPC)</text>
-  <text x="702" y="4082" fill="#94a3b8" font-size="9">PK-dedup Arrow IPC — legacy ArrowFragment 除去済み</text>
+  <text x="702" y="4082" fill="#94a3b8" font-size="9">PK-dedup → Lance fragments (Arrow IPC, immutable)</text>
   <text x="702" y="4092" fill="#3b82f6" font-size="7">MMAP-FIRST COLD START (disk ~100µs → R2 fallback)</text>
 
   <!-- Read Replicas -->
