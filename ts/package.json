@@ -10,10 +10,12 @@
     "./lance": "./src/lance.ts",
     "./lance-arrow": "./src/lance-arrow.ts",
     "./manifest": "./src/manifest.ts",
+    "./pipeline": "./src/pipeline.ts",
     "./schema": "./src/schema.ts",
     "./types": "./src/types.ts",
     "./cypher": "./src/cypher.ts",
     "./wal": "./src/wal.ts",
+    "./writer": "./src/writer.ts",
     "./helpers": "./src/helpers.ts"
   },
   "files": ["src"],

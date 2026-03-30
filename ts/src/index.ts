@@ -90,6 +90,8 @@ export { GraphCatalog } from "./catalog.js";
 export {
   applyEdgeMutation,
   applyVertexMutation,
+  projectEdgeMutation,
+  projectVertexMutation,
 } from "./writer.js";
 export type {
   EdgeMutation,
@@ -97,6 +99,31 @@ export type {
   VertexMutation,
   YataWritableTables,
 } from "./writer.js";
+export {
+  createEdgePipelineEnvelope,
+  createVertexPipelineEnvelope,
+  decodeGraphPipelineEnvelope,
+  emitGraphPipelineEnvelope,
+  hydrateEdgeMutation,
+  hydrateVertexMutation,
+  parseGraphPipelineEnvelope,
+  projectGraphPipelineBatch,
+  projectGraphPipelineRecord,
+  stringifyGraphPipelineEnvelope,
+  toGraphProjectedRecord,
+  toGraphProjectedRecords,
+} from "./pipeline.js";
+export type {
+  EdgePipelineMutation,
+  GraphEdgePipelineEnvelope,
+  GraphPipelineConsumerRecord,
+  GraphPipelineEnvelope,
+  GraphPipelineEnvelopeBase,
+  GraphProjectedRecord,
+  GraphVertexPipelineEnvelope,
+  PipelineWriterLike,
+  VertexPipelineMutation,
+} from "./pipeline.js";
 
 // Cypher builder
 export { G, buildLabelCypher } from "./cypher.js";

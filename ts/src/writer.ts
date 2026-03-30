@@ -1,6 +1,13 @@
 import type { GraphManifest, ManifestStore } from "./manifest.js";
 import { GraphCatalog } from "./catalog.js";
 
+/**
+ * Projector/materializer-side Lance writer.
+ *
+ * User-facing write ACK should come from Pipeline.send().
+ * These helpers are for the async projection stage that consumes
+ * ordered pipeline events and appends them into Lance tables.
+ */
 export interface LanceWritableTableLike {
   add(rows: Record<string, unknown>[]): Promise<unknown>;
 }
@@ -57,7 +64,7 @@ function baseUriFromTableUri(uri: string): string {
   return idx >= 0 ? uri.slice(0, idx) : uri;
 }
 
-export async function applyVertexMutation(
+export async function projectVertexMutation(
   tables: YataWritableTables,
   store: ManifestStore,
   currentManifest: GraphManifest,
@@ -94,7 +101,7 @@ export async function applyVertexMutation(
   return next;
 }
 
-export async function applyEdgeMutation(
+export async function projectEdgeMutation(
   tables: YataWritableTables,
   store: ManifestStore,
   currentManifest: GraphManifest,
@@ -145,4 +152,26 @@ export async function applyEdgeMutation(
   next.generated_at_ms = mutation.updated_at_ms;
   await GraphCatalog.publish(store, next);
   return next;
+}
+
+/**
+ * Backward-compatible aliases.
+ * Prefer `projectVertexMutation` / `projectEdgeMutation` for new code.
+ */
+export async function applyVertexMutation(
+  tables: YataWritableTables,
+  store: ManifestStore,
+  currentManifest: GraphManifest,
+  mutation: VertexMutation,
+): Promise<GraphManifest> {
+  return projectVertexMutation(tables, store, currentManifest, mutation);
+}
+
+export async function applyEdgeMutation(
+  tables: YataWritableTables,
+  store: ManifestStore,
+  currentManifest: GraphManifest,
+  mutation: EdgeMutation,
+): Promise<GraphManifest> {
+  return projectEdgeMutation(tables, store, currentManifest, mutation);
 }
