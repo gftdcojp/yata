@@ -231,9 +231,9 @@ pub fn two_hop(
 
 // ── Internal execution ──────────────────────────────────────────────
 
-/// Execute a read query on a single partition's MutableCsrStore (public for distributed).
-pub fn execute_on_partition_pub(
-    store: &MutableCsrStore,
+/// Execute a read query on a single partition store (public for distributed).
+pub fn execute_on_partition_pub<S: GraphStore>(
+    store: &S,
     cypher: &str,
     params: &[(String, String)],
     hints: &PQueryHints,
@@ -241,9 +241,9 @@ pub fn execute_on_partition_pub(
     execute_on_partition(store, cypher, params, hints)
 }
 
-/// Execute a read query on a single partition's MutableCsrStore.
-fn execute_on_partition(
-    store: &MutableCsrStore,
+/// Execute a read query on a single partition store.
+fn execute_on_partition<S: GraphStore>(
+    store: &S,
     cypher: &str,
     _params: &[(String, String)],
     hints: &PQueryHints,

@@ -6057,6 +6057,7 @@ dependencies = [
  "tokio",
  "tracing",
  "yata-cypher",
+ "yata-grin",
  "yata-s3",
  "yata-vex",
 ]

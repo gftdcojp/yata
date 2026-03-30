@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use yata_grin::*;
-use yata_store::MutableCsrStore;
 
 use crate::ir::*;
 
@@ -35,7 +34,7 @@ pub struct MaterializedRecord {
 
 impl MaterializedRecord {
     /// Convert a local Record to a MaterializedRecord by resolving vids to rkeys.
-    pub fn from_record(record: &Record, store: &MutableCsrStore) -> Self {
+    pub fn from_record<S: GraphStore>(record: &Record, store: &S) -> Self {
         use yata_grin::Property;
         let mut bindings = HashMap::new();
         let mut labels = HashMap::new();
@@ -54,7 +53,7 @@ impl MaterializedRecord {
     }
 
     /// Resolve a MaterializedRecord back to a local Record by looking up rkeys.
-    pub fn to_record(&self, store: &MutableCsrStore) -> Option<Record> {
+    pub fn to_record<S: GraphStore>(&self, store: &S) -> Option<Record> {
         let mut bindings = HashMap::new();
         for (alias, rkey) in &self.bindings {
             let label = self.labels.get(alias).map(|s| s.as_str()).unwrap_or("");
@@ -93,8 +92,8 @@ impl Record {
     }
 }
 
-/// Execute a query plan against a MutableCsrStore.
-pub fn execute(plan: &QueryPlan, store: &MutableCsrStore) -> Vec<Record> {
+/// Execute a query plan against a graph store.
+pub fn execute<S: GraphStore>(plan: &QueryPlan, store: &S) -> Vec<Record> {
     let mut data: Vec<Record> = Vec::new();
 
     for op in &plan.ops {
@@ -104,7 +103,7 @@ pub fn execute(plan: &QueryPlan, store: &MutableCsrStore) -> Vec<Record> {
     data
 }
 
-pub fn execute_op(op: &LogicalOp, input: Vec<Record>, store: &MutableCsrStore) -> Vec<Record> {
+pub fn execute_op<S: GraphStore>(op: &LogicalOp, input: Vec<Record>, store: &S) -> Vec<Record> {
     match op {
         LogicalOp::Scan {
             label,
@@ -380,7 +379,7 @@ pub fn execute_op(op: &LogicalOp, input: Vec<Record>, store: &MutableCsrStore) -
 }
 
 /// Evaluate an expression against a record.
-pub fn eval_expr(expr: &Expr, record: &Record, store: &MutableCsrStore) -> PropValue {
+pub fn eval_expr<S: GraphStore>(expr: &Expr, record: &Record, store: &S) -> PropValue {
     match expr {
         Expr::Var(name) => {
             if let Some(&vid) = record.bindings.get(name.as_str()) {
@@ -429,7 +428,7 @@ pub fn eval_expr(expr: &Expr, record: &Record, store: &MutableCsrStore) -> PropV
 /// Check if a vertex passes GIE SecurityFilter.
 /// Uses vertex properties: sensitivity_ord (u8), owner_hash (u32), collection (str).
 /// O(1) per vertex — no MemoryGraph copy, no subgraph extraction.
-fn vertex_passes_security(store: &MutableCsrStore, vid: u32, scope: &crate::ir::SecurityScope) -> bool {
+fn vertex_passes_security<S: GraphStore>(store: &S, vid: u32, scope: &crate::ir::SecurityScope) -> bool {
     // 1. Sensitivity floor: vertex.sensitivity_ord <= max_sensitivity_ord
     //    Vertices without sensitivity_ord default to 0 (public) — always visible.
     let sens_ord = match store.vertex_prop(vid, "sensitivity_ord") {
@@ -469,7 +468,7 @@ fn vertex_passes_security(store: &MutableCsrStore, vid: u32, scope: &crate::ir::
 }
 
 /// Check if a vertex matches a predicate using the store's property access.
-fn predicate_matches_vertex(store: &MutableCsrStore, vid: u32, predicate: &Predicate) -> bool {
+fn predicate_matches_vertex<S: GraphStore>(store: &S, vid: u32, predicate: &Predicate) -> bool {
     match predicate {
         Predicate::True => true,
         Predicate::Eq(key, val) => store.vertex_prop(vid, key).as_ref() == Some(val),
@@ -520,7 +519,7 @@ fn compute_aggregate(
     agg_op: &AggOp,
     expr: &Expr,
     records: &[Record],
-    store: &MutableCsrStore,
+    store: &impl GraphStore,
 ) -> PropValue {
     match agg_op {
         AggOp::Count => PropValue::Int(records.len() as i64),
