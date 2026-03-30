@@ -108,6 +108,10 @@ pub struct TieredGraphEngine {
     cache: Arc<Mutex<QueryCache>>,
     hot_initialized: Arc<AtomicBool>,
     cold_starting: Arc<AtomicBool>,
+    /// Cached manifest for demand-paged label loading (LanceDB pattern).
+    /// Loaded once on first query, then ensure_labels() fetches individual labels on-demand.
+    /// Multi-node: each node loads manifest independently from R2 (shared source of truth).
+    manifest_cache: Arc<Mutex<Option<crate::compaction::CompactionManifest>>>,
     loaded_labels: Arc<Mutex<HashSet<String>>>,
     blob_cache: Arc<dyn BlobCache>,
     s3_client: Arc<Mutex<Option<Arc<yata_s3::s3::S3Client>>>>,
@@ -207,6 +211,7 @@ impl TieredGraphEngine {
             cache: Arc::new(Mutex::new(cache)),
             hot_initialized: Arc::new(AtomicBool::new(false)),
             cold_starting: Arc::new(AtomicBool::new(false)),
+            manifest_cache: Arc::new(Mutex::new(None)),
             loaded_labels: Arc::new(Mutex::new(HashSet::new())),
             blob_cache,
             s3_client,
@@ -324,26 +329,32 @@ impl TieredGraphEngine {
     /// If `labels` is empty, loads ALL labels (mutation path fallback).
     /// If `labels` is non-empty AND hot_initialized, enriches only needed labels on-demand
     /// via enrich_label_from_r2 (zero-copy for already-loaded labels).
+    /// LanceDB-style demand-paged label loading. Multi-node: each node loads independently.
+    ///
+    /// Phase 1 (manifest-only cold start): Download manifest from R2, set hot_initialized.
+    /// Phase 2 (per-label demand page-in): Fetch only needed labels from R2 on each query.
+    ///
+    /// Multi-node safe: R2 = shared source of truth. Each node's loaded_labels is independent.
+    /// No cross-node coordination needed — each node builds its own in-memory CSR subset.
     fn ensure_labels(&self, vertex_labels: &[&str]) {
+        // Phase 1: Manifest-only cold start (one thread, ~50ms)
         if !self.hot_initialized.load(Ordering::SeqCst) {
-            // Prevent concurrent cold starts (399MB R2 download × N threads = OOM).
-            // Only one thread does the cold start; others spin-wait until done.
             if self.cold_starting.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                let _ = self.wal_cold_start();
+                let _ = self.wal_cold_start_manifest_only();
                 self.cold_starting.store(false, Ordering::SeqCst);
             } else {
-                // Another thread is doing cold start — spin-wait with backoff
-                let mut wait_ms = 10;
-                for _ in 0..200 {
+                // Spin-wait for manifest load only (fast, ~50ms not ~30s)
+                let mut wait_ms = 5;
+                for _ in 0..100 {
                     if self.hot_initialized.load(Ordering::SeqCst) { break; }
                     std::thread::sleep(std::time::Duration::from_millis(wait_ms));
-                    wait_ms = (wait_ms * 2).min(500);
+                    wait_ms = (wait_ms * 2).min(200);
                 }
             }
-            return;
+            // Fall through to Phase 2 (demand page-in)
         }
 
-        // Hot path: enrich only labels not yet loaded
+        // Phase 2: Demand page-in — fetch only needed labels
         if vertex_labels.is_empty() { return; }
         let needed: Vec<String> = {
             let loaded = match self.loaded_labels.lock() {
@@ -358,12 +369,41 @@ impl TieredGraphEngine {
         };
         if needed.is_empty() { return; }
 
+        // Fetch from manifest cache (populated in Phase 1)
+        let manifest = match self.manifest_cache.lock() {
+            Ok(mc) => mc.clone(),
+            Err(_) => None,
+        };
+
+        if let Some(ref manifest) = manifest {
+            if manifest.version >= 2 && !manifest.label_segments.is_empty() {
+                // v2: per-label demand page-in from R2
+                let s3 = match self.get_s3_client() {
+                    Some(s3) => s3.clone(),
+                    None => return,
+                };
+                let vineyard_dir = std::env::var("YATA_VINEYARD_DIR").ok();
+                let pid = self.config.hot_partition_id.get();
+                for label in &needed {
+                    if let Some(state) = manifest.label_segments.get(label.as_str()) {
+                        let loaded = self.load_label_segment(&s3, state, label, &vineyard_dir, pid);
+                        if loaded {
+                            if let Ok(mut ll) = self.loaded_labels.lock() {
+                                ll.insert(label.clone());
+                            }
+                            tracing::info!(label, entries = state.entry_count, "demand page-in: label loaded from R2");
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
+        // Fallback: legacy YataFragment path (for labels not in manifest)
         let s3 = match self.get_s3_client() {
             Some(s3) => s3.clone(),
             None => return,
         };
-
-        // Fetch meta + schema from R2 (3-tier: disk cache → R2)
         let meta = match crate::loader::fetch_fragment_meta(&s3, &self.s3_prefix) {
             Ok(m) => m,
             Err(e) => { tracing::warn!(error = %e, "ensure_labels: meta fetch failed"); return; }
@@ -378,8 +418,6 @@ impl TieredGraphEngine {
             Ok(s) => s,
             Err(e) => { tracing::warn!(error = %e, "ensure_labels: schema parse failed"); return; }
         };
-
-        // Enrich each needed label via existing enrich_label_from_r2 (per-label R2 GET)
         for label in &needed {
             let mut enriched = false;
             if let Ok(mut hot) = self.hot.write() {
@@ -390,10 +428,9 @@ impl TieredGraphEngine {
                         Ok(()) => {
                             single.commit();
                             enriched = true;
-                            tracing::debug!(label, "enriched label from R2 (on-demand)");
                         }
                         Err(e) => {
-                            tracing::warn!(label, error = %e, "label enrichment failed, will retry on next query");
+                            tracing::warn!(label, error = %e, "label enrichment failed");
                         }
                     }
                 }
@@ -1476,8 +1513,138 @@ impl TieredGraphEngine {
         })
     }
 
+    /// LanceDB-style manifest-only cold start. Downloads manifest + WAL tail only.
+    /// Sets hot_initialized = true immediately — labels are loaded on-demand by ensure_labels().
+    /// Multi-node safe: each node loads manifest independently, builds its own label subset.
+    fn wal_cold_start_manifest_only(&self) -> Result<u64, String> {
+        let s3 = self.get_s3_client()
+            .ok_or_else(|| "S3 client not configured".to_string())?;
+        let prefix = &self.s3_prefix;
+        let pid = self.config.hot_partition_id.get();
+
+        let checkpoint_seq = match crate::compaction::find_latest_manifest(&s3, prefix, pid) {
+            Some((manifest_ver, data)) => {
+                match serde_json::from_slice::<crate::compaction::CompactionManifest>(&data) {
+                    Ok(manifest) => {
+                        let seq = manifest.compacted_seq;
+                        let labels = manifest.label_segments.len();
+                        tracing::info!(
+                            manifest_ver, compacted_seq = seq, labels,
+                            entries = manifest.entry_count,
+                            "manifest-only cold start: loaded (demand page-in enabled)"
+                        );
+                        // Cache manifest for demand page-in in ensure_labels()
+                        if let Ok(mut mc) = self.manifest_cache.lock() {
+                            *mc = Some(manifest);
+                        }
+                        seq
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "manifest parse failed, starting empty");
+                        0
+                    }
+                }
+            }
+            None => {
+                tracing::info!("no manifest found (new database)");
+                0
+            }
+        };
+
+        // Replay WAL tail (entries after compacted_seq)
+        let head_key = format!("{prefix}wal/meta/{pid}/head.json");
+        let segment_keys: Vec<String> = match s3.get_sync(&head_key) {
+            Ok(Some(data)) => serde_json::from_slice::<serde_json::Value>(&data)
+                .ok()
+                .and_then(|v| v.get("segments").cloned())
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let mut tail_applied = 0u64;
+        for seg_key in &segment_keys {
+            let seq_end = seg_key.rsplit('/').next()
+                .and_then(|f| f.split('-').nth(1))
+                .and_then(|s| s.strip_suffix(".arrow").or_else(|| s.strip_suffix(".ndjson")))
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            if seq_end <= checkpoint_seq { continue; }
+            if let Ok(Some(data)) = s3.get_sync(seg_key) {
+                let entries = crate::arrow_wal::deserialize_segment_auto(seg_key, &data);
+                let filtered: Vec<_> = entries.into_iter().filter(|e| e.seq > checkpoint_seq).collect();
+                if !filtered.is_empty() {
+                    let _ = self.wal_apply(&filtered);
+                    tail_applied += filtered.len() as u64;
+                }
+            }
+        }
+        if tail_applied > 0 {
+            tracing::info!(tail_applied, "WAL tail replay complete");
+        }
+
+        // Set hot_initialized IMMEDIATELY — labels load on-demand
+        self.hot_initialized.store(true, Ordering::SeqCst);
+        Ok(checkpoint_seq)
+    }
+
+    /// Load a single label segment from R2 (demand page-in).
+    /// Used by ensure_labels() for on-demand label loading.
+    /// Multi-node safe: each node fetches independently from R2.
+    fn load_label_segment(
+        &self,
+        s3: &yata_s3::s3::S3Client,
+        state: &crate::compaction::LabelSegmentState,
+        label: &str,
+        vineyard_dir: &Option<String>,
+        pid: u32,
+    ) -> bool {
+        // 1. Try disk cache first (mmap, ~100µs)
+        let disk_path = vineyard_dir.as_ref()
+            .map(|d| format!("{d}/log/compacted/{pid}/label/{label}.arrow"));
+        if let Some(ref path) = disk_path {
+            if std::path::Path::new(path).exists() {
+                if let Ok(store) = yata_store::ArrowWalStore::from_file(std::path::Path::new(path)) {
+                    tracing::debug!(label, path, "demand page-in: mmap from disk cache");
+                    return self.apply_arrow_wal_store(&store).is_ok();
+                }
+            }
+        }
+
+        // 2. R2 GET (full segment for small, range GET consideration for large)
+        match s3.get_sync(&state.key) {
+            Ok(Some(data)) => {
+                // Blake3 verify
+                if let Err(e) = crate::compaction::verify_blake3(&data, &state.blake3_hex, label) {
+                    tracing::error!(label, error = %e, "demand page-in: checksum failed, skipping");
+                    return false;
+                }
+                let entries = crate::arrow_wal::deserialize_segment_auto(&state.key, &data);
+                if entries.is_empty() { return false; }
+                let ok = self.wal_apply(&entries).is_ok();
+                // Write-through disk cache
+                if ok {
+                    if let Some(ref path) = disk_path {
+                        if let Some(parent) = std::path::Path::new(path).parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = std::fs::write(path, &data);
+                    }
+                }
+                ok
+            }
+            Ok(None) => {
+                tracing::warn!(label, key = %state.key, "demand page-in: segment not found in R2");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(label, error = %e, "demand page-in: R2 fetch failed");
+                false
+            }
+        }
+    }
+
     /// Cold start: L1 compacted segment (mmap disk → R2 GET) + WAL tail replay.
-    /// Legacy ArrowFragment path removed. Triggered by ensure_labels on first query.
+    /// Legacy full-preload path. Kept for backward compat — new code uses wal_cold_start_manifest_only().
     pub fn wal_cold_start(&self) -> Result<u64, String> {
         let s3 = self.get_s3_client()
             .ok_or_else(|| "S3 client not configured".to_string())?;

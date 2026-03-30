@@ -1,6 +1,17 @@
 # packages/rust/yata
 
-yata — Rust Cypher graph engine. `[PRODUCTION]` Container (CSR → **Sorted COO 移行中**) × 1 partition. Workers RPC coordinator. GraphScope parity 21/25 (14 PRODUCTION + 7 IMPLEMENTED)。GIE push-based + Design E SecurityScope (policy vertex lookup, parameter-based RLS 除去済み) + label-selective page-in + edge property lookup + edge tombstone deletion + **per-label delta compaction** (dirty labels only, clean labels = zero R2 I/O) + adaptive √N fan-out + CpmStats observability + cypherBatch + delta-apply mutation (CP5)。**Target: Sorted COO** — CSR rebuild 排除、mutable snapshot 排除、granular page-in。設計: `docs/260329-yata-coo-sorted-design.md`
+yata — Rust Cypher graph engine. `[PRODUCTION]` Container × N partition (**multi-container/multi-node 前提 CRITICAL**)。Workers RPC coordinator。GraphScope parity 21/25 (14 PRODUCTION + 7 IMPLEMENTED)。GIE push-based + Design E SecurityScope + **LanceDB-style demand-paged cold start** (manifest-only → per-label on-demand page-in, cold start 2.2s) + per-label delta compaction (dirty labels only) + adaptive √N fan-out + CpmStats + cypherBatch + **immutable versioned manifest** (`manifest-{inverted:020}.json`) + **Range GET** (`get_range_sync`) + **concurrent cold start guard** (`cold_starting` AtomicBool)。設計: `docs/260329-yata-coo-sorted-design.md`
+
+## CRITICAL: Multi-Container/Multi-Node 前提 (MUST)
+
+**yata は常に multi-container/multi-node を前提とする。** Single-node 最適化は禁止。
+
+- **R2 = shared source of truth**: 全ノードが同一 R2 bucket/prefix から manifest + segments を独立に読む
+- **各ノードの in-memory state は独立**: `loaded_labels`, `hot_initialized`, CSR は per-node。cross-node state sharing なし
+- **Demand-paged cold start**: manifest のみ load → `hot_initialized = true` → label は query 時に on-demand page-in (LanceDB pattern)。各ノードが必要な label のみ fetch
+- **Immutable manifest versioning**: `manifest-{inverted:020}.json` で O(1) latest lookup。古い manifest は point-in-time recovery 用に保持
+- **Coordinator (YataRPC)**: label-based routing で `hash(label) % N` → partition。Write/Read split。Read replica × M
+- **禁止**: node 間 state 依存、single-node 前提の設計、manifest に node-specific 情報を書く
 
 ## Architecture (CRITICAL)
 
@@ -105,9 +116,9 @@ env.YATA.stats()                        // → all partition CpmStats (K3a)
 
 `gftd symbol-graph --package yata` で component status を確認。985+ unit tests (+ e2e)。
 
-## R2 Persistence `[PRODUCTION]` (verified 2026-03-29: 964v, 33 labels, 1.58 MB, full properties)
+## R2 Persistence `[PRODUCTION]` (verified 2026-03-30: 65K entries, 13 labels, 47 MB per-label segments)
 
-R2 = source of truth。**Per-label sorted COO segments**: `log/coo/{pid}/label/{label}/{range}.arrow` (Arrow IPC, sorted by (label, src, dst))。**Append-only write**: mergeRecord は page-in 不要 (L0 buffer append + WAL ring append + `dirty_labels.insert(label)`)。PK dedup は LSM compaction 時。**Dirty tracking**: `drain_dirty_labels()` で dirty set を取得し compaction 後にクリア。dirty empty = zero R2 I/O (skip)。**LSM Compaction `[DESIGN]`**: L0 (unsorted append buffer) + L1 (existing sorted segments) → merge-sort → PK-dedup → per-label R2 PUT。Clean labels は untouched。CompactionManifest v2 (`label_segments: HashMap<String, LabelSegmentState>`)。**Blake3 checksum `[PRODUCTION]`**: `LabelSegmentState.blake3_hex` に segment hash 記録。cold start 時 `verify_blake3()` で検証、mismatch → skip + error log。**Two-phase PUT `[PRODUCTION]`**: Phase 1: per-label segment upload (失敗 label はスキップ)。Phase 2: 成功 label のみから manifest 構築 → PUT。**Segment-level page-in**: `fetch_blob_cached()` — disk cache → R2 GET → write-through。Cold start: per-label sorted segments mmap (~100µs/segment) → R2 GET fallback → Blake3 verify → sparse index build。**No snapshot serialize** — sorted segments ARE the persistent format (commit() rebuild 排除)。
+R2 = source of truth。**Per-label compacted segments**: `log/compacted/{pid}/label/{label}.arrow` (Arrow IPC)。**Append-only write**: mergeRecord は page-in 不要 (L0 buffer append + WAL ring append + `dirty_labels.insert(label)`)。PK dedup は LSM compaction 時。**Dirty tracking**: `drain_dirty_labels()` で dirty set を取得し compaction 後にクリア。dirty empty = zero R2 I/O (skip)。**LSM Compaction `[PRODUCTION]`**: L0 (unsorted append buffer) + L1 (existing sorted segments) → merge-sort → PK-dedup → per-label R2 PUT。Clean labels は untouched。CompactionManifest v2 (`label_segments: HashMap<String, LabelSegmentState>`)。**Blake3 checksum `[PRODUCTION]`**: `LabelSegmentState.blake3_hex` に segment hash 記録。cold start 時 `verify_blake3()` で検証、mismatch → skip + error log。**Two-phase PUT `[PRODUCTION]`**: Phase 1: per-label segment upload (失敗 label はスキップ)。Phase 2: 成功 label のみから manifest 構築 → legacy `manifest.json` + versioned `manifest-{inverted:020}.json` PUT。**Immutable Manifest Versioning (LanceDB pattern)**: `manifest-{u64::MAX - version:020}.json` — inverted naming で S3 ListObjects が O(1) 最新取得。`find_latest_manifest()` が versioned → legacy fallback。**Segment-level page-in**: `fetch_blob_cached()` — disk cache → R2 GET → write-through。**Range GET `[IMPLEMENTED]`**: `get_range_sync(key, offset, length)` で byte-range R2 GET (SigV4 signed)。Cold start: per-label sorted segments mmap (~100µs/segment) → R2 GET fallback → Blake3 verify → sparse index build。**Concurrent cold start guard**: `cold_starting` AtomicBool で CAS — 1 thread のみ cold start 実行、他は spin-wait (399MB monolithic segment × N threads = OOM 防止)。**No snapshot serialize** — sorted segments ARE the persistent format (commit() rebuild 排除)。
 
 ## Concurrency Model (CRITICAL)
 
@@ -142,12 +153,12 @@ R2 = source of truth。**Per-label sorted COO segments**: `log/coo/{pid}/label/{
 | **Pipeline WAL** | R2 JSON (`pipeline/wal/`) | `Pipeline.send()` 10s flush | source of truth (durable) |
 | **yata WAL segments** | Arrow IPC (`wal/segments/{pid}/`) | cron 10s `walFlushSegment` | Cold start replay |
 | **L0 buffer** | in-memory unsorted COO tuples | mergeRecord append | instant write, pending compaction |
-| **L1 sorted COO segments** | Arrow IPC (`log/coo/{pid}/label/{label}/{range}.arrow`) | LSM compaction (dirty labels only) | query + persistence (PK-dedup, P=1.0) |
-| **CompactionManifest v2** | JSON (`log/coo/{pid}/manifest.json`) | `trigger_compaction` | Per-label state tracking |
+| **L1 compacted segments** | Arrow IPC (`log/compacted/{pid}/label/{label}.arrow`) | LSM compaction (dirty labels only) | query + persistence (PK-dedup, P=1.0) |
+| **CompactionManifest v2** | JSON (`log/compacted/{pid}/manifest.json` + versioned `manifest-{inverted:020}.json`) | `trigger_compaction` | Per-label state tracking + immutable version chain |
 
 **`trigger_compaction()` = `wal_flush_segment` + `drain_dirty_labels` + per-label LSM merge-sort。** L0 + existing L1 → merge-sort by (label, src, dst) → PK-dedup → R2 PUT。Clean labels = zero R2 I/O。**No commit() rebuild** — compaction 出力がそのまま query 用 sorted segments。
 
-**Cold start**: `ensure_labels` → `hot_initialized == false` → `cold_start()` 自動実行。Per-label sorted COO segments mmap (~100µs/segment) → R2 GET fallback → sparse index build。WAL tail replay → L0 buffer に append。Read replica は初 query で自動 cold start。
+**Cold start (LanceDB-style demand-paged)**: `ensure_labels` → `hot_initialized == false` → `wal_cold_start_manifest_only()` (manifest + WAL tail のみ, ~50ms) → `hot_initialized = true` **即座**。Per-label segment は query 時に on-demand page-in (`load_label_segment`: disk cache ~100µs → R2 GET ~4ms → Blake3 verify → write-through)。Multi-node: 各ノードが独立に manifest load + label page-in。Cold start 2.2s (manifest + first label) vs 旧 30s (全 label preload)。
 
 ## Arrow IPC WAL + LSM Compaction `[PRODUCTION]` (verified 2026-03-29)
 
@@ -155,9 +166,9 @@ R2 = source of truth。**Per-label sorted COO segments**: `log/coo/{pid}/label/{
 
 - **WAL format**: Arrow IPC File (default `YATA_WAL_FORMAT=arrow`)。`WalEntry.props` = `Vec<(String, PropValue)>` (typed, zero JSON overhead)。custom serde で flat JSON map backward compat
 - **Segment registry**: `head.json` の `segments` array に全 segment key を記録。R2 ListObjectsV2 不使用
-- **LSM Compaction (two-phase PUT)**: `trigger_compaction()` が `drain_dirty_labels()` → dirty labels のみ L0 + L1 merge-sort → PK-dedup。Phase 1: per-label sorted segment upload (Blake3 checksum、失敗 label はスキップ)。Phase 2: 成功 label のみから manifest v2 構築 → PUT。R2 key: `log/coo/{pid}/label/{label}/{range}.arrow` + `log/coo/{pid}/manifest.json`。Clean labels = zero R2 I/O。**No CSR rebuild — compaction 出力 = query 用 sorted segments**
+- **LSM Compaction (two-phase PUT)**: `trigger_compaction()` が `drain_dirty_labels()` → dirty labels のみ L0 + L1 merge-sort → PK-dedup。Phase 1: per-label sorted segment upload (Blake3 checksum、失敗 label はスキップ)。Phase 2: 成功 label のみから manifest v2 構築 → legacy `manifest.json` + versioned `manifest-{inverted:020}.json` PUT。R2 key: `log/compacted/{pid}/label/{label}.arrow` + `log/compacted/{pid}/manifest.json`。Clean labels = zero R2 I/O。**No CSR rebuild — compaction 出力 = query 用 sorted segments**
 - **Blake3 checksum**: `LabelSegmentState.blake3_hex`。Cold start 時 R2 GET → verify → mismatch で corrupt segment スキップ (panic なし)
-- **Cold start**: per-label sorted COO segments (disk cache mmap ~100µs/segment → R2 GET fallback → Blake3 verify) → sparse index build → WAL tail replay → L0 buffer。Read replica は初 query で自動 cold start
+- **Cold start**: `find_latest_manifest()` (versioned → legacy fallback) → per-label compacted segments (disk cache mmap ~100µs/segment → R2 GET fallback → Blake3 verify) → sparse index build → WAL tail replay → L0 buffer。**`cold_starting` AtomicBool CAS** で concurrent cold start 防止 (1 thread のみ実行、他は spin-wait)。Read replica は初 query で自動 cold start
 - **WAL flush safety**: pattern match 安全 early return。空 entries でパニックしない
 - **Replica transport**: `/xrpc/ai.gftd.yata.walTailArrow` (Arrow IPC body) + `/xrpc/ai.gftd.yata.walApplyArrow`
 - **Migration CLI**: `gftd yata migrate --from csr --to coo` (CSR→COO forward) / `--from coo --to csr` (rollback)
@@ -176,7 +187,7 @@ R2 = source of truth。**Per-label sorted COO segments**: `log/coo/{pid}/label/{
 | Traversal | O(1) + O(degree) CSR direct | O(log 256) + O(degree) sparse index |
 | Recovery | P=1.0 (compacted + tail) | P=1.0 (sorted segments + tail) |
 
-**禁止**: CSR offsets rebuild の新規導入。mutable snapshot (commit() → serialize → R2 PUT)。PDS `cyCached` に edge cache 再導入。monolithic compacted segment。time-based cron compaction (size-based のみ)
+**禁止**: CSR offsets rebuild の新規導入。mutable snapshot (commit() → serialize → R2 PUT)。PDS `cyCached` に edge cache 再導入。**v1 monolithic compacted segment の新規作成** (v2 per-label のみ)。time-based cron compaction (size-based のみ)。**cold start での full segment GET without `cold_starting` guard** (concurrent cold start = OOM)
 
 ## CRITICAL: 3 概念は直交 — partition ≠ label ≠ security
 
@@ -211,7 +222,7 @@ Production: PARTITION_COUNT=1, per-label sorted COO Arrow IPC, segment-level pag
 
 ## Test Coverage
 
-1,060 Rust unit tests + 68 e2e, 0 failures. E2E: 8 tests (docker-compose + MinIO, 2-partition). 6-node distributed: 6 tests (10K records, label routing, cold put/pull). Phase 3 load test: 8 tests (chunk snapshot, 2-hop traversal, label-selective reads, mixed load). WAL cold start recovery: 14 tests (flush safety, apply roundtrip, PK dedup, Arrow serialize, dirty-only compaction, Blake3 checksum roundtrip+tamper, gap detection 5 scenarios, empty buffer, dirty_labels drain, v1/v2 manifest backward compat). YataFragment snapshot roundtrip verified. R2 persistence verified (2026-03-29): 964 vertices, 33 labels, 1.58 MB snapshot, full property columns (rkey/collection/repo/value_b64/owner_hash/updated_at/_app_id/_org_id).
+1,068+ Rust unit tests (yata-s3: 48, yata-engine: 220, others) + 68 e2e, 0 failures. E2E: 8 tests (docker-compose + MinIO, 2-partition). 6-node distributed: 6 tests (10K records, label routing, cold put/pull). Phase 3 load test: 8 tests (chunk snapshot, 2-hop traversal, label-selective reads, mixed load). WAL cold start recovery: 14 tests (flush safety, apply roundtrip, PK dedup, Arrow serialize, dirty-only compaction, Blake3 checksum roundtrip+tamper, gap detection 5 scenarios, empty buffer, dirty_labels drain, v1/v2 manifest backward compat). YataFragment snapshot roundtrip verified. R2 persistence verified (2026-03-29): 964 vertices, 33 labels, 1.58 MB snapshot, full property columns (rkey/collection/repo/value_b64/owner_hash/updated_at/_app_id/_org_id).
 
 ## Benchmark (measured, release build)
 
@@ -285,6 +296,33 @@ bench: `cargo run -p yata-bench --bin coo-read-bench --release`
 | searchActors (warm, 20x avg) | **424ms** | PDS → YataRPC → Container → Cypher |
 | getTimeline (2-hop) | **271ms** | Graph traversal through PDS |
 | listRecords (label-specific) | **371ms** | Label-selective page-in path |
+
+**v4 Performance Test (2026-03-30, `gftd performance-test`, 3 VUs, 5s/endpoint, v2 per-label segments):**
+
+| Endpoint | p50 | Grade | Notes |
+|---|---|---|---|
+| Health | **13.3ms** | S | — |
+| SearchPosts | **13.7ms** | S | v2 per-label page-in |
+| GetProfile | **13.5ms** | S | v2 per-label page-in |
+| SearchActors | **13.5ms** | S | v2 per-label page-in |
+| GetSuggestions | **13.4ms** | S | v2 per-label page-in |
+| GetFollowers | **13.2ms** | S | v2 per-label page-in |
+| GetFollows | **13.4ms** | S | v2 per-label page-in |
+| ListNotifications | **13.2ms** | S | v2 per-label page-in |
+| GetUnreadCount | **13.6ms** | S | v2 per-label page-in |
+| GetAuthorFeed | **1560ms** | D | Container round-trip |
+| GetPostThread | **1042ms** | D | Container round-trip |
+| ListRecords | **879ms** | D | Container round-trip |
+| GetTimeline | **15s** | F | Cold start timing |
+| GetDiscoverFeed | **10.5s** | F | Cold start timing |
+
+**Overall: grade=C, p50=13.5ms, 9/14 S-grade。** v3→v4 改善: v1 monolithic 399MB → v2 per-label 47MB migration。S-grade 2→9 endpoints。v1 cold start 20-30s → v2 cold start 8-13s。
+
+**LanceDB-inspired improvements (2026-03-30):**
+- **Range GET**: `yata-s3` に `get_range_sync(key, offset, length)` 追加 (HTTP Range header, SigV4 signed)
+- **Immutable manifest versioning**: `manifest-{u64::MAX-version:020}.json` (inverted naming, O(1) latest lookup via ListObjects)。`find_latest_manifest()` で versioned → legacy fallback
+- **Concurrent cold start guard**: `cold_starting` AtomicBool CAS (1 thread 排他実行)
+- **v1→v2 migration**: 399MB monolithic → 13 per-label segments (47MB total)
 
 **Trillion scale projection:**
 | Scale | Partitions | Write/sec | Point QPS | Scan QPS | Cost/月 |
