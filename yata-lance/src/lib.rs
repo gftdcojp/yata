@@ -4,6 +4,7 @@
 //! LanceDB handles versioning, manifest, fragments, compaction, and S3/R2 internally.
 //! Schema definitions and graph materialization (read_store) remain yata-specific.
 
+pub mod compat;
 pub mod dataset;
 pub mod read_store;
 pub mod schema;
@@ -23,6 +24,9 @@ pub use schema::{
     vertex_live_schema,
     vertex_log_schema,
 };
+
+// Backward-compat aliases for yata-engine migration
+pub use compat::{YataDataset, YataVectorStore, UreqObjectStore};
 
 // Re-export lancedb for downstream crates
 pub use lancedb;

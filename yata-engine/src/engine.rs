@@ -211,32 +211,31 @@ impl TieredGraphEngine {
                 return Some(client.clone());
             }
         }
-        // Try to build via object_store → S3Client
-        let store = self.get_object_store()?;
-        let client = store.client().clone();
+        let client = Self::try_build_s3_client()?;
         if let Ok(mut guard) = self.s3_client.lock() {
             *guard = Some(client.clone());
         }
         Some(client)
     }
 
-    /// Get or lazily initialize the UreqObjectStore. Returns None if not configured.
-    pub fn get_object_store(&self) -> Option<Arc<yata_lance::UreqObjectStore>> {
-        if let Ok(guard) = self.object_store.lock() {
-            if let Some(ref store) = *guard {
-                return Some(store.clone());
-            }
+    fn try_build_s3_client() -> Option<Arc<yata_s3::s3::S3Client>> {
+        let endpoint = std::env::var("YATA_S3_ENDPOINT").ok()?;
+        let bucket = std::env::var("YATA_S3_BUCKET").unwrap_or_default();
+        let key_id = std::env::var("YATA_S3_ACCESS_KEY_ID")
+            .or_else(|_| std::env::var("YATA_S3_KEY_ID"))
+            .unwrap_or_default();
+        let secret = std::env::var("YATA_S3_SECRET_ACCESS_KEY")
+            .or_else(|_| std::env::var("YATA_S3_SECRET_KEY"))
+            .or_else(|_| std::env::var("YATA_S3_APPLICATION_KEY"))
+            .unwrap_or_default();
+        let region = std::env::var("YATA_S3_REGION").unwrap_or_else(|_| "auto".to_string());
+        if endpoint.is_empty() || bucket.is_empty() || key_id.is_empty() || secret.is_empty() {
+            return None;
         }
-        let store = Arc::new(yata_lance::UreqObjectStore::from_env()?);
-        if let Ok(mut guard) = self.object_store.lock() {
-            tracing::info!("UreqObjectStore initialized for Lance persistence");
-            *guard = Some(store.clone());
-        }
-        // Also populate s3_client from the same underlying client
-        if let Ok(mut guard) = self.s3_client.lock() {
-            *guard = Some(store.client().clone());
-        }
-        Some(store)
+        tracing::info!(%endpoint, %bucket, "S3/R2 client configured");
+        Some(Arc::new(yata_s3::s3::S3Client::new(
+            &endpoint, &bucket, &key_id, &secret, &region,
+        )))
     }
 
     /// Ensure HOT tier is initialized.
@@ -1028,8 +1027,6 @@ impl TieredGraphEngine {
         let prefix = &self.s3_prefix;
         let pid = self.config.hot_partition_id.get();
         let lance_uri = format!("{}lance/vertices/{}", prefix, pid);
-        let object_store = self.get_object_store();
-
         let lance_ok = ENGINE_RT.block_on(async {
             let mut ds_guard = lance_ds.lock().await;
             if let Some(ref mut ds) = *ds_guard {
@@ -1041,23 +1038,17 @@ impl TieredGraphEngine {
                     }
                 }
             } else {
-                // Create new Dataset — use R2 store if available
-                let result = if let Some(ref store) = object_store {
-                    let base_url = url::Url::parse(&format!("r2://{}", lance_uri.trim_start_matches('/')))
-                        .unwrap_or_else(|_| url::Url::parse("r2://yata").unwrap());
-                    yata_lance::YataDataset::create_with_store(
-                        &lance_uri,
-                        vec![batch.clone()],
-                        schema.clone(),
-                        store.clone() as std::sync::Arc<dyn object_store::ObjectStore>,
-                        base_url,
-                    ).await
-                } else {
-                    yata_lance::YataDataset::create(&lance_uri, vec![batch.clone()], schema.clone()).await
+                // Create new Dataset — try S3/R2 env first, fallback to local
+                let result = match yata_lance::YataDataset::create_with_store(
+                    &lance_uri, vec![batch.clone()], schema.clone(), prefix,
+                ).await {
+                    Ok(ds) => Ok(ds),
+                    Err(_) => yata_lance::YataDataset::create(&lance_uri, vec![batch.clone()], schema.clone()).await,
                 };
                 match result {
                     Ok(ds) => {
-                        tracing::info!(version = ds.version(), "Lance Dataset created from WAL flush");
+                        let v = ds.version().await;
+                        tracing::info!(version = v, "Lance Dataset created from WAL flush");
                         *ds_guard = Some(ds);
                         true
                     }
@@ -1187,8 +1178,6 @@ impl TieredGraphEngine {
     pub fn migrate_to_lance(&self) -> Result<MigrateToLanceResult, String> {
         let s3 = self.get_s3_client()
             .ok_or_else(|| "S3 client not configured".to_string())?;
-        let object_store = self.get_object_store()
-            .ok_or_else(|| "UreqObjectStore not configured".to_string())?;
         let prefix = &self.s3_prefix;
         let pid = self.config.hot_partition_id.get();
 
@@ -1323,26 +1312,19 @@ impl TieredGraphEngine {
         // Open Lance Dataset from R2 via UreqObjectStore
         let lance_uri = format!("{}lance/vertices/{}", prefix, pid);
         let lance_ds = self.lance_dataset.clone();
-        let object_store = self.get_object_store();
+        let prefix_owned = prefix.to_string();
+        let lance_uri_owned = lance_uri.clone();
         let checkpoint_seq = ENGINE_RT.block_on(async {
-            let result = if let Some(ref store) = object_store {
-                // R2-backed: pass UreqObjectStore to Lance
-                let base_url = url::Url::parse(&format!("r2://{}", lance_uri.trim_start_matches('/')))
-                    .unwrap_or_else(|_| url::Url::parse("r2://yata").unwrap());
-                yata_lance::YataDataset::open_with_store(
-                    &lance_uri,
-                    store.clone() as std::sync::Arc<dyn object_store::ObjectStore>,
-                    base_url,
-                ).await
-            } else {
-                // Local fallback (no R2 configured)
-                yata_lance::YataDataset::open(&lance_uri).await
+            // Try S3/R2 first, fallback to local
+            let result = match yata_lance::YataDataset::open_from_env(&prefix_owned).await {
+                Some(ds) => Ok(ds),
+                None => yata_lance::YataDataset::open(&lance_uri_owned).await,
             };
             match result {
                 Ok(ds) => {
-                    let version = ds.version();
+                    let version = ds.version().await;
                     let rows = ds.count_rows(None).await.unwrap_or(0);
-                    tracing::info!(version, rows, "Lance cold start: Dataset opened from R2");
+                    tracing::info!(version, rows, "Lance cold start: Dataset opened");
                     let mut guard = lance_ds.lock().await;
                     *guard = Some(ds);
                     version
