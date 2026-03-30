@@ -104,7 +104,6 @@ env.YATA.stats()                        // → all partition CpmStats (K3a)
 |---|---|
 | `yata-core` | GlobalVid, LocalVid, PartitionId |
 | `yata-grin` | GRIN trait (Topology, Property, Schema, Scannable, Mutable) |
-| `yata-format` | **YataFragment format** (snapshot format, test/migration utility)。NbrUnit zero-copy (CSR legacy, Phase 3 removal candidate)。**Arrow row-group chunk**: `split_record_batch` + byte-based chunking (32 MB default)。PropertyGraphSchema (typed vertex/edge labels + Arrow property columns)。**COO segment format**: sorted (label, src, dst) Arrow IPC segments |
 | `yata-store` | **CooStore** (sorted COO, L0 append buffer + L1 sorted segments, sparse index), MutableCsrStore (legacy CSR, Phase 3 removal), DiskBlobCache/MmapBlobCache/MemoryBlobCache (BlobCache trait impls), PartitionStoreSet, GraphStoreEnum |
 | `yata-engine` | TieredGraphEngine, CpmStats (K3a), **Lance compaction** (`compaction.rs`: L0 + existing Lance fragments merge-sort, PK-dedup, dirty_labels drain → Lance fragment R2 PUT + `TableManifest` R2 PUT), **Arrow IPC WAL** (`arrow_wal.rs`: serialize/deserialize/auto-detect, default format), **Lance cold start** (`lance_manifest_cache` → `ensure_labels()` fragment demand page-in, **`cold_starting` AtomicBool** concurrent guard), `loader.rs` (CSR rebuild helpers のみ, legacy page-in 除去済み), Frontier BFS, ShardedCoordinator, WAL Projection (ring buffer + segment flush)。Design E SecurityScope (`query_with_did` → policy vertex lookup) |
 | `yata-cypher` | Full Cypher parser + executor (incl. untyped edge traversal) |
@@ -256,7 +255,7 @@ Production: PARTITION_COUNT=1, per-label sorted COO Arrow IPC, segment-level pag
 
 ## Test Coverage
 
-1,068+ Rust unit tests (yata-s3: 48, yata-engine: 220, others) + 68 e2e, 0 failures. E2E: 8 tests (docker-compose + MinIO, 2-partition). 6-node distributed: 6 tests (10K records, label routing, cold put/pull). Phase 3 load test: 8 tests (chunk snapshot, 2-hop traversal, label-selective reads, mixed load). WAL cold start recovery: 14 tests (flush safety, apply roundtrip, PK dedup, Arrow serialize, dirty-only compaction, Blake3 checksum roundtrip+tamper, gap detection 5 scenarios, empty buffer, dirty_labels drain, v1/v2 manifest backward compat). YataFragment snapshot roundtrip verified. R2 persistence verified (2026-03-29): 964 vertices, 33 labels, 1.58 MB snapshot, full property columns (rkey/collection/repo/value_b64/owner_hash/updated_at/_app_id/_org_id).
+1,068+ Rust unit tests (yata-s3: 48, yata-engine: 220, others) + 68 e2e, 0 failures. E2E: 8 tests (docker-compose + MinIO, 2-partition). 6-node distributed: 6 tests (10K records, label routing, cold put/pull). Phase 3 load test: 8 tests. WAL cold start recovery: 14 tests (flush safety, apply roundtrip, PK dedup, Arrow serialize, dirty-only compaction, Blake3 checksum roundtrip+tamper, gap detection 5 scenarios, empty buffer, dirty_labels drain, v1/v2 manifest backward compat). R2 persistence verified (2026-03-29): 964 vertices, 33 labels.
 
 ## Benchmark (measured, release build)
 
@@ -392,7 +391,7 @@ RUSTC_WRAPPER="" cargo zigbuild --manifest-path packages/server/yata/Cargo.toml 
 
 ## PDS Dispatch Fixes (2026-03-25)
 
-**R2 永続化 verified**: R2 に YataFragment 12 blobs, 10 vertex labels, 684 vertices 存在確認済み。
+**R2 永続化 verified**: R2 に Lance fragments / manifest と WAL が存在確認済み。
 
 | Issue | Fix | Location |
 |---|---|---|

@@ -7,8 +7,6 @@ members = [
     # Layer 1: core primitives
     "yata-arrow",
     "yata-object",
-    # Layer 1.5: native format
-    "yata-format",
     # Layer 2: graph
     "yata-cypher",
     "yata-store",
@@ -56,7 +54,6 @@ yata-gie = { path = "yata-gie" }
 yata-vex = { path = "yata-vex" }
 yata-server = { path = "yata-server" }
 yata-arrow = { path = "yata-arrow" }
-yata-format = { path = "yata-format" }
 yata-lance = { path = "yata-lance" }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
@@ -118,4 +115,3 @@ rkyv = { version = "0.8", features = ["bytecheck"] }
 
 # Force rustls to use ring instead of aws-lc-rs (aws-lc-sys cross-compile障害)
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
-

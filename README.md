@@ -26,9 +26,6 @@ Arrow-native graph database and event store with Raft consensus.
 │                   Layer 2: Graph                             │
 │  yata-store (MutableCSR)  yata-graph  yata-cypher           │
 ├─────────────────────────────────────────────────────────────┤
-│                Layer 1.5: Persistence Format                 │
-│  yata-format (YataFragment, NbrUnit zero-copy CSR)          │
-├─────────────────────────────────────────────────────────────┤
 │                 Layer 1: Core Primitives                     │
 │  yata-arrow  yata-object                                    │
 ├─────────────────────────────────────────────────────────────┤
@@ -45,7 +42,6 @@ Arrow-native graph database and event store with Raft consensus.
 | **yata-grin** | GRIN storage-agnostic graph traits (Topology, Property, Schema, Mutable) |
 | **yata-arrow** | Arrow IPC encode/decode |
 | **yata-object** | Object storage abstraction (CAS + S3 write-through) |
-| **yata-format** | YataFragment format — NbrUnit zero-copy CSR, PropertyGraphSchema, BlobStore |
 | **yata-cypher** | Pure-Rust Cypher parser and execution engine |
 | **yata-store** | MutableCSR in-memory graph, partitioned facade, blob cache primitives |
 | **yata-graph** | Graph store with CSR cache, yata-vex vector search |

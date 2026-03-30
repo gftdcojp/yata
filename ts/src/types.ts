@@ -74,7 +74,6 @@ export interface YataRPC {
   health(): Promise<string>;
   ping(): Promise<string>;
   warmup(): Promise<string>;
-  snapshot(): Promise<WalCheckpointResult>;
 }
 
 // ── Merge Props ──
