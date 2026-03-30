@@ -131,6 +131,72 @@ impl LanceReadStore {
 
         Ok(store)
     }
+
+    pub fn merge_vertex_by_pk(
+        &mut self,
+        label: &str,
+        pk_key: &str,
+        pk_value: &PropValue,
+        props: &[(&str, PropValue)],
+    ) -> u32 {
+        if let Some(existing) = self.find_vertex_by_pk(label, pk_key, pk_value) {
+            if let Some(prop_map) = self.vertex_props.get_mut(existing as usize) {
+                for (k, v) in props {
+                    prop_map.insert((*k).to_string(), v.clone());
+                }
+                prop_map.entry(pk_key.to_string()).or_insert(pk_value.clone());
+            }
+            if let Some(alive) = self.vertex_alive.get_mut(existing as usize) {
+                *alive = true;
+            }
+            return existing;
+        }
+
+        let vid = self.vertex_alive.len() as u32;
+        self.vertex_alive.push(true);
+        self.vertex_labels_by_vid.push(vec![label.to_string()]);
+        self.label_index.entry(label.to_string()).or_default().push(vid);
+        if !self.known_vertex_labels.contains(&label.to_string()) {
+            self.known_vertex_labels.push(label.to_string());
+        }
+        self.vertex_pk
+            .entry(label.to_string())
+            .or_insert_with(|| pk_key.to_string());
+
+        let mut prop_map = HashMap::new();
+        prop_map.insert(pk_key.to_string(), pk_value.clone());
+        for (k, v) in props {
+            prop_map.insert((*k).to_string(), v.clone());
+        }
+        self.vertex_props.push(prop_map);
+        self.out_adj.push(Vec::new());
+        self.in_adj.push(Vec::new());
+        vid
+    }
+
+    pub fn delete_vertex_by_pk(&mut self, label: &str, pk_key: &str, pk_value: &PropValue) -> bool {
+        let Some(vid) = self.find_vertex_by_pk(label, pk_key, pk_value) else {
+            return false;
+        };
+        if let Some(alive) = self.vertex_alive.get_mut(vid as usize) {
+            *alive = false;
+        }
+        if let Some(vids) = self.label_index.get_mut(label) {
+            vids.retain(|&v| v != vid);
+        }
+        true
+    }
+
+    fn find_vertex_by_pk(&self, label: &str, pk_key: &str, pk_value: &PropValue) -> Option<u32> {
+        self.label_index.get(label)?.iter().copied().find(|&vid| {
+            self.vertex_alive.get(vid as usize).copied().unwrap_or(false)
+                && self
+                    .vertex_props
+                    .get(vid as usize)
+                    .and_then(|props| props.get(pk_key))
+                    == Some(pk_value)
+        })
+    }
 }
 
 impl Topology for LanceReadStore {

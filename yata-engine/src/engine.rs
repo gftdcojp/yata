@@ -131,7 +131,7 @@ impl TieredGraphEngine {
         Self {
             config,
             hot: Arc::new(RwLock::new(hot_store)),
-            read_store: Arc::new(RwLock::new(None)),
+            read_store: Arc::new(RwLock::new(Some(yata_lance::LanceReadStore::default()))),
             warm,
             cache: Arc::new(Mutex::new(cache)),
             hot_initialized: Arc::new(AtomicBool::new(false)),
@@ -815,28 +815,22 @@ impl TieredGraphEngine {
         }
 
         // Hot store: append-only (tombstone old + append new, no in-place mutation)
-        if let Ok(mut hot) = self.hot.write() {
-            if let Some(single) = hot.as_single_mut() {
+        if let Ok(mut read_store) = self.read_store.write() {
+            if let Some(ref mut store) = *read_store {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
-                let vid = single.merge_by_pk(label, pk_key, &pk, props);
-                // Lightweight commit: rebuild label_index + label_bitmap only
-                // (keeps label scans correct). Expensive columnar/btree deferred.
-                single.commit_labels_only();
+                let vid = store.merge_vertex_by_pk(label, pk_key, &pk, props);
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     ll.insert(label.to_string());
                 }
-                self.refresh_read_store();
                 let pw = self.pending_writes.fetch_add(1, Ordering::Relaxed) + 1;
                 if pw >= Self::L0_COMPACT_THRESHOLD {
                     self.pending_writes.store(0, Ordering::Relaxed);
-                    // Full commit at compaction (rebuild columnar cache, btree, prop indexes)
-                    single.commit();
                     let _ = self.trigger_compaction();
                 }
                 return Ok(vid);
             }
         }
-        Err("failed to acquire hot store lock".into())
+        Err("failed to acquire read store lock".into())
     }
 
     /// Append-only merge record AND return the WAL entry for pushing to read replicas.
@@ -869,26 +863,22 @@ impl TieredGraphEngine {
         self.mark_label_dirty(label);
         self.invalidate_security_cache_if_policy(label, props);
 
-        if let Ok(mut hot) = self.hot.write() {
-            if let Some(single) = hot.as_single_mut() {
+        if let Ok(mut read_store) = self.read_store.write() {
+            if let Some(ref mut store) = *read_store {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
-                let vid = single.merge_by_pk(label, pk_key, &pk, props);
-                // Lightweight commit: label_index + label_bitmap only
-                single.commit_labels_only();
+                let vid = store.merge_vertex_by_pk(label, pk_key, &pk, props);
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     ll.insert(label.to_string());
                 }
-                self.refresh_read_store();
                 let pw = self.pending_writes.fetch_add(1, Ordering::Relaxed) + 1;
                 if pw >= Self::L0_COMPACT_THRESHOLD {
                     self.pending_writes.store(0, Ordering::Relaxed);
-                    single.commit();
                     let _ = self.trigger_compaction();
                 }
                 return Ok((vid, wal_entry));
             }
         }
-        Err("failed to acquire hot store lock".into())
+        Err("failed to acquire read store lock".into())
     }
 
     /// DELETE by primary key: O(1) lookup + WAL Delete entry.
@@ -913,18 +903,14 @@ impl TieredGraphEngine {
             wal.append(entry);
         }
 
-        if let Ok(mut hot) = self.hot.write() {
-            if let Some(single) = hot.as_single_mut() {
+        if let Ok(mut read_store) = self.read_store.write() {
+            if let Some(ref mut store) = *read_store {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
-                let deleted = single.delete_by_pk(label, pk_key, &pk);
-                if deleted {
-                    single.commit();
-                    self.refresh_read_store();
-                }
+                let deleted = store.delete_vertex_by_pk(label, pk_key, &pk);
                 return Ok(deleted);
             }
         }
-        Err("failed to acquire hot store lock".into())
+        Err("failed to acquire read store lock".into())
     }
 
     /// Delete a record AND return the WAL entry for pushing to read replicas.
@@ -954,18 +940,14 @@ impl TieredGraphEngine {
             None
         };
 
-        if let Ok(mut hot) = self.hot.write() {
-            if let Some(single) = hot.as_single_mut() {
+        if let Ok(mut read_store) = self.read_store.write() {
+            if let Some(ref mut store) = *read_store {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
-                let deleted = single.delete_by_pk(label, pk_key, &pk);
-                if deleted {
-                    single.commit();
-                    self.refresh_read_store();
-                }
+                let deleted = store.delete_vertex_by_pk(label, pk_key, &pk);
                 return Ok((deleted, wal_entry));
             }
         }
-        Err("failed to acquire hot store lock".into())
+        Err("failed to acquire read store lock".into())
     }
 
     /// CPM metrics: read/mutation/mergeRecord counters + mutation latency.
@@ -974,8 +956,12 @@ impl TieredGraphEngine {
         let mutations = self.cypher_mutation_count.load(Ordering::Relaxed);
         let mutation_us = self.cypher_mutation_us_total.load(Ordering::Relaxed);
         let merges = self.merge_record_count.load(Ordering::Relaxed);
-        let (v_count, e_count) = if let Ok(csr) = self.hot.read() {
-            (csr.vertex_count() as u64, csr.edge_count() as u64)
+        let (v_count, e_count) = if let Ok(read_store) = self.read_store.read() {
+            if let Some(ref store) = *read_store {
+                (store.vertex_count() as u64, store.edge_count() as u64)
+            } else {
+                (0, 0)
+            }
         } else {
             (0, 0)
         };
@@ -1038,43 +1024,37 @@ impl TieredGraphEngine {
             return Ok(0);
         }
         let mut applied = 0u64;
-        if let Ok(mut hot) = self.hot.write() {
-            if let Some(single) = hot.as_single_mut() {
+        if let Ok(mut read_store) = self.read_store.write() {
+            if let Some(ref mut store) = *read_store {
                 for entry in entries {
                     match entry.op {
                         crate::wal::WalOp::Upsert => {
-                            // Phase 1: props are already typed PropValue — zero conversion
-                            let props: Vec<(&str, yata_grin::PropValue)> = entry.props.iter()
-                                .map(|(k, v)| (k.as_str(), v.clone()))
-                                .collect();
+                            let props: Vec<(&str, yata_grin::PropValue)> =
+                                entry.props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
                             let pk = yata_grin::PropValue::Str(entry.pk_value.clone());
-                            single.merge_by_pk(&entry.label, &entry.pk_key, &pk, &props);
+                            store.merge_vertex_by_pk(&entry.label, &entry.pk_key, &pk, &props);
                         }
                         crate::wal::WalOp::Delete => {
                             let pk = yata_grin::PropValue::Str(entry.pk_value.clone());
-                            single.delete_by_pk(&entry.label, &entry.pk_key, &pk);
+                            store.delete_vertex_by_pk(&entry.label, &entry.pk_key, &pk);
                         }
                     }
                     applied += 1;
                 }
-                single.commit();
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     for entry in entries {
                         ll.insert(entry.label.clone());
                     }
                 }
-                // Mark HOT as initialized (read container is now live)
                 self.hot_initialized.store(true, Ordering::SeqCst);
-                self.refresh_read_store();
-                // Invalidate query cache
                 if let Ok(mut c) = self.cache.lock() {
                     c.invalidate();
                 }
             } else {
-                return Err("no store available for wal_apply".into());
+                return Err("no read store available for wal_apply".into());
             }
         } else {
-            return Err("failed to acquire hot store lock".into());
+            return Err("failed to acquire read store lock".into());
         }
         tracing::info!(applied, last_seq = entries.last().map(|e| e.seq).unwrap_or(0), "wal_apply complete");
         Ok(applied)
