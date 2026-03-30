@@ -5,63 +5,6 @@ use yata_graph::GraphStore;
 use yata_grin::{Mutable, PropValue};
 use yata_store::MutableCsrStore;
 
-// ── 3-Tier Blob Fetch: Disk Cache → R2 ──────────────────────────────
-
-/// Resolve the disk cache directory from YATA_VINEYARD_DIR env var.
-/// Returns `Some("{dir}/snap/fragment")` if set, None otherwise.
-pub(crate) fn disk_cache_dir() -> Option<String> {
-    std::env::var("YATA_VINEYARD_DIR").ok().map(|d| format!("{d}/snap/fragment"))
-}
-
-/// Fetch a blob by name with 3-tier strategy:
-///   1. Disk cache (`YATA_VINEYARD_DIR/snap/fragment/{name}`) — ~100µs
-///   2. R2 GET (`{prefix}snap/fragment/{name}`) — ~3-5ms
-///   3. On R2 hit: write to disk cache for next time
-///
-/// Returns the blob bytes, or None if not found in either tier.
-pub(crate) fn fetch_blob_cached(
-    s3: &yata_s3::s3::S3Client,
-    prefix: &str,
-    name: &str,
-    disk_dir: Option<&str>,
-) -> Option<bytes::Bytes> {
-    // Tier 1: disk cache
-    if let Some(dir) = disk_dir {
-        let path = format!("{dir}/{name}");
-        if let Ok(data) = std::fs::read(&path) {
-            tracing::trace!(name, "blob from disk cache");
-            return Some(bytes::Bytes::from(data));
-        }
-    }
-
-    // Tier 2: R2
-    let key = format!("{prefix}snap/fragment/{name}");
-    match s3.get_sync(&key) {
-        Ok(Some(data)) => {
-            // Write-through to disk cache
-            if let Some(dir) = disk_dir {
-                let path = format!("{dir}/{name}");
-                // Ensure parent dir exists for chunked blob names
-                if let Some(parent) = std::path::Path::new(&path).parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                if let Err(e) = std::fs::write(&path, &data[..]) {
-                    tracing::trace!(name, error = %e, "disk cache write failed (non-fatal)");
-                }
-            }
-            Some(data)
-        }
-        Ok(None) => {
-            tracing::warn!(name, "blob not found in R2");
-            None
-        }
-        Err(e) => {
-            tracing::warn!(name, error = %e, "R2 blob fetch failed");
-            None
-        }
-    }
-}
-
 /// Convert yata_cypher::Value → yata_grin::PropValue for CSR property storage.
 pub fn cypher_to_prop(v: &yata_cypher::types::Value) -> PropValue {
     match v {
@@ -169,4 +112,3 @@ pub fn rebuild_csr_from_graph_with_partition(
     csr.commit();
     csr
 }
-

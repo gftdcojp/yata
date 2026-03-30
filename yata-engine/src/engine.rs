@@ -5,9 +5,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use yata_cypher::Graph;
 use yata_graph::{GraphStore, QueryableGraph};
 use yata_grin::{Mutable, Predicate, PropValue, Property, Scannable, Topology};
-use yata_store::blob_cache::{
-    DiskBlobCache, MemoryBlobCache, MmapBlobCache, BlobCache,
-};
 
 use crate::cache::{QueryCache, cache_key};
 use crate::config::TieredEngineConfig;
@@ -87,7 +84,6 @@ pub struct TieredGraphEngine {
     /// Opened once on first query via Dataset::open(). Labels loaded on-demand by ensure_labels().
     lance_dataset: Arc<tokio::sync::Mutex<Option<yata_lance::YataDataset>>>,
     loaded_labels: Arc<Mutex<HashSet<String>>>,
-    blob_cache: Arc<dyn BlobCache>,
     s3_client: Arc<Mutex<Option<Arc<yata_s3::s3::S3Client>>>>,
     s3_prefix: String,
     dirty_labels: Arc<Mutex<HashSet<String>>>,
@@ -124,52 +120,6 @@ impl TieredGraphEngine {
         if partition_count > 1 {
             tracing::info!(partition_count, "partitioned graph store enabled");
         }
-        let blob_cache_budget_mb = config.blob_cache_budget_mb;
-        let vineyard_dir = std::env::var("YATA_VINEYARD_DIR").ok();
-        let use_mmap = std::env::var("YATA_MMAP_VINEYARD").unwrap_or_default() == "true";
-        let blob_cache: Arc<dyn BlobCache> = if use_mmap {
-            if let Some(ref dir) = vineyard_dir {
-                match MmapBlobCache::new(dir) {
-                    Ok(mv) => {
-                        let meta_count = mv.load_all_meta();
-                        tracing::info!(
-                            dir,
-                            meta_count,
-                            "MmapBlobCache initialized (zero-copy OS page cache)"
-                        );
-                        Arc::new(mv)
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "MmapBlobCache init failed, falling back to MemoryBlobCache");
-                        Arc::new(MemoryBlobCache::new(blob_cache_budget_mb))
-                    }
-                }
-            } else {
-                tracing::warn!("YATA_MMAP_VINEYARD=true but YATA_VINEYARD_DIR not set, falling back to MemoryBlobCache");
-                Arc::new(MemoryBlobCache::new(blob_cache_budget_mb))
-            }
-        } else if let Some(ref dir) = vineyard_dir {
-            match DiskBlobCache::new(dir, blob_cache_budget_mb) {
-                Ok(dv) => {
-                    let meta_count = dv.load_all_meta();
-                    tracing::info!(
-                        dir,
-                        blob_cache_budget_mb,
-                        meta_count,
-                        "DiskBlobCache initialized (Container disk)"
-                    );
-                    Arc::new(dv)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "DiskBlobCache init failed, falling back to MemoryBlobCache");
-                    Arc::new(MemoryBlobCache::new(blob_cache_budget_mb))
-                }
-            }
-        } else {
-            tracing::info!(blob_cache_budget_mb, "MemoryBlobCache initialized (in-memory)");
-            Arc::new(MemoryBlobCache::new(blob_cache_budget_mb))
-        };
-
         // ── S3/R2 client for read (page-in from R2, lazy init) ──
         let s3_prefix = std::env::var("YATA_S3_PREFIX").unwrap_or_default();
         let s3_client = Arc::new(Mutex::new(None));
@@ -187,7 +137,6 @@ impl TieredGraphEngine {
             cold_starting: Arc::new(AtomicBool::new(false)),
             lance_dataset: Arc::new(tokio::sync::Mutex::new(None)),
             loaded_labels: Arc::new(Mutex::new(HashSet::new())),
-            blob_cache,
             s3_client,
             s3_prefix,
             dirty_labels: Arc::new(Mutex::new(HashSet::new())),
@@ -382,7 +331,7 @@ impl TieredGraphEngine {
     pub fn batch_query_with_context(
         &self,
         statements: &[(&str, &[(String, String)])],
-        rls_org_id: Option<&str>,
+        _rls_org_id: Option<&str>,
         ctx: &MutationContext,
     ) -> Result<Vec<Vec<Vec<(String, String)>>>, String> {
         if statements.is_empty() {
@@ -1396,158 +1345,11 @@ impl TieredGraphEngine {
         Ok(checkpoint_seq)
     }
 
-    /// Cold start: full-preload path (all labels). Use wal_cold_start_manifest_only() for demand-paged.
+    /// Cold start entrypoint used by the REST API.
+    /// Legacy compacted-segment preload has been removed; this now uses the
+    /// Lance manifest-only path and replays the WAL tail.
     pub fn wal_cold_start(&self) -> Result<u64, String> {
-        let s3 = self.get_s3_client()
-            .ok_or_else(|| "S3 client not configured".to_string())?;
-        let prefix = &self.s3_prefix;
-        let pid = self.config.hot_partition_id.get();
-
-        // Load compacted segment(s) — try versioned manifest first, fallback to legacy
-        let checkpoint_seq = match crate::compaction::find_latest_manifest(&s3, prefix, pid) {
-            Some((manifest_ver, data)) => {
-                if manifest_ver > 0 {
-                    tracing::info!(manifest_ver, "cold start: loaded versioned manifest");
-                }
-                match serde_json::from_slice::<crate::compaction::CompactionManifest>(&data) {
-                    Ok(manifest) if manifest.version >= 2 && !manifest.label_segments.is_empty() => {
-                        // v2: load per-label compacted segments
-                        tracing::info!(
-                            compacted_seq = manifest.compacted_seq,
-                            labels = manifest.label_segments.len(),
-                            entries = manifest.entry_count,
-                            "cold start: loading per-label compacted segments (v2)"
-                        );
-                        let vineyard_dir = std::env::var("YATA_VINEYARD_DIR").ok();
-                        for (label, state) in &manifest.label_segments {
-                            let disk_path = vineyard_dir.as_ref()
-                                .map(|d| format!("{d}/log/compacted/{pid}/label/{label}.arrow"));
-
-                            let loaded = disk_path.as_ref().map_or(false, |path| {
-                                if !std::path::Path::new(path).exists() { return false; }
-                                match yata_store::ArrowWalStore::from_file(std::path::Path::new(path)) {
-                                    Ok(store) => {
-                                        tracing::info!(label, path, vertices = store.len(), "cold start: mmap label from disk");
-                                        self.apply_arrow_wal_store(&store).is_ok()
-                                    }
-                                    Err(_) => false,
-                                }
-                            });
-
-                            if !loaded {
-                                if let Ok(Some(data)) = s3.get_sync(&state.key) {
-                                    // Verify Blake3 checksum if present
-                                    if let Err(e) = crate::compaction::verify_blake3(&data, &state.blake3_hex, label) {
-                                        tracing::error!(label, error = %e, "cold start: checksum verification failed, skipping corrupt segment");
-                                        continue;
-                                    }
-                                    let entries = crate::arrow_wal::deserialize_segment_auto(&state.key, &data);
-                                    if !entries.is_empty() {
-                                        let _ = self.wal_apply(&entries);
-                                        tracing::info!(label, applied = entries.len(), "cold start: label segment from R2");
-                                    }
-                                    if let Some(ref path) = disk_path {
-                                        if let Some(parent) = std::path::Path::new(path).parent() {
-                                            let _ = std::fs::create_dir_all(parent);
-                                        }
-                                        let _ = std::fs::write(path, &data);
-                                    }
-                                }
-                            }
-                        }
-                        manifest.compacted_seq
-                    }
-                    Ok(manifest) => {
-                        // v1: monolithic compacted segment
-                        tracing::info!(
-                            compacted_seq = manifest.compacted_seq,
-                            entries = manifest.entry_count,
-                            labels = manifest.labels.len(),
-                            "cold start: loading compacted segment (v1)"
-                        );
-                        let filename = manifest.compacted_segment_key
-                            .rsplit('/').next().unwrap_or("compacted.arrow");
-                        let disk_path = std::env::var("YATA_VINEYARD_DIR").ok()
-                            .map(|d| format!("{d}/log/compacted/{pid}/{filename}"));
-
-                        let loaded = disk_path.as_ref().map_or(false, |path| {
-                            if !std::path::Path::new(path).exists() { return false; }
-                            match yata_store::ArrowWalStore::from_file(std::path::Path::new(path)) {
-                                Ok(store) => {
-                                    tracing::info!(path, vertices = store.len(), "cold start: mmap from disk");
-                                    self.apply_arrow_wal_store(&store).is_ok()
-                                }
-                                Err(_) => false,
-                            }
-                        });
-
-                        if !loaded {
-                            if let Ok(Some(data)) = s3.get_sync(&manifest.compacted_segment_key) {
-                                let entries = crate::arrow_wal::deserialize_segment_auto(
-                                    &manifest.compacted_segment_key, &data,
-                                );
-                                if !entries.is_empty() {
-                                    let _ = self.wal_apply(&entries);
-                                    tracing::info!(applied = entries.len(), "cold start: compacted segment from R2");
-                                }
-                                if let Some(ref path) = disk_path {
-                                    if let Some(parent) = std::path::Path::new(path).parent() {
-                                        let _ = std::fs::create_dir_all(parent);
-                                    }
-                                    let _ = std::fs::write(path, &data);
-                                }
-                            }
-                        }
-                        manifest.compacted_seq
-                    }
-                    Err(_) => 0,
-                }
-            }
-            None => {
-                tracing::info!("cold start: no compaction manifest (run gftd yata migrate)");
-                self.hot_initialized.store(true, Ordering::SeqCst);
-                0
-            }
-        };
-
-        // Replay WAL segments after compacted_seq (use segment registry from head.json)
-        let head_key = format!("{prefix}wal/meta/{pid}/head.json");
-        let segment_keys: Vec<String> = match s3.get_sync(&head_key) {
-            Ok(Some(data)) => serde_json::from_slice::<serde_json::Value>(&data)
-                .ok()
-                .and_then(|v| v.get("segments").cloned())
-                .and_then(|v| serde_json::from_value(v).ok())
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
-
-        let mut replayed = 0u64;
-        for key in &segment_keys {
-            if let Some(filename) = key.rsplit('/').next() {
-                let stripped = filename.strip_suffix(".ndjson")
-                    .or_else(|| filename.strip_suffix(".arrow"));
-                if let Some(stripped) = stripped {
-                    let parts: Vec<&str> = stripped.split('-').collect();
-                    if parts.len() == 2 {
-                        if let Ok(seg_end) = parts[1].parse::<u64>() {
-                            if seg_end <= checkpoint_seq { continue; }
-                            if let Ok(Some(data)) = s3.get_sync(key) {
-                                let mut entries = crate::arrow_wal::deserialize_segment_auto(key, &data);
-                                entries.retain(|e| e.seq > checkpoint_seq);
-                                if !entries.is_empty() {
-                                    let count = entries.len();
-                                    let _ = self.wal_apply(&entries);
-                                    replayed += count as u64;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        tracing::info!(checkpoint_seq, replayed, "cold start complete");
-        Ok(checkpoint_seq)
+        self.wal_cold_start_manifest_only()
     }
 
     // ── Design E: SecurityScope compilation from graph policy vertices ──

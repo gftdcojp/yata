@@ -244,7 +244,7 @@ pub fn execute_on_partition_pub(
 fn execute_on_partition(
     store: &MutableCsrStore,
     cypher: &str,
-    params: &[(String, String)],
+    _params: &[(String, String)],
     hints: &PQueryHints,
 ) -> Result<Vec<Vec<(String, String)>>, String> {
     // Try GIE fast path (direct CSR execution)

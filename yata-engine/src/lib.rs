@@ -17,12 +17,10 @@ pub mod partition_query;
 pub mod partition_router;
 pub mod router;
 pub mod sharded_coordinator;
-pub mod snapshot;
 pub mod wal;
 
 pub use config::{TieredEngineConfig, WalFormat};
 pub use engine::{CpmStats, MutationContext, TieredGraphEngine};
 pub use partition_query::PartitionQueryMetrics;
 pub use partition_router::{PartitionHints, PartitionScope, extract_partition_hints, route};
-pub use snapshot::SnapshotManifest;
 pub use wal::{WalEntry, WalOp, WalRingBuffer};

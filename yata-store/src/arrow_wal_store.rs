@@ -13,7 +13,7 @@ use base64::Engine as _;
 use std::collections::HashMap;
 use std::path::Path;
 
-use arrow::array::{Array, RecordBatch, StringArray, UInt8Array, UInt64Array};
+use arrow::array::{Array, StringArray, UInt8Array};
 use yata_grin::*;
 
 /// A graph store backed by mmap'd Arrow IPC WAL data.
@@ -24,8 +24,6 @@ pub struct ArrowWalStore {
     /// Per-VID vertex data, indexed by position in the compacted segment.
     /// VID = array index (0-based, dense).
     labels: Vec<String>,
-    pk_keys: Vec<String>,
-    pk_values: Vec<String>,
 
     /// Property columns: the Arrow RecordBatch rows, stored as (key, value) pairs per VID.
     /// Parsed from props_json column on load (Phase 3).
@@ -53,8 +51,6 @@ impl ArrowWalStore {
     pub fn new() -> Self {
         Self {
             labels: Vec::new(),
-            pk_keys: Vec::new(),
-            pk_values: Vec::new(),
             vertex_props: Vec::new(),
             label_index: HashMap::new(),
             prop_eq_index: HashMap::new(),
@@ -93,8 +89,6 @@ impl ArrowWalStore {
             .map_err(|e| format!("Arrow FileReader failed: {e}"))?;
 
         let mut labels = Vec::new();
-        let mut pk_keys = Vec::new();
-        let mut pk_values = Vec::new();
         let mut vertex_props = Vec::new();
         let mut label_index: HashMap<String, Vec<u32>> = HashMap::new();
         let mut prop_eq_index: HashMap<(String, String), HashMap<String, u32>> = HashMap::new();
@@ -152,8 +146,6 @@ impl ArrowWalStore {
                     .insert(pk_value.clone(), vid);
 
                 labels.push(label);
-                pk_keys.push(pk_key);
-                pk_values.push(pk_value);
                 vertex_props.push(props);
                 vid += 1;
             }
@@ -166,8 +158,6 @@ impl ArrowWalStore {
 
         Ok(Self {
             labels,
-            pk_keys,
-            pk_values,
             vertex_props,
             label_index,
             prop_eq_index,
@@ -654,4 +644,3 @@ mod tests {
         assert!(store._mmap.is_some());
     }
 }
-
