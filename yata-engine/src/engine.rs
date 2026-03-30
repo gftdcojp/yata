@@ -113,14 +113,17 @@ impl TieredGraphEngine {
         Self::build(config, data_dir)
     }
 
-    fn build(config: TieredEngineConfig, _data_dir: &str) -> Self {
+    fn build(config: TieredEngineConfig, data_dir: &str) -> Self {
         let cache = QueryCache::new(config.cache_max_entries, config.cache_ttl_secs);
 
         let partition_count = config.partition_count;
         if partition_count > 1 {
             tracing::info!(partition_count, "partitioned graph store enabled");
         }
-        let s3_prefix = std::env::var("YATA_S3_PREFIX").unwrap_or_default();
+        // s3_prefix is used for LanceDB connect path.
+        // In production: YATA_S3_PREFIX env (e.g. "yata/") → connect_from_env builds s3:// URI
+        // In tests: data_dir (tempdir) → connect_local uses this path
+        let s3_prefix = std::env::var("YATA_S3_PREFIX").unwrap_or_else(|_| data_dir.to_string());
 
         tracing::info!("using LanceDB read store");
         let wal_ring_capacity = config.wal_ring_capacity;
@@ -627,7 +630,7 @@ impl TieredGraphEngine {
     pub fn write_embeddings(
         &self,
         nodes: &[yata_cypher::NodeRef],
-        _embedding_key: &str,
+        embedding_key: &str,
         dim: usize,
     ) -> Result<usize, String> {
         if nodes.is_empty() { return Ok(0); }
@@ -635,6 +638,7 @@ impl TieredGraphEngine {
 
         let lance_db = self.lance_db.clone();
         let prefix_owned = self.s3_prefix.clone();
+        let emb_key = embedding_key.to_string();
 
         ENGINE_RT.block_on(async {
             let mut db_guard = lance_db.lock().await;
@@ -650,17 +654,26 @@ impl TieredGraphEngine {
             let tbl = db.open_or_create_embeddings_table(dim).await
                 .map_err(|e| format!("embeddings table: {e}"))?;
 
-            // Build batch from nodes (vid, label, vector placeholder)
+            // Build batch from nodes — extract vector from props[emb_key]
+            let embedding_key = &emb_key;
             let vids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
             let labels: Vec<&str> = nodes.iter().map(|n| {
                 n.labels.first().map(|s| s.as_str()).unwrap_or("unknown")
             }).collect();
             let vid_arr = arrow::array::StringArray::from(vids);
             let label_arr = arrow::array::StringArray::from(labels);
-            // Zero vectors as placeholder (real embeddings come from Murakumo)
-            let vectors: Vec<Option<Vec<Option<f32>>>> = (0..count)
-                .map(|_| Some(vec![Some(0.0f32); dim]))
-                .collect();
+            let vectors: Vec<Option<Vec<Option<f32>>>> = nodes.iter().map(|n| {
+                if let Some(yata_cypher::types::Value::List(list)) = n.props.get(embedding_key) {
+                    let v: Vec<Option<f32>> = list.iter().map(|val| match val {
+                        yata_cypher::types::Value::Float(f) => Some(*f as f32),
+                        yata_cypher::types::Value::Int(i) => Some(*i as f32),
+                        _ => Some(0.0),
+                    }).collect();
+                    Some(v)
+                } else {
+                    Some(vec![Some(0.0f32); dim])
+                }
+            }).collect();
             let vec_arr = arrow::array::FixedSizeListArray::from_iter_primitive::<arrow::datatypes::Float32Type, _, _>(
                 vectors, dim as i32,
             );
