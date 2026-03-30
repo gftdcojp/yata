@@ -119,9 +119,9 @@ env.YATA.stats()                        // → all partition CpmStats (K3a)
 
 `gftd symbol-graph --package yata` で component status を確認。985+ unit tests (+ e2e)。
 
-## R2 Persistence `[PRODUCTION]` (verified 2026-03-30: 65K entries, 13 labels, 47 MB per-label segments)
+## R2 Persistence `[PRODUCTION]` — Lance Fragment Format (verified 2026-03-30)
 
-R2 = source of truth。**Per-label compacted segments**: `log/compacted/{pid}/label/{label}.arrow` (Arrow IPC)。**Append-only write**: mergeRecord は page-in 不要 (L0 buffer append + WAL ring append + `dirty_labels.insert(label)`)。PK dedup は LSM compaction 時。**Dirty tracking**: `drain_dirty_labels()` で dirty set を取得し compaction 後にクリア。dirty empty = zero R2 I/O (skip)。**LSM Compaction `[PRODUCTION]`**: L0 (unsorted append buffer) + L1 (existing sorted segments) → merge-sort → PK-dedup → per-label R2 PUT。Clean labels は untouched。CompactionManifest v2 (`label_segments: HashMap<String, LabelSegmentState>`)。**Blake3 checksum `[PRODUCTION]`**: `LabelSegmentState.blake3_hex` に segment hash 記録。cold start 時 `verify_blake3()` で検証、mismatch → skip + error log。**Two-phase PUT `[PRODUCTION]`**: Phase 1: per-label segment upload (失敗 label はスキップ)。Phase 2: 成功 label のみから manifest 構築 → legacy `manifest.json` + versioned `manifest-{inverted:020}.json` PUT。**Immutable Manifest Versioning (LanceDB pattern)**: `manifest-{u64::MAX - version:020}.json` — inverted naming で S3 ListObjects が O(1) 最新取得。`find_latest_manifest()` が versioned → legacy fallback。**Segment-level page-in**: `fetch_blob_cached()` — disk cache → R2 GET → write-through。**Range GET `[IMPLEMENTED]`**: `get_range_sync(key, offset, length)` で byte-range R2 GET (SigV4 signed)。Cold start: per-label sorted segments mmap (~100µs/segment) → R2 GET fallback → Blake3 verify → sparse index build。**Concurrent cold start guard**: `cold_starting` AtomicBool で CAS — 1 thread のみ cold start 実行、他は spin-wait (399MB monolithic segment × N threads = OOM 防止)。**No snapshot serialize** — sorted segments ARE the persistent format (commit() rebuild 排除)。
+R2 = source of truth。**Lance fragments**: `lance/vertices/{pid}/fragments/{ver}-{frag}.arrow` (Arrow IPC, immutable)。**Lance TableManifest**: `lance/vertices/{pid}/manifest-{inverted:020}.json` (versioned, immutable)。**Append-only write**: mergeRecord = tombstone old + append new (L0 buffer, page-in 不要)。PK dedup は compaction 時。**Dirty tracking**: `drain_dirty_labels()` で dirty set を取得。dirty empty = zero R2 I/O (skip)。**Lance Compaction `[PRODUCTION]`**: L0 + existing Lance fragments → merge-sort → PK-dedup → new Lance fragment R2 PUT → `TableManifest` R2 PUT。Clean labels = zero R2 I/O。**Blake3 checksum**: `Fragment.blake3_hex`。cold start 時 R2 GET → verify → mismatch で corrupt fragment スキップ。**Two-phase PUT**: Phase 1: per-label Lance fragment upload (失敗 label はスキップ)。Phase 2: 成功 fragments から `TableManifest` 構築 → versioned manifest PUT。**Immutable Manifest Versioning**: `manifest-{u64::MAX - version:020}.json` — inverted naming で S3 ListObjects が O(1) 最新取得。**Fragment demand page-in**: 3-tier (disk cache → R2 GET → Blake3 verify → write-through)。**Range GET `[IMPLEMENTED]`**: `get_range_sync(key, offset, length)` で byte-range R2 GET (SigV4 signed)。**Cold start**: Lance `TableManifest` load (~50ms) → `hot_initialized = true` → labels demand-paged on first query。**Concurrent cold start guard**: `cold_starting` AtomicBool CAS (1 thread のみ実行)。**No snapshot serialize** — Lance fragments ARE the persistent + query format。
 
 ## Concurrency Model (CRITICAL)
 
@@ -192,7 +192,7 @@ R2 = source of truth。**Per-label compacted segments**: `log/compacted/{pid}/la
 
 **`trigger_compaction()` = `wal_flush_segment` + `drain_dirty_labels` + Lance fragment compaction。** L0 + existing Lance fragments → merge-sort → PK-dedup → new Lance fragment R2 PUT + TableManifest R2 PUT。Clean labels = zero R2 I/O。
 
-**Cold start (LanceDB-style demand-paged)**: `ensure_labels` → `hot_initialized == false` → `wal_cold_start_manifest_only()` (manifest + WAL tail のみ, ~50ms) → `hot_initialized = true` **即座**。Per-label segment は query 時に on-demand page-in (`load_label_segment`: disk cache ~100µs → R2 GET ~4ms → Blake3 verify → write-through)。Multi-node: 各ノードが独立に manifest load + label page-in。Cold start 2.2s (manifest + first label) vs 旧 30s (全 label preload)。
+**Cold start (Lance demand-paged)**: `ensure_labels` → `hot_initialized == false` → `wal_cold_start_manifest_only()` (Lance `TableManifest` load + WAL tail のみ, ~50ms) → `hot_initialized = true` **即座**。Per-label fragment は query 時に on-demand page-in (3-tier: disk cache ~100µs → R2 GET ~4ms → Blake3 verify → write-through)。Multi-node: 各ノードが独立に manifest load + fragment page-in。
 
 ## Arrow IPC WAL + Lance Fragment Compaction `[PRODUCTION]` (verified 2026-03-30)
 
@@ -352,11 +352,14 @@ bench: `cargo run -p yata-bench --bin coo-read-bench --release`
 
 **Overall: grade=C, p50=13.5ms, 9/14 S-grade。** v3→v4 改善: v1 monolithic 399MB → v2 per-label 47MB migration。S-grade 2→9 endpoints。v1 cold start 20-30s → v2 cold start 8-13s。
 
-**LanceDB-inspired improvements (2026-03-30):**
-- **Range GET**: `yata-s3` に `get_range_sync(key, offset, length)` 追加 (HTTP Range header, SigV4 signed)
-- **Immutable manifest versioning**: `manifest-{u64::MAX-version:020}.json` (inverted naming, O(1) latest lookup via ListObjects)。`find_latest_manifest()` で versioned → legacy fallback
+**Lance format migration (2026-03-30):**
+- **yata-lance crate**: Lance-table-compatible persistence (VERTICES_SCHEMA/EDGES_SCHEMA, Arrow IPC fragments, versioned TableManifest)
+- **Append-only write**: `merge_by_pk` = tombstone old + append new (LanceDB immutable pattern)。`commit_labels_only()` per-write
+- **Lance compaction**: dirty labels → new Lance fragments + TableManifest (R2 `lance/vertices/{pid}/`)
+- **Lance cold start**: TableManifest load → `lance_manifest_cache` → fragment demand page-in (3-tier)
+- **Range GET**: `yata-s3` `get_range_sync(key, offset, length)` (HTTP Range, SigV4 signed)
 - **Concurrent cold start guard**: `cold_starting` AtomicBool CAS (1 thread 排他実行)
-- **v1→v2 migration**: 399MB monolithic → 13 per-label segments (47MB total)
+- **Dead code 除去**: loader.rs 870行除去 (9 legacy page-in functions), engine.rs 100行除去 (5 dead functions)
 
 **Trillion scale projection:**
 | Scale | Partitions | Write/sec | Point QPS | Scan QPS | Cost/月 |
@@ -398,21 +401,21 @@ RUSTC_WRAPPER="" cargo zigbuild --manifest-path packages/server/yata/Cargo.toml 
 | `AppBskyActorGetProfile` が `Profile` label のみ参照 (R2 未永続化) | structured `Profile` (R2 永続化) へ fallback 追加。display_name/description を補完 | `pds-dispatch.ts:910-927` |
 | label consistency テスト未整備 | `pds-helpers.test.ts` に snake_case テスト 5 件 + label consistency check 追加 (214 tests pass) | `pds-helpers.test.ts` |
 
-**診断手順 (label ↔ collection mismatch)**:
+**診断手順 (Lance manifest)**:
 ```bash
-# R2 schema の label 一覧
-npx wrangler r2 object get ai-gftd-graph/yata/snap/fragment/schema --remote --file /tmp/schema.json
-python3 -c "import json; [print(e['label']) for e in json.load(open('/tmp/schema.json'))['vertex_entries']]"
+# Latest Lance manifest
+npx wrangler r2 object list ai-gftd-graph --prefix "yata/lance/vertices/0/manifest-" --remote | head -1
 ```
 
 ## 禁止事項
 
-- **R2 以外を source of truth にする禁止** — R2 が正本
+- **R2 以外を source of truth にする禁止** — R2 Lance fragments が正本
 - **JSON RPC で graph data 転送禁止** — Workers RPC (structured clone) + ArrayBuffer
 - **lite instance 禁止** — standard-1 以上
-- **CSR offsets rebuild 新規導入禁止** — Sorted COO に移行。commit() → offsets rebuild は Shannon 非効率 (η = O(log E / V) → 0)
-- **mutable snapshot 新規導入禁止** — sorted segments が persistent format。別途 serialize → R2 PUT の snapshot パス不要
-- **既存 vertex の in-place props 上書き禁止 (CRITICAL)** — LanceDB immutable 原則。update = tombstone old + append new。`merge_by_pk` は既に append-only 実装
-- **per-write full commit() 禁止** — `commit_labels_only()` (label_index + label_bitmap + btree) を使用。full commit (columnar/prop_eq) は compaction 時のみ。Shannon: per-write full commit η=0.001%
-- **`reqwest` crate 再追加禁止** — `aws-lc-sys` (OpenSSL/BoringSSL C cross-compile) を引き込む。`ureq` + `rustls` を使用
+- **CSR offsets rebuild 新規導入禁止** — Sorted COO に移行
+- **既存 vertex の in-place props 上書き禁止 (CRITICAL)** — LanceDB immutable 原則。update = tombstone old + append new
+- **per-write full commit() 禁止** — `commit_labels_only()` (label_index + label_bitmap + btree) を使用。full commit (columnar/prop_eq) は compaction 時のみ
+- **legacy persistence path 新規追加禁止** — `log/compacted/`, `snap/fragment/`, `CompactionManifest` は除去済み。Lance fragment path (`lance/vertices/`) のみ使用
+- **loader.rs に page-in 関数新規追加禁止** — Lance fragment demand page-in は engine.rs `ensure_labels()` が担当
+- **`reqwest` crate 再追加禁止** — `aws-lc-sys` cross-compile 障害。`ureq` + `rustls` を使用
 - **`RUSTC_WRAPPER=sccache` での cross-compile 禁止** — `cargo zigbuild` を使用
