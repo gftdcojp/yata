@@ -105,7 +105,7 @@ pub struct TieredGraphEngine {
 }
 
 impl TieredGraphEngine {
-    /// Create a new engine with snapshot-only persistence.
+    /// Create a new engine with Lance-backed persistence.
     pub fn new(config: TieredEngineConfig, data_dir: &str) -> Self {
         Self::build(config, data_dir)
     }
@@ -220,7 +220,7 @@ impl TieredGraphEngine {
         }
     }
 
-    /// Mark a single label as dirty (snapshot will include it).
+    /// Mark a single label as dirty.
     fn mark_label_dirty(&self, label: &str) {
         match self.dirty_labels.lock() {
             Ok(mut dl) => { dl.insert(label.to_string()); }
@@ -279,7 +279,7 @@ impl TieredGraphEngine {
             }
             return None;
         }
-        tracing::info!(endpoint = %endpoint, bucket = %bucket, "S3/R2 client configured for snapshot persistence");
+        tracing::info!(endpoint = %endpoint, bucket = %bucket, "S3/R2 client configured for Lance persistence");
         Some(Arc::new(yata_s3::s3::S3Client::new(
             &endpoint, &bucket, &key_id, &secret, &region,
         )))
@@ -287,18 +287,10 @@ impl TieredGraphEngine {
 
     /// Ensure HOT tier is initialized.
     fn ensure_hot(&self) {
-        // HOT is always initialized in snapshot-only mode
+        // HOT is initialized lazily from Lance on first read.
     }
 
     /// Ensure specific labels are loaded into HOT CSR (lazy mode).
-    ///
-    /// **Vineyard page-in / page-out flow:**
-    /// 1. Check Vineyard blob cache (in-memory, ~0ms)
-    /// 2. If miss, data must come from R2 snapshot restore
-    /// 3. Decode Arrow IPC → add to CSR (page-in)
-    /// 4. If max labels exceeded, evict oldest CSR labels (page-out)
-    ///    — evicted labels remain in Vineyard blob cache (warm tier)
-    ///    — re-page-in from Vineyard is Arrow decode only (no R2 fetch)
     ///
     /// If `labels` is empty, loads ALL labels (mutation path fallback).
     /// If `labels` is non-empty AND hot_initialized, enriches only needed labels on-demand
@@ -1050,49 +1042,6 @@ impl TieredGraphEngine {
         } else {
             0
         }
-    }
-
-    /// Apply vertex data from an ArrowWalStore (mmap'd compacted segment) to the store.
-    /// Uses GRIN Property trait to read vertex data without intermediate WalEntry allocation.
-    fn apply_arrow_wal_store(&self, store: &yata_store::ArrowWalStore) -> Result<u64, String> {
-        use yata_grin::{Property, Scannable, Schema};
-        if store.is_empty() {
-            return Ok(0);
-        }
-        let mut applied = 0u64;
-        if let Ok(mut hot) = self.hot.write() {
-            if let Some(single) = hot.as_single_mut() {
-                for vid in store.scan_all_vertices() {
-                    let labels = Property::vertex_labels(store, vid);
-                    let label = labels.first().map(|s| s.as_str()).unwrap_or("_default");
-                    let all_props = store.vertex_all_props(vid);
-                    let props: Vec<(&str, yata_grin::PropValue)> = all_props
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.clone()))
-                        .collect();
-                    // Use "rkey" as PK key (WAL convention)
-                    if let Some(yata_grin::PropValue::Str(pk_val)) = all_props.get("rkey") {
-                        let pk = yata_grin::PropValue::Str(pk_val.clone());
-                        single.merge_by_pk(label, "rkey", &pk, &props);
-                    } else {
-                        // Fallback: use find_vid_by_pk from the store
-                        single.add_vertex(label, &props);
-                    }
-                    applied += 1;
-                }
-                single.commit();
-                if let Ok(mut ll) = self.loaded_labels.lock() {
-                    for label in Schema::vertex_labels(store) {
-                        ll.insert(label);
-                    }
-                }
-                self.hot_initialized.store(true, std::sync::atomic::Ordering::SeqCst);
-                if let Ok(mut c) = self.cache.lock() {
-                    c.invalidate();
-                }
-            }
-        }
-        Ok(applied)
     }
 
     pub fn wal_apply(&self, entries: &[crate::wal::WalEntry]) -> Result<u64, String> {
