@@ -830,31 +830,6 @@ impl TieredGraphEngine {
         })
     }
 
-    /// Restore CSR from R2 YataFragment snapshot (legacy fallback).
-    /// Replaces current CSR with the restored snapshot.
-    fn restore_from_r2(&self) {
-        let s3 = match self.get_s3_client() {
-            Some(s3) => s3,
-            None => {
-                tracing::warn!("restore_from_r2: no S3 client configured");
-                return;
-            }
-        };
-        let pid = self.config.hot_partition_id;
-        match crate::loader::page_in_from_r2(&s3, &self.s3_prefix, pid) {
-            Ok(restored) => {
-                let v = restored.vertex_count();
-                if let Ok(mut hot) = self.hot.write() {
-                    *hot = yata_store::GraphStoreEnum::Single(restored);
-                    tracing::info!(vertices = v, "restore_from_r2: replaced CSR from R2 YataFragment");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "restore_from_r2: page-in failed");
-            }
-        }
-    }
-
     // ── Vector search (yata-vex) ────────────────────────────────────────
 
     /// Write vertices with embeddings for vector search.
@@ -1588,64 +1563,7 @@ impl TieredGraphEngine {
         Ok(checkpoint_seq)
     }
 
-    /// Load a single label segment from R2 (demand page-in).
-    /// Used by ensure_labels() for on-demand label loading.
-    /// Multi-node safe: each node fetches independently from R2.
-    fn load_label_segment(
-        &self,
-        s3: &yata_s3::s3::S3Client,
-        state: &crate::compaction::LabelSegmentState,
-        label: &str,
-        vineyard_dir: &Option<String>,
-        pid: u32,
-    ) -> bool {
-        // 1. Try disk cache first (mmap, ~100µs)
-        let disk_path = vineyard_dir.as_ref()
-            .map(|d| format!("{d}/log/compacted/{pid}/label/{label}.arrow"));
-        if let Some(ref path) = disk_path {
-            if std::path::Path::new(path).exists() {
-                if let Ok(store) = yata_store::ArrowWalStore::from_file(std::path::Path::new(path)) {
-                    tracing::debug!(label, path, "demand page-in: mmap from disk cache");
-                    return self.apply_arrow_wal_store(&store).is_ok();
-                }
-            }
-        }
-
-        // 2. R2 GET (full segment for small, range GET consideration for large)
-        match s3.get_sync(&state.key) {
-            Ok(Some(data)) => {
-                // Blake3 verify
-                if let Err(e) = crate::compaction::verify_blake3(&data, &state.blake3_hex, label) {
-                    tracing::error!(label, error = %e, "demand page-in: checksum failed, skipping");
-                    return false;
-                }
-                let entries = crate::arrow_wal::deserialize_segment_auto(&state.key, &data);
-                if entries.is_empty() { return false; }
-                let ok = self.wal_apply(&entries).is_ok();
-                // Write-through disk cache
-                if ok {
-                    if let Some(ref path) = disk_path {
-                        if let Some(parent) = std::path::Path::new(path).parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        let _ = std::fs::write(path, &data);
-                    }
-                }
-                ok
-            }
-            Ok(None) => {
-                tracing::warn!(label, key = %state.key, "demand page-in: segment not found in R2");
-                false
-            }
-            Err(e) => {
-                tracing::warn!(label, error = %e, "demand page-in: R2 fetch failed");
-                false
-            }
-        }
-    }
-
-    /// Cold start: L1 compacted segment (mmap disk → R2 GET) + WAL tail replay.
-    /// Legacy full-preload path. Kept for backward compat — new code uses wal_cold_start_manifest_only().
+    /// Cold start: full-preload path (all labels). Use wal_cold_start_manifest_only() for demand-paged.
     pub fn wal_cold_start(&self) -> Result<u64, String> {
         let s3 = self.get_s3_client()
             .ok_or_else(|| "S3 client not configured".to_string())?;

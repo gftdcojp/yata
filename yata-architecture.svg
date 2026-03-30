@@ -312,7 +312,7 @@
   <text x="980" y="1050" fill="#93c5fd" font-size="14" font-weight="bold">COLD (R2 Source of Truth)</text>
   <text x="1200" y="1050" fill="#3b82f6" font-size="11">~3-5ms</text>
   <rect x="980" y="1065" width="280" height="45" rx="6" fill="#1e293b" stroke="#3b82f6" stroke-width="1" stroke-opacity="0.4"/>
-  <text x="995" y="1085" fill="#e2e8f0" font-size="11">log/compacted/{pid}/manifest.json</text>
+  <text x="995" y="1085" fill="#e2e8f0" font-size="11">lance/vertices/{pid}/manifest-{inv}.json</text>
   <text x="995" y="1100" fill="#94a3b8" font-size="9">v2 per-label state tracking</text>
   <rect x="980" y="1120" width="280" height="45" rx="6" fill="#1e293b" stroke="#3b82f6" stroke-width="1" stroke-opacity="0.4"/>
   <text x="995" y="1140" fill="#e2e8f0" font-size="11">label/{label}.arrow (per-label)</text>
@@ -367,10 +367,10 @@
   <rect x="830" y="1435" width="430" height="55" rx="6" fill="#052e16" stroke="#166534" stroke-width="1"/>
   <text x="845" y="1453" fill="#4ade80" font-size="11" font-weight="bold">P2 FIXED: per-label R2 PUT</text>
   <text x="845" y="1470" fill="#86efac" font-size="10">drain_dirty_labels() → per dirty label only</text>
-  <text x="845" y="1483" fill="#86efac" font-size="10">log/compacted/{pid}/label/{label}.arrow</text>
+  <text x="845" y="1483" fill="#86efac" font-size="10">lance/vertices/{pid}/fragments/{ver}-{frag}.arrow</text>
 
   <rect x="830" y="1498" width="430" height="42" rx="6" fill="#052e16" stroke="#166534" stroke-width="1"/>
-  <text x="845" y="1516" fill="#4ade80" font-size="11" font-weight="bold">P9 FIXED: per-label WAL compaction</text>
+  <text x="845" y="1516" fill="#4ade80" font-size="11" font-weight="bold">P9: Lance-table compaction (fragment append + manifest)</text>
   <text x="845" y="1533" fill="#86efac" font-size="10">Clean labels = zero R2 I/O (no read, no write)</text>
 
   <rect x="830" y="1548" width="430" height="30" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
@@ -686,7 +686,7 @@
   <rect x="100" y="2704" width="1400" height="24" fill="#1e293b"/>
   <text x="130" y="2721" fill="#f59e0b" font-size="11" font-weight="bold">4</text>
   <text x="170" y="2721" fill="#86efac" font-size="9">CP4 Compaction</text>
-  <text x="350" y="2721" fill="#4ade80" font-size="9">per-label delta compaction (dirty only)</text>
+  <text x="350" y="2721" fill="#4ade80" font-size="9">Lance fragment compaction (dirty labels → new fragments)</text>
   <text x="620" y="2721" fill="#4ade80" font-size="9">O(dirty)</text>
   <text x="730" y="2721" fill="#22c55e" font-size="9" font-weight="bold">FIXED</text>
   <text x="800" y="2721" fill="#94a3b8" font-size="9">drain_dirty_labels → per-label PK-dedup → label/{label}.arrow</text>

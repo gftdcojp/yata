@@ -189,8 +189,8 @@ R2 = source of truth。**Per-label compacted segments**: `log/compacted/{pid}/la
 | **Pipeline WAL** | R2 JSON (`pipeline/wal/`) | `Pipeline.send()` 10s flush | source of truth (durable) |
 | **yata WAL segments** | Arrow IPC (`wal/segments/{pid}/`) | cron 10s `walFlushSegment` | Cold start replay |
 | **L0 buffer** | in-memory unsorted COO tuples | mergeRecord append | instant write, pending compaction |
-| **L1 compacted segments** | Arrow IPC (`log/compacted/{pid}/label/{label}.arrow`) | LSM compaction (dirty labels only) | query + persistence (PK-dedup, P=1.0) |
-| **CompactionManifest v2** | JSON (`log/compacted/{pid}/manifest.json` + versioned `manifest-{inverted:020}.json`) | `trigger_compaction` | Per-label state tracking + immutable version chain |
+| **Lance fragments** | Arrow IPC (`lance/vertices/{pid}/fragments/{ver}-{frag}.arrow`) | LSM compaction (dirty labels only) | query + persistence (PK-dedup, P=1.0) |
+| **Lance TableManifest** | JSON (`lance/vertices/{pid}/manifest-{inverted:020}.json`) | `trigger_compaction` | Fragment tracking + immutable version chain |
 
 **`trigger_compaction()` = `wal_flush_segment` + `drain_dirty_labels` + per-label LSM merge-sort。** L0 + existing L1 → merge-sort by (label, src, dst) → PK-dedup → R2 PUT。Clean labels = zero R2 I/O。**No commit() rebuild** — compaction 出力がそのまま query 用 sorted segments。
 
