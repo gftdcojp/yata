@@ -47,10 +47,10 @@ Arrow-native graph database and event store with Raft consensus.
 | **yata-object** | Object storage abstraction (CAS + S3 write-through) |
 | **yata-format** | YataFragment format — NbrUnit zero-copy CSR, PropertyGraphSchema, BlobStore |
 | **yata-cypher** | Pure-Rust Cypher parser and execution engine |
-| **yata-store** | MutableCSR in-memory graph, ArrowGraphStore, DiskBlobCache/MmapBlobCache |
+| **yata-store** | MutableCSR in-memory graph, partitioned facade, blob cache primitives |
 | **yata-graph** | Graph store with CSR cache, yata-vex vector search |
 | **yata-gie** | Graph Interactive Engine (IR operators, push-based executor) |
-| **yata-engine** | TieredGraphEngine — YataFragment snapshot/page-in, partition routing |
+| **yata-engine** | TieredGraphEngine — Lance-backed cold start, WAL projection, partition routing |
 | **yata-s3** | S3/R2 adapter (sync ureq+rustls, SigV4) |
 | **yata-vex** | Vector index (IVF_PQ + DiskANN) |
 | **yata-server** | XRPC API server (Cypher, mergeRecord, triggerSnapshot) |

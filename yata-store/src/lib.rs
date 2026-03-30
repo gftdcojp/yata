@@ -30,7 +30,6 @@ pub type EdgeVineyard = MemoryBlobCache;
 pub type DiskVineyard = DiskBlobCache;
 pub type MmapVineyard = MmapBlobCache;
 
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -75,155 +74,6 @@ fn discriminant_index(v: &PropValue) -> u8 {
         PropValue::Float(_) => 3,
         PropValue::Str(_) => 4,
         PropValue::Binary(_) => 5,
-    }
-}
-
-// ── WAL (Write-Ahead Log) for graph mutations ────────────────────────
-
-/// WAL entry for graph mutations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum WalEntry {
-    AddVertex {
-        vid: u32,
-        global_vid: Option<GlobalVid>,
-        label: String,
-        props: Vec<(String, PropValue)>,
-    },
-    AddEdge {
-        edge_id: u32,
-        src: u32,
-        dst: u32,
-        label: String,
-        props: Vec<(String, PropValue)>,
-    },
-    DeleteVertex {
-        vid: u32,
-    },
-    DeleteEdge {
-        edge_id: u32,
-    },
-    SetProperty {
-        vid: u32,
-        key: String,
-        value: PropValue,
-    },
-    Commit {
-        version: u64,
-    },
-}
-
-/// In-memory WAL for graph mutations. Supports serialization for future file persistence.
-pub struct GraphWal {
-    entries: Vec<WalEntry>,
-}
-
-impl GraphWal {
-    pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    pub fn append(&mut self, entry: WalEntry) {
-        self.entries.push(entry);
-    }
-
-    pub fn entries(&self) -> &[WalEntry] {
-        &self.entries
-    }
-
-    pub fn clear(&mut self) {
-        self.entries.clear();
-    }
-
-    /// Replay WAL entries into a MutableCsrStore to recover state.
-    pub fn replay(&self, store: &mut MutableCsrStore) {
-        for entry in &self.entries {
-            match entry {
-                WalEntry::AddVertex {
-                    label,
-                    props,
-                    global_vid,
-                    ..
-                } => {
-                    let p: Vec<(&str, PropValue)> =
-                        props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-                    if let Some(global_vid) = global_vid {
-                        store.add_vertex_with_global_id(*global_vid, label, &p);
-                    } else {
-                        store.add_vertex(label, &p);
-                    }
-                }
-                WalEntry::AddEdge {
-                    src,
-                    dst,
-                    label,
-                    props,
-                    ..
-                } => {
-                    let p: Vec<(&str, PropValue)> =
-                        props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-                    store.add_edge(*src, *dst, label, &p);
-                }
-                WalEntry::DeleteVertex { vid } => {
-                    store.delete_vertex(*vid);
-                }
-                WalEntry::DeleteEdge { edge_id } => {
-                    store.delete_edge(*edge_id);
-                }
-                WalEntry::SetProperty { vid, key, value } => {
-                    store.set_vertex_prop(*vid, key, value.clone());
-                }
-                WalEntry::Commit { .. } => {
-                    store.commit();
-                }
-            }
-        }
-    }
-
-    /// Serialize WAL to bytes (JSON lines format).
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        for entry in &self.entries {
-            let line = serde_json::to_string(entry).unwrap_or_default();
-            buf.extend(line.as_bytes());
-            buf.push(b'\n');
-        }
-        buf
-    }
-
-    /// Deserialize WAL from bytes.
-    pub fn from_bytes(data: &[u8]) -> Self {
-        let text = String::from_utf8_lossy(data);
-        let entries: Vec<WalEntry> = text
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
-        Self { entries }
-    }
-}
-
-impl Default for GraphWal {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ── MVCC Snapshot ────────────────────────────────────────────────────
-
-/// Read-only snapshot of the graph at a specific version.
-pub struct GraphSnapshot {
-    version: u64,
-    store: MutableCsrStore,
-}
-
-impl GraphSnapshot {
-    pub fn version(&self) -> u64 {
-        self.version
-    }
-    pub fn store(&self) -> &MutableCsrStore {
-        &self.store
     }
 }
 
@@ -651,9 +501,6 @@ pub struct MutableCsrStore {
     // Partition
     partition_id: PartitionId,
 
-    // WAL (optional, enabled via enable_wal())
-    wal: Option<GraphWal>,
-
     /// Label bitmap index: label -> list of alive VIDs with that label.
     /// Rebuilt on commit(). O(popcount) scan instead of O(V).
     label_index: HashMap<String, Vec<u32>>,
@@ -719,7 +566,6 @@ impl MutableCsrStore {
             known_edge_labels: Vec::new(),
             vertex_pk: HashMap::new(),
             partition_id,
-            wal: None,
             label_index: HashMap::new(),
             prop_eq_index: HashMap::new(),
             dirty_vertex_labels: HashSet::new(),
@@ -1052,17 +898,6 @@ impl MutableCsrStore {
         for label in labels {
             self.register_vertex_label(label);
             self.dirty_vertex_labels.insert(label.clone());
-        }
-        if let Some(ref mut wal) = self.wal {
-            wal.append(WalEntry::AddVertex {
-                vid,
-                global_vid,
-                label: labels.first().cloned().unwrap_or_default(),
-                props: props
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.clone()))
-                    .collect(),
-            });
         }
         vid
     }
@@ -1522,35 +1357,6 @@ impl MutableCsrStore {
         }
     }
 
-    // ── WAL methods ──────────────────────────────────────────────────
-
-    /// Enable WAL tracking. After this, all mutations are recorded.
-    pub fn enable_wal(&mut self) {
-        self.wal = Some(GraphWal::new());
-    }
-
-    /// Get WAL reference (if enabled).
-    pub fn wal(&self) -> Option<&GraphWal> {
-        self.wal.as_ref()
-    }
-
-    /// Take WAL (for persistence), replacing with a fresh empty WAL.
-    pub fn take_wal(&mut self) -> Option<GraphWal> {
-        self.wal.take().map(|w| {
-            self.wal = Some(GraphWal::new());
-            w
-        })
-    }
-
-    // ── MVCC snapshot ────────────────────────────────────────────────
-
-    /// Create a read-only snapshot at the current version.
-    pub fn snapshot(&self) -> GraphSnapshot {
-        GraphSnapshot {
-            version: self.version.load(Ordering::Relaxed),
-            store: self.clone(),
-        }
-    }
 }
 
 /// Manual Clone impl for MutableCsrStore (atomics are copied by value).
@@ -1579,7 +1385,6 @@ impl Clone for MutableCsrStore {
             known_edge_labels: self.known_edge_labels.clone(),
             vertex_pk: self.vertex_pk.clone(),
             partition_id: self.partition_id,
-            wal: None, // WAL is not cloned into snapshots
             label_index: self.label_index.clone(),
             prop_eq_index: self.prop_eq_index.clone(),
             dirty_vertex_labels: HashSet::new(),
@@ -2178,19 +1983,6 @@ impl Mutable for MutableCsrStore {
         self.register_vertex_label(label);
         self.dirty_vertex_labels.insert(label.to_string());
 
-        // WAL
-        if let Some(ref mut wal) = self.wal {
-            wal.append(WalEntry::AddVertex {
-                vid,
-                global_vid: None,
-                label: label.to_string(),
-                props: props
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.clone()))
-                    .collect(),
-            });
-        }
-
         vid
     }
 
@@ -2220,20 +2012,6 @@ impl Mutable for MutableCsrStore {
         self.register_edge_label(label);
         self.dirty_edge_labels.insert(label.to_string());
 
-        // WAL
-        if let Some(ref mut wal) = self.wal {
-            wal.append(WalEntry::AddEdge {
-                edge_id: eid,
-                src,
-                dst,
-                label: label.to_string(),
-                props: props
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.clone()))
-                    .collect(),
-            });
-        }
-
         eid
     }
 
@@ -2246,14 +2024,6 @@ impl Mutable for MutableCsrStore {
             for l in labels {
                 self.dirty_vertex_labels.insert(l.clone());
             }
-        }
-        // WAL
-        if let Some(ref mut wal) = self.wal {
-            wal.append(WalEntry::SetProperty {
-                vid,
-                key: key.to_string(),
-                value,
-            });
         }
     }
 
@@ -2281,10 +2051,6 @@ impl Mutable for MutableCsrStore {
                 self.edge_alive[eid] = false;
             }
         }
-        // WAL
-        if let Some(ref mut wal) = self.wal {
-            wal.append(WalEntry::DeleteVertex { vid });
-        }
     }
 
     fn delete_edge(&mut self, edge_id: u32) {
@@ -2297,10 +2063,6 @@ impl Mutable for MutableCsrStore {
         }
         if let Some(Some(global_eid)) = self.edge_global_ids.get(edge_id as usize) {
             self.global_to_local_eid.remove(global_eid);
-        }
-        // WAL
-        if let Some(ref mut wal) = self.wal {
-            wal.append(WalEntry::DeleteEdge { edge_id });
         }
     }
 
@@ -2327,12 +2089,7 @@ impl Mutable for MutableCsrStore {
         // Reset dirty tracking after index rebuild
         self.dirty_vertex_labels.clear();
         self.dirty_edge_labels.clear();
-        let ver = self.version.fetch_add(1, Ordering::Relaxed) + 1;
-        // WAL
-        if let Some(ref mut wal) = self.wal {
-            wal.append(WalEntry::Commit { version: ver });
-        }
-        ver
+        self.version.fetch_add(1, Ordering::Relaxed) + 1
     }
 }
 
@@ -3425,253 +3182,6 @@ mod lazy_csr_tests {
     }
 }
 
-#[cfg(test)]
-mod wal_tests {
-    use super::*;
-
-    #[test]
-    fn test_wal_records_mutations() {
-        let mut store = MutableCsrStore::new();
-        store.enable_wal();
-
-        store.add_vertex("Person", &[("name", PropValue::Str("Alice".into()))]);
-        store.add_edge(0, 0, "SELF", &[("w", PropValue::Int(1))]);
-
-        let wal = store.wal().unwrap();
-        assert_eq!(wal.entries().len(), 2);
-        match &wal.entries()[0] {
-            WalEntry::AddVertex {
-                vid,
-                global_vid,
-                label,
-                props,
-            } => {
-                assert_eq!(*vid, 0);
-                assert_eq!(*global_vid, None);
-                assert_eq!(label, "Person");
-                assert_eq!(props.len(), 1);
-            }
-            other => panic!("expected AddVertex, got {:?}", other),
-        }
-        match &wal.entries()[1] {
-            WalEntry::AddEdge {
-                edge_id,
-                src,
-                dst,
-                label,
-                props,
-            } => {
-                assert_eq!(*edge_id, 0);
-                assert_eq!(*src, 0);
-                assert_eq!(*dst, 0);
-                assert_eq!(label, "SELF");
-                assert_eq!(props.len(), 1);
-            }
-            other => panic!("expected AddEdge, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_wal_replay() {
-        // Build a store with WAL enabled and populate it
-        let mut src_store = MutableCsrStore::new();
-        src_store.enable_wal();
-
-        src_store.add_vertex(
-            "Person",
-            &[
-                ("name", PropValue::Str("Alice".into())),
-                ("age", PropValue::Int(30)),
-            ],
-        );
-        src_store.add_vertex(
-            "Person",
-            &[
-                ("name", PropValue::Str("Bob".into())),
-                ("age", PropValue::Int(25)),
-            ],
-        );
-        src_store.add_edge(0, 1, "KNOWS", &[("since", PropValue::Int(2020))]);
-        src_store.commit();
-
-        // Take the WAL and replay into a fresh store
-        let wal = src_store.take_wal().unwrap();
-        let mut dst_store = MutableCsrStore::new();
-        wal.replay(&mut dst_store);
-
-        // Verify the replayed store matches
-        assert_eq!(dst_store.vertex_count(), 2);
-        assert_eq!(dst_store.edge_count(), 1);
-        assert_eq!(
-            dst_store.vertex_prop(0, "name"),
-            Some(PropValue::Str("Alice".into()))
-        );
-        assert_eq!(
-            dst_store.vertex_prop(1, "name"),
-            Some(PropValue::Str("Bob".into()))
-        );
-        assert_eq!(dst_store.out_degree(0), 1);
-    }
-
-    #[test]
-    fn test_wal_serialization() {
-        let mut wal = GraphWal::new();
-        wal.append(WalEntry::AddVertex {
-            vid: 0,
-            global_vid: Some(GlobalVid::from(9u64)),
-            label: "Person".into(),
-            props: vec![("name".into(), PropValue::Str("Alice".into()))],
-        });
-        wal.append(WalEntry::AddEdge {
-            edge_id: 0,
-            src: 0,
-            dst: 1,
-            label: "KNOWS".into(),
-            props: vec![],
-        });
-        wal.append(WalEntry::DeleteVertex { vid: 42 });
-        wal.append(WalEntry::Commit { version: 1 });
-
-        let bytes = wal.to_bytes();
-        let restored = GraphWal::from_bytes(&bytes);
-
-        assert_eq!(restored.entries().len(), 4);
-        match &restored.entries()[0] {
-            WalEntry::AddVertex {
-                vid,
-                global_vid,
-                label,
-                ..
-            } => {
-                assert_eq!(*vid, 0);
-                assert_eq!(*global_vid, Some(GlobalVid::from(9u64)));
-                assert_eq!(label, "Person");
-            }
-            other => panic!("expected AddVertex, got {:?}", other),
-        }
-        match &restored.entries()[3] {
-            WalEntry::Commit { version } => assert_eq!(*version, 1),
-            other => panic!("expected Commit, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_wal_commit_entry() {
-        let mut store = MutableCsrStore::new();
-        store.enable_wal();
-
-        store.add_vertex("V", &[]);
-        store.commit();
-
-        let wal = store.wal().unwrap();
-        let last = wal.entries().last().unwrap();
-        match last {
-            WalEntry::Commit { version } => assert_eq!(*version, 1),
-            other => panic!("expected Commit, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_wal_replay_with_deletes() {
-        let mut src_store = MutableCsrStore::new();
-        src_store.enable_wal();
-
-        src_store.add_vertex("Person", &[("name", PropValue::Str("Alice".into()))]);
-        src_store.add_vertex("Person", &[("name", PropValue::Str("Bob".into()))]);
-        src_store.add_edge(0, 1, "KNOWS", &[]);
-        src_store.commit();
-        src_store.delete_vertex(0);
-        src_store.commit();
-
-        let wal = src_store.take_wal().unwrap();
-        let mut dst_store = MutableCsrStore::new();
-        wal.replay(&mut dst_store);
-
-        // Alice deleted, Bob alive
-        assert!(!dst_store.has_vertex(0));
-        assert!(dst_store.has_vertex(1));
-        assert_eq!(dst_store.vertex_count(), 1);
-        // Incident edge also soft-deleted
-        assert_eq!(dst_store.edge_count(), 0);
-    }
-}
-
-#[cfg(test)]
-mod mvcc_tests {
-    use super::*;
-
-    #[test]
-    fn test_snapshot_isolation() {
-        let mut store = MutableCsrStore::new();
-        store.add_vertex("Person", &[("name", PropValue::Str("Alice".into()))]);
-        store.commit();
-
-        // Take snapshot at version 1
-        let snap = store.snapshot();
-        assert_eq!(snap.version(), 1);
-        assert_eq!(snap.store().vertex_count(), 1);
-
-        // Mutate after snapshot
-        store.add_vertex("Person", &[("name", PropValue::Str("Bob".into()))]);
-        store.commit();
-
-        // Snapshot still sees only Alice
-        assert_eq!(snap.store().vertex_count(), 1);
-        assert_eq!(
-            snap.store().vertex_prop(0, "name"),
-            Some(PropValue::Str("Alice".into()))
-        );
-
-        // Live store sees both
-        assert_eq!(store.vertex_count(), 2);
-    }
-
-    #[test]
-    fn test_snapshot_version() {
-        let mut store = MutableCsrStore::new();
-        assert_eq!(store.version(), 0);
-
-        store.add_vertex("V", &[]);
-        store.commit(); // version 1
-
-        let snap1 = store.snapshot();
-        assert_eq!(snap1.version(), 1);
-
-        store.add_vertex("V", &[]);
-        store.commit(); // version 2
-
-        let snap2 = store.snapshot();
-        assert_eq!(snap2.version(), 2);
-
-        // snap1 still at version 1
-        assert_eq!(snap1.version(), 1);
-    }
-
-    #[test]
-    fn test_multiple_snapshots() {
-        let mut store = MutableCsrStore::new();
-
-        store.add_vertex("Person", &[("name", PropValue::Str("Alice".into()))]);
-        store.commit();
-        let snap1 = store.snapshot();
-
-        store.add_vertex("Person", &[("name", PropValue::Str("Bob".into()))]);
-        store.commit();
-        let snap2 = store.snapshot();
-
-        store.add_vertex("Person", &[("name", PropValue::Str("Charlie".into()))]);
-        store.commit();
-        let snap3 = store.snapshot();
-
-        assert_eq!(snap1.store().vertex_count(), 1);
-        assert_eq!(snap2.store().vertex_count(), 2);
-        assert_eq!(snap3.store().vertex_count(), 3);
-
-        assert_eq!(snap1.version(), 1);
-        assert_eq!(snap2.version(), 2);
-        assert_eq!(snap3.version(), 3);
-    }
-}
 
 #[cfg(test)]
 mod bench {
