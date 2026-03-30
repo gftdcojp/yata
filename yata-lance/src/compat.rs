@@ -177,6 +177,10 @@ impl YataVectorStore {
     pub async fn create_embedding_index(&self) -> Result<(), String> {
         Ok(()) // stub — lancedb table.create_index() will replace
     }
+
+    pub async fn vector_count(&self) -> usize {
+        0 // stub
+    }
 }
 
 /// Compat stub: replaces the old UreqObjectStore.

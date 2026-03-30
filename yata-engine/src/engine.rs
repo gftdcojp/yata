@@ -86,7 +86,6 @@ pub struct MutationContext {
 pub struct TieredGraphEngine {
     config: TieredEngineConfig,
     read_store: Arc<RwLock<Option<yata_lance::LanceReadStore>>>,
-    warm: Arc<yata_lance::YataVectorStore>,
     cache: Arc<Mutex<QueryCache>>,
     hot_initialized: Arc<AtomicBool>,
     cold_starting: Arc<AtomicBool>,

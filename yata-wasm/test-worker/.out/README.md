@@ -1,0 +1,1 @@
+This folder contains the built output assets for the worker "yata-wasm-test" generated at 2026-03-30T14:50:17.916Z.
