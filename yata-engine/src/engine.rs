@@ -111,8 +111,7 @@ pub struct TieredGraphEngine {
     /// Cached manifest for demand-paged label loading (LanceDB pattern).
     /// Loaded once on first query, then ensure_labels() fetches individual labels on-demand.
     /// Multi-node: each node loads manifest independently from R2 (shared source of truth).
-    manifest_cache: Arc<Mutex<Option<crate::compaction::CompactionManifest>>>,
-    /// Lance TableManifest (primary cold start source). Fragment-level page-in.
+    /// Lance TableManifest — single source for cold start + demand page-in.
     lance_manifest_cache: Arc<Mutex<Option<yata_lance::table::TableManifest>>>,
     loaded_labels: Arc<Mutex<HashSet<String>>>,
     blob_cache: Arc<dyn BlobCache>,
@@ -213,7 +212,6 @@ impl TieredGraphEngine {
             cache: Arc::new(Mutex::new(cache)),
             hot_initialized: Arc::new(AtomicBool::new(false)),
             cold_starting: Arc::new(AtomicBool::new(false)),
-            manifest_cache: Arc::new(Mutex::new(None)),
             lance_manifest_cache: Arc::new(Mutex::new(None)),
             loaded_labels: Arc::new(Mutex::new(HashSet::new())),
             blob_cache,
@@ -1318,13 +1316,12 @@ impl TieredGraphEngine {
         // Drain dirty_labels — only these labels need re-compaction
         let dirty = self.drain_dirty_labels();
 
-        // Read existing compaction manifest
-        let manifest_key = crate::compaction::manifest_r2_key(prefix, pid);
-        let existing_manifest: Option<crate::compaction::CompactionManifest> = match s3.get_sync(&manifest_key) {
-            Ok(Some(data)) => serde_json::from_slice(&data).ok(),
-            _ => None,
+        // Read existing Lance manifest (or from cache)
+        let existing_lance: Option<yata_lance::table::TableManifest> = {
+            let cache = self.lance_manifest_cache.lock().ok();
+            cache.and_then(|c| c.clone())
         };
-        let existing_compacted_seq = existing_manifest.as_ref().map(|m| m.compacted_seq).unwrap_or(0);
+        let existing_compacted_seq = existing_lance.as_ref().map(|m| m.version).unwrap_or(0);
 
         // Segment registry from head.json
         let head_key = format!("{prefix}wal/meta/{pid}/head.json");
@@ -1373,45 +1370,22 @@ impl TieredGraphEngine {
             }
         }
 
-        // v2 per-label compaction: for each dirty label, merge existing per-label
-        // compacted segment + new WAL entries → per-label compacted segment.
-        let existing_label_segments = existing_manifest.as_ref()
-            .map(|m| &m.label_segments)
-            .cloned()
-            .unwrap_or_default();
-
-        // Build segment refs for per-label compaction
+        // Include existing Lance fragments for dirty labels
         let mut all_segment_refs: Vec<(String, bytes::Bytes)> = Vec::new();
-
-        // Include existing per-label compacted segments for dirty labels
-        for label in &dirty {
-            if let Some(state) = existing_label_segments.get(label) {
-                if let Ok(Some(data)) = s3.get_sync(&state.key) {
-                    all_segment_refs.push((state.key.clone(), data));
+        if let Some(ref lm) = existing_lance {
+            for label in &dirty {
+                for frag in &lm.fragments {
+                    if frag.labels.iter().any(|l| l == label) {
+                        if let Ok(Some(data)) = s3.get_sync(&frag.r2_key) {
+                            all_segment_refs.push((frag.r2_key.clone(), data));
+                        }
+                    }
                 }
             }
         }
 
-        // Include new WAL segments (will be filtered to dirty labels by compact_segments_by_label)
+        // Include new WAL segments
         all_segment_refs.extend(new_segment_data);
-
-        // If v1 monolithic compacted segment exists (migration), include it
-        if let Some(ref v1_manifest) = existing_manifest.as_ref().filter(|m| m.version == 1 && !m.compacted_segment_key.is_empty()) {
-            let v1_key = &v1_manifest.compacted_segment_key;
-            if let Ok(Some(data)) = s3.get_sync(v1_key) {
-                all_segment_refs.push((v1_key.clone(), data));
-            }
-            // v1 migration: treat all labels as dirty
-            let v1_labels = v1_manifest.labels.clone();
-            if let Ok(mut dl) = self.dirty_labels.lock() {
-                dl.extend(v1_labels);
-            }
-            // Re-drain to include v1 labels
-            let extra = self.drain_dirty_labels();
-            // Use union of original dirty + v1 labels
-            let dirty = dirty.union(&extra).cloned().collect::<std::collections::HashSet<String>>();
-            return self.do_per_label_compaction(s3, prefix, pid, &manifest_key, &all_segment_refs, &dirty, &existing_label_segments, global_max_seq);
-        }
 
         if all_segment_refs.is_empty() && dirty.is_empty() {
             tracing::debug!("compaction: no new segments to compact");
@@ -1425,7 +1399,7 @@ impl TieredGraphEngine {
             });
         }
 
-        self.do_per_label_compaction(s3, prefix, pid, &manifest_key, &all_segment_refs, &dirty, &existing_label_segments, global_max_seq)
+        self.do_per_label_compaction(s3, prefix, pid, "", &all_segment_refs, &dirty, &std::collections::HashMap::new(), global_max_seq)
     }
 
     /// Execute per-label compaction: compact dirty labels → Lance-table-compatible fragments + manifest.
@@ -1479,14 +1453,11 @@ impl TieredGraphEngine {
             let r2_key = &fragment.r2_key;
             match s3.put_sync(r2_key, lr.data.clone()) {
                 Ok(_) => {
-                    // Also write to legacy path for backward compat (cold start reads both)
-                    let legacy_key = crate::compaction::label_compacted_r2_key(prefix, pid, &lr.label);
-                    let _ = s3.put_sync(&legacy_key, lr.data.clone());
-                    // Disk cache
+                    // Disk cache (Lance layout)
                     if let Some(ref dir) = vineyard_dir {
-                        let label_dir = format!("{dir}/log/compacted/{pid}/label");
-                        let _ = std::fs::create_dir_all(&label_dir);
-                        let _ = std::fs::write(format!("{label_dir}/{}.arrow", lr.label), &lr.data);
+                        let frag_dir = format!("{dir}/lance/vertices/{pid}/fragments");
+                        let _ = std::fs::create_dir_all(&frag_dir);
+                        let _ = std::fs::write(format!("{frag_dir}/{:020}-{:06}.arrow", global_max_seq, frag_idx), &lr.data);
                     }
                     new_fragments.push(fragment);
                     uploaded_results.push(lr);
@@ -1499,38 +1470,35 @@ impl TieredGraphEngine {
             }
         }
 
-        // Phase 2: Build Lance TableManifest (versioned, immutable) + legacy CompactionManifest.
-        // Read existing Lance manifest if available
-        let lance_manifest_key = lance_table.manifest_key(global_max_seq.saturating_sub(1));
-        let existing_lance: Option<yata_lance::table::TableManifest> = s3.get_sync(&lance_manifest_key)
-            .ok().flatten()
-            .and_then(|data| serde_json::from_slice(&data).ok());
+        // Phase 2: Build Lance TableManifest (versioned, immutable). Single manifest path.
+        let existing_lance: Option<yata_lance::table::TableManifest> = {
+            let cache = self.lance_manifest_cache.lock().ok();
+            cache.and_then(|c| c.clone())
+        };
         let lance_manifest = lance_table.build_manifest(existing_lance.as_ref(), new_fragments);
         let lance_json = serde_json::to_vec(&lance_manifest).unwrap_or_default();
         let lance_versioned_key = lance_table.manifest_key(global_max_seq);
-        let _ = s3.put_sync(&lance_versioned_key, bytes::Bytes::from(lance_json));
-        tracing::info!(lance_versioned_key, version = lance_manifest.version, "wrote Lance table manifest");
+        s3.put_sync(&lance_versioned_key, bytes::Bytes::from(lance_json))
+            .map_err(|e| format!("R2 Lance manifest upload failed: {e}"))?;
+        // Update in-memory cache
+        if let Ok(mut lmc) = self.lance_manifest_cache.lock() {
+            *lmc = Some(lance_manifest.clone());
+        }
 
-        // Legacy CompactionManifest (backward compat for cold start)
-        let uploaded_label_results: Vec<crate::compaction::LabelCompactionResult> = uploaded_results
-            .iter().map(|lr| (*lr).clone()).collect();
-        let manifest = crate::compaction::build_manifest_v2(pid, prefix, global_max_seq, &uploaded_label_results, existing_label_segments);
-        let manifest_json = serde_json::to_vec(&manifest).unwrap_or_default();
-        s3.put_sync(manifest_key, bytes::Bytes::from(manifest_json.clone()))
-            .map_err(|e| format!("R2 compaction manifest upload failed: {e}"))?;
-        let versioned_key = crate::compaction::manifest_versioned_r2_key(prefix, pid, global_max_seq);
-        let _ = s3.put_sync(&versioned_key, bytes::Bytes::from(manifest_json));
-
-        let all_labels: Vec<String> = manifest.labels.clone();
+        let all_labels: Vec<String> = lance_manifest.fragments.iter()
+            .flat_map(|f| f.labels.iter().cloned())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter().collect();
 
         tracing::info!(
             dirty_labels = label_results.len(),
             total_labels = all_labels.len(),
             output_entries = total_output,
             lance_version = lance_manifest.version,
+            lance_fragments = lance_manifest.fragments.len(),
             global_max_seq,
             bytes = total_bytes,
-            "Lance-table L1 compaction complete"
+            "Lance compaction complete"
         );
 
         Ok(crate::compaction::CompactionResult {
