@@ -3,7 +3,7 @@ name = "yata-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Graph engine: HOT (CSR) + Lance-backed persistence"
+description = "Graph engine: Lance-backed read store with WAL projection"
 
 [dependencies]
 yata-core = { path = "../yata-core" }

@@ -1,7 +1,7 @@
 //! yata XRPC API — Cypher query endpoint for Workers RPC.
 //!
 //! XRPC-only: `/xrpc/ai.gftd.yata.cypher` (unified read+write).
-//! Design E: yata-native JWT auth + SecurityScope lazy compile from CSR policy vertices.
+//! Design E: yata-native JWT auth + SecurityScope lazy compile from policy vertices.
 //! Auth: X-Magatama-Verified: true (internal bypass) or Authorization: Bearer {ES256 JWT}.
 
 use axum::{
@@ -25,7 +25,7 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
     ) -> Result<Vec<Vec<(String, String)>>, String>;
 
     /// Query with DID-based SecurityScope (Design E path).
-    /// Compiles SecurityScope from policy vertices in CSR, then applies GIE SecurityFilter.
+    /// Compiles SecurityScope from policy vertices, then applies GIE SecurityFilter.
     fn query_with_did(
         &self,
         cypher: &str,
@@ -36,7 +36,7 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
         self.query(cypher, params, None)
     }
 
-    /// Resolve a DID's P-256 public key from CSR DIDDocument vertex.
+    /// Resolve a DID's P-256 public key from the DIDDocument vertex.
     /// Returns uncompressed P-256 key (65 bytes) or None.
     fn resolve_did_pubkey(&self, _did: &str) -> Option<Vec<u8>> {
         None
@@ -184,7 +184,7 @@ fn authorize<G: GraphQueryExecutor>(headers: &HeaderMap, state: &YataRestState<G
         let auth_str = auth_header.to_str().unwrap_or("");
         if let Some(token) = auth_str.strip_prefix("Bearer ") {
             let resolve_key = |did: &str| -> Option<Vec<u8>> {
-                // Resolve P-256 public key from CSR DIDDocument vertex
+                // Resolve P-256 public key from the DIDDocument vertex
                 let pubkey_multibase = state.graph.resolve_did_pubkey(did)?;
                 // pubkey_multibase is already uncompressed P-256 (65 bytes)
                 Some(pubkey_multibase)

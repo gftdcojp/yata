@@ -44,7 +44,7 @@ Lance-backed graph database and event store with Raft consensus.
 | **yata-object** | Object storage abstraction (CAS + S3 write-through) |
 | **yata-cypher** | Pure-Rust Cypher parser and execution engine |
 | **yata-gie** | Graph Interactive Engine (IR operators, push-based executor) |
-| **yata-engine** | TieredGraphEngine — Lance-backed cold start, WAL projection, partition routing |
+| **yata-engine** | TieredGraphEngine — Lance-backed cold start and WAL projection |
 | **yata-lance** | Lance-table-compatible persistence and vector store (fragments, manifests, typed Arrow schema) |
 | **yata-s3** | S3/R2 adapter (sync ureq+rustls, SigV4) |
 | **yata-vex** | Vector index (IVF_PQ + DiskANN) |

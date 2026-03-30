@@ -278,7 +278,7 @@
 
   <!-- HOT -->
   <rect x="60" y="1025" width="460" height="165" rx="10" fill="url(#hotGrad)" stroke="#dc2626" stroke-width="1.5" stroke-opacity="0.5"/>
-  <text x="80" y="1050" fill="#fca5a5" font-size="14" font-weight="bold">HOT (Sorted COO In-Memory)</text>
+  <text x="80" y="1050" fill="#fca5a5" font-size="14" font-weight="bold">Read Store (In-Memory)</text>
   <text x="360" y="1050" fill="#dc2626" font-size="11">&lt;1us query</text>
   <rect x="80" y="1065" width="200" height="45" rx="6" fill="#1e293b" stroke="#dc2626" stroke-width="1" stroke-opacity="0.4"/>
   <text x="95" y="1085" fill="#e2e8f0" font-size="11">CooStore + L0 buffer</text>

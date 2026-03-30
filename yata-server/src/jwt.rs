@@ -1,7 +1,7 @@
 //! ES256 JWT verification for yata-native authentication (Design E).
 //!
 //! Port of PDS `verifyServiceAuthJWT` (index.ts:654-698).
-//! Resolves DID signing keys from CSR DIDDocument vertices — no external HTTP fetch needed.
+//! Resolves DID signing keys from DIDDocument vertices in the local read store.
 
 use ring::signature;
 
@@ -42,7 +42,7 @@ impl std::fmt::Display for JwtError {
 /// Verify an ES256 (ECDSA P-256 + SHA-256) JWT and return claims.
 ///
 /// `resolve_pubkey` resolves a DID to its P-256 public key bytes (uncompressed, 65 bytes).
-/// For internal DIDs, this queries the CSR DIDDocument vertex directly.
+/// For internal DIDs, this queries the local DIDDocument vertex directly.
 pub fn verify_es256_jwt(
     token: &str,
     expected_aud: &str,

@@ -110,7 +110,7 @@ env.YATA.stats()                        // → all partition CpmStats (K3a)
 | `yata-s3` | R2 persistence (sync ureq+rustls S3 client, SigV4)。`get_sync` (full GET) + **`get_range_sync` (HTTP Range GET, SigV4 signed)**。`trigger_compaction()` → R2 PUT、page-in → R2 GET/Range GET |
 | `yata-lance` | **Lance-table-compatible persistence + vector store** — typed Arrow schema (VERTICES_SCHEMA/EDGES_SCHEMA), Arrow IPC fragment serialize/deserialize, versioned TableManifest, deletion info, embedding index。`yata-engine` compaction + cold start + vector search の persistence layer |
 | `yata-vex` | Vector index (IVF_PQ + DiskANN) |
-| `yata-bench` | Benchmarks: `coo-read-bench` (COO read + R2 page-in), `cypher-bench`, `cypher-transport-bench` |
+| `yata-bench` | Benchmarks: `cypher-bench`, `cypher-transport-bench` |
 | `yata-server` | XRPC API server (`/xrpc/ai.gftd.yata.cypher` + `compact`)。GraphQueryExecutor trait |
 
 ## GraphScope Parity
@@ -304,7 +304,6 @@ Production: PARTITION_COUNT=1, per-label sorted COO Arrow IPC, segment-level pag
 
 **Key insight**: R2 latency が cold start の支配項。compute (deser+apply) は 5K entries で 8ms。Production 33 labels → ~33×4ms R2 + ~20ms compute ≈ **152ms** (Container wake 2.8s はコンテナ起動コスト込み)。page-in 後の query は warm CSR と同一 (COO overhead = cold start のみ)。
 
-bench: `cargo run -p yata-bench --bin coo-read-bench --release`
 
 **Write path (10K records):**
 
