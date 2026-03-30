@@ -6082,6 +6082,7 @@ dependencies = [
  "arrow-schema",
  "futures",
  "lance",
+ "rustls",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

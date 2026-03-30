@@ -18,6 +18,9 @@ lance = { version = "3.0", default-features = false }
 tokio = { workspace = true }
 futures = { workspace = true }
 
+# Force rustls to use ring (not aws-lc-rs) for cross-compile compat
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+
 # Serialization / IO
 tracing.workspace = true
 thiserror.workspace = true

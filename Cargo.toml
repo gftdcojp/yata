@@ -116,3 +116,6 @@ rayon = "1.10"
 # rkyv zero-copy serialization (yata-core DurableWalOp types)
 rkyv = { version = "0.8", features = ["bytecheck"] }
 
+# Force rustls to use ring instead of aws-lc-rs (aws-lc-sys cross-compile障害)
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+
