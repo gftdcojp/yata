@@ -83,11 +83,9 @@ pub struct TieredGraphEngine {
     cache: Arc<Mutex<QueryCache>>,
     hot_initialized: Arc<AtomicBool>,
     cold_starting: Arc<AtomicBool>,
-    /// Cached manifest for demand-paged label loading (LanceDB pattern).
-    /// Loaded once on first query, then ensure_labels() fetches individual labels on-demand.
-    /// Multi-node: each node loads manifest independently from R2 (shared source of truth).
-    /// Lance TableManifest — single source for cold start + demand page-in.
-    lance_manifest_cache: Arc<Mutex<Option<yata_lance::table::TableManifest>>>,
+    /// Lance Dataset for demand-paged label loading.
+    /// Opened once on first query via Dataset::open(). Labels loaded on-demand by ensure_labels().
+    lance_dataset: Arc<tokio::sync::Mutex<Option<yata_lance::YataDataset>>>,
     loaded_labels: Arc<Mutex<HashSet<String>>>,
     blob_cache: Arc<dyn BlobCache>,
     s3_client: Arc<Mutex<Option<Arc<yata_s3::s3::S3Client>>>>,
@@ -187,7 +185,7 @@ impl TieredGraphEngine {
             cache: Arc::new(Mutex::new(cache)),
             hot_initialized: Arc::new(AtomicBool::new(false)),
             cold_starting: Arc::new(AtomicBool::new(false)),
-            lance_manifest_cache: Arc::new(Mutex::new(None)),
+            lance_dataset: Arc::new(tokio::sync::Mutex::new(None)),
             loaded_labels: Arc::new(Mutex::new(HashSet::new())),
             blob_cache,
             s3_client,
@@ -330,7 +328,7 @@ impl TieredGraphEngine {
             // Fall through to Phase 2 (demand page-in)
         }
 
-        // Phase 2: Demand page-in — fetch only needed labels
+        // Phase 2: Demand page-in — scan Dataset for needed labels
         if vertex_labels.is_empty() { return; }
         let needed: Vec<String> = {
             let loaded = match self.loaded_labels.lock() {
@@ -345,78 +343,30 @@ impl TieredGraphEngine {
         };
         if needed.is_empty() { return; }
 
-        let s3 = match self.get_s3_client() {
-            Some(s3) => s3.clone(),
-            None => return,
-        };
-        let vineyard_dir = std::env::var("YATA_VINEYARD_DIR").ok();
-        let pid = self.config.hot_partition_id.get();
-
-        // Lance TableManifest: fragment-level demand page-in (3-tier: disk → R2 → verify)
-        let lance_manifest = match self.lance_manifest_cache.lock() {
-            Ok(lmc) => lmc.clone(),
-            Err(_) => None,
-        };
-        if let Some(ref lm) = lance_manifest {
-            for label in &needed {
-                let matching_fragments: Vec<&yata_lance::Fragment> = lm.fragments.iter()
-                    .filter(|f| f.labels.iter().any(|l| l == label))
-                    .collect();
-                if matching_fragments.is_empty() { continue; }
-                for frag in matching_fragments {
-                    let ext = if frag.r2_key.ends_with(".lance") { "lance" } else { "arrow" };
-                    let disk_path = vineyard_dir.as_ref()
-                        .map(|d| format!("{d}/lance/vertices/{pid}/fragments/{:020}-{:06}.{ext}", frag.version, frag.id));
-                    // Tier 1: disk cache
-                    let data = if let Some(ref path) = disk_path {
-                        if std::path::Path::new(path).exists() {
-                            std::fs::read(path).ok().map(bytes::Bytes::from)
-                        } else { None }
-                    } else { None };
-                    // Tier 2: R2
-                    let data = match data {
-                        Some(d) => d,
-                        None => match s3.get_sync(&frag.r2_key) {
-                            Ok(Some(d)) => {
-                                let actual = blake3::hash(&d).to_hex().to_string();
-                                if !frag.blake3_hex.is_empty() && actual != frag.blake3_hex {
-                                    tracing::error!(label, frag_id = frag.id, "Lance fragment checksum mismatch");
-                                    continue;
-                                }
-                                if let Some(ref path) = disk_path {
-                                    if let Some(parent) = std::path::Path::new(path).parent() {
-                                        let _ = std::fs::create_dir_all(parent);
-                                    }
-                                    let _ = std::fs::write(path, &d);
-                                }
-                                d
-                            }
-                            _ => { continue; }
+        let lance_ds = self.lance_dataset.clone();
+        for label in &needed {
+            let label_clone = label.clone();
+            let result = ENGINE_RT.block_on(async {
+                let ds_guard = lance_ds.lock().await;
+                if let Some(ref ds) = *ds_guard {
+                    ds.scan_filter(&format!("label = '{}'", label_clone.replace('\'', "''"))).await.ok()
+                } else {
+                    None
+                }
+            });
+            if let Some(batches) = result {
+                for batch in &batches {
+                    match crate::arrow_wal::batch_to_wal_entries(batch) {
+                        Ok(entries) if !entries.is_empty() => {
+                            let _ = self.wal_apply(&entries);
                         }
-                    };
-                    // Dual-format: Lance native (.lance) or Arrow IPC (.arrow)
-                    let entries = if frag.r2_key.ends_with(".lance") {
-                        #[cfg(feature = "native-lance")]
-                        {
-                            crate::arrow_wal::deserialize_segment_lance(&data)
-                                .unwrap_or_default()
-                        }
-                        #[cfg(not(feature = "native-lance"))]
-                        {
-                            tracing::error!(label, "Lance fragment but native-lance disabled");
-                            continue;
-                        }
-                    } else {
-                        crate::arrow_wal::deserialize_segment_auto(&frag.r2_key, &data)
-                    };
-                    if !entries.is_empty() {
-                        let _ = self.wal_apply(&entries);
+                        _ => {}
                     }
                 }
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     ll.insert(label.clone());
                 }
-                tracing::info!(label, "demand page-in: loaded from Lance fragment");
+                tracing::info!(label, "demand page-in: loaded from Lance Dataset");
             }
         }
     }
@@ -1473,37 +1423,25 @@ impl TieredGraphEngine {
         let prefix = &self.s3_prefix;
         let pid = self.config.hot_partition_id.get();
 
-        // Load Lance TableManifest from R2 (O(1) latest via inverted naming)
-        let lance_prefix = format!("{}lance/vertices/{}/manifest-", prefix, pid);
-        let checkpoint_seq = if let Ok(objects) = s3.list_sync(&lance_prefix) {
-            if let Some(first) = objects.first() {
-                if let Ok(Some(data)) = s3.get_sync(&first.key) {
-                    match serde_json::from_slice::<yata_lance::table::TableManifest>(&data) {
-                        Ok(lance_manifest) => {
-                            let frag_count = lance_manifest.fragments.len();
-                            let total_rows = lance_manifest.total_rows;
-                            let version = lance_manifest.version;
-                            tracing::info!(
-                                version, fragments = frag_count,
-                                total_rows, "Lance cold start: manifest loaded"
-                            );
-                            if let Ok(mut lmc) = self.lance_manifest_cache.lock() {
-                                *lmc = Some(lance_manifest);
-                            }
-                            // Use version as checkpoint_seq proxy for WAL tail replay
-                            version
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Lance manifest parse failed, starting empty");
-                            0
-                        }
-                    }
-                } else { 0 }
-            } else {
-                tracing::info!("no Lance manifest found (new database)");
-                0
+        // Open Lance Dataset from R2
+        let lance_uri = format!("{}lance/vertices/{}", prefix, pid);
+        let lance_ds = self.lance_dataset.clone();
+        let checkpoint_seq = ENGINE_RT.block_on(async {
+            match yata_lance::YataDataset::open(&lance_uri).await {
+                Ok(ds) => {
+                    let version = ds.version();
+                    let rows = ds.count_rows(None).await.unwrap_or(0);
+                    tracing::info!(version, rows, "Lance cold start: Dataset opened");
+                    let mut guard = lance_ds.lock().await;
+                    *guard = Some(ds);
+                    version
+                }
+                Err(e) => {
+                    tracing::info!(error = %e, "no Lance Dataset found (new database)");
+                    0
+                }
             }
-        } else { 0 };
+        });
 
         // Replay WAL tail (entries after compacted_seq)
         let head_key = format!("{prefix}wal/meta/{pid}/head.json");
