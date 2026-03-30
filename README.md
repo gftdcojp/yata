@@ -24,7 +24,7 @@ Lance-backed graph database and event store with Raft consensus.
 │  yata-engine  yata-gie  yata-vex  yata-s3                   │
 ├─────────────────────────────────────────────────────────────┤
 │                   Layer 2: Graph                             │
-│  yata-store (MutableCSR)  yata-cypher                       │
+│  yata-cypher             yata-lance                        │
 ├─────────────────────────────────────────────────────────────┤
 │                 Layer 1: Core Primitives                     │
 │  yata-arrow  yata-object                                    │
@@ -43,7 +43,6 @@ Lance-backed graph database and event store with Raft consensus.
 | **yata-arrow** | Arrow IPC encode/decode |
 | **yata-object** | Object storage abstraction (CAS + S3 write-through) |
 | **yata-cypher** | Pure-Rust Cypher parser and execution engine |
-| **yata-store** | MutableCSR in-memory graph, partitioned facade, blob cache primitives |
 | **yata-gie** | Graph Interactive Engine (IR operators, push-based executor) |
 | **yata-engine** | TieredGraphEngine — Lance-backed cold start, WAL projection, partition routing |
 | **yata-lance** | Lance-table-compatible persistence and vector store (fragments, manifests, typed Arrow schema) |

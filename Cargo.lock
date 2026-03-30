@@ -5962,7 +5962,6 @@ dependencies = [
  "yata-grin",
  "yata-lance",
  "yata-object",
- "yata-store",
 ]
 
 [[package]]
