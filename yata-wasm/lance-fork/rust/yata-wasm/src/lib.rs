@@ -13,11 +13,27 @@ use prost::Message;
 use prost_types::Any;
 use std::sync::Arc;
 
-/// Generated protobuf types for Lance file format v2
-mod pbfile {
+/// Generated protobuf types — nested to match proto package hierarchy
+mod lance {
     #![allow(clippy::all, non_camel_case_types, unused)]
-    include!(concat!(env!("OUT_DIR"), "/lance.file.v2.rs"));
+
+    pub mod file {
+        include!(concat!(env!("OUT_DIR"), "/lance.file.rs"));
+
+        pub mod v2 {
+            include!(concat!(env!("OUT_DIR"), "/lance.file.v2.rs"));
+        }
+    }
+
+    pub mod table {
+        include!(concat!(env!("OUT_DIR"), "/lance.table.rs"));
+    }
 }
+
+// Convenience aliases
+use lance::file as pb;
+use lance::file::v2 as pbfile;
+use lance::table as pbtable;
 
 /// Lance v2 file magic bytes
 const MAGIC: &[u8; 4] = b"LANC";
@@ -229,4 +245,133 @@ pub fn read_lance_footer(file_bytes: &[u8]) -> Result<String, JsValue> {
 pub fn generate_fragment_path() -> String {
     let uuid = uuid::Uuid::new_v4();
     format!("data/{}.lance", uuid)
+}
+
+// ── Manifest Operations ──
+
+/// Create a new manifest (version 1) with a single fragment.
+/// Returns serialized protobuf bytes for the manifest.
+#[wasm_bindgen]
+pub fn create_manifest(
+    fragment_path: &str,
+    num_rows: u64,
+    field_names: Vec<String>,
+    field_ids: Vec<i32>,
+) -> Result<Vec<u8>, JsValue> {
+    use prost::Message;
+
+    let fields: Vec<pb::Field> = field_names
+        .iter()
+        .zip(field_ids.iter())
+        .enumerate()
+        .map(|(_, (name, &id))| pb::Field {
+            name: name.clone(),
+            id,
+            parent_id: -1,
+            logical_type: "utf8".to_string(),
+            ..Default::default()
+        })
+        .collect();
+
+    let data_file = pbtable::DataFile {
+        path: fragment_path.to_string(),
+        fields: field_ids.clone(),
+        ..Default::default()
+    };
+
+    let fragment = pbtable::DataFragment {
+        id: 0,
+        files: vec![data_file],
+        physical_rows: num_rows,
+        ..Default::default()
+    };
+
+    let manifest = pbtable::Manifest {
+        fields,
+        fragments: vec![fragment],
+        version: 1,
+        max_fragment_id: 0,
+        writer_version: Some(pbtable::manifest::WriterVersion {
+            library: "yata-wasm".to_string(),
+            version: "0.1.0".to_string(),
+        }),
+        data_format: Some(pbtable::manifest::DataStorageFormat {
+            file_format: "lance".to_string(),
+            version: "2.1".to_string(),
+        }),
+        ..Default::default()
+    };
+
+    let bytes = manifest.encode_to_vec();
+    Ok(bytes)
+}
+
+/// Add a fragment to an existing manifest. Returns updated manifest bytes.
+/// Increments version, assigns new fragment ID.
+#[wasm_bindgen]
+pub fn add_fragment_to_manifest(
+    manifest_bytes: &[u8],
+    fragment_path: &str,
+    num_rows: u64,
+    field_ids: Vec<i32>,
+) -> Result<Vec<u8>, JsValue> {
+    use prost::Message;
+
+    let mut manifest = pbtable::Manifest::decode(manifest_bytes)
+        .map_err(|e| JsValue::from_str(&format!("manifest decode error: {e}")))?;
+
+    let new_fragment_id = manifest.max_fragment_id + 1;
+    manifest.max_fragment_id = new_fragment_id;
+    manifest.version += 1;
+
+    let data_file = pbtable::DataFile {
+        path: fragment_path.to_string(),
+        fields: field_ids,
+        ..Default::default()
+    };
+
+    manifest.fragments.push(pbtable::DataFragment {
+        id: new_fragment_id as u64,
+        files: vec![data_file],
+        physical_rows: num_rows,
+        ..Default::default()
+    });
+
+    Ok(manifest.encode_to_vec())
+}
+
+/// Get the manifest version path (V2 naming scheme: {version:020}.manifest).
+#[wasm_bindgen]
+pub fn manifest_path(version: u64) -> String {
+    format!("_versions/{:020}.manifest", version)
+}
+
+/// Parse a manifest and return summary as JSON.
+#[wasm_bindgen]
+pub fn read_manifest(manifest_bytes: &[u8]) -> Result<String, JsValue> {
+    use prost::Message;
+
+    let manifest = pbtable::Manifest::decode(manifest_bytes)
+        .map_err(|e| JsValue::from_str(&format!("manifest decode error: {e}")))?;
+
+    let fragments: Vec<serde_json::Value> = manifest
+        .fragments
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "id": f.id,
+                "physical_rows": f.physical_rows,
+                "files": f.files.iter().map(|df| &df.path).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "version": manifest.version,
+        "max_fragment_id": manifest.max_fragment_id,
+        "num_fragments": manifest.fragments.len(),
+        "fragments": fragments,
+        "num_fields": manifest.fields.len(),
+    })
+    .to_string())
 }

@@ -8509,30 +8509,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
-name = "yata-wasm"
-version = "0.1.0"
-dependencies = [
- "arrow-array",
- "arrow-schema",
- "async-trait",
- "bytes",
- "futures",
- "js-sys",
- "lance-core",
- "lance-encoding",
- "lance-file",
- "lance-io",
- "object_store",
- "prost 0.13.5",
- "prost-build 0.13.5",
- "prost-types 0.13.5",
- "serde",
- "serde_json",
- "tokio",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "yoke"
 version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

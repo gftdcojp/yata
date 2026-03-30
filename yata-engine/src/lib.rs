@@ -1,7 +1,6 @@
 //! yata-engine: LanceDB-backed graph engine with WAL projection.
 
 pub mod arrow_wal;
-pub mod cache;
 pub mod config;
 pub mod engine;
 pub mod hints;

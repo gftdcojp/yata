@@ -13,6 +13,24 @@ export function read_lance_footer(file_bytes: Uint8Array): string;
  * Generate a Lance Dataset fragment path (UUID-based, LanceDB standard layout).
  */
 export function generate_fragment_path(): string;
+/**
+ * Create a new manifest (version 1) with a single fragment.
+ * Returns serialized protobuf bytes for the manifest.
+ */
+export function create_manifest(fragment_path: string, num_rows: bigint, field_names: string[], field_ids: Int32Array): Uint8Array;
+/**
+ * Add a fragment to an existing manifest. Returns updated manifest bytes.
+ * Increments version, assigns new fragment ID.
+ */
+export function add_fragment_to_manifest(manifest_bytes: Uint8Array, fragment_path: string, num_rows: bigint, field_ids: Int32Array): Uint8Array;
+/**
+ * Get the manifest version path (V2 naming scheme: {version:020}.manifest).
+ */
+export function manifest_path(version: bigint): string;
+/**
+ * Parse a manifest and return summary as JSON.
+ */
+export function read_manifest(manifest_bytes: Uint8Array): string;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
@@ -22,6 +40,10 @@ export interface InitOutput {
   readonly encode_vertex_lance: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number, number];
   readonly read_lance_footer: (a: number, b: number) => [number, number, number, number];
   readonly generate_fragment_path: () => [number, number];
+  readonly create_manifest: (a: number, b: number, c: bigint, d: number, e: number, f: number, g: number) => [number, number, number, number];
+  readonly add_fragment_to_manifest: (a: number, b: number, c: number, d: number, e: bigint, f: number, g: number) => [number, number, number, number];
+  readonly manifest_path: (a: bigint) => [number, number];
+  readonly read_manifest: (a: number, b: number) => [number, number, number, number];
   readonly __wbindgen_exn_store: (a: number) => void;
   readonly __externref_table_alloc: () => number;
   readonly __wbindgen_export_2: WebAssembly.Table;

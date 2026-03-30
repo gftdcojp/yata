@@ -5,8 +5,6 @@ use yata_core::PartitionId;
 pub struct TieredEngineConfig {
     pub hot_max_vertices: usize,
     pub hot_max_edges: usize,
-    pub cache_max_entries: usize,
-    pub cache_ttl_secs: u64,
     pub adj_expansion_limit: usize,
     pub runtime_workers: usize,
     pub enable_ocel_events: bool,
@@ -39,8 +37,6 @@ impl Default for TieredEngineConfig {
         Self {
             hot_max_vertices: 50_000,
             hot_max_edges: 200_000,
-            cache_max_entries: 256,
-            cache_ttl_secs: 30,
             adj_expansion_limit: 5_000,
             runtime_workers: 2,
             enable_ocel_events: std::env::var("YATA_OCEL_EVENTS")
@@ -70,7 +66,6 @@ mod tests {
     fn test_default_config_values() {
         let cfg = TieredEngineConfig::default();
         assert_eq!(cfg.hot_max_vertices, 50_000);
-        assert_eq!(cfg.cache_max_entries, 256);
         assert_eq!(cfg.partition_count, 1);
         assert_eq!(cfg.wal_ring_capacity, 100_000);
     }

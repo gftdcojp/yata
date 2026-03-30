@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use yata_cypher::Graph;
 use yata_grin::{Predicate, PropValue, Property, Scannable, Topology};
 
-use crate::cache::{QueryCache, cache_key};
 use crate::config::TieredEngineConfig;
 use crate::memory_bridge;
 use crate::router;
@@ -84,7 +83,6 @@ pub struct MutationContext {
 pub struct TieredGraphEngine {
     config: TieredEngineConfig,
     read_store: Arc<RwLock<Option<yata_lance::LanceReadStore>>>,
-    cache: Arc<Mutex<QueryCache>>,
     hot_initialized: Arc<AtomicBool>,
     cold_starting: Arc<AtomicBool>,
     /// Lance Dataset for demand-paged label loading.
@@ -114,8 +112,6 @@ impl TieredGraphEngine {
     }
 
     fn build(config: TieredEngineConfig, data_dir: &str) -> Self {
-        let cache = QueryCache::new(config.cache_max_entries, config.cache_ttl_secs);
-
         let partition_count = config.partition_count;
         if partition_count > 1 {
             tracing::info!(partition_count, "partitioned graph store enabled");
@@ -130,7 +126,6 @@ impl TieredGraphEngine {
         Self {
             config,
             read_store: Arc::new(RwLock::new(Some(yata_lance::LanceReadStore::default()))),
-            cache: Arc::new(Mutex::new(cache)),
             hot_initialized: Arc::new(AtomicBool::new(false)),
             cold_starting: Arc::new(AtomicBool::new(false)),
             lance_db: Arc::new(tokio::sync::Mutex::new(None)),
@@ -404,10 +399,6 @@ impl TieredGraphEngine {
                 );
             }
 
-            if let Ok(mut c) = self.cache.lock() {
-                c.invalidate();
-            }
-
             Ok(all_results)
         })
     }
@@ -481,17 +472,6 @@ impl TieredGraphEngine {
         };
         let query_start = std::time::Instant::now();
 
-        // Cache lookup (reads only)
-        if !is_mutation {
-            let k = cache_key(cypher, params, rls_org_id);
-            if let Ok(c) = self.cache.lock() {
-                if let Some(rows) = c.get(&k) {
-                    tracing::trace!("engine: cache hit");
-                    return Ok(rows.clone());
-                }
-            }
-        }
-
         if !is_mutation {
             self.ensure_hot();
 
@@ -512,11 +492,6 @@ impl TieredGraphEngine {
                         if let Some(ref read_store) = *rs {
                             let records = yata_gie::executor::execute(&plan, read_store);
                             let rows = yata_gie::executor::result_to_rows(&records, &plan);
-
-                            let k = cache_key(cypher, params, rls_org_id);
-                            if let Ok(mut c) = self.cache.lock() {
-                                c.put(k, rows.clone());
-                            }
                             return Ok(rows);
                         }
                     }
@@ -608,10 +583,6 @@ impl TieredGraphEngine {
                     *read_store = Some(new_store);
                     self.hot_initialized.store(true, Ordering::SeqCst);
                 }
-            }
-
-            if let Ok(mut c) = self.cache.lock() {
-                c.invalidate();
             }
 
             // Record mutation elapsed time for CPM metrics
@@ -1025,9 +996,6 @@ impl TieredGraphEngine {
                     }
                 }
                 self.hot_initialized.store(true, Ordering::SeqCst);
-                if let Ok(mut c) = self.cache.lock() {
-                    c.invalidate();
-                }
             } else {
                 return Err("no read store available for wal_apply".into());
             }
@@ -1364,16 +1332,6 @@ impl TieredGraphEngine {
         }
 
         // Cache lookup (reads only, scope-aware key)
-        let cache_did = if scope.bypass { "internal" } else { "" };
-        if !is_mutation {
-            let k = cache_key(cypher, params, Some(cache_did));
-            if let Ok(c) = self.cache.lock() {
-                if let Some(rows) = c.get(&k) {
-                    return Ok(rows.clone());
-                }
-            }
-        }
-
         if !is_mutation {
             self.ensure_hot();
             let (hints_labels, _) = router::extract_pushdown_hints(cypher).unwrap_or_default();
@@ -1387,10 +1345,6 @@ impl TieredGraphEngine {
                     if let Some(ref read_store) = *rs {
                         let records = yata_gie::executor::execute(&plan, read_store);
                         let rows = yata_gie::executor::result_to_rows(&records, &plan);
-                        let k = cache_key(cypher, params, Some(cache_did));
-                        if let Ok(mut c) = self.cache.lock() {
-                            c.put(k, rows.clone());
-                        }
                         return Ok(rows);
                     }
                 }
