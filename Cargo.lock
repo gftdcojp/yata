@@ -6809,7 +6809,6 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "base64",
- "blake3",
  "bytes",
  "chrono",
  "indexmap 2.13.0",
@@ -6823,7 +6822,6 @@ dependencies = [
  "yata-gie",
  "yata-grin",
  "yata-lance",
- "yata-s3",
 ]
 
 [[package]]

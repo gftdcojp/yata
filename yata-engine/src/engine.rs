@@ -10,14 +10,12 @@ use crate::config::TieredEngineConfig;
 use crate::memory_bridge;
 use crate::router;
 
-/// Result of WAL → Lance migration.
+/// Compaction result (LanceDB-native).
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct MigrateToLanceResult {
-    pub wal_segments_read: usize,
-    pub compacted_segments_read: usize,
-    pub total_entries: usize,
-    pub deduplicated_entries: usize,
-    pub lance_version: u64,
+pub struct CompactionResult {
+    pub max_seq: u64,
+    pub input_entries: usize,
+    pub output_entries: usize,
     pub labels: Vec<String>,
 }
 
@@ -94,7 +92,6 @@ pub struct TieredGraphEngine {
     lance_db: Arc<tokio::sync::Mutex<Option<yata_lance::YataDb>>>,
     lance_table: Arc<tokio::sync::Mutex<Option<yata_lance::YataTable>>>,
     loaded_labels: Arc<Mutex<HashSet<String>>>,
-    s3_client: Arc<Mutex<Option<Arc<yata_s3::s3::S3Client>>>>,
     s3_prefix: String,
     dirty_labels: Arc<Mutex<HashSet<String>>>,
     pending_writes: Arc<AtomicUsize>,
@@ -123,11 +120,9 @@ impl TieredGraphEngine {
         if partition_count > 1 {
             tracing::info!(partition_count, "partitioned graph store enabled");
         }
-        // ── S3/R2 client for read (page-in from R2, lazy init) ──
         let s3_prefix = std::env::var("YATA_S3_PREFIX").unwrap_or_default();
-        let s3_client = Arc::new(Mutex::new(None));
 
-        tracing::info!("using Lance read store (WAL Projection)");
+        tracing::info!("using LanceDB read store");
         let wal_ring_capacity = config.wal_ring_capacity;
         Self {
             config,
@@ -138,7 +133,6 @@ impl TieredGraphEngine {
             lance_db: Arc::new(tokio::sync::Mutex::new(None)),
             lance_table: Arc::new(tokio::sync::Mutex::new(None)),
             loaded_labels: Arc::new(Mutex::new(HashSet::new())),
-            s3_client,
             s3_prefix,
             dirty_labels: Arc::new(Mutex::new(HashSet::new())),
             pending_writes: Arc::new(AtomicUsize::new(0)),
@@ -188,40 +182,6 @@ impl TieredGraphEngine {
         if !labels.is_empty() {
             self.mark_labels_dirty(labels);
         }
-    }
-
-    /// Get or lazily initialize the S3 client. Returns None if not configured.
-    fn get_s3_client(&self) -> Option<Arc<yata_s3::s3::S3Client>> {
-        if let Ok(guard) = self.s3_client.lock() {
-            if let Some(ref client) = *guard {
-                return Some(client.clone());
-            }
-        }
-        let client = Self::try_build_s3_client()?;
-        if let Ok(mut guard) = self.s3_client.lock() {
-            *guard = Some(client.clone());
-        }
-        Some(client)
-    }
-
-    fn try_build_s3_client() -> Option<Arc<yata_s3::s3::S3Client>> {
-        let endpoint = std::env::var("YATA_S3_ENDPOINT").ok()?;
-        let bucket = std::env::var("YATA_S3_BUCKET").unwrap_or_default();
-        let key_id = std::env::var("YATA_S3_ACCESS_KEY_ID")
-            .or_else(|_| std::env::var("YATA_S3_KEY_ID"))
-            .unwrap_or_default();
-        let secret = std::env::var("YATA_S3_SECRET_ACCESS_KEY")
-            .or_else(|_| std::env::var("YATA_S3_SECRET_KEY"))
-            .or_else(|_| std::env::var("YATA_S3_APPLICATION_KEY"))
-            .unwrap_or_default();
-        let region = std::env::var("YATA_S3_REGION").unwrap_or_else(|_| "auto".to_string());
-        if endpoint.is_empty() || bucket.is_empty() || key_id.is_empty() || secret.is_empty() {
-            return None;
-        }
-        tracing::info!(%endpoint, %bucket, "S3/R2 client configured");
-        Some(Arc::new(yata_s3::s3::S3Client::new(
-            &endpoint, &bucket, &key_id, &secret, &region,
-        )))
     }
 
     /// Ensure HOT tier is initialized.
@@ -997,83 +957,40 @@ impl TieredGraphEngine {
         };
 
         let entry_count = entries.len();
-
-        // Primary path: append to Lance Dataset directly
         let batch = crate::arrow_wal::wal_entries_to_batch(&entries)
             .map_err(|e| format!("WAL batch conversion failed: {e}"))?;
-        let schema = crate::arrow_wal::wal_arrow_schema();
+
+        // LanceDB table.add() — sole persistence path
         let lance_tbl = self.lance_table.clone();
         let lance_db = self.lance_db.clone();
-        let prefix = &self.s3_prefix;
-        let pid = self.config.hot_partition_id.get();
-        let prefix_owned = prefix.to_string();
+        let prefix_owned = self.s3_prefix.clone();
 
-        let lance_ok = ENGINE_RT.block_on(async {
+        ENGINE_RT.block_on(async {
             let mut tbl_guard = lance_tbl.lock().await;
             if let Some(ref tbl) = *tbl_guard {
-                match tbl.add(batch.clone()).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "LanceDB add failed, falling back to R2 segment");
-                        false
-                    }
-                }
+                tbl.add(batch.clone()).await.map_err(|e| format!("LanceDB add failed: {e}"))?;
             } else {
-                // Connect + create table
+                // Lazy connect + create table on first flush
                 let mut db_guard = lance_db.lock().await;
                 if db_guard.is_none() {
-                    let new_db = if let Some(db) = yata_lance::YataDb::connect_from_env(&prefix_owned).await {
-                        db
-                    } else {
-                        match yata_lance::YataDb::connect_local(&prefix_owned).await {
-                            Ok(db) => db,
-                            Err(e) => { tracing::warn!(error = %e, "LanceDB connect failed"); return false; }
-                        }
+                    let new_db = match yata_lance::YataDb::connect_from_env(&prefix_owned).await {
+                        Some(db) => db,
+                        None => yata_lance::YataDb::connect_local(&prefix_owned).await
+                            .map_err(|e| format!("LanceDB connect failed: {e}"))?,
                     };
                     *db_guard = Some(new_db);
                 }
-                if let Some(ref db) = *db_guard {
-                    match db.create_table("vertices", batch.clone()).await {
-                        Ok(tbl) => {
-                            let v = tbl.version().await.unwrap_or(0);
-                            tracing::info!(version = v, "LanceDB table created from WAL flush");
-                            *tbl_guard = Some(tbl);
-                            true
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "LanceDB create_table failed");
-                            false
-                        }
-                    }
-                } else { false }
+                let db = db_guard.as_ref().ok_or("LanceDB not connected")?;
+                let tbl = db.create_table("vertices", batch.clone()).await
+                    .map_err(|e| format!("LanceDB create_table failed: {e}"))?;
+                tracing::info!("LanceDB vertices table created");
+                *tbl_guard = Some(tbl);
             }
-        });
-
-        // Fallback: write raw segment to R2 if Lance failed
-        if !lance_ok {
-            if let Some(s3) = self.get_s3_client() {
-                let (data, key) = match self.config.wal_format {
-                    crate::config::WalFormat::Arrow => {
-                        let arrow_data = crate::arrow_wal::serialize_segment_arrow(&entries)
-                            .map_err(|e| format!("Arrow WAL serialize failed: {e}"))?;
-                        let k = crate::arrow_wal::segment_r2_key_arrow(prefix, pid, seq_start, seq_end);
-                        (arrow_data.to_vec(), k)
-                    }
-                    crate::config::WalFormat::Ndjson => {
-                        let ndjson_data = crate::wal::serialize_segment(&entries);
-                        let k = crate::wal::segment_r2_key(prefix, pid, seq_start, seq_end);
-                        (ndjson_data, k)
-                    }
-                };
-                s3.put_sync(&key, bytes::Bytes::from(data))
-                    .map_err(|e| format!("R2 WAL segment upload failed: {e}"))?;
-            } else {
-                return Err("neither Lance Dataset nor S3 client available".into());
-            }
-        }
+            Ok::<(), String>(())
+        })?;
 
         self.wal_last_flushed_seq.store(seq_end, Ordering::SeqCst);
-        tracing::info!(seq_start, seq_end, entries = entry_count, lance = lance_ok, "WAL flush complete");
+        tracing::info!(seq_start, seq_end, entries = entry_count, "WAL flushed to LanceDB");
         Ok((seq_start, seq_end, entry_count))
     }
 
@@ -1083,7 +1000,7 @@ impl TieredGraphEngine {
     /// Fallback path: read WAL segments from R2, PK-dedup, append to Lance Dataset.
     ///
     /// Triggered by size-based threshold (L0_COMPACT_THRESHOLD) or manually via XRPC.
-    pub fn trigger_compaction(&self) -> Result<crate::compaction::CompactionResult, String> {
+    pub fn trigger_compaction(&self) -> Result<CompactionResult, String> {
         // First flush pending WAL entries to Lance Dataset
         let _ = self.wal_flush_segment();
 
@@ -1091,9 +1008,7 @@ impl TieredGraphEngine {
         let dirty = self.drain_dirty_labels();
         if dirty.is_empty() {
             tracing::debug!("compaction: no dirty labels");
-            return Ok(crate::compaction::CompactionResult {
-                data: bytes::Bytes::new(),
-                min_seq: 0,
+            return Ok(CompactionResult {
                 max_seq: 0,
                 input_entries: 0,
                 output_entries: 0,
@@ -1122,9 +1037,7 @@ impl TieredGraphEngine {
                             dirty_labels = dirty_labels.len(),
                             "Lance compaction complete"
                         );
-                        Ok(crate::compaction::CompactionResult {
-                            data: bytes::Bytes::new(),
-                            min_seq: 0,
+                        Ok(CompactionResult {
                             max_seq: version_after,
                             input_entries: removed,
                             output_entries: added,
@@ -1133,9 +1046,7 @@ impl TieredGraphEngine {
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "Lance compaction failed, skipping");
-                        Ok(crate::compaction::CompactionResult {
-                            data: bytes::Bytes::new(),
-                            min_seq: 0,
+                        Ok(CompactionResult {
                             max_seq: version_before,
                             input_entries: 0,
                             output_entries: 0,
@@ -1145,9 +1056,7 @@ impl TieredGraphEngine {
                 }
             } else {
                 tracing::debug!("compaction: no Lance Dataset available");
-                Ok(crate::compaction::CompactionResult {
-                    data: bytes::Bytes::new(),
-                    min_seq: 0,
+                Ok(CompactionResult {
                     max_seq: 0,
                     input_entries: 0,
                     output_entries: 0,
@@ -1161,166 +1070,27 @@ impl TieredGraphEngine {
         result
     }
 
-    /// Migrate existing WAL segments + compacted segments from R2 → Lance Dataset.
-    ///
-    /// Reads all WAL segments and v2 compacted segments from R2, PK-dedups,
-    /// and writes the result into a Lance Dataset on R2 via UreqObjectStore.
-    /// This is a one-time migration for transitioning from WAL-only persistence to Lance-native.
-    pub fn migrate_to_lance(&self) -> Result<MigrateToLanceResult, String> {
-        let s3 = self.get_s3_client()
-            .ok_or_else(|| "S3 client not configured".to_string())?;
-        let prefix = &self.s3_prefix;
-        let pid = self.config.hot_partition_id.get();
-
-        tracing::info!("migrate_to_lance: starting migration for partition {pid}");
-
-        // Phase 1: Read existing WAL segments from head.json registry
-        let head_key = format!("{prefix}wal/meta/{pid}/head.json");
-        let segment_keys: Vec<String> = match s3.get_sync(&head_key) {
-            Ok(Some(data)) => serde_json::from_slice::<serde_json::Value>(&data)
-                .ok()
-                .and_then(|v| v.get("segments").cloned())
-                .and_then(|v| serde_json::from_value(v).ok())
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        tracing::info!(wal_segments = segment_keys.len(), "Phase 1: reading WAL segments");
-
-        let mut all_entries: Vec<crate::wal::WalEntry> = Vec::new();
-        let mut wal_segments_read = 0usize;
-        for key in &segment_keys {
-            if let Ok(Some(data)) = s3.get_sync(key) {
-                let entries = crate::arrow_wal::deserialize_segment_auto(key, &data);
-                all_entries.extend(entries);
-                wal_segments_read += 1;
-            }
-        }
-
-        // Phase 2: Read v2 compacted segments (per-label)
-        let manifest_key = crate::compaction::manifest_r2_key(prefix, pid);
-        let mut compacted_segments_read = 0usize;
-        if let Ok(Some(manifest_data)) = s3.get_sync(&manifest_key) {
-            if let Ok(manifest) = serde_json::from_slice::<crate::compaction::CompactionManifest>(&manifest_data) {
-                for (label, state) in &manifest.label_segments {
-                    if let Ok(Some(seg_data)) = s3.get_sync(&state.key) {
-                        let entries = crate::arrow_wal::deserialize_segment_auto(&state.key, &seg_data);
-                        tracing::info!(label, entries = entries.len(), "read compacted segment");
-                        all_entries.extend(entries);
-                        compacted_segments_read += 1;
-                    }
-                }
-            }
-        }
-        // Also try versioned manifest
-        if let Some((_ver, manifest_data)) = crate::compaction::find_latest_manifest(&s3, prefix, pid) {
-            if let Ok(manifest) = serde_json::from_slice::<crate::compaction::CompactionManifest>(&manifest_data) {
-                for (_label, state) in &manifest.label_segments {
-                    if let Ok(Some(seg_data)) = s3.get_sync(&state.key) {
-                        let entries = crate::arrow_wal::deserialize_segment_auto(&state.key, &seg_data);
-                        all_entries.extend(entries);
-                        compacted_segments_read += 1;
-                    }
-                }
-            }
-        }
-
-        let total_entries = all_entries.len();
-        tracing::info!(total_entries, wal_segments_read, compacted_segments_read, "Phase 2: PK-dedup");
-
-        if total_entries == 0 {
-            return Ok(MigrateToLanceResult {
-                wal_segments_read,
-                compacted_segments_read,
-                total_entries: 0,
-                deduplicated_entries: 0,
-                lance_version: 0,
-                labels: Vec::new(),
-            });
-        }
-
-        // Phase 3: PK-dedup
-        let refs = vec![all_entries.as_slice()];
-        let deduped = crate::compaction::compact_entries(&refs);
-        let deduplicated_entries = deduped.len();
-        let mut labels: Vec<String> = deduped.iter().map(|e| e.label.clone()).collect();
-        labels.sort();
-        labels.dedup();
-        tracing::info!(deduplicated_entries, labels = labels.len(), "Phase 3: writing to Lance Dataset");
-
-        // Phase 4: Write to Lance Dataset on R2
-        let batch = crate::arrow_wal::wal_entries_to_batch(&deduped)
-            .map_err(|e| format!("batch conversion failed: {e}"))?;
-        let schema = crate::arrow_wal::wal_arrow_schema();
-        let lance_uri = format!("{prefix}lance/vertices/{pid}");
-        let lance_tbl = self.lance_table.clone();
-        let lance_db = self.lance_db.clone();
-        let prefix_owned = prefix.to_string();
-
-        let lance_version = ENGINE_RT.block_on(async {
-            let mut tbl_guard = lance_tbl.lock().await;
-            // Connect to DB if needed
-            {
-                let mut db_guard = lance_db.lock().await;
-                if db_guard.is_none() {
-                    let new_db = if let Some(db) = yata_lance::YataDb::connect_from_env(&prefix_owned).await {
-                        db
-                    } else {
-                        yata_lance::YataDb::connect_local(&prefix_owned).await
-                            .map_err(|e| format!("LanceDB connect failed: {e}"))?
-                    };
-                    *db_guard = Some(new_db);
-                }
-            }
-            let db_guard = lance_db.lock().await;
-            let db = db_guard.as_ref().ok_or("LanceDB not connected")?;
-
-            // Create/recreate table with migrated data
-            let tbl = db.create_table("vertices", batch).await
-                .map_err(|e| format!("LanceDB create_table failed: {e}"))?;
-            let version = tbl.version().await.unwrap_or(0);
-            *tbl_guard = Some(tbl);
-            Ok::<u64, String>(version)
-        })?;
-
-        tracing::info!(lance_version, deduplicated_entries, "migrate_to_lance complete");
-
-        Ok(MigrateToLanceResult {
-            wal_segments_read,
-            compacted_segments_read,
-            total_entries,
-            deduplicated_entries,
-            lance_version,
-            labels,
-        })
-    }
-
-    /// Lance manifest-only cold start. Downloads Lance TableManifest + WAL tail only.
+    /// LanceDB cold start. Downloads Lance TableManifest + WAL tail only.
     /// Sets hot_initialized = true immediately — labels are loaded on-demand by ensure_labels().
     /// Multi-node safe: each node loads manifest independently, builds its own label subset.
     fn wal_cold_start_manifest_only(&self) -> Result<u64, String> {
-        let s3 = self.get_s3_client()
-            .ok_or_else(|| "S3 client not configured".to_string())?;
-        let prefix = &self.s3_prefix;
-        let pid = self.config.hot_partition_id.get();
-
-        // Open LanceDB from R2 or local
         let lance_tbl = self.lance_table.clone();
         let lance_db = self.lance_db.clone();
-        let prefix_owned = prefix.to_string();
+        let prefix_owned = self.s3_prefix.clone();
+
+        // Open LanceDB → vertices table. LanceDB handles R2/local, manifest, fragments.
         let checkpoint_seq = ENGINE_RT.block_on(async {
-            // Connect to DB + open table (S3/R2 first, fallback to local)
             let mut db_guard = lance_db.lock().await;
             if db_guard.is_none() {
-                let new_db = if let Some(db) = yata_lance::YataDb::connect_from_env(&prefix_owned).await {
-                    db
-                } else {
-                    match yata_lance::YataDb::connect_local(&prefix_owned).await {
+                let new_db = match yata_lance::YataDb::connect_from_env(&prefix_owned).await {
+                    Some(db) => db,
+                    None => match yata_lance::YataDb::connect_local(&prefix_owned).await {
                         Ok(db) => db,
                         Err(e) => {
                             tracing::info!(error = %e, "LanceDB connect failed (new database)");
                             return 0u64;
                         }
-                    }
+                    },
                 };
                 *db_guard = Some(new_db);
             }
@@ -1335,47 +1105,13 @@ impl TieredGraphEngine {
                         version
                     }
                     Err(e) => {
-                        tracing::info!(error = %e, "no LanceDB vertices table found (new database)");
+                        tracing::info!(error = %e, "no LanceDB vertices table (new database)");
                         0
                     }
                 }
-            } else {
-                0
-            }
+            } else { 0 }
         });
 
-        // Replay WAL tail (entries after compacted_seq)
-        let head_key = format!("{prefix}wal/meta/{pid}/head.json");
-        let segment_keys: Vec<String> = match s3.get_sync(&head_key) {
-            Ok(Some(data)) => serde_json::from_slice::<serde_json::Value>(&data)
-                .ok()
-                .and_then(|v| v.get("segments").cloned())
-                .and_then(|v| serde_json::from_value(v).ok())
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        let mut tail_applied = 0u64;
-        for seg_key in &segment_keys {
-            let seq_end = seg_key.rsplit('/').next()
-                .and_then(|f| f.split('-').nth(1))
-                .and_then(|s| s.strip_suffix(".arrow").or_else(|| s.strip_suffix(".ndjson")))
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-            if seq_end <= checkpoint_seq { continue; }
-            if let Ok(Some(data)) = s3.get_sync(seg_key) {
-                let entries = crate::arrow_wal::deserialize_segment_auto(seg_key, &data);
-                let filtered: Vec<_> = entries.into_iter().filter(|e| e.seq > checkpoint_seq).collect();
-                if !filtered.is_empty() {
-                    let _ = self.wal_apply(&filtered);
-                    tail_applied += filtered.len() as u64;
-                }
-            }
-        }
-        if tail_applied > 0 {
-            tracing::info!(tail_applied, "WAL tail replay complete");
-        }
-
-        // Set hot_initialized IMMEDIATELY — labels load on-demand
         self.hot_initialized.store(true, Ordering::SeqCst);
         Ok(checkpoint_seq)
     }
@@ -3209,69 +2945,14 @@ mod tests {
     }
 
     #[test]
-    fn test_compaction_per_label_dirty_only() {
-        use crate::wal::{WalEntry, WalOp};
-
-        let entries = vec![
-            WalEntry {
-                seq: 1, op: WalOp::Upsert,
-                label: "Post".into(), pk_key: "rkey".into(), pk_value: "p1".into(),
-                props: vec![("title".into(), yata_grin::PropValue::Str("Hello".into()))],
-                timestamp_ms: 1000,
-            },
-            WalEntry {
-                seq: 2, op: WalOp::Upsert,
-                label: "Like".into(), pk_key: "rkey".into(), pk_value: "l1".into(),
-                props: vec![], timestamp_ms: 2000,
-            },
-            WalEntry {
-                seq: 3, op: WalOp::Upsert,
-                label: "Follow".into(), pk_key: "rkey".into(), pk_value: "f1".into(),
-                props: vec![], timestamp_ms: 3000,
-            },
-        ];
-
-        let seg = crate::arrow_wal::serialize_segment_arrow(&entries).unwrap();
-        let dirty: std::collections::HashSet<String> = ["Post".to_string()].into_iter().collect();
-        let results = crate::compaction::compact_segments_by_label(
-            &[("seg.arrow", &seg)], &dirty,
-        ).unwrap();
-
-        assert_eq!(results.len(), 1, "Only dirty label Post should be compacted");
-        assert_eq!(results[0].label, "Post");
-    }
-
-    #[test]
-    fn test_compaction_blake3_checksum_roundtrip() {
-        use crate::wal::{WalEntry, WalOp};
-
-        let entries = vec![WalEntry {
-            seq: 1, op: WalOp::Upsert,
-            label: "Post".into(), pk_key: "rkey".into(), pk_value: "p1".into(),
-            props: vec![("v".into(), yata_grin::PropValue::Int(42))],
-            timestamp_ms: 1000,
-        }];
-
-        let seg_data = crate::arrow_wal::serialize_segment_arrow(&entries).unwrap();
-        let checksum = crate::compaction::blake3_hex(&seg_data);
-
-        // Verify passes
-        assert!(crate::compaction::verify_blake3(&seg_data, &checksum, "Post").is_ok());
-
-        // Tampered data fails
-        let mut tampered = seg_data.to_vec();
-        if let Some(last) = tampered.last_mut() { *last ^= 0xFF; }
-        assert!(crate::compaction::verify_blake3(&tampered, &checksum, "Post").is_err());
-    }
-
-    #[test]
-    fn test_cold_start_no_s3_graceful() {
-        // Without S3 config, cold start should not panic
+    fn test_cold_start_no_storage_graceful() {
+        // Without storage config, cold start should succeed (new database)
         let dir = tempfile::tempdir().unwrap();
         let e = make_engine(&dir);
         let result = e.wal_cold_start();
-        // Should return error (no S3 client) but not panic
-        assert!(result.is_err());
+        // LanceDB cold start succeeds (returns version 0 for new database)
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
     }
 
     #[test]
@@ -3346,21 +3027,4 @@ mod tests {
         assert!(dirty2.is_empty(), "dirty_labels should be empty after drain");
     }
 
-    #[test]
-    fn test_v1_manifest_backward_compat() {
-        // v1 JSON without label_segments and blake3_hex — should deserialize with defaults
-        let json = r#"{"partition_id":0,"version":1,"compacted_segment_key":"k","compacted_seq":50,"entry_count":10,"labels":["Post"],"created_at_ms":0,"segment_bytes":100}"#;
-        let manifest: crate::compaction::CompactionManifest = serde_json::from_str(json).unwrap();
-        assert_eq!(manifest.version, 1);
-        assert!(manifest.label_segments.is_empty());
-    }
-
-    #[test]
-    fn test_v2_manifest_blake3_backward_compat() {
-        // v2 label_segments without blake3_hex field — should default to empty string
-        let json = r#"{"partition_id":0,"version":2,"compacted_segment_key":"","compacted_seq":100,"entry_count":30,"labels":["Post"],"created_at_ms":0,"segment_bytes":2048,"label_segments":{"Post":{"key":"k","max_seq":100,"entry_count":30,"segment_bytes":2048}}}"#;
-        let manifest: crate::compaction::CompactionManifest = serde_json::from_str(json).unwrap();
-        assert_eq!(manifest.version, 2);
-        assert!(manifest.label_segments["Post"].blake3_hex.is_empty(), "blake3_hex should default to empty");
-    }
 }

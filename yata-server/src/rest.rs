@@ -81,14 +81,8 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
     }
 
     /// L1 Compaction: PK-dedup WAL segments → compacted Arrow IPC segment.
-    fn trigger_compaction(&self) -> Result<yata_engine::compaction::CompactionResult, String> {
+    fn trigger_compaction(&self) -> Result<yata_engine::engine::CompactionResult, String> {
         Err("trigger_compaction not implemented".to_string())
-    }
-
-    /// Migrate existing WAL segments + compacted data → Lance Dataset on R2.
-    /// Reads all R2 WAL segments + compacted segments, PK-dedups, writes to Lance Dataset.
-    fn migrate_to_lance(&self) -> Result<MigrateToLanceResult, String> {
-        Err("migrate_to_lance not implemented".to_string())
     }
 
     /// Current WAL head sequence number.
@@ -111,8 +105,6 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
         Err("merge_record_with_wal not implemented".to_string())
     }
 }
-
-pub use yata_engine::engine::MigrateToLanceResult;
 
 pub struct YataRestState<G: GraphQueryExecutor> {
     pub graph: Arc<G>,
@@ -147,7 +139,6 @@ pub fn router<G: GraphQueryExecutor>(state: YataRestState<G>) -> Router {
         .route("/xrpc/ai.gftd.yata.walFlushSegment", post(wal_flush_segment_handler::<G>))
         .route("/xrpc/ai.gftd.yata.walColdStart", post(wal_cold_start_handler::<G>))
         .route("/xrpc/ai.gftd.yata.compact", post(compact_handler::<G>))
-        .route("/xrpc/ai.gftd.yata.migrateToLance", post(migrate_to_lance_handler::<G>))
         .route("/xrpc/ai.gftd.yata.mergeRecordWal", post(merge_record_wal_handler::<G>))
         .route("/xrpc/ai.gftd.yata.stats", get(stats_handler::<G>))
         // Phase 5: Distributed GIE fragment execution
@@ -596,32 +587,6 @@ async fn compact_handler<G: GraphQueryExecutor>(
             "output_entries": r.output_entries,
             "compacted_seq": r.max_seq,
             "labels": r.labels,
-            "bytes": r.data.len(),
-        }))),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
-    }
-}
-
-/// POST /xrpc/ai.gftd.yata.migrateToLance — Migrate WAL segments → Lance Dataset on R2.
-/// Reads all existing WAL + compacted segments, PK-dedups, writes to Lance Dataset.
-/// Write Container only. Intended for one-time migration.
-async fn migrate_to_lance_handler<G: GraphQueryExecutor>(
-    State(state): State<YataRestState<G>>,
-) -> impl IntoResponse {
-    if state.readonly {
-        return (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"error": "read-only container"})));
-    }
-    let graph = state.graph.clone();
-    let result = tokio::task::spawn_blocking(move || graph.migrate_to_lance()).await;
-    match result {
-        Ok(Ok(r)) => (StatusCode::OK, Json(serde_json::json!({
-            "wal_segments_read": r.wal_segments_read,
-            "compacted_segments_read": r.compacted_segments_read,
-            "total_entries": r.total_entries,
-            "deduplicated_entries": r.deduplicated_entries,
-            "lance_version": r.lance_version,
-            "labels": r.labels,
         }))),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
@@ -740,12 +705,8 @@ impl GraphQueryExecutor for yata_engine::TieredGraphEngine {
         self.wal_cold_start()
     }
 
-    fn trigger_compaction(&self) -> Result<yata_engine::compaction::CompactionResult, String> {
+    fn trigger_compaction(&self) -> Result<yata_engine::engine::CompactionResult, String> {
         self.trigger_compaction()
-    }
-
-    fn migrate_to_lance(&self) -> Result<MigrateToLanceResult, String> {
-        self.migrate_to_lance()
     }
 
     fn wal_head_seq(&self) -> u64 {
@@ -830,7 +791,7 @@ mod tests {
             self.engine.wal_cold_start()
         }
 
-        fn trigger_compaction(&self) -> Result<yata_engine::compaction::CompactionResult, String> {
+        fn trigger_compaction(&self) -> Result<yata_engine::engine::CompactionResult, String> {
             self.engine.trigger_compaction()
         }
 

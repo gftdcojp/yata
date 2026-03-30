@@ -1,24 +1,6 @@
 use yata_core::PartitionId;
 
-/// WAL segment serialization format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WalFormat {
-    /// NDJSON (legacy, default for backward compatibility).
-    Ndjson,
-    /// Arrow IPC File format (zero-copy mmap, Phase 0 of Shannon-optimal architecture).
-    Arrow,
-}
-
-impl WalFormat {
-    pub fn from_env() -> Self {
-        match std::env::var("YATA_WAL_FORMAT").as_deref() {
-            Ok("ndjson") => WalFormat::Ndjson,
-            _ => WalFormat::Arrow, // Default: Arrow IPC (Phase 1)
-        }
-    }
-}
-
-/// Configuration for the tiered graph engine (WAL Projection only).
+/// Configuration for the tiered graph engine (LanceDB persistence).
 #[derive(Debug, Clone)]
 pub struct TieredEngineConfig {
     pub hot_max_vertices: usize,
@@ -36,12 +18,6 @@ pub struct TieredEngineConfig {
     pub blob_cache_budget_mb: u64,
     /// WAL ring buffer capacity (entries). Write Container only.
     pub wal_ring_capacity: usize,
-    /// WAL segment max bytes before R2 flush.
-    pub wal_segment_max_bytes: usize,
-    /// WAL segment max age (seconds) before R2 flush.
-    pub wal_segment_max_age_secs: u64,
-    /// WAL segment format (ndjson or arrow). Arrow enables zero-copy mmap reads.
-    pub wal_format: WalFormat,
 }
 
 impl Default for TieredEngineConfig {
@@ -82,11 +58,6 @@ impl Default for TieredEngineConfig {
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(256),
             wal_ring_capacity: std::env::var("YATA_WAL_RING_CAPACITY")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(100_000),
-            wal_segment_max_bytes: std::env::var("YATA_WAL_SEGMENT_MAX_BYTES")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(1_048_576),
-            wal_segment_max_age_secs: std::env::var("YATA_WAL_SEGMENT_MAX_AGE_SECS")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(10),
-            wal_format: WalFormat::from_env(),
         }
     }
 }
@@ -102,8 +73,6 @@ mod tests {
         assert_eq!(cfg.cache_max_entries, 256);
         assert_eq!(cfg.partition_count, 1);
         assert_eq!(cfg.wal_ring_capacity, 100_000);
-        assert_eq!(cfg.wal_segment_max_bytes, 1_048_576);
-        assert_eq!(cfg.wal_segment_max_age_secs, 10);
     }
 
     #[test]
@@ -111,5 +80,4 @@ mod tests {
         let cfg = TieredEngineConfig::default();
         assert_eq!(cfg.hot_partition_id, PartitionId::from(0));
     }
-
 }
