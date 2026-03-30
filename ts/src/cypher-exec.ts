@@ -164,13 +164,15 @@ function filterRows(
   params: Record<string, unknown>,
   rowCount: number,
 ): number[] {
-  // Pre-filter: only alive vertices
+  // Pre-filter: only alive vertices (vertex_live: alive column, WAL: op column where 0=upsert)
   const aliveCol = table.getChild("alive");
+  const opCol = !aliveCol ? table.getChild("op") : null; // WAL schema fallback
 
   if (!where) {
     const result: number[] = [];
     for (let i = 0; i < rowCount; i++) {
       if (aliveCol && !aliveCol.get(i)) continue;
+      if (opCol && opCol.get(i) === 1) continue; // WAL: op=1 is delete
       result.push(i);
     }
     return result;
@@ -223,6 +225,40 @@ function evalWhere(
   }
 }
 
+// Cache parsed props_json per table+row to avoid re-parsing
+const _propsCache = new WeakMap<Table, Map<number, Record<string, unknown>>>();
+
+function getProps(table: Table, row: number): Record<string, unknown> {
+  let tableCache = _propsCache.get(table);
+  if (!tableCache) {
+    tableCache = new Map();
+    _propsCache.set(table, tableCache);
+  }
+  let cached = tableCache.get(row);
+  if (cached) return cached;
+
+  const propsCol = table.getChild("props_json");
+  if (!propsCol) return {};
+  const raw = propsCol.get(row);
+  if (!raw || typeof raw !== "string") return {};
+  try {
+    cached = JSON.parse(raw);
+    tableCache.set(row, cached!);
+    return cached!;
+  } catch {
+    return {};
+  }
+}
+
+// WAL schema → vertex_live field aliases
+const WAL_FIELD_ALIASES: Record<string, string> = {
+  rkey: "pk_value",
+  repo: "repo",              // props_json fallback
+  collection: "collection",  // props_json fallback
+  value_b64: "value_b64",   // props_json fallback
+  updated_at: "timestamp_ms",
+};
+
 function resolveValue(
   table: Table,
   row: number,
@@ -231,9 +267,18 @@ function resolveValue(
   _params: Record<string, unknown>,
 ): unknown {
   if (prop.alias !== alias) return undefined;
+  // 1. Try direct column first
   const col = table.getChild(prop.field);
-  if (!col) return undefined;
-  return col.get(row);
+  if (col) return col.get(row);
+  // 2. Try WAL field alias (e.g. rkey → pk_value)
+  const aliasField = WAL_FIELD_ALIASES[prop.field];
+  if (aliasField) {
+    const aliasCol = table.getChild(aliasField);
+    if (aliasCol) return aliasCol.get(row);
+  }
+  // 3. Fallback: look inside props_json (WAL schema has flattened props here)
+  const props = getProps(table, row);
+  return props[prop.field];
 }
 
 function resolveExpr(
@@ -310,8 +355,7 @@ function projectRows(
         row.push(rows.length);
       } else if (ret.expr.kind === "prop") {
         if (ret.expr.alias === alias || ret.expr.alias === "") {
-          const col = table.getChild(ret.expr.field);
-          row.push(col ? col.get(rowIdx) : null);
+          row.push(resolveValue(table, rowIdx, alias, ret.expr, {}));
         } else {
           row.push(null);
         }
