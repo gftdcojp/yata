@@ -18,6 +18,7 @@ members = [
     "yata-engine",
     "yata-vex",
     "yata-s3",
+    "yata-lance",
     # Layer 4: protocol
     "yata-server",
     # Layer 5: dev
@@ -56,6 +57,7 @@ yata-vex = { path = "yata-vex" }
 yata-server = { path = "yata-server" }
 yata-arrow = { path = "yata-arrow" }
 yata-format = { path = "yata-format" }
+yata-lance = { path = "yata-lance" }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 # Arrow
@@ -99,7 +101,7 @@ axum = { version = "0.7", features = ["ws", "macros"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # Utils
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = ">=0.4.38, <0.4.40", features = ["serde"] }
 smallvec = "1"
 indexmap = { version = "2", features = ["serde"] }
 
