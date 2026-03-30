@@ -11,15 +11,11 @@
 //! - Read path: lazy CSR rebuild for stale labels only, then O(1) adjacency lookup
 //! - commit() rebuilds property indexes only (needed for merge_by_pk O(1)), NOT CSR
 
-pub mod arrow_store;
-pub mod arrow_wal_store;
 pub mod graph_store_enum;
 pub mod mirror;
 pub mod partition;
 pub mod partitioned;
 pub mod blob_cache;
-pub use arrow_store::ArrowGraphStore;
-pub use arrow_wal_store::ArrowWalStore;
 pub use graph_store_enum::{GraphStoreEnum, MemoryBudget};
 pub use mirror::{MirrorEdge, MirrorRegistry, MirrorVertex};
 pub use partitioned::PartitionedGraphStore;
@@ -394,19 +390,6 @@ impl BTreeIndex {
             }
         }
         result
-    }
-
-    /// Rebuild all B-tree indexes from vertex data.
-    fn rebuild(
-        &mut self,
-        label_index: &HashMap<String, Vec<u32>>,
-        vertex_props_map: &[HashMap<String, PropValue>],
-        vertex_alive: &[bool],
-    ) {
-        let keys: Vec<(String, String)> = self.trees.keys().cloned().collect();
-        for (label, prop) in keys {
-            self.rebuild_single(label_index, vertex_props_map, vertex_alive, &label, &prop);
-        }
     }
 
     /// Rebuild only dirty labels (zero-copy for clean labels).
