@@ -112,6 +112,8 @@ export {
   stringifyGraphPipelineEnvelope,
   toGraphProjectedRecord,
   toGraphProjectedRecords,
+  walRecordToProjectedRecords,
+  walRecordToVertexEnvelopes,
 } from "./pipeline.js";
 export type {
   EdgePipelineMutation,
@@ -121,6 +123,9 @@ export type {
   GraphPipelineEnvelopeBase,
   GraphProjectedRecord,
   GraphVertexPipelineEnvelope,
+  PipelineWalOp,
+  PipelineWalRecordLike,
+  PipelineWalVertexDefaults,
   PipelineWriterLike,
   VertexPipelineMutation,
 } from "./pipeline.js";

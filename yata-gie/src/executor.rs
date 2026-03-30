@@ -603,6 +603,7 @@ fn compute_aggregate(
 mod tests {
     use super::*;
     use crate::planner::PlanBuilder;
+    use yata_store::MutableCsrStore;
 
     /// Helper: create a test store with Person/Company graph.
     fn test_store() -> MutableCsrStore {
@@ -1545,6 +1546,7 @@ fn prop_value_to_json(v: &PropValue) -> String {
 mod untyped_edge_tests {
     use super::*;
     use crate::planner::PlanBuilder;
+    use yata_store::MutableCsrStore;
 
     #[test]
     fn test_untyped_edge_traversal() {
@@ -1639,6 +1641,7 @@ mod coverage_tests {
     use super::*;
     use crate::planner::PlanBuilder;
     use std::collections::HashSet;
+    use yata_store::MutableCsrStore;
 
     /// Helper: create the standard test store (same as tests::test_store).
     fn test_store() -> MutableCsrStore {
@@ -1959,6 +1962,7 @@ mod security_filter_tests {
     use super::*;
     use crate::ir::SecurityScope;
     use crate::planner::PlanBuilder;
+    use yata_store::MutableCsrStore;
 
     /// Build a store with security properties (sensitivity_ord, owner_hash, collection).
     fn security_store() -> MutableCsrStore {
@@ -2207,6 +2211,7 @@ mod security_filter_tests {
 mod eval_expr_tests {
     use super::*;
     use crate::ir::Expr;
+    use yata_store::MutableCsrStore;
 
     fn test_store() -> MutableCsrStore {
         let mut store = MutableCsrStore::new();
@@ -2348,6 +2353,7 @@ mod eval_expr_tests {
 mod predicate_match_tests {
     use super::*;
     use crate::planner::PlanBuilder;
+    use yata_store::MutableCsrStore;
 
     fn test_store() -> MutableCsrStore {
         let mut store = MutableCsrStore::new();
@@ -2463,6 +2469,7 @@ mod result_to_rows_tests {
     use super::*;
     use crate::ir::{AggOp, Expr};
     use crate::planner::PlanBuilder;
+    use yata_store::MutableCsrStore;
 
     fn test_store() -> MutableCsrStore {
         let mut store = MutableCsrStore::new();
@@ -2681,6 +2688,7 @@ mod prop_value_cmp_tests {
 mod exchange_passthrough_tests {
     use super::*;
     use crate::ir::{ExchangeKind, Expr, LogicalOp};
+    use yata_store::MutableCsrStore;
 
     fn test_store() -> MutableCsrStore {
         let mut store = MutableCsrStore::new();
@@ -2725,6 +2733,7 @@ mod collect_aggregate_tests {
     use super::*;
     use crate::ir::{AggOp, Expr};
     use crate::planner::PlanBuilder;
+    use yata_store::MutableCsrStore;
 
     #[test]
     fn test_collect_returns_count_fallback() {

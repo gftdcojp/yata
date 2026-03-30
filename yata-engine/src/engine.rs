@@ -71,7 +71,7 @@ pub struct MutationContext {
     pub actor_did: String,
 }
 
-/// Graph engine: Sorted COO in-memory + WAL Projection (R2 segments + L1 compaction).
+/// Graph engine: Lance-backed read store + WAL Projection (R2 segments + L1 compaction).
 pub struct TieredGraphEngine {
     config: TieredEngineConfig,
     read_store: Arc<RwLock<Option<yata_lance::LanceReadStore>>>,
@@ -249,7 +249,7 @@ impl TieredGraphEngine {
         }
     }
 
-    /// Ensure specific labels are loaded into HOT CSR (lazy mode).
+    /// Ensure specific labels are loaded into the in-memory read store (lazy mode).
     ///
     /// If `labels` is empty, loads ALL labels (mutation path fallback).
     /// If `labels` is non-empty AND hot_initialized, enriches only needed labels on-demand
@@ -260,7 +260,7 @@ impl TieredGraphEngine {
     /// Phase 2 (per-label demand page-in): Fetch only needed labels from R2 on each query.
     ///
     /// Multi-node safe: R2 = shared source of truth. Each node's loaded_labels is independent.
-    /// No cross-node coordination needed — each node builds its own in-memory CSR subset.
+    /// No cross-node coordination needed — each node builds its own in-memory read-store subset.
     fn ensure_labels(&self, vertex_labels: &[&str]) {
         // Phase 1: Manifest-only cold start (one thread, ~50ms)
         if !self.hot_initialized.load(Ordering::SeqCst) {
@@ -337,7 +337,7 @@ impl TieredGraphEngine {
     }
 
     /// Execute multiple Cypher mutations in a single batch:
-    /// 1 label load, 1 MemoryGraph copy, N mutations, 1 CSR rebuild, 1 WAL fsync.
+    /// 1 label load, 1 MemoryGraph copy, N mutations, 1 read-store rebuild, 1 WAL fsync.
     /// Returns per-statement results.
     pub fn batch_query_with_context(
         &self,
@@ -708,7 +708,7 @@ impl TieredGraphEngine {
     const L0_COMPACT_THRESHOLD: usize = 10_000;
 
     /// Append-only merge record (LanceDB-style: tombstone old + append new fragment).
-    /// WAL append + hot store append. No per-write commit() — index rebuild deferred
+    /// WAL append + read-store append. No per-write commit() — index rebuild deferred
     /// to compaction (size-based trigger at L0_COMPACT_THRESHOLD).
     pub fn merge_record(
         &self,
@@ -1447,23 +1447,13 @@ impl TieredGraphEngine {
             let vl_refs: Vec<&str> = hints_labels.iter().map(|s| s.as_str()).collect();
             self.ensure_labels(&vl_refs);
 
-            if let Ok(csr) = self.hot.read() {
-                if let Some(single_csr) = csr.as_single() {
-                    if let Ok(ast) = yata_cypher::parse(cypher) {
-                        let plan = yata_gie::transpile::transpile_secured(&ast, scope)
-                            .map_err(|e| format!("GIE transpile: {}", e))?;
-                        let rows = if let Ok(rs) = self.read_store.read() {
-                            if let Some(ref read_store) = *rs {
-                                let records = yata_gie::executor::execute(&plan, read_store);
-                                yata_gie::executor::result_to_rows(&records, &plan)
-                            } else {
-                                let records = yata_gie::executor::execute(&plan, single_csr);
-                                yata_gie::executor::result_to_rows(&records, &plan)
-                            }
-                        } else {
-                            let records = yata_gie::executor::execute(&plan, single_csr);
-                            yata_gie::executor::result_to_rows(&records, &plan)
-                        };
+            if let Ok(ast) = yata_cypher::parse(cypher) {
+                let plan = yata_gie::transpile::transpile_secured(&ast, scope)
+                    .map_err(|e| format!("GIE transpile: {}", e))?;
+                if let Ok(rs) = self.read_store.read() {
+                    if let Some(ref read_store) = *rs {
+                        let records = yata_gie::executor::execute(&plan, read_store);
+                        let rows = yata_gie::executor::result_to_rows(&records, &plan);
                         let k = cache_key(cypher, params, Some(cache_did));
                         if let Ok(mut c) = self.cache.lock() {
                             c.put(k, rows.clone());
@@ -1471,6 +1461,7 @@ impl TieredGraphEngine {
                         return Ok(rows);
                     }
                 }
+                return Err("no read store available for secured query execution".to_string());
             }
         }
 
@@ -1478,7 +1469,7 @@ impl TieredGraphEngine {
         self.query(cypher, params, None)
     }
 
-    /// Resolve DID's P-256 public key multibase string from DIDDocument vertex in CSR.
+    /// Resolve DID's P-256 public key multibase string from DIDDocument vertex.
     /// Returns the raw multibase string (z-prefix base58btc) or None.
     pub fn resolve_did_pubkey_multibase(&self, did: &str) -> Option<String> {
         if let Ok(read_store) = self.read_store.read() {
@@ -1492,18 +1483,10 @@ impl TieredGraphEngine {
                 }
             }
         }
-        let hot = self.hot.read().ok()?;
-        let single = hot.as_single()?;
-        let did_val = PropValue::Str(did.to_string());
-        let vids = single.scan_vertices("DIDDocument", &Predicate::Eq("did".to_string(), did_val));
-        let vid = *vids.first()?;
-        match single.vertex_prop(vid, "public_key_multibase") {
-            Some(PropValue::Str(s)) => Some(s.clone()),
-            _ => None,
-        }
+        None
     }
 
-    /// Phase 5: Execute a distributed plan fragment step on local CSR.
+    /// Phase 5: Execute a distributed plan fragment step on the local read store.
     pub fn execute_fragment_step(
         &self,
         cypher: &str,
@@ -1513,9 +1496,11 @@ impl TieredGraphEngine {
         inbound: &std::collections::HashMap<u32, Vec<yata_gie::MaterializedRecord>>,
     ) -> Result<yata_gie::ExchangePayload, String> {
         self.ensure_hot();
-        let hot = self.hot.read().map_err(|e| format!("lock: {e}"))?;
-        let single = hot.as_single().ok_or("not single-partition store")?;
-        yata_gie::execute_step(cypher, single, partition_id, partition_count, target_round, inbound)
+        let read_store = self.read_store.read().map_err(|e| format!("lock: {e}"))?;
+        let store = read_store
+            .as_ref()
+            .ok_or("no read store available for fragment execution")?;
+        yata_gie::execute_step(cypher, store, partition_id, partition_count, target_round, inbound)
     }
 }
 
@@ -1528,7 +1513,6 @@ impl TieredGraphEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yata_cypher::{Graph, MemoryGraph, NodeRef, RelRef};
     use yata_grin::{Property, Scannable};
 
     fn make_engine(dir: &tempfile::TempDir) -> TieredGraphEngine {
@@ -1547,6 +1531,16 @@ mod tests {
         rls: Option<&str>,
     ) -> Result<Vec<Vec<(String, String)>>, String> {
         engine.query(cypher, params, rls)
+    }
+
+    fn snapshot_store(engine: &TieredGraphEngine) -> yata_lance::LanceReadStore {
+        engine
+            .read_store
+            .read()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .expect("read store")
     }
 
     #[test]
@@ -1596,7 +1590,7 @@ mod tests {
     fn test_rls() {
         // Design E: query_inner is Internal-only (no SecurityFilter).
         // Parameter-based RLS removed — all nodes visible on internal path.
-        // Security filtering is via query_with_did() → CSR policy vertex lookup.
+        // Security filtering is via query_with_did() → policy vertex lookup on read_store.
         let dir = tempfile::tempdir().unwrap();
         let engine = make_engine(&dir);
         run_query(
@@ -1652,10 +1646,10 @@ mod tests {
             .unwrap()
     }
 
-    // ── HOT (CSR in-memory) write/read ──────────────────────────────────
+    // ── In-memory read-store write/read ────────────────────────────────
 
     #[test]
-    fn test_tier_hot_write_read() {
+    fn test_tier_read_store_write_read() {
         let dir = tempfile::tempdir().unwrap();
         let e = make_engine(&dir);
 
@@ -1668,36 +1662,35 @@ mod tests {
         )
         .unwrap();
 
-        // Directly inspect HOT CSR
-        let csr = e.hot.read().unwrap();
-        assert_eq!(csr.vertex_count(), 2, "HOT: vertex_count");
+        let store = snapshot_store(&e);
+        assert_eq!(store.vertex_count(), 2, "read_store: vertex_count");
         assert!(
             e.hot_initialized.load(Ordering::Relaxed),
-            "HOT: must be initialized"
+            "read_store: must be initialized"
         );
 
         // Verify labels via Topology trait
         use yata_grin::Topology;
-        let vids = csr.scan_all_vertices();
+        let vids = store.scan_all_vertices();
         assert_eq!(vids.len(), 2);
         for &vid in &vids {
-            let labels = Property::vertex_labels(&*csr, vid);
-            assert_eq!(labels, vec!["Fruit"], "HOT: label must be Fruit");
+            let labels = Property::vertex_labels(&store, vid);
+            assert_eq!(labels, vec!["Fruit"], "read_store: label must be Fruit");
         }
 
         // Verify props via Property trait
         let mut names: Vec<String> = Vec::new();
         for &vid in &vids {
-            if let Some(yata_grin::PropValue::Str(s)) = csr.vertex_prop(vid, "name") {
+            if let Some(yata_grin::PropValue::Str(s)) = store.vertex_prop(vid, "name") {
                 names.push(s);
             }
         }
         names.sort();
-        assert_eq!(names, vec!["apple", "banana"], "HOT: props round-trip");
+        assert_eq!(names, vec!["apple", "banana"], "read_store: props round-trip");
     }
 
     #[test]
-    fn test_tier_hot_mutation_updates_csr() {
+    fn test_tier_read_store_mutation_updates_value() {
         let dir = tempfile::tempdir().unwrap();
         let e = make_engine(&dir);
 
@@ -1705,50 +1698,50 @@ mod tests {
 
         // Before SET
         {
-            let csr = e.hot.read().unwrap();
-            let vids = yata_grin::Scannable::scan_all_vertices(&*csr);
-            let val = csr.vertex_prop(vids[0], "v");
+            let store = snapshot_store(&e);
+            let vids = yata_grin::Scannable::scan_all_vertices(&store);
+            let val = store.vertex_prop(vids[0], "v");
             assert_eq!(
                 val,
                 Some(yata_grin::PropValue::Int(1)),
-                "HOT: initial value"
+                "read_store: initial value"
             );
         }
 
         run_query(&e, "MATCH (n:T {k: 'x'}) SET n.v = 999", &[], None).unwrap();
 
-        // After SET — CSR must reflect new value
+        // After SET — read-store must reflect new value
         {
-            let csr = e.hot.read().unwrap();
-            let vids = yata_grin::Scannable::scan_all_vertices(&*csr);
-            let val = csr.vertex_prop(vids[0], "v");
+            let store = snapshot_store(&e);
+            let vids = yata_grin::Scannable::scan_all_vertices(&store);
+            let val = store.vertex_prop(vids[0], "v");
             assert_eq!(
                 val,
                 Some(yata_grin::PropValue::Int(999)),
-                "HOT: value after SET"
+                "read_store: value after SET"
             );
         }
     }
 
     #[test]
-    fn test_tier_hot_delete_removes_from_csr() {
+    fn test_tier_read_store_delete_removes_vertex() {
         let dir = tempfile::tempdir().unwrap();
         let e = make_engine(&dir);
 
         run_query(&e, "CREATE (:D {k: 'd1'})", &[], None).unwrap();
         run_query(&e, "CREATE (:D {k: 'd2'})", &[], None).unwrap();
-        assert_eq!(e.hot.read().unwrap().vertex_count(), 2);
+        assert_eq!(snapshot_store(&e).vertex_count(), 2);
 
         run_query(&e, "MATCH (n:D {k: 'd1'}) DELETE n", &[], None).unwrap();
         assert_eq!(
-            e.hot.read().unwrap().vertex_count(),
+            snapshot_store(&e).vertex_count(),
             1,
-            "HOT: delete must reduce count"
+            "read_store: delete must reduce count"
         );
     }
 
     #[test]
-    fn test_tier_hot_edge_in_csr() {
+    fn test_tier_read_store_edge_cache() {
         let dir = tempfile::tempdir().unwrap();
         let e = make_engine(&dir);
 
@@ -1760,9 +1753,9 @@ mod tests {
         )
         .unwrap();
 
-        let csr = e.hot.read().unwrap();
-        assert_eq!(csr.vertex_count(), 2, "HOT: 2 vertices");
-        assert_eq!(csr.edge_count(), 1, "HOT: 1 edge");
+        let store = snapshot_store(&e);
+        assert_eq!(store.vertex_count(), 2, "read_store: 2 vertices");
+        assert_eq!(store.edge_count(), 1, "read_store: 1 edge");
     }
 
     // ── Vector search (yata-vex only, not in graph write path) ─────────
@@ -2334,8 +2327,8 @@ mod tests {
     #[test]
     fn test_cypher_vector_search() {
         // Cypher CALL db.index.vector.queryNodes on MemoryGraph directly
-        // (CSR PropValue has no List variant, so embedding must be set via set_node_embedding)
-        use yata_cypher::{Executor, Graph, MemoryGraph, NodeRef, Value};
+        // (PropValue has no List variant, so embedding must be set via set_node_embedding)
+        use yata_cypher::{Graph, MemoryGraph, NodeRef, Value};
 
         let mut g = MemoryGraph::new();
         let mut props_a = indexmap::IndexMap::new();
@@ -2632,7 +2625,7 @@ mod tests {
 
     // Snapshot persistence tests removed (write path moved to PDS Pipeline).
 
-    // ── merge_record / delete_record (CSR-direct write path) ──────────
+    // ── merge_record / delete_record (read-store write path) ──────────
 
     #[test]
     fn test_merge_record_creates_vertex() {
@@ -2650,8 +2643,8 @@ mod tests {
             )
             .unwrap();
         assert!(vid < u32::MAX);
-        let csr = e.hot.read().unwrap();
-        assert_eq!(csr.vertex_count(), 1);
+        let store = snapshot_store(&e);
+        assert_eq!(store.vertex_count(), 1);
     }
 
     #[test]
@@ -2679,8 +2672,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let csr = e.hot.read().unwrap();
-        assert_eq!(csr.vertex_count(), 1, "PK dedup: should not create duplicate");
+        let store = snapshot_store(&e);
+        assert_eq!(store.vertex_count(), 1, "PK dedup: should not create duplicate");
     }
 
     #[test]
@@ -2701,8 +2694,8 @@ mod tests {
             &[("rkey", PropValue::Str("bob-1".into()))],
         )
         .unwrap();
-        let csr = e.hot.read().unwrap();
-        assert_eq!(csr.vertex_count(), 2);
+        let store = snapshot_store(&e);
+        assert_eq!(store.vertex_count(), 2);
     }
 
     #[test]
@@ -2730,8 +2723,8 @@ mod tests {
         )
         .unwrap();
         // PK dedup: only 1 vertex should exist
-        let csr = e.hot.read().unwrap();
-        assert_eq!(csr.vertex_count(), 1, "PK dedup: should have exactly 1 vertex");
+        let store = snapshot_store(&e);
+        assert_eq!(store.vertex_count(), 1, "PK dedup: should have exactly 1 vertex");
     }
 
     #[test]
@@ -2752,9 +2745,9 @@ mod tests {
             &[("rkey", PropValue::Str("c1".into()))],
         )
         .unwrap();
-        let csr = e.hot.read().unwrap();
-        assert_eq!(csr.vertex_count(), 2);
-        let labels = yata_grin::Schema::vertex_labels(&*csr);
+        let store = snapshot_store(&e);
+        assert_eq!(store.vertex_count(), 2);
+        let labels = yata_grin::Schema::vertex_labels(&store);
         assert!(labels.contains(&"Person".to_string()));
         assert!(labels.contains(&"Company".to_string()));
     }
@@ -2770,7 +2763,7 @@ mod tests {
             &[("rkey", PropValue::Str("del-1".into()))],
         )
         .unwrap();
-        assert_eq!(e.hot.read().unwrap().vertex_count(), 1);
+        assert_eq!(snapshot_store(&e).vertex_count(), 1);
         let deleted = e.delete_record("Item", "rkey", "del-1").unwrap();
         assert!(deleted, "delete_record should return true when vertex found");
     }
@@ -2797,7 +2790,7 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(e.hot.read().unwrap().vertex_count(), 1);
+        assert_eq!(snapshot_store(&e).vertex_count(), 1);
         e.delete_record("X", "rkey", "x1").unwrap();
         // Re-create after delete
         e.merge_record(
@@ -2811,8 +2804,8 @@ mod tests {
         )
         .unwrap();
         // Should have exactly 1 vertex (re-created after delete)
-        let csr = e.hot.read().unwrap();
-        assert!(csr.vertex_count() >= 1, "should have at least 1 vertex after re-merge");
+        let store = snapshot_store(&e);
+        assert!(store.vertex_count() >= 1, "should have at least 1 vertex after re-merge");
     }
 
     // ── dirty_labels tracking ────────────────────────────────────────
@@ -2938,9 +2931,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let csr = e.hot.read().unwrap();
-        assert_eq!(csr.vertex_count(), 1);
-        let labels = yata_grin::Schema::vertex_labels(&*csr);
+        let store = snapshot_store(&e);
+        assert_eq!(store.vertex_count(), 1);
+        let labels = yata_grin::Schema::vertex_labels(&store);
         assert!(labels.contains(&"Actor".to_string()));
     }
 
@@ -2959,8 +2952,8 @@ mod tests {
             )
             .unwrap();
         }
-        let csr = e.hot.read().unwrap();
-        assert_eq!(csr.vertex_count(), 50);
+        let store = snapshot_store(&e);
+        assert_eq!(store.vertex_count(), 50);
     }
 
     // ── query_with_context injects metadata ──────────────────────────
