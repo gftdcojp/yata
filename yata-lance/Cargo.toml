@@ -3,23 +3,16 @@ name = "yata-lance"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Lance Dataset persistence for yata graph"
+description = "LanceDB persistence for yata graph"
 
 [dependencies]
-# Arrow (aligned with lance 3.0.1)
+# Arrow (aligned with lancedb 0.27)
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 
-# Lance Dataset API (no cloud features — yata uses local/S3 via object_store directly)
-lance = { version = "3.0", default-features = false }
-lance-arrow = "3.0"
-lance-index = "3.0"
-lance-linalg = "3.0"
-lance-table = "3.0"
-
-# ObjectStore trait (same version as lance 3.0 transitive dep)
-object_store = "0.12"
+# LanceDB — high-level API (embeds lance 4.0, object_store, S3 support)
+lancedb = { version = "0.27", default-features = false, features = ["aws"] }
 
 # Async
 tokio = { workspace = true }
@@ -36,10 +29,8 @@ serde.workspace = true
 serde_json.workspace = true
 indexmap.workspace = true
 bytes.workspace = true
-url = "2"
 yata-cypher = { path = "../yata-cypher" }
 yata-grin = { path = "../yata-grin" }
-yata-s3 = { path = "../yata-s3" }
 
 [dev-dependencies]
 tempfile = "3"

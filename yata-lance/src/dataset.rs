@@ -1,223 +1,166 @@
-//! YataDataset — Lance Dataset wrapper for yata graph persistence.
+//! YataDb — LanceDB-backed persistence for yata graph.
 //!
-//! Provides create/open/append/scan/compact operations on a Lance dataset
-//! stored at an S3/R2/local URI. All versioning, manifest management, fragment
-//! tracking, and compaction are handled by Lance internally.
+//! Uses lancedb::Connection + Table for all storage operations.
+//! LanceDB handles versioning, manifest, fragments, compaction, and S3/R2 internally.
 
-use arrow::record_batch::{RecordBatch, RecordBatchIterator};
+use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
-use lance::dataset::{Dataset, WriteMode, WriteParams};
-use lance::io::ObjectStoreParams;
-use object_store::ObjectStore as DynObjectStore;
+use lancedb::query::{ExecutableQuery, QueryBase};
 use std::sync::Arc;
-use url::Url;
 
-/// Wrapper around a Lance Dataset for yata graph vertices.
-pub struct YataDataset {
-    ds: Dataset,
+/// LanceDB connection wrapper for yata graph persistence.
+pub struct YataDb {
+    db: lancedb::Connection,
 }
 
-impl YataDataset {
-    /// Create a new empty dataset with the given schema.
-    pub async fn create_empty(
-        uri: &str,
-        schema: Arc<arrow::datatypes::Schema>,
-    ) -> Result<Self, lance::Error> {
-        let empty = RecordBatch::new_empty(schema.clone());
-        let reader = RecordBatchIterator::new(vec![Ok(empty)].into_iter(), schema);
-        let ds = Dataset::write(reader, uri, Some(WriteParams::default())).await?;
-        Ok(Self { ds })
+/// Single table handle (vertices or edges).
+pub struct YataTable {
+    table: lancedb::Table,
+}
+
+impl YataDb {
+    /// Connect to a local LanceDB database.
+    pub async fn connect_local(path: &str) -> Result<Self, lancedb::Error> {
+        let db = lancedb::connect(path).execute().await?;
+        Ok(Self { db })
     }
 
-    /// Open an existing dataset at the given URI (local filesystem only).
-    pub async fn open(uri: &str) -> Result<Self, lance::Error> {
-        let ds = Dataset::open(uri).await?;
-        Ok(Self { ds })
-    }
-
-    /// Open an existing dataset backed by a custom ObjectStore (e.g. UreqObjectStore for R2).
+    /// Connect to an S3/R2-backed LanceDB database.
     ///
-    /// `base_url` should be a well-formed URL like `r2://ai-gftd-graph/yata/lance/vertices/0`.
-    /// The `store` provides the actual I/O (get/put/list) to R2 via ureq.
-    #[allow(deprecated)]
-    pub async fn open_with_store(
+    /// `uri` should be `s3://bucket/prefix` or `s3+ddb://bucket/prefix` for DynamoDB commit store.
+    /// R2 is S3-compatible, so use `s3://bucket/prefix` with R2 endpoint.
+    pub async fn connect_s3(
         uri: &str,
-        store: Arc<dyn DynObjectStore>,
-        base_url: Url,
-    ) -> Result<Self, lance::Error> {
-        use lance::dataset::builder::DatasetBuilder;
-        let commit_handler = Arc::new(lance_table::io::commit::RenameCommitHandler);
-        let ds = DatasetBuilder::from_uri(uri)
-            .with_object_store(store, base_url, commit_handler)
-            .load()
+        endpoint: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+        region: &str,
+    ) -> Result<Self, lancedb::Error> {
+        let db = lancedb::connect(uri)
+            .storage_option("aws_access_key_id", access_key_id)
+            .storage_option("aws_secret_access_key", secret_access_key)
+            .storage_option("aws_endpoint", endpoint)
+            .storage_option("aws_region", region)
+            .storage_option("aws_virtual_hosted_style_request", "false")
+            .execute()
             .await?;
-        Ok(Self { ds })
+        Ok(Self { db })
     }
 
-    /// Create a new dataset (or overwrite) with initial batches (local filesystem only).
-    pub async fn create(
-        uri: &str,
-        batches: Vec<RecordBatch>,
-        schema: Arc<arrow::datatypes::Schema>,
-    ) -> Result<Self, lance::Error> {
-        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-        let ds = Dataset::write(reader, uri, Some(WriteParams::default())).await?;
-        Ok(Self { ds })
+    /// Connect from YATA_S3_* env vars. Returns None if not configured.
+    pub async fn connect_from_env(prefix: &str) -> Option<Self> {
+        let endpoint = std::env::var("YATA_S3_ENDPOINT").ok()?;
+        let bucket = std::env::var("YATA_S3_BUCKET").unwrap_or_default();
+        let key_id = std::env::var("YATA_S3_ACCESS_KEY_ID")
+            .or_else(|_| std::env::var("YATA_S3_KEY_ID"))
+            .unwrap_or_default();
+        let secret = std::env::var("YATA_S3_SECRET_ACCESS_KEY")
+            .or_else(|_| std::env::var("YATA_S3_SECRET_KEY"))
+            .or_else(|_| std::env::var("YATA_S3_APPLICATION_KEY"))
+            .unwrap_or_default();
+        let region = std::env::var("YATA_S3_REGION").unwrap_or_else(|_| "auto".to_string());
+        if endpoint.is_empty() || bucket.is_empty() || key_id.is_empty() || secret.is_empty() {
+            return None;
+        }
+        let uri = format!("s3://{bucket}/{prefix}");
+        tracing::info!(%uri, %endpoint, "connecting to LanceDB on R2");
+        Self::connect_s3(&uri, &endpoint, &key_id, &secret, &region)
+            .await
+            .ok()
     }
 
-    /// Create a new dataset backed by a custom ObjectStore (e.g. UreqObjectStore for R2).
-    #[allow(deprecated)]
-    pub async fn create_with_store(
-        uri: &str,
-        batches: Vec<RecordBatch>,
-        schema: Arc<arrow::datatypes::Schema>,
-        store: Arc<dyn DynObjectStore>,
-        base_url: Url,
-    ) -> Result<Self, lance::Error> {
-        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-        let params = WriteParams {
-            store_params: Some(ObjectStoreParams {
-                object_store: Some((store, base_url)),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let ds = Dataset::write(reader, uri, Some(params)).await?;
-        Ok(Self { ds })
+    /// Open an existing table.
+    pub async fn open_table(&self, name: &str) -> Result<YataTable, lancedb::Error> {
+        let table = self.db.open_table(name).execute().await?;
+        Ok(YataTable { table })
     }
 
-    /// Append batches to the dataset (creates a new version).
-    pub async fn append(
-        &mut self,
-        batches: Vec<RecordBatch>,
-        schema: Arc<arrow::datatypes::Schema>,
-    ) -> Result<(), lance::Error> {
-        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-        self.ds.append(reader, None).await
+    /// Create a new table with initial data.
+    pub async fn create_table(
+        &self,
+        name: &str,
+        batch: RecordBatch,
+    ) -> Result<YataTable, lancedb::Error> {
+        let table = self.db.create_table(name, batch).execute().await?;
+        Ok(YataTable { table })
     }
 
-    /// Overwrite the dataset with new batches (creates a new version).
-    pub async fn overwrite(
-        &mut self,
-        batches: Vec<RecordBatch>,
+    /// Create an empty table with a given schema.
+    pub async fn create_empty_table(
+        &self,
+        name: &str,
         schema: Arc<arrow::datatypes::Schema>,
-    ) -> Result<(), lance::Error> {
-        let params = WriteParams {
-            mode: WriteMode::Overwrite,
-            ..Default::default()
-        };
-        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-        let new_ds = Dataset::write(
-            reader,
-            self.ds.uri(),
-            Some(params),
-        )
-        .await?;
-        self.ds = new_ds;
+    ) -> Result<YataTable, lancedb::Error> {
+        let table = self.db.create_empty_table(name, schema).execute().await?;
+        Ok(YataTable { table })
+    }
+
+    /// List all table names.
+    pub async fn table_names(&self) -> Result<Vec<String>, lancedb::Error> {
+        self.db.table_names().execute().await
+    }
+
+    /// Get the underlying LanceDB connection.
+    pub fn inner(&self) -> &lancedb::Connection {
+        &self.db
+    }
+}
+
+impl YataTable {
+    /// Append a batch to the table (creates a new version).
+    pub async fn add(&self, batch: RecordBatch) -> Result<(), lancedb::Error> {
+        self.table.add(batch).execute().await?;
         Ok(())
     }
 
-    /// Scan the full dataset, returning all rows as RecordBatches.
-    pub async fn scan_all(&self) -> Result<Vec<RecordBatch>, lance::Error> {
-        let stream = self.ds.scan().try_into_stream().await?;
+    /// Scan the full table, returning all rows.
+    pub async fn scan_all(&self) -> Result<Vec<RecordBatch>, lancedb::Error> {
+        let stream = self.table.query().execute().await?;
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
         Ok(batches)
     }
 
     /// Scan with a SQL filter expression (e.g. `"label = 'Post'"`).
-    pub async fn scan_filter(&self, filter: &str) -> Result<Vec<RecordBatch>, lance::Error> {
-        let mut scanner = self.ds.scan();
-        scanner.filter(filter)?;
-        let stream = scanner.try_into_stream().await?;
+    pub async fn scan_filter(&self, filter: &str) -> Result<Vec<RecordBatch>, lancedb::Error> {
+        let stream = self
+            .table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await?;
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
         Ok(batches)
     }
 
     /// Count rows, optionally with a filter.
-    pub async fn count_rows(&self, filter: Option<&str>) -> Result<usize, lance::Error> {
-        self.ds
-            .count_rows(filter.map(|s| s.to_string()))
+    pub async fn count_rows(&self, filter: Option<&str>) -> Result<usize, lancedb::Error> {
+        self.table.count_rows(filter.map(|s| s.to_string())).await
+    }
+
+    /// Compact fragments (merge small files). Delegates to LanceDB built-in optimization.
+    pub async fn compact(&self) -> Result<lancedb::table::OptimizeStats, lancedb::Error> {
+        self.table
+            .optimize(lancedb::table::OptimizeAction::Compact {
+                options: Default::default(),
+                remap_options: None,
+            })
             .await
     }
 
-    /// Compact fragments (merge small files). Delegates to Lance's built-in compaction.
-    pub async fn compact(&mut self) -> Result<lance::dataset::optimize::CompactionMetrics, lance::Error> {
-        let metrics = lance::dataset::optimize::compact_files(
-            &mut self.ds,
-            lance::dataset::optimize::CompactionOptions::default(),
-            None,
-        )
-        .await?;
-        self.ds.checkout_latest().await?;
-        Ok(metrics)
+    /// Get the current table version.
+    pub async fn version(&self) -> Result<u64, lancedb::Error> {
+        self.table.version().await
     }
 
-    /// Get the current dataset version.
-    pub fn version(&self) -> u64 {
-        self.ds.manifest().version
+    /// Get table name.
+    pub fn name(&self) -> &str {
+        self.table.name()
     }
 
-    /// Get the dataset URI.
-    pub fn uri(&self) -> &str {
-        self.ds.uri()
+    /// Get the underlying LanceDB table.
+    pub fn inner(&self) -> &lancedb::Table {
+        &self.table
     }
-
-    /// Get a reference to the inner Lance Dataset.
-    pub fn inner(&self) -> &Dataset {
-        &self.ds
-    }
-}
-
-pub async fn create_vertex_log_dataset(uri: &str) -> Result<YataDataset, lance::Error> {
-    YataDataset::create_empty(
-        uri,
-        Arc::new(crate::schema::vertex_log_schema().clone()),
-    )
-    .await
-}
-
-pub async fn create_edge_log_dataset(uri: &str) -> Result<YataDataset, lance::Error> {
-    YataDataset::create_empty(
-        uri,
-        Arc::new(crate::schema::edge_log_schema().clone()),
-    )
-    .await
-}
-
-pub async fn create_vertex_live_dataset(uri: &str) -> Result<YataDataset, lance::Error> {
-    YataDataset::create_empty(
-        uri,
-        Arc::new(crate::schema::vertex_live_schema().clone()),
-    )
-    .await
-}
-
-pub async fn create_edge_live_out_dataset(uri: &str) -> Result<YataDataset, lance::Error> {
-    YataDataset::create_empty(
-        uri,
-        Arc::new(crate::schema::edge_live_out_schema().clone()),
-    )
-    .await
-}
-
-pub async fn create_edge_live_in_dataset(uri: &str) -> Result<YataDataset, lance::Error> {
-    YataDataset::create_empty(
-        uri,
-        Arc::new(crate::schema::edge_live_in_schema().clone()),
-    )
-    .await
-}
-
-pub async fn open_datasets_from_manifest(
-    manifest: &crate::manifest::GraphManifest,
-) -> Result<crate::manifest::OpenedGraphDatasets, lance::Error> {
-    Ok(crate::manifest::OpenedGraphDatasets {
-        vertex_log: YataDataset::open(&manifest.tables.vertex_log.uri).await?,
-        edge_log: YataDataset::open(&manifest.tables.edge_log.uri).await?,
-        vertex_live: YataDataset::open(&manifest.tables.vertex_live.uri).await?,
-        edge_live_out: YataDataset::open(&manifest.tables.edge_live_out.uri).await?,
-        edge_live_in: YataDataset::open(&manifest.tables.edge_live_in.uri).await?,
-    })
 }
 
 #[cfg(test)]
@@ -238,7 +181,12 @@ mod tests {
         ]))
     }
 
-    fn test_batch(schema: &Arc<Schema>, seq: &[u64], labels: &[&str], rkeys: &[&str]) -> RecordBatch {
+    fn test_batch(
+        schema: &Arc<Schema>,
+        seq: &[u64],
+        labels: &[&str],
+        rkeys: &[&str],
+    ) -> RecordBatch {
         RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -257,53 +205,55 @@ mod tests {
     #[tokio::test]
     async fn test_create_and_scan() {
         let tmpdir = tempfile::tempdir().unwrap();
-        let uri = tmpdir.path().to_str().unwrap();
+        let db = YataDb::connect_local(tmpdir.path().to_str().unwrap())
+            .await
+            .unwrap();
         let schema = wal_schema();
         let batch = test_batch(&schema, &[1, 2, 3], &["Post", "Like", "Post"], &["a", "b", "c"]);
 
-        let ds = YataDataset::create(uri, vec![batch], schema).await.unwrap();
-        assert_eq!(ds.count_rows(None).await.unwrap(), 3);
-        assert_eq!(ds.version(), 1);
+        let table = db.create_table("vertices", batch).await.unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 3);
     }
 
     #[tokio::test]
-    async fn test_append_and_reopen() {
+    async fn test_add_and_reopen() {
         let tmpdir = tempfile::tempdir().unwrap();
-        let uri = tmpdir.path().to_str().unwrap();
+        let path = tmpdir.path().to_str().unwrap();
+        let db = YataDb::connect_local(path).await.unwrap();
         let schema = wal_schema();
 
-        let mut ds = YataDataset::create(
-            uri,
-            vec![test_batch(&schema, &[1, 2], &["Post", "Like"], &["a", "b"])],
-            schema.clone(),
-        )
-        .await
-        .unwrap();
+        let table = db
+            .create_table(
+                "vertices",
+                test_batch(&schema, &[1, 2], &["Post", "Like"], &["a", "b"]),
+            )
+            .await
+            .unwrap();
 
-        ds.append(
-            vec![test_batch(&schema, &[3], &["Follow"], &["c"])],
-            schema,
-        )
-        .await
-        .unwrap();
+        table
+            .add(test_batch(&schema, &[3], &["Follow"], &["c"]))
+            .await
+            .unwrap();
 
-        assert_eq!(ds.count_rows(None).await.unwrap(), 3);
-        assert_eq!(ds.version(), 2);
+        assert_eq!(table.count_rows(None).await.unwrap(), 3);
 
         // Re-open
-        let ds2 = YataDataset::open(uri).await.unwrap();
-        assert_eq!(ds2.count_rows(None).await.unwrap(), 3);
+        let db2 = YataDb::connect_local(path).await.unwrap();
+        let table2 = db2.open_table("vertices").await.unwrap();
+        assert_eq!(table2.count_rows(None).await.unwrap(), 3);
     }
 
     #[tokio::test]
     async fn test_scan_filter() {
         let tmpdir = tempfile::tempdir().unwrap();
-        let uri = tmpdir.path().to_str().unwrap();
+        let db = YataDb::connect_local(tmpdir.path().to_str().unwrap())
+            .await
+            .unwrap();
         let schema = wal_schema();
         let batch = test_batch(&schema, &[1, 2, 3], &["Post", "Like", "Post"], &["a", "b", "c"]);
 
-        let ds = YataDataset::create(uri, vec![batch], schema).await.unwrap();
-        let posts = ds.count_rows(Some("label = 'Post'")).await.unwrap();
+        let table = db.create_table("vertices", batch).await.unwrap();
+        let posts = table.count_rows(Some("label = 'Post'")).await.unwrap();
         assert_eq!(posts, 2);
     }
 }
