@@ -93,8 +93,7 @@ pub struct TieredGraphEngine {
     s3_prefix: String,
     dirty_labels: Arc<Mutex<HashSet<String>>>,
     pending_writes: Arc<AtomicUsize>,
-    wal: Arc<Mutex<crate::wal::WalRingBuffer>>,
-    wal_last_flushed_seq: Arc<AtomicU64>,
+    write_seq: Arc<AtomicU64>,
     /// SecurityScope cache: DID → (SecurityScope, compiled_at). Design E.
     security_scope_cache: Arc<Mutex<HashMap<String, (yata_gie::ir::SecurityScope, std::time::Instant)>>>,
     // CPM metrics: CP5 mutation frequency + compaction monitoring
@@ -122,7 +121,6 @@ impl TieredGraphEngine {
         let s3_prefix = std::env::var("YATA_S3_PREFIX").unwrap_or_else(|_| data_dir.to_string());
 
         tracing::info!("using LanceDB read store");
-        let wal_ring_capacity = config.wal_ring_capacity;
         Self {
             config,
             read_store: Arc::new(RwLock::new(Some(yata_lance::LanceReadStore::default()))),
@@ -134,8 +132,7 @@ impl TieredGraphEngine {
             s3_prefix,
             dirty_labels: Arc::new(Mutex::new(HashSet::new())),
             pending_writes: Arc::new(AtomicUsize::new(0)),
-            wal: Arc::new(Mutex::new(crate::wal::WalRingBuffer::new(wal_ring_capacity))),
-            wal_last_flushed_seq: Arc::new(AtomicU64::new(0)),
+            write_seq: Arc::new(AtomicU64::new(0)),
             security_scope_cache: Arc::new(Mutex::new(HashMap::new())),
             cypher_read_count: Arc::new(AtomicU64::new(0)),
             cypher_mutation_count: Arc::new(AtomicU64::new(0)),
@@ -260,21 +257,28 @@ impl TieredGraphEngine {
                 }
             });
             if let Some(batches) = result {
-                for batch in &batches {
-                    match crate::arrow_wal::batch_to_wal_entries(batch) {
-                        Ok(entries) if !entries.is_empty() => {
-                            let _ = self.wal_apply(&entries);
+                // Apply batches directly to read store (bypass WAL)
+                if let Ok(mut rs) = self.read_store.write() {
+                    if let Some(ref mut store) = *rs {
+                        for batch in &batches {
+                            if let Ok(entries) = crate::arrow_wal::batch_to_wal_entries(batch) {
+                                for entry in &entries {
+                                    let props: Vec<(&str, yata_grin::PropValue)> =
+                                        entry.props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                                    let pk = yata_grin::PropValue::Str(entry.pk_value.clone());
+                                    store.merge_vertex_by_pk(&entry.label, &entry.pk_key, &pk, &props);
+                                }
+                            }
                         }
-                        _ => {}
                     }
                 }
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     ll.insert(label.clone());
                 }
-                tracing::info!(label, "demand page-in: loaded from Lance Dataset");
+                self.hot_initialized.store(true, Ordering::SeqCst);
+                tracing::info!(label, "demand page-in: loaded from LanceDB");
             }
         }
-        self.refresh_read_store();
     }
 
 
@@ -747,19 +751,7 @@ impl TieredGraphEngine {
         self.mark_label_dirty(label);
         self.invalidate_security_cache_if_policy(label, props);
 
-        // WAL append (typed PropValue, zero JSON overhead)
-        if let Ok(mut wal) = self.wal.lock() {
-            let seq = wal.next_seq();
-            let entry = crate::wal::WalEntry {
-                seq, op: crate::wal::WalOp::Upsert,
-                label: label.to_string(), pk_key: pk_key.to_string(),
-                pk_value: pk_value.to_string(), props: props_to_owned(props),
-                timestamp_ms: now_ms(),
-            };
-            wal.append(entry);
-        }
-
-        // Hot store: append-only (tombstone old + append new, no in-place mutation)
+        // L0 hot store: append-only (tombstone old + append new)
         if let Ok(mut read_store) = self.read_store.write() {
             if let Some(ref mut store) = *read_store {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
@@ -779,8 +771,8 @@ impl TieredGraphEngine {
         Err("failed to acquire read store lock".into())
     }
 
-    /// Append-only merge record AND return the WAL entry for pushing to read replicas.
-    /// Write Container only. Returns (vid, WalEntry).
+    /// Append-only merge record. Write Container only. Returns (vid, None).
+    /// WAL entry return is deprecated — read replicas use LanceDB directly.
     pub fn merge_record_with_wal(
         &self,
         label: &str,
@@ -788,23 +780,6 @@ impl TieredGraphEngine {
         pk_value: &str,
         props: &[(&str, yata_grin::PropValue)],
     ) -> Result<(u32, Option<crate::wal::WalEntry>), String> {
-        let wal_entry = if let Ok(mut wal) = self.wal.lock() {
-            let seq = wal.next_seq();
-            let entry = crate::wal::WalEntry {
-                seq,
-                op: crate::wal::WalOp::Upsert,
-                label: label.to_string(),
-                pk_key: pk_key.to_string(),
-                pk_value: pk_value.to_string(),
-                props: props_to_owned(props),
-                timestamp_ms: now_ms(),
-            };
-            wal.append(entry.clone());
-            Some(entry)
-        } else {
-            None
-        };
-
         self.merge_record_count.fetch_add(1, Ordering::Relaxed);
         self.mark_label_dirty(label);
         self.invalidate_security_cache_if_policy(label, props);
@@ -822,7 +797,7 @@ impl TieredGraphEngine {
                     self.pending_writes.store(0, Ordering::Relaxed);
                     let _ = self.trigger_compaction();
                 }
-                return Ok((vid, wal_entry));
+                return Ok((vid, None));
             }
         }
         Err("failed to acquire read store lock".into())
@@ -838,18 +813,6 @@ impl TieredGraphEngine {
         self.ensure_labels(&[label]);
         self.mark_label_dirty(label);
 
-        // WAL append (Delete)
-        if let Ok(mut wal) = self.wal.lock() {
-            let seq = wal.next_seq();
-            let entry = crate::wal::WalEntry {
-                seq, op: crate::wal::WalOp::Delete,
-                label: label.to_string(), pk_key: pk_key.to_string(),
-                pk_value: pk_value.to_string(), props: Vec::new(),
-                timestamp_ms: now_ms(),
-            };
-            wal.append(entry);
-        }
-
         if let Ok(mut read_store) = self.read_store.write() {
             if let Some(ref mut store) = *read_store {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
@@ -861,7 +824,7 @@ impl TieredGraphEngine {
         Err("failed to acquire read store lock".into())
     }
 
-    /// Delete a record AND return the WAL entry for pushing to read replicas.
+    /// Delete a record. WAL entry return is deprecated.
     pub fn delete_record_with_wal(
         &self,
         label: &str,
@@ -871,29 +834,12 @@ impl TieredGraphEngine {
         self.ensure_labels(&[label]);
         self.mark_label_dirty(label);
 
-        let wal_entry = if let Ok(mut wal) = self.wal.lock() {
-            let seq = wal.next_seq();
-            let entry = crate::wal::WalEntry {
-                seq,
-                op: crate::wal::WalOp::Delete,
-                label: label.to_string(),
-                pk_key: pk_key.to_string(),
-                pk_value: pk_value.to_string(),
-                props: Vec::new(),
-                timestamp_ms: now_ms(),
-            };
-            wal.append(entry.clone());
-            Some(entry)
-        } else {
-            None
-        };
-
         if let Ok(mut read_store) = self.read_store.write() {
             if let Some(ref mut store) = *read_store {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
                 let deleted = store.delete_vertex_by_pk(label, pk_key, &pk);
                 self.hot_initialized.store(true, Ordering::SeqCst);
-                return Ok((deleted, wal_entry));
+                return Ok((deleted, None));
             }
         }
         Err("failed to acquire read store lock".into())
@@ -945,139 +891,13 @@ impl TieredGraphEngine {
     /// Export snapshot blobs for external upload (TS Worker → R2).
     // ── WAL Projection API ──────────────────────────────────────────────
 
-    /// Read WAL entries after `after_seq`, up to `limit`.
-    /// Returns `Ok(entries)` or `Err("gap")` if entries were evicted.
-    /// Write Container only.
-    pub fn wal_tail(&self, after_seq: u64, limit: usize) -> Result<Vec<crate::wal::WalEntry>, String> {
-        if let Ok(wal) = self.wal.lock() {
-            match wal.tail(after_seq, limit) {
-                Some(entries) => Ok(entries),
-                None => Err("gap: entries evicted, use R2 segments".to_string()),
-            }
-        } else {
-            Err("failed to acquire WAL lock".into())
-        }
-    }
-
-    /// Current WAL head sequence number.
+    /// Current write sequence number.
     pub fn wal_head_seq(&self) -> u64 {
-        if let Ok(wal) = self.wal.lock() {
-            wal.head_seq()
-        } else {
-            0
-        }
+        self.write_seq.load(Ordering::SeqCst)
     }
 
-    pub fn wal_apply(&self, entries: &[crate::wal::WalEntry]) -> Result<u64, String> {
-        if entries.is_empty() {
-            return Ok(0);
-        }
-        let mut applied = 0u64;
-        if let Ok(mut read_store) = self.read_store.write() {
-            if let Some(ref mut store) = *read_store {
-                for entry in entries {
-                    match entry.op {
-                        crate::wal::WalOp::Upsert => {
-                            let props: Vec<(&str, yata_grin::PropValue)> =
-                                entry.props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-                            let pk = yata_grin::PropValue::Str(entry.pk_value.clone());
-                            store.merge_vertex_by_pk(&entry.label, &entry.pk_key, &pk, &props);
-                        }
-                        crate::wal::WalOp::Delete => {
-                            let pk = yata_grin::PropValue::Str(entry.pk_value.clone());
-                            store.delete_vertex_by_pk(&entry.label, &entry.pk_key, &pk);
-                        }
-                    }
-                    applied += 1;
-                }
-                if let Ok(mut ll) = self.loaded_labels.lock() {
-                    for entry in entries {
-                        ll.insert(entry.label.clone());
-                    }
-                }
-                self.hot_initialized.store(true, Ordering::SeqCst);
-            } else {
-                return Err("no read store available for wal_apply".into());
-            }
-        } else {
-            return Err("failed to acquire read store lock".into());
-        }
-        tracing::info!(applied, last_seq = entries.last().map(|e| e.seq).unwrap_or(0), "wal_apply complete");
-        Ok(applied)
-    }
-
-    /// Flush pending WAL entries to Lance Dataset (primary) + R2 segment (fallback).
-    ///
-    /// Primary path: convert WAL entries to RecordBatch → Lance Dataset::append().
-    /// Lance handles versioning, manifest, and fragment management internally.
-    /// Fallback: if Lance Dataset is not available, flush to R2 as raw Arrow IPC segment.
-    ///
-    /// Returns (seq_start, seq_end, entry_count) or Ok((0,0,0)) if nothing to flush.
-    pub fn wal_flush_segment(&self) -> Result<(u64, u64, usize), String> {
-        let last_flushed = self.wal_last_flushed_seq.load(Ordering::SeqCst);
-
-        let entries = if let Ok(wal) = self.wal.lock() {
-            match wal.tail(last_flushed, 10_000) {
-                Some(e) if !e.is_empty() => e,
-                _ => return Ok((0, 0, 0)),
-            }
-        } else {
-            return Err("failed to acquire WAL lock".into());
-        };
-
-        let (seq_start, seq_end) = match (entries.first(), entries.last()) {
-            (Some(first), Some(last)) => (first.seq, last.seq),
-            _ => return Ok((0, 0, 0)),
-        };
-
-        let entry_count = entries.len();
-        let batch = crate::arrow_wal::wal_entries_to_batch(&entries)
-            .map_err(|e| format!("WAL batch conversion failed: {e}"))?;
-
-        // LanceDB table.add() — sole persistence path
-        let lance_tbl = self.lance_table.clone();
-        let lance_db = self.lance_db.clone();
-        let prefix_owned = self.s3_prefix.clone();
-
-        ENGINE_RT.block_on(async {
-            let mut tbl_guard = lance_tbl.lock().await;
-            if let Some(ref tbl) = *tbl_guard {
-                tbl.add(batch.clone()).await.map_err(|e| format!("LanceDB add failed: {e}"))?;
-            } else {
-                // Lazy connect + create table on first flush
-                let mut db_guard = lance_db.lock().await;
-                if db_guard.is_none() {
-                    let new_db = match yata_lance::YataDb::connect_from_env(&prefix_owned).await {
-                        Some(db) => db,
-                        None => yata_lance::YataDb::connect_local(&prefix_owned).await
-                            .map_err(|e| format!("LanceDB connect failed: {e}"))?,
-                    };
-                    *db_guard = Some(new_db);
-                }
-                let db = db_guard.as_ref().ok_or("LanceDB not connected")?;
-                let tbl = db.create_table("vertices", batch.clone()).await
-                    .map_err(|e| format!("LanceDB create_table failed: {e}"))?;
-                tracing::info!("LanceDB vertices table created");
-                *tbl_guard = Some(tbl);
-            }
-            Ok::<(), String>(())
-        })?;
-
-        self.wal_last_flushed_seq.store(seq_end, Ordering::SeqCst);
-        tracing::info!(seq_start, seq_end, entries = entry_count, "WAL flushed to LanceDB");
-        Ok((seq_start, seq_end, entry_count))
-    }
-
-    /// L1 Compaction: Lance-native fragment merge + PK-dedup fallback.
-    ///
-    /// Primary path: Lance Dataset::compact() merges small fragments into larger ones.
-    /// Fallback path: read WAL segments from R2, PK-dedup, append to Lance Dataset.
-    ///
-    /// Triggered by size-based threshold (L0_COMPACT_THRESHOLD) or manually via XRPC.
+    /// LanceDB compaction. Merges small fragments.
     pub fn trigger_compaction(&self) -> Result<CompactionResult, String> {
-        // First flush pending WAL entries to Lance Dataset
-        let _ = self.wal_flush_segment();
-
         // Drain dirty_labels
         let dirty = self.drain_dirty_labels();
         if dirty.is_empty() {
@@ -2906,166 +2726,6 @@ mod tests {
 
     // ── WAL cold start recovery tests ──────────────────────────────────
 
-    #[test]
-    fn test_wal_flush_no_entries_returns_ok_zero() {
-        // Without WAL entries, wal_flush_segment should return Ok((0,0,0))
-        let dir = tempfile::tempdir().unwrap();
-        let e = make_engine(&dir);
-        let result = e.wal_flush_segment();
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), (0, 0, 0));
-    }
-
-    #[test]
-    fn test_wal_flush_with_entries_no_storage_returns_error() {
-        // With WAL entries but no S3/Lance, wal_flush_segment should error gracefully
-        let dir = tempfile::tempdir().unwrap();
-        let e = make_engine(&dir);
-        // Add a WAL entry so flush has work to do
-        e.merge_record("Post", "rkey", "pk_1", &[
-            ("text", yata_grin::PropValue::Str("hello".to_string())),
-        ]).unwrap();
-        let result = e.wal_flush_segment();
-        // Lance flush to local dir should succeed (Dataset::create works on local paths)
-        // OR error gracefully if storage is unavailable — either way, no panic
-        assert!(result.is_ok() || result.is_err());
-    }
-
-    #[test]
-    fn test_wal_apply_roundtrip() {
-        // Write entries via merge_record, then apply them to a fresh engine via wal_apply
-        let dir = tempfile::tempdir().unwrap();
-        let e = make_engine(&dir);
-
-        e.merge_record("Person", "rkey", "alice", &[
-            ("name", yata_grin::PropValue::Str("Alice".to_string())),
-        ]).unwrap();
-        e.merge_record("Person", "rkey", "bob", &[
-            ("name", yata_grin::PropValue::Str("Bob".to_string())),
-        ]).unwrap();
-
-        // Extract WAL entries
-        let entries = e.wal.lock().unwrap().tail(0, 100).unwrap();
-        assert_eq!(entries.len(), 2);
-
-        // Apply to a fresh engine
-        let dir2 = tempfile::tempdir().unwrap();
-        let e2 = make_engine(&dir2);
-        let applied = e2.wal_apply(&entries).unwrap();
-        assert_eq!(applied, 2);
-
-        // Verify data is readable
-        let rows = run_query(&e2, "MATCH (n:Person) RETURN n.name AS name", &[], None).unwrap();
-        assert_eq!(rows.len(), 2);
-    }
-
-    #[test]
-    fn test_wal_apply_pk_dedup() {
-        // Applying entries with same PK should dedup (last write wins)
-        let dir = tempfile::tempdir().unwrap();
-        let e = make_engine(&dir);
-
-        e.merge_record("Person", "rkey", "alice", &[
-            ("name", yata_grin::PropValue::Str("Alice_v1".to_string())),
-        ]).unwrap();
-        e.merge_record("Person", "rkey", "alice", &[
-            ("name", yata_grin::PropValue::Str("Alice_v2".to_string())),
-        ]).unwrap();
-
-        let rows = run_query(&e, "MATCH (n:Person) RETURN n.name AS name", &[], None).unwrap();
-        assert_eq!(rows.len(), 1, "PK dedup: should have 1 Person, not 2");
-    }
-
-    #[test]
-    fn test_wal_serialize_deserialize_arrow() {
-        use crate::wal::{WalEntry, WalOp};
-
-        let entries = vec![
-            WalEntry {
-                seq: 1, op: WalOp::Upsert,
-                label: "Post".into(), pk_key: "rkey".into(), pk_value: "p1".into(),
-                props: vec![("title".into(), yata_grin::PropValue::Str("Hello".into()))],
-                timestamp_ms: 1000,
-            },
-            WalEntry {
-                seq: 2, op: WalOp::Delete,
-                label: "Post".into(), pk_key: "rkey".into(), pk_value: "p2".into(),
-                props: vec![], timestamp_ms: 2000,
-            },
-        ];
-
-        let data = crate::arrow_wal::serialize_segment_arrow(&entries).unwrap();
-        let recovered = crate::arrow_wal::deserialize_segment_arrow(&data).unwrap();
-
-        assert_eq!(recovered.len(), 2);
-        assert_eq!(recovered[0].seq, 1);
-        assert_eq!(recovered[0].label, "Post");
-        assert_eq!(recovered[0].pk_value, "p1");
-        assert_eq!(recovered[1].op, WalOp::Delete);
-    }
-
-    #[test]
-    fn test_cold_start_no_storage_graceful() {
-        // Without storage config, cold start should succeed (new database)
-        let dir = tempfile::tempdir().unwrap();
-        let e = make_engine(&dir);
-        let result = e.wal_cold_start();
-        // LanceDB cold start succeeds (returns version 0 for new database)
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 0);
-    }
-
-    #[test]
-    fn test_wal_gap_detection() {
-        use crate::wal::WalRingBuffer;
-
-        let mut wal = WalRingBuffer::new(3); // capacity 3
-
-        // Fill and evict
-        for i in 1..=5 {
-            let entry = crate::wal::WalEntry {
-                seq: i, op: crate::wal::WalOp::Upsert,
-                label: "T".into(), pk_key: "k".into(), pk_value: format!("v{i}"),
-                props: vec![], timestamp_ms: 1000 + i,
-            };
-            wal.append(entry);
-        }
-
-        // Buffer has seq 3,4,5 (1,2 evicted). oldest_evicted = 2.
-        assert_eq!(wal.oldest_evicted(), 2);
-        assert_eq!(wal.oldest_seq(), 3);
-
-        // Consumer at seq 0 — gap exists (needs R2 segments)
-        assert!(wal.tail(0, 10).is_some(), "after_seq=0 should return all entries from buffer");
-
-        // Consumer at seq 1 — gap (1 < oldest=3 AND 1 < oldest_evicted=2)
-        assert!(wal.tail(1, 10).is_none(), "after_seq=1 should detect gap");
-
-        // Consumer at seq 2 — at eviction boundary, no gap
-        let tail = wal.tail(2, 10);
-        assert!(tail.is_some(), "after_seq=2 should not have gap (boundary)");
-        assert_eq!(tail.unwrap().len(), 3); // seq 3,4,5
-
-        // Consumer at seq 4 — no gap, returns seq 5
-        let tail = wal.tail(4, 10).unwrap();
-        assert_eq!(tail.len(), 1);
-        assert_eq!(tail[0].seq, 5);
-
-        // Consumer fully caught up
-        let tail = wal.tail(5, 10).unwrap();
-        assert!(tail.is_empty());
-    }
-
-    #[test]
-    fn test_wal_empty_buffer_tail() {
-        use crate::wal::WalRingBuffer;
-        let wal = WalRingBuffer::new(10);
-
-        // Empty buffer — no gap, empty result
-        let tail = wal.tail(0, 10);
-        assert!(tail.is_some());
-        assert!(tail.unwrap().is_empty());
-    }
 
     #[test]
     fn test_dirty_labels_drain() {

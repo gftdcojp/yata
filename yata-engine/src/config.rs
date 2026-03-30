@@ -14,8 +14,6 @@ pub struct TieredEngineConfig {
     pub hot_partition_id: PartitionId,
     pub partition_count: u32,
     pub blob_cache_budget_mb: u64,
-    /// WAL ring buffer capacity (entries). Write Container only.
-    pub wal_ring_capacity: usize,
 }
 
 impl Default for TieredEngineConfig {
@@ -52,8 +50,6 @@ impl Default for TieredEngineConfig {
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(1),
             blob_cache_budget_mb: std::env::var("YATA_VINEYARD_BUDGET_MB")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(256),
-            wal_ring_capacity: std::env::var("YATA_WAL_RING_CAPACITY")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(100_000),
         }
     }
 }
@@ -67,7 +63,6 @@ mod tests {
         let cfg = TieredEngineConfig::default();
         assert_eq!(cfg.hot_max_vertices, 50_000);
         assert_eq!(cfg.partition_count, 1);
-        assert_eq!(cfg.wal_ring_capacity, 100_000);
     }
 
     #[test]
