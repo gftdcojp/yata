@@ -379,39 +379,36 @@ impl TieredGraphEngine {
         let vineyard_dir = std::env::var("YATA_VINEYARD_DIR").ok();
         let pid = self.config.hot_partition_id.get();
 
-        // Try Lance TableManifest first (fragment-level page-in)
+        // Lance TableManifest: fragment-level demand page-in (3-tier: disk → R2 → verify)
         let lance_manifest = match self.lance_manifest_cache.lock() {
             Ok(lmc) => lmc.clone(),
             Err(_) => None,
         };
         if let Some(ref lm) = lance_manifest {
-            let mut lance_loaded_count = 0usize;
             for label in &needed {
-                // Find fragments containing this label
                 let matching_fragments: Vec<&yata_lance::Fragment> = lm.fragments.iter()
                     .filter(|f| f.labels.iter().any(|l| l == label))
                     .collect();
                 if matching_fragments.is_empty() { continue; }
                 for frag in matching_fragments {
-                    // 3-tier: disk cache → R2 Lance fragment → fallback
                     let disk_path = vineyard_dir.as_ref()
                         .map(|d| format!("{d}/lance/vertices/{pid}/fragments/{:020}-{:06}.arrow", frag.version, frag.id));
+                    // Tier 1: disk cache
                     let data = if let Some(ref path) = disk_path {
                         if std::path::Path::new(path).exists() {
                             std::fs::read(path).ok().map(bytes::Bytes::from)
                         } else { None }
                     } else { None };
+                    // Tier 2: R2
                     let data = match data {
                         Some(d) => d,
                         None => match s3.get_sync(&frag.r2_key) {
                             Ok(Some(d)) => {
-                                // Blake3 verify
                                 let actual = blake3::hash(&d).to_hex().to_string();
                                 if !frag.blake3_hex.is_empty() && actual != frag.blake3_hex {
-                                    tracing::error!(label, frag_id = frag.id, "Lance fragment checksum mismatch, skipping");
+                                    tracing::error!(label, frag_id = frag.id, "Lance fragment checksum mismatch");
                                     continue;
                                 }
-                                // Write-through disk cache
                                 if let Some(ref path) = disk_path {
                                     if let Some(parent) = std::path::Path::new(path).parent() {
                                         let _ = std::fs::create_dir_all(parent);
@@ -426,79 +423,12 @@ impl TieredGraphEngine {
                     let entries = crate::arrow_wal::deserialize_segment_auto(&frag.r2_key, &data);
                     if !entries.is_empty() {
                         let _ = self.wal_apply(&entries);
-                        lance_loaded_count += entries.len();
                     }
                 }
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     ll.insert(label.clone());
                 }
                 tracing::info!(label, "demand page-in: loaded from Lance fragment");
-            }
-            if lance_loaded_count > 0 { return; }
-        }
-
-        // Fallback: legacy CompactionManifest (v2 per-label segments)
-        let manifest = match self.manifest_cache.lock() {
-            Ok(mc) => mc.clone(),
-            Err(_) => None,
-        };
-        if let Some(ref manifest) = manifest {
-            if manifest.version >= 2 && !manifest.label_segments.is_empty() {
-                for label in &needed {
-                    if let Some(state) = manifest.label_segments.get(label.as_str()) {
-                        let loaded = self.load_label_segment(&s3, state, label, &vineyard_dir, pid);
-                        if loaded {
-                            if let Ok(mut ll) = self.loaded_labels.lock() {
-                                ll.insert(label.clone());
-                            }
-                            tracing::info!(label, entries = state.entry_count, "demand page-in: label loaded from legacy R2");
-                        }
-                    }
-                }
-                return;
-            }
-        }
-
-        // Fallback: legacy YataFragment path (for labels not in manifest)
-        let s3 = match self.get_s3_client() {
-            Some(s3) => s3.clone(),
-            None => return,
-        };
-        let meta = match crate::loader::fetch_fragment_meta(&s3, &self.s3_prefix) {
-            Ok(m) => m,
-            Err(e) => { tracing::warn!(error = %e, "ensure_labels: meta fetch failed"); return; }
-        };
-        let schema_bytes = match crate::loader::fetch_blob_cached(
-            &s3, &self.s3_prefix, "schema", crate::loader::disk_cache_dir().as_deref(),
-        ) {
-            Some(b) => b,
-            None => { tracing::warn!("ensure_labels: schema blob not found"); return; }
-        };
-        let schema: yata_format::schema::PropertyGraphSchema = match serde_json::from_slice(&schema_bytes) {
-            Ok(s) => s,
-            Err(e) => { tracing::warn!(error = %e, "ensure_labels: schema parse failed"); return; }
-        };
-        for label in &needed {
-            let mut enriched = false;
-            if let Ok(mut hot) = self.hot.write() {
-                if let Some(single) = hot.as_single_mut() {
-                    match crate::loader::enrich_label_from_r2(
-                        &s3, &self.s3_prefix, &meta, &schema, label, single, 0,
-                    ) {
-                        Ok(()) => {
-                            single.commit();
-                            enriched = true;
-                        }
-                        Err(e) => {
-                            tracing::warn!(label, error = %e, "label enrichment failed");
-                        }
-                    }
-                }
-            }
-            if enriched {
-                if let Ok(mut ll) = self.loaded_labels.lock() {
-                    ll.insert(label.clone());
-                }
             }
         }
     }
@@ -1613,74 +1543,46 @@ impl TieredGraphEngine {
         })
     }
 
-    /// LanceDB-style manifest-only cold start. Downloads manifest + WAL tail only.
+    /// Lance manifest-only cold start. Downloads Lance TableManifest + WAL tail only.
     /// Sets hot_initialized = true immediately — labels are loaded on-demand by ensure_labels().
     /// Multi-node safe: each node loads manifest independently, builds its own label subset.
-    ///
-    /// Priority: Lance TableManifest → legacy CompactionManifest → empty.
     fn wal_cold_start_manifest_only(&self) -> Result<u64, String> {
         let s3 = self.get_s3_client()
             .ok_or_else(|| "S3 client not configured".to_string())?;
         let prefix = &self.s3_prefix;
         let pid = self.config.hot_partition_id.get();
 
-        // Try Lance TableManifest first (primary path)
-        let lance_table = yata_lance::LanceTable::new("vertices", pid, prefix);
+        // Load Lance TableManifest from R2 (O(1) latest via inverted naming)
         let lance_prefix = format!("{}lance/vertices/{}/manifest-", prefix, pid);
-        let lance_loaded = if let Ok(objects) = s3.list_sync(&lance_prefix) {
+        let checkpoint_seq = if let Ok(objects) = s3.list_sync(&lance_prefix) {
             if let Some(first) = objects.first() {
                 if let Ok(Some(data)) = s3.get_sync(&first.key) {
                     match serde_json::from_slice::<yata_lance::table::TableManifest>(&data) {
                         Ok(lance_manifest) => {
                             let frag_count = lance_manifest.fragments.len();
                             let total_rows = lance_manifest.total_rows;
+                            let version = lance_manifest.version;
                             tracing::info!(
-                                version = lance_manifest.version, fragments = frag_count,
-                                total_rows, "Lance manifest cold start: loaded"
+                                version, fragments = frag_count,
+                                total_rows, "Lance cold start: manifest loaded"
                             );
                             if let Ok(mut lmc) = self.lance_manifest_cache.lock() {
                                 *lmc = Some(lance_manifest);
                             }
-                            true
+                            // Use version as checkpoint_seq proxy for WAL tail replay
+                            version
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "Lance manifest parse failed, falling back to legacy");
-                            false
+                            tracing::warn!(error = %e, "Lance manifest parse failed, starting empty");
+                            0
                         }
                     }
-                } else { false }
-            } else { false }
-        } else { false };
-
-        // Legacy CompactionManifest (fallback or parallel)
-        let checkpoint_seq = match crate::compaction::find_latest_manifest(&s3, prefix, pid) {
-            Some((manifest_ver, data)) => {
-                match serde_json::from_slice::<crate::compaction::CompactionManifest>(&data) {
-                    Ok(manifest) => {
-                        let seq = manifest.compacted_seq;
-                        let labels = manifest.label_segments.len();
-                        tracing::info!(
-                            manifest_ver, compacted_seq = seq, labels,
-                            entries = manifest.entry_count,
-                            lance_loaded,
-                            "manifest-only cold start: loaded (demand page-in enabled)"
-                        );
-                        if let Ok(mut mc) = self.manifest_cache.lock() {
-                            *mc = Some(manifest);
-                        }
-                        seq
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "manifest parse failed, starting empty");
-                        0
-                    }
-                }
-            }
-            None => {
-                tracing::info!(lance_loaded, "no legacy manifest found");
+                } else { 0 }
+            } else {
+                tracing::info!("no Lance manifest found (new database)");
                 0
             }
-        };
+        } else { 0 };
 
         // Replay WAL tail (entries after compacted_seq)
         let head_key = format!("{prefix}wal/meta/{pid}/head.json");
