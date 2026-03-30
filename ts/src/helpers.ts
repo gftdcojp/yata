@@ -55,6 +55,7 @@ export function buildMergeProps(
     repo,
     sensitivity_ord: "0",
     owner_hash: String(fnv1a32(repo)),
+    updated_at: String(Date.now()),
   };
 }
 

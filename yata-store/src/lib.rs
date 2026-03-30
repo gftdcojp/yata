@@ -763,12 +763,11 @@ impl MutableCsrStore {
         self.vertex_pk.insert(label.to_string(), key.to_string());
     }
 
-    /// MERGE by primary key: O(1) lookup via prop_eq_index.
-    /// If vertex with matching (label, pk_key=pk_value) exists → update props, return vid.
-    /// If not → create vertex with label + props, return vid.
-    /// Requires commit() to rebuild indexes after mutation.
-    ///
-    /// GraphScope Groot parity: get_vertex_by_primary_key → O(1) upsert.
+    /// MERGE by primary key: LanceDB-style append-only (tombstone old + append new).
+    /// If vertex with matching (label, pk_key=pk_value) exists → tombstone old, append new.
+    /// If not → append new vertex.
+    /// Existing data is immutable; updates always produce a new vertex.
+    /// PK dedup finalised during LSM compaction.
     pub fn merge_by_pk(
         &mut self,
         label: &str,
@@ -784,30 +783,26 @@ impl MutableCsrStore {
             .and_then(|idx| idx.get(&lookup_key))
             .and_then(|vids| vids.first().copied());
 
-        if let Some(vid) = existing_vid {
-            // UPDATE: set properties on existing vertex
-            if let Some(pmap) = self.vertex_props_map.get_mut(vid as usize) {
-                for (k, v) in props {
-                    pmap.insert(k.to_string(), v.clone());
-                }
+        // Tombstone old vertex if exists (LanceDB deletion vector equivalent)
+        if let Some(old_vid) = existing_vid {
+            if let Some(alive) = self.vertex_alive.get_mut(old_vid as usize) {
+                *alive = false;
             }
-            self.dirty_vertex_labels.insert(label.to_string());
-            vid
-        } else {
-            // CREATE: add new vertex + register PK index for future lookups
-            let mut all_props: Vec<(&str, PropValue)> = vec![(pk_key, pk_value.clone())];
-            all_props.extend(props.iter().map(|(k, v)| (*k, v.clone())));
-            let vid = self.add_vertex_with_labels(&[label.to_string()], &all_props);
-            // Eagerly register (label, pk_key) in prop_eq_index so commit() rebuilds it
-            let lookup_key = format!("{:?}", pk_value);
-            self.prop_eq_index
-                .entry((label.to_string(), pk_key.to_string()))
-                .or_default()
-                .entry(lookup_key)
-                .or_default()
-                .push(vid);
-            vid
         }
+
+        // Always append new vertex (immutable write)
+        let mut all_props: Vec<(&str, PropValue)> = vec![(pk_key, pk_value.clone())];
+        all_props.extend(props.iter().map(|(k, v)| (*k, v.clone())));
+        let vid = self.add_vertex_with_labels(&[label.to_string()], &all_props);
+
+        // Update PK index to point to new vertex
+        self.prop_eq_index
+            .entry((label.to_string(), pk_key.to_string()))
+            .or_default()
+            .insert(lookup_key, vec![vid]);
+
+        self.dirty_vertex_labels.insert(label.to_string());
+        vid
     }
 
     /// Delete vertex by primary key: O(1) lookup via prop_eq_index.
@@ -3328,14 +3323,18 @@ mod lazy_csr_tests {
         let v1 = store.merge_by_pk("Post", "rkey", &pk, &[("title", PropValue::Str("Hello".into()))]);
         store.commit();
 
-        // Second merge: updates same vertex (O(1) via prop_eq_index)
+        // Second merge: LanceDB-style — tombstone old + append new (different vid)
         let v2 = store.merge_by_pk("Post", "rkey", &pk, &[("title", PropValue::Str("Updated".into()))]);
         store.commit();
 
-        assert_eq!(v1, v2, "merge_by_pk should return same vid for same PK");
+        assert_ne!(v1, v2, "merge_by_pk appends new vertex (LanceDB-style)");
 
-        // Property should be updated
-        let title = store.vertex_prop(v1, "title");
+        // Old vertex is tombstoned
+        assert!(!store.vertex_alive[v1 as usize], "old vertex should be tombstoned");
+        assert!(store.vertex_alive[v2 as usize], "new vertex should be alive");
+
+        // New vertex has updated property
+        let title = store.vertex_prop(v2, "title");
         assert_eq!(title, Some(PropValue::Str("Updated".into())));
     }
 

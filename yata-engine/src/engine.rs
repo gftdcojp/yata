@@ -912,8 +912,9 @@ impl TieredGraphEngine {
     /// Size-based (workload-adaptive), replaces time-based cron.
     const L0_COMPACT_THRESHOLD: usize = 10_000;
 
-    /// MERGE by primary key: O(1) lookup, no Cypher parse, no MemoryGraph copy.
-    /// L0 buffer append + WAL ring append. Size-based compaction trigger.
+    /// Append-only merge record (LanceDB-style: tombstone old + append new fragment).
+    /// WAL append + hot store append. No per-write commit() — index rebuild deferred
+    /// to compaction (size-based trigger at L0_COMPACT_THRESHOLD).
     pub fn merge_record(
         &self,
         label: &str,
@@ -937,18 +938,22 @@ impl TieredGraphEngine {
             wal.append(entry);
         }
 
+        // Hot store: append-only (tombstone old + append new, no in-place mutation)
         if let Ok(mut hot) = self.hot.write() {
             if let Some(single) = hot.as_single_mut() {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
                 let vid = single.merge_by_pk(label, pk_key, &pk, props);
-                single.commit();
+                // Deferred commit: only rebuild indexes when L0 threshold reached.
+                // PK index is eagerly updated by merge_by_pk for query correctness.
+                // Full index rebuild (columnar cache, label bitmap, btree) deferred.
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     ll.insert(label.to_string());
                 }
                 let pw = self.pending_writes.fetch_add(1, Ordering::Relaxed) + 1;
-                // Size-based compaction: trigger when L0 exceeds threshold
                 if pw >= Self::L0_COMPACT_THRESHOLD {
                     self.pending_writes.store(0, Ordering::Relaxed);
+                    // Batch commit before compaction (rebuild all deferred indexes)
+                    single.commit();
                     let _ = self.trigger_compaction();
                 }
                 return Ok(vid);
@@ -957,7 +962,7 @@ impl TieredGraphEngine {
         Err("failed to acquire hot store lock".into())
     }
 
-    /// Merge a record AND return the WAL entry for pushing to read replicas.
+    /// Append-only merge record AND return the WAL entry for pushing to read replicas.
     /// Write Container only. Returns (vid, WalEntry).
     pub fn merge_record_with_wal(
         &self,
@@ -983,6 +988,7 @@ impl TieredGraphEngine {
             None
         };
 
+        self.merge_record_count.fetch_add(1, Ordering::Relaxed);
         self.mark_label_dirty(label);
         self.invalidate_security_cache_if_policy(label, props);
 
@@ -990,13 +996,14 @@ impl TieredGraphEngine {
             if let Some(single) = hot.as_single_mut() {
                 let pk = yata_grin::PropValue::Str(pk_value.to_string());
                 let vid = single.merge_by_pk(label, pk_key, &pk, props);
-                single.commit();
+                // Deferred commit: PK index updated eagerly, full rebuild at compaction
                 if let Ok(mut ll) = self.loaded_labels.lock() {
                     ll.insert(label.to_string());
                 }
                 let pw = self.pending_writes.fetch_add(1, Ordering::Relaxed) + 1;
                 if pw >= Self::L0_COMPACT_THRESHOLD {
                     self.pending_writes.store(0, Ordering::Relaxed);
+                    single.commit();
                     let _ = self.trigger_compaction();
                 }
                 return Ok((vid, wal_entry));
