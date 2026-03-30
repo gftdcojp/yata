@@ -6,6 +6,7 @@
 pub mod catalog;
 pub mod dataset;
 pub mod manifest;
+pub mod read_store;
 pub mod schema;
 pub mod vector;
 pub mod writer;
@@ -39,6 +40,7 @@ pub use manifest::{
     save_manifest,
     render_manifest_json,
 };
+pub use read_store::LanceReadStore;
 pub use schema::{
     EDGE_LIVE_IN_TABLE,
     EDGE_LIVE_OUT_TABLE,

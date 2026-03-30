@@ -1,0 +1,425 @@
+use std::collections::{HashMap, HashSet};
+
+use arrow::array::{Array, BooleanArray, StringArray};
+use arrow::record_batch::RecordBatch;
+use yata_grin::{GraphStore, Neighbor, Predicate, PropValue, Property, Scannable, Schema, Topology};
+
+#[derive(Debug, Clone, Default)]
+pub struct LanceReadStore {
+    vertex_labels_by_vid: Vec<Vec<String>>,
+    vertex_props: Vec<HashMap<String, PropValue>>,
+    vertex_alive: Vec<bool>,
+    edge_props: Vec<HashMap<String, PropValue>>,
+    edge_labels: Vec<String>,
+    out_adj: Vec<Vec<Neighbor>>,
+    in_adj: Vec<Vec<Neighbor>>,
+    label_index: HashMap<String, Vec<u32>>,
+    known_vertex_labels: Vec<String>,
+    known_edge_labels: Vec<String>,
+    vertex_pk: HashMap<String, String>,
+}
+
+impl LanceReadStore {
+    pub async fn from_datasets(
+        vertex_live: &crate::YataDataset,
+        edge_live_out: &crate::YataDataset,
+    ) -> Result<Self, String> {
+        let vertex_batches = vertex_live.scan_all().await.map_err(|e| e.to_string())?;
+        let edge_batches = edge_live_out.scan_all().await.map_err(|e| e.to_string())?;
+        Self::from_live_batches(&vertex_batches, &edge_batches)
+    }
+
+    pub fn from_live_batches(
+        vertex_batches: &[RecordBatch],
+        edge_out_batches: &[RecordBatch],
+    ) -> Result<Self, String> {
+        let mut vid_map = HashMap::<String, u32>::new();
+        let mut store = Self::default();
+
+        for batch in vertex_batches {
+            let labels = str_col(batch, 1)?;
+            let pk_keys = str_col(batch, 2)?;
+            let pk_values = str_col(batch, 3)?;
+            let vids = str_col(batch, 4)?;
+            let alive = bool_col(batch, 5)?;
+            let repos = optional_str_col(batch, 7)?;
+            let rkeys = optional_str_col(batch, 8)?;
+            let owner_dids = optional_str_col(batch, 9)?;
+            let props_json = optional_str_col(batch, 11)?;
+
+            for row in 0..batch.num_rows() {
+                let label = labels.value(row).to_string();
+                let pk_key = pk_keys.value(row).to_string();
+                let pk_value = pk_values.value(row).to_string();
+                let raw_vid = vids.value(row).to_string();
+                let is_alive = alive.value(row);
+
+                let local_vid = store.vertex_alive.len() as u32;
+                vid_map.insert(raw_vid, local_vid);
+                store.vertex_alive.push(is_alive);
+                store.vertex_labels_by_vid.push(vec![label.clone()]);
+
+                if !store.known_vertex_labels.contains(&label) {
+                    store.known_vertex_labels.push(label.clone());
+                }
+                store.vertex_pk.entry(label.clone()).or_insert(pk_key.clone());
+                if is_alive {
+                    store.label_index.entry(label).or_default().push(local_vid);
+                }
+
+                let mut props = parse_props_json(props_json[row].as_deref())?;
+                props.entry(pk_key).or_insert(PropValue::Str(pk_value.clone()));
+                props.entry("pk_value".to_string()).or_insert(PropValue::Str(pk_value));
+                if let Some(repo) = &repos[row] {
+                    props.entry("repo".to_string()).or_insert(PropValue::Str(repo.clone()));
+                }
+                if let Some(rkey) = &rkeys[row] {
+                    props.entry("rkey".to_string()).or_insert(PropValue::Str(rkey.clone()));
+                }
+                if let Some(owner_did) = &owner_dids[row] {
+                    props.entry("owner_did".to_string()).or_insert(PropValue::Str(owner_did.clone()));
+                }
+                store.vertex_props.push(props);
+            }
+        }
+
+        store.out_adj = vec![Vec::new(); store.vertex_alive.len()];
+        store.in_adj = vec![Vec::new(); store.vertex_alive.len()];
+
+        for batch in edge_out_batches {
+            let edge_labels = str_col(batch, 1)?;
+            let eids = str_col(batch, 4)?;
+            let src_vids = str_col(batch, 5)?;
+            let dst_vids = str_col(batch, 6)?;
+            let alive = bool_col(batch, 9)?;
+            let props_json = optional_str_col(batch, 12)?;
+
+            for row in 0..batch.num_rows() {
+                if !alive.value(row) {
+                    continue;
+                }
+                let src = match vid_map.get(src_vids.value(row)) {
+                    Some(v) => *v,
+                    None => continue,
+                };
+                let dst = match vid_map.get(dst_vids.value(row)) {
+                    Some(v) => *v,
+                    None => continue,
+                };
+                let edge_label = edge_labels.value(row).to_string();
+                if !store.known_edge_labels.contains(&edge_label) {
+                    store.known_edge_labels.push(edge_label.clone());
+                }
+                let mut props = parse_props_json(props_json[row].as_deref())?;
+                props.entry("eid".to_string())
+                    .or_insert(PropValue::Str(eids.value(row).to_string()));
+                let edge_id = store.edge_labels.len() as u32;
+                store.edge_labels.push(edge_label.clone());
+                store.edge_props.push(props);
+                store.out_adj[src as usize].push(Neighbor {
+                    vid: dst,
+                    edge_id,
+                    edge_label: edge_label.clone(),
+                });
+                store.in_adj[dst as usize].push(Neighbor {
+                    vid: src,
+                    edge_id,
+                    edge_label,
+                });
+            }
+        }
+
+        Ok(store)
+    }
+}
+
+impl Topology for LanceReadStore {
+    fn vertex_count(&self) -> usize {
+        self.vertex_alive.iter().filter(|&&v| v).count()
+    }
+
+    fn edge_count(&self) -> usize {
+        self.edge_labels.len()
+    }
+
+    fn has_vertex(&self, vid: u32) -> bool {
+        self.vertex_alive.get(vid as usize).copied().unwrap_or(false)
+    }
+
+    fn out_degree(&self, vid: u32) -> usize {
+        self.out_adj.get(vid as usize).map(|v| v.len()).unwrap_or(0)
+    }
+
+    fn in_degree(&self, vid: u32) -> usize {
+        self.in_adj.get(vid as usize).map(|v| v.len()).unwrap_or(0)
+    }
+
+    fn out_neighbors(&self, vid: u32) -> Vec<Neighbor> {
+        self.out_adj.get(vid as usize).cloned().unwrap_or_default()
+    }
+
+    fn in_neighbors(&self, vid: u32) -> Vec<Neighbor> {
+        self.in_adj.get(vid as usize).cloned().unwrap_or_default()
+    }
+
+    fn out_neighbors_by_label(&self, vid: u32, edge_label: &str) -> Vec<Neighbor> {
+        self.out_neighbors(vid)
+            .into_iter()
+            .filter(|n| n.edge_label == edge_label)
+            .collect()
+    }
+
+    fn in_neighbors_by_label(&self, vid: u32, edge_label: &str) -> Vec<Neighbor> {
+        self.in_neighbors(vid)
+            .into_iter()
+            .filter(|n| n.edge_label == edge_label)
+            .collect()
+    }
+}
+
+impl Property for LanceReadStore {
+    fn vertex_labels(&self, vid: u32) -> Vec<String> {
+        self.vertex_labels_by_vid
+            .get(vid as usize)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn vertex_prop(&self, vid: u32, key: &str) -> Option<PropValue> {
+        self.vertex_props.get(vid as usize)?.get(key).cloned()
+    }
+
+    fn edge_prop(&self, edge_id: u32, key: &str) -> Option<PropValue> {
+        self.edge_props.get(edge_id as usize)?.get(key).cloned()
+    }
+
+    fn vertex_prop_keys(&self, label: &str) -> Vec<String> {
+        let mut keys = HashSet::new();
+        for &vid in self.label_index.get(label).into_iter().flatten() {
+            if let Some(props) = self.vertex_props.get(vid as usize) {
+                keys.extend(props.keys().cloned());
+            }
+        }
+        let mut keys: Vec<String> = keys.into_iter().collect();
+        keys.sort();
+        keys
+    }
+
+    fn edge_prop_keys(&self, label: &str) -> Vec<String> {
+        let mut keys = HashSet::new();
+        for (idx, edge_label) in self.edge_labels.iter().enumerate() {
+            if edge_label == label {
+                keys.extend(self.edge_props[idx].keys().cloned());
+            }
+        }
+        let mut keys: Vec<String> = keys.into_iter().collect();
+        keys.sort();
+        keys
+    }
+
+    fn vertex_all_props(&self, vid: u32) -> HashMap<String, PropValue> {
+        self.vertex_props.get(vid as usize).cloned().unwrap_or_default()
+    }
+}
+
+impl Schema for LanceReadStore {
+    fn vertex_labels(&self) -> Vec<String> {
+        self.known_vertex_labels.clone()
+    }
+
+    fn edge_labels(&self) -> Vec<String> {
+        self.known_edge_labels.clone()
+    }
+
+    fn vertex_primary_key(&self, label: &str) -> Option<String> {
+        self.vertex_pk.get(label).cloned()
+    }
+}
+
+impl Scannable for LanceReadStore {
+    fn scan_vertices(&self, label: &str, predicate: &Predicate) -> Vec<u32> {
+        self.scan_vertices_by_label(label)
+            .into_iter()
+            .filter(|&vid| predicate_matches_vertex(self, vid, predicate))
+            .collect()
+    }
+
+    fn scan_vertices_by_label(&self, label: &str) -> Vec<u32> {
+        self.label_index.get(label).cloned().unwrap_or_default()
+    }
+
+    fn scan_all_vertices(&self) -> Vec<u32> {
+        self.vertex_alive
+            .iter()
+            .enumerate()
+            .filter_map(|(vid, alive)| if *alive { Some(vid as u32) } else { None })
+            .collect()
+    }
+}
+
+fn predicate_matches_vertex<S: GraphStore>(store: &S, vid: u32, predicate: &Predicate) -> bool {
+    match predicate {
+        Predicate::True => true,
+        Predicate::Eq(key, val) => store.vertex_prop(vid, key).as_ref() == Some(val),
+        Predicate::Neq(key, val) => store.vertex_prop(vid, key).as_ref() != Some(val),
+        Predicate::Lt(key, val) => store
+            .vertex_prop(vid, key)
+            .is_some_and(|v| prop_value_cmp(&v, val).is_lt()),
+        Predicate::Gt(key, val) => store
+            .vertex_prop(vid, key)
+            .is_some_and(|v| prop_value_cmp(&v, val).is_gt()),
+        Predicate::In(key, vals) => store
+            .vertex_prop(vid, key)
+            .is_some_and(|v| vals.contains(&v)),
+        Predicate::StartsWith(key, prefix) => match store.vertex_prop(vid, key) {
+            Some(PropValue::Str(s)) => s.starts_with(prefix),
+            _ => false,
+        },
+        Predicate::And(a, b) => predicate_matches_vertex(store, vid, a) && predicate_matches_vertex(store, vid, b),
+        Predicate::Or(a, b) => predicate_matches_vertex(store, vid, a) || predicate_matches_vertex(store, vid, b),
+    }
+}
+
+fn prop_value_cmp(a: &PropValue, b: &PropValue) -> std::cmp::Ordering {
+    match (a, b) {
+        (PropValue::Int(x), PropValue::Int(y)) => x.cmp(y),
+        (PropValue::Float(x), PropValue::Float(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+        (PropValue::Str(x), PropValue::Str(y)) => x.cmp(y),
+        (PropValue::Bool(x), PropValue::Bool(y)) => x.cmp(y),
+        (PropValue::Null, PropValue::Null) => std::cmp::Ordering::Equal,
+        (PropValue::Null, _) => std::cmp::Ordering::Less,
+        (_, PropValue::Null) => std::cmp::Ordering::Greater,
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+fn parse_props_json(raw: Option<&str>) -> Result<HashMap<String, PropValue>, String> {
+    let Some(raw) = raw else {
+        return Ok(HashMap::new());
+    };
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    let serde_json::Value::Object(map) = value else {
+        return Ok(HashMap::new());
+    };
+    Ok(map
+        .into_iter()
+        .map(|(k, v)| (k, json_to_prop(v)))
+        .collect())
+}
+
+fn json_to_prop(v: serde_json::Value) -> PropValue {
+    match v {
+        serde_json::Value::Null => PropValue::Null,
+        serde_json::Value::Bool(v) => PropValue::Bool(v),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                PropValue::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                PropValue::Float(f)
+            } else {
+                PropValue::Null
+            }
+        }
+        serde_json::Value::String(s) => PropValue::Str(s),
+        other => PropValue::Str(other.to_string()),
+    }
+}
+
+fn str_col<'a>(batch: &'a RecordBatch, idx: usize) -> Result<&'a StringArray, String> {
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| format!("column {idx} is not Utf8"))
+}
+
+fn bool_col<'a>(batch: &'a RecordBatch, idx: usize) -> Result<&'a BooleanArray, String> {
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| format!("column {idx} is not Boolean"))
+}
+
+fn optional_str_col(batch: &RecordBatch, idx: usize) -> Result<Vec<Option<String>>, String> {
+    let col = str_col(batch, idx)?;
+    Ok((0..batch.num_rows())
+        .map(|row| (!col.is_null(row)).then(|| col.value(row).to_string()))
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{BooleanArray, StringArray, UInt32Array, UInt64Array};
+
+    use super::*;
+
+    fn vertex_batch() -> RecordBatch {
+        let schema = Arc::new(crate::vertex_live_schema().clone());
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt32Array::from(vec![0u32, 0])),
+                Arc::new(StringArray::from(vec!["Person", "Person"])),
+                Arc::new(StringArray::from(vec!["rkey", "rkey"])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(StringArray::from(vec!["v0", "v1"])),
+                Arc::new(BooleanArray::from(vec![true, true])),
+                Arc::new(UInt64Array::from(vec![1u64, 2])),
+                Arc::new(StringArray::from(vec![Some("bench"), Some("bench")])),
+                Arc::new(StringArray::from(vec![Some("a"), Some("b")])),
+                Arc::new(StringArray::from(vec![None::<String>, None::<String>])),
+                Arc::new(UInt64Array::from(vec![1u64, 2])),
+                Arc::new(StringArray::from(vec![
+                    Some(r#"{"name":"Alice","age":30}"#),
+                    Some(r#"{"name":"Bob","age":25}"#),
+                ])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn edge_batch() -> RecordBatch {
+        let schema = Arc::new(crate::edge_live_out_schema().clone());
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt32Array::from(vec![0u32])),
+                Arc::new(StringArray::from(vec!["KNOWS"])),
+                Arc::new(StringArray::from(vec!["eid"])),
+                Arc::new(StringArray::from(vec!["e0"])),
+                Arc::new(StringArray::from(vec!["e0"])),
+                Arc::new(StringArray::from(vec!["v0"])),
+                Arc::new(StringArray::from(vec!["v1"])),
+                Arc::new(StringArray::from(vec![Some("Person")])),
+                Arc::new(StringArray::from(vec![Some("Person")])),
+                Arc::new(BooleanArray::from(vec![true])),
+                Arc::new(UInt64Array::from(vec![1u64])),
+                Arc::new(UInt64Array::from(vec![1u64])),
+                Arc::new(StringArray::from(vec![Some(r#"{"since":2020}"#)])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_from_live_batches_scan_and_expand() {
+        let store = LanceReadStore::from_live_batches(&[vertex_batch()], &[edge_batch()]).unwrap();
+        let vids = store.scan_vertices_by_label("Person");
+        assert_eq!(vids.len(), 2);
+        assert_eq!(store.vertex_prop(0, "name"), Some(PropValue::Str("Alice".into())));
+        let out = store.out_neighbors_by_label(0, "KNOWS");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].vid, 1);
+        assert_eq!(store.edge_prop(out[0].edge_id, "since"), Some(PropValue::Int(2020)));
+    }
+
+    #[test]
+    fn test_predicate_scan() {
+        let store = LanceReadStore::from_live_batches(&[vertex_batch()], &[edge_batch()]).unwrap();
+        let vids = store.scan_vertices("Person", &Predicate::Gt("age".into(), PropValue::Int(26)));
+        assert_eq!(vids, vec![0]);
+    }
+}
