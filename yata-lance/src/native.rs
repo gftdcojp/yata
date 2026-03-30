@@ -25,6 +25,84 @@ use object_store::path::Path;
 use crate::schema::VERTICES_SCHEMA;
 use crate::table::VertexRow;
 
+/// Serialize an arbitrary RecordBatch to Lance v2 native format bytes.
+///
+/// This is the general-purpose function used by the engine's compaction path.
+/// The batch schema is preserved in the Lance file metadata.
+pub async fn serialize_batch_lance(batch: &RecordBatch) -> Result<Bytes, String> {
+    let store = LanceObjectStore::memory();
+    let path = Path::from("fragment.lance");
+    let lance_schema =
+        LanceSchema::try_from(batch.schema().as_ref()).map_err(|e| e.to_string())?;
+
+    FileWriter::create_file_with_batches(
+        &store,
+        &path,
+        lance_schema,
+        std::iter::once(batch.clone()),
+        FileWriterOptions::default(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let get_result = store.inner.get(&path).await.map_err(|e| e.to_string())?;
+    get_result.bytes().await.map_err(|e| e.to_string())
+}
+
+/// Deserialize Lance v2 native format bytes back to a RecordBatch.
+pub async fn deserialize_batch_lance(data: Bytes) -> Result<RecordBatch, String> {
+    let store = LanceObjectStore::memory();
+    let path = Path::from("fragment.lance");
+    store
+        .inner
+        .put(&path, data.clone().into())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let cache = LanceCache::no_cache();
+    let scheduler = ScanScheduler::new(
+        Arc::new(store),
+        SchedulerConfig::new(64 * 1024 * 1024),
+    );
+    let file_scheduler = scheduler
+        .open_file(&path, &CachedFileSize::new(data.len() as u64))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let reader = FileReader::try_open(
+        file_scheduler,
+        None,
+        Arc::default(),
+        &cache,
+        FileReaderOptions::default(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut stream = reader
+        .read_stream(
+            ReadBatchParams::RangeFull,
+            65536,
+            16,
+            FilterExpression::no_filter(),
+        )
+        .map_err(|e| e.to_string())?;
+
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    while let Some(result) = stream.next().await {
+        batches.push(result.map_err(|e| e.to_string())?);
+    }
+
+    if batches.is_empty() {
+        return Err("empty Lance file".into());
+    }
+    if batches.len() == 1 {
+        return Ok(batches.into_iter().next().unwrap());
+    }
+    // Concat multiple batches
+    arrow::compute::concat_batches(&batches[0].schema(), &batches).map_err(|e| e.to_string())
+}
+
 /// Serialize vertex rows to Lance v2 native format bytes (in-memory).
 ///
 /// Returns the raw bytes of a single Lance file that can be uploaded to R2.
