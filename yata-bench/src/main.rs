@@ -1,10 +1,10 @@
 //! YATA load test harness.
 //!
 //! Usage:
-//!   cargo run -p yata-bench --release -- [graph-scale|trillion]
+//!   cargo run -p yata-bench --release -- [coo-read|trillion]
 //!
 //! For specific benchmarks, use the dedicated binaries:
-//!   cargo run -p yata-bench --bin graph-scale-bench --release
+//!   cargo run -p yata-bench --bin coo-read-bench --release
 //!   cargo run -p yata-bench --bin trillion-scale-test --release
 
 fn main() {
@@ -12,7 +12,7 @@ fn main() {
     let scenario = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
     println!("yata-bench: Available benchmarks:");
-    println!("  graph-scale-bench     — Arrow IPC encode/decode + CSR scale");
+    println!("  coo-read-bench        — Arrow IPC encode/decode + COO page-in");
     println!("  trillion-scale-test   — Trillion-scale partition test");
     println!("  cypher-bench          — Cypher parser benchmark");
     println!("  cypher-transport-bench — Cypher transport benchmark");

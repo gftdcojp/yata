@@ -636,7 +636,7 @@ pub mod traits {
     pub trait WrpcBroker: Send + Sync + 'static {
         /// Store bytes in CAS, returning Blake3 hash.
         async fn cas_put(&self, data: bytes::Bytes) -> Result<crate::Blake3Hash>;
-        /// Per-app single-writer: always true (MDAG-native replication).
+        /// Per-app single-writer: always true.
         fn is_leader(&self) -> bool;
     }
 

@@ -3,7 +3,7 @@ name = "yata-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Embedded broker: graph (Cypher) + objects (CAS), MDAG-native replication"
+description = "Embedded broker: graph (Cypher) + objects (CAS)"
 
 [[bin]]
 name = "ai-gftd-yata-server"
@@ -14,16 +14,9 @@ name = "yata_server"
 path = "src/lib.rs"
 
 [dependencies]
-yata-core.workspace = true
-yata-arrow.workspace = true
-yata-object.workspace = true
-yata-graph.workspace = true
-yata-s3.workspace = true
-yata-store.workspace = true
 yata-engine.workspace = true
 yata-grin.workspace = true
 yata-gie = { path = "../yata-gie" }
-arrow.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 bytes.workspace = true
@@ -31,10 +24,8 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tokio = { workspace = true }
-uuid.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-chrono.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 axum.workspace = true

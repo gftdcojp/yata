@@ -1,16 +1,16 @@
 //! Federated query engine stub.
 //!
-//! MDAG CAS-based federated query has been removed. This module retains
+//! Legacy federated query has been removed. This module retains
 //! the public API types as stubs for downstream compatibility.
 
 use yata_core::PartitionId;
 
-/// A registered app source for federated queries (stub — CAS removed).
+/// A registered app source for federated queries.
 pub struct AppSource {
     pub app_id: String,
 }
 
-/// Federated query engine stub (MDAG CAS removed).
+/// Federated query engine stub.
 pub struct FederatedQueryEngine {
     _private: (),
 }

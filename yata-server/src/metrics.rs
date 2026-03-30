@@ -1,4 +1,4 @@
-//! Prometheus metrics for yata broker.
+//! Prometheus metrics for yata-server.
 //!
 //! Exposes `/metrics` HTTP endpoint on a configurable port (default 9090).
 //! Uses the `metrics` crate with `metrics-exporter-prometheus` backend.
@@ -12,7 +12,7 @@ pub mod names {
     pub const LOG_BYTES_WRITTEN: &str = "yata_log_bytes_written_total";
     pub const LOG_SEGMENTS_COMPACTED: &str = "yata_log_segments_compacted_total";
     pub const OCEL_EVENTS_PROJECTED: &str = "yata_ocel_events_projected_total";
-    pub const B2_SYNCS: &str = "yata_s3_syncs_total";
+    pub const S3_SYNCS: &str = "yata_s3_syncs_total";
 }
 
 /// Install the Prometheus exporter and start the HTTP listener.
@@ -45,5 +45,5 @@ pub fn describe() {
         "Total log segments removed by compaction"
     );
     describe_counter!(names::OCEL_EVENTS_PROJECTED, "Total OCEL events projected");
-    describe_counter!(names::B2_SYNCS, "Total B2 sync cycles");
+    describe_counter!(names::S3_SYNCS, "Total S3/R2 sync cycles");
 }

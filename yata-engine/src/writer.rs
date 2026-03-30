@@ -1,11 +1,11 @@
-//! Delta writer — graph persistence is now via MDAG CAS (Arrow IPC blocks).
+//! Delta writer — graph persistence is handled outside GraphStore.
 //! This module provides vector search embedding writes only (via GraphStore/yata-vex).
-//! Graph data writes (vertices/edges) are handled by engine.rs → MDAG delta_commit.
+//! Graph data writes (vertices/edges) are handled by engine.rs.
 
 use yata_graph::GraphStore;
 
 /// Write vertices with embeddings to the vector search index.
-/// This is the ONLY write path through GraphStore. Graph persistence uses MDAG CAS.
+/// This is the ONLY write path through GraphStore.
 pub async fn write_embeddings(
     store: &GraphStore,
     nodes: &[yata_cypher::NodeRef],

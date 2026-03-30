@@ -3,12 +3,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use yata_cypher::Graph;
-use yata_graph::{GraphStore, QueryableGraph};
+use yata_graph::GraphStore;
 use yata_grin::{Mutable, Predicate, PropValue, Property, Scannable, Topology};
 
 use crate::cache::{QueryCache, cache_key};
 use crate::config::TieredEngineConfig;
-use crate::loader;
+use crate::memory_bridge;
 use crate::router;
 
 /// CPM metrics: CP5 mutation frequency + read/write ratio + compaction monitoring.
@@ -361,25 +361,26 @@ impl TieredGraphEngine {
 
             // Single MemoryGraph copy from CSR.
             let mut g = if let Ok(csr) = self.hot.read() {
-                QueryableGraph(csr.to_filtered_memory_graph(&[], &[]))
+                csr.to_filtered_memory_graph(&[], &[])
             } else {
                 return Err("failed to acquire CSR lock".to_string());
             };
 
             // Track initial state once.
-            let initial_vids: HashSet<String> = g.0.nodes().iter().map(|n| n.id.clone()).collect();
-            let initial_eids: HashSet<String> = g.0.rels().iter().map(|r| r.id.clone()).collect();
+            let initial_vids: HashSet<String> = g.nodes().iter().map(|n| n.id.clone()).collect();
+            let initial_eids: HashSet<String> = g.rels().iter().map(|r| r.id.clone()).collect();
 
             // Execute all statements sequentially on the same MemoryGraph.
             let mut all_results = Vec::with_capacity(statements.len());
             for (cypher, params) in statements {
-                let rows = g.query(cypher, params).map_err(|e| e.to_string())?;
+                let rows = memory_bridge::execute_query(&mut g, cypher, params)
+                    .map_err(|e| e.to_string())?;
                 all_results.push(rows);
             }
 
             // Inject provenance metadata on new nodes.
             let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-            for node in g.0.nodes_mut() {
+            for node in g.nodes_mut() {
                 let is_new = !initial_vids.contains(&node.id);
                 if is_new {
                     use yata_cypher::types::Value;
@@ -409,16 +410,18 @@ impl TieredGraphEngine {
             }
 
             // Change detection: compare ID sets.
-            let after_vids: HashSet<String> = g.0.nodes().iter().map(|n| n.id.clone()).collect();
-            let after_eids: HashSet<String> = g.0.rels().iter().map(|r| r.id.clone()).collect();
+            let after_vids: HashSet<String> = g.nodes().iter().map(|n| n.id.clone()).collect();
+            let after_eids: HashSet<String> = g.rels().iter().map(|r| r.id.clone()).collect();
             let new_vids: Vec<String> = after_vids.difference(&initial_vids).cloned().collect();
 
             let has_changes = initial_vids != after_vids || initial_eids != after_eids;
 
             if has_changes {
                 // Single CSR rebuild.
-                let new_csr =
-                    loader::rebuild_csr_from_graph_with_partition(&g, self.config.hot_partition_id);
+                let new_csr = memory_bridge::rebuild_csr_from_memory_graph_with_partition(
+                    &g,
+                    self.config.hot_partition_id,
+                );
 
                 if let Ok(mut hot) = self.hot.write() {
                     *hot = yata_store::GraphStoreEnum::Single(new_csr);
@@ -564,25 +567,26 @@ impl TieredGraphEngine {
         self.block_on(async {
             self.ensure_hot();
             let mut g = if let Ok(csr) = self.hot.read() {
-                QueryableGraph(csr.to_filtered_memory_graph(&[], &[]))
+                csr.to_filtered_memory_graph(&[], &[])
             } else {
                 return Err("failed to acquire CSR lock".to_string());
             };
 
             // Lightweight mutation tracking: only track IDs (O(n) ID clones, no format! serialization)
             let before_vids: HashSet<String> =
-                g.0.nodes().iter().map(|n| n.id.clone()).collect();
+                g.nodes().iter().map(|n| n.id.clone()).collect();
             let before_eids: HashSet<String> =
-                g.0.rels().iter().map(|r| r.id.clone()).collect();
+                g.rels().iter().map(|r| r.id.clone()).collect();
             let before_count = (before_vids.len(), before_eids.len());
 
             // Execute Cypher
-            let rows = g.query(cypher, params).map_err(|e| e.to_string())?;
+            let rows = memory_bridge::execute_query(&mut g, cypher, params)
+                .map_err(|e| e.to_string())?;
 
             // Inject mutation metadata for new nodes (skip expensive modified-node detection)
             if let Some(ctx) = mutation_ctx {
                 let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-                for node in g.0.nodes_mut() {
+                for node in g.nodes_mut() {
                     if !before_vids.contains(&node.id) {
                         use yata_cypher::types::Value;
                         node.props.insert("_app_id".to_string(), Value::Str(ctx.app_id.clone()));
@@ -606,9 +610,9 @@ impl TieredGraphEngine {
 
             // Detect changes: compare counts + check for new/deleted IDs
             let after_vids: HashSet<String> =
-                g.0.nodes().iter().map(|n| n.id.clone()).collect();
+                g.nodes().iter().map(|n| n.id.clone()).collect();
             let after_eids: HashSet<String> =
-                g.0.rels().iter().map(|r| r.id.clone()).collect();
+                g.rels().iter().map(|r| r.id.clone()).collect();
             let after_count = (after_vids.len(), after_eids.len());
 
             let has_changes = before_count != after_count
@@ -639,9 +643,9 @@ impl TieredGraphEngine {
                             }
                             // Add new vertices
                             for vid_str in &new_vids {
-                                if let Some(node) = g.0.nodes().iter().find(|n| &n.id == *vid_str) {
+                                if let Some(node) = g.nodes().iter().find(|n| &n.id == *vid_str) {
                                     let props: Vec<(&str, PropValue)> = node.props.iter()
-                                        .map(|(k, v)| (k.as_str(), loader::cypher_to_prop(v)))
+                                        .map(|(k, v)| (k.as_str(), memory_bridge::cypher_to_prop(v)))
                                         .chain(std::iter::once(("_vid", PropValue::Str(node.id.clone()))))
                                         .collect();
                                     single.add_vertex_with_labels(
@@ -652,13 +656,13 @@ impl TieredGraphEngine {
                             }
                             // Add new edges
                             for eid_str in &new_eids {
-                                if let Some(rel) = g.0.rels().iter().find(|r| &r.id == *eid_str) {
+                                if let Some(rel) = g.rels().iter().find(|r| &r.id == *eid_str) {
                                     // Look up src/dst vids by _vid property
                                     let src_vid = single.find_vid_by_prop("_vid", &PropValue::Str(rel.src.clone()));
                                     let dst_vid = single.find_vid_by_prop("_vid", &PropValue::Str(rel.dst.clone()));
                                     if let (Some(s), Some(d)) = (src_vid, dst_vid) {
                                         let props: Vec<(&str, PropValue)> = rel.props.iter()
-                                            .map(|(k, v)| (k.as_str(), loader::cypher_to_prop(v)))
+                                            .map(|(k, v)| (k.as_str(), memory_bridge::cypher_to_prop(v)))
                                             .collect();
                                         single.add_edge(s, d, &rel.rel_type, &props);
                                     }
@@ -680,7 +684,10 @@ impl TieredGraphEngine {
                     tracing::debug!(delta = delta_size, total = total_size, "incremental CSR delta-apply");
                 } else {
                     // Full rebuild fallback (large delta or empty graph)
-                    let new_csr = loader::rebuild_csr_from_graph_with_partition(&g, self.config.hot_partition_id);
+                    let new_csr = memory_bridge::rebuild_csr_from_memory_graph_with_partition(
+                        &g,
+                        self.config.hot_partition_id,
+                    );
                     if let Ok(mut ll) = self.loaded_labels.lock() {
                         for label in <yata_store::MutableCsrStore as yata_grin::Schema>::vertex_labels(&new_csr) {
                             ll.insert(label);
@@ -1829,7 +1836,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_persistence_in_memory() {
-        // Verify in-memory graph operations work without MDAG
+        // Verify in-memory graph operations work without any external persistence layer
         let dir = tempfile::tempdir().unwrap();
         let e = make_engine(&dir);
 
@@ -2413,8 +2420,8 @@ mod tests {
         });
         g.set_node_embedding("c", &[0.9, 0.1, 0.0]);
 
-        let mut qg = yata_graph::QueryableGraph(g);
-        let rows = qg.query(
+        let rows = memory_bridge::execute_query(
+            &mut g,
             "CALL db.index.vector.queryNodes('Doc', 'embedding', [1.0, 0.0, 0.0], 2) YIELD node, score RETURN node.name AS name, score",
             &[],
         ).unwrap();

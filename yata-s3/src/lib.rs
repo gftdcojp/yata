@@ -92,25 +92,6 @@ impl S3Sync {
         self.config.eager
     }
 
-    /// Push MDAG HEAD CID to well-known key `{prefix}MDAG_HEAD`.
-    pub async fn push_head(&self, head_cid: &Blake3Hash) {
-        let key = format!("{}MDAG_HEAD", self.config.prefix);
-        let data = bytes::Bytes::from(head_cid.hex());
-        s3_put_with_retry(&self.store, &key, data).await;
-    }
-
-    /// Restore MDAG HEAD CID from well-known key.
-    pub async fn restore_head(&self) -> Option<Blake3Hash> {
-        let key = format!("{}MDAG_HEAD", self.config.prefix);
-        match self.store.get(&key).await {
-            Ok(Some(data)) => {
-                let hex = std::str::from_utf8(&data).ok()?.trim();
-                Blake3Hash::from_hex(hex).ok()
-            }
-            _ => None,
-        }
-    }
-
     /// Sync all unsynced chunks and manifests.
     /// Returns (chunks_uploaded, manifests_uploaded).
     pub async fn sync_all(&self) -> Result<(u64, u64)> {
@@ -635,10 +616,9 @@ mod tests {
     // ── Key format conventions ──────────────────────────────────────────
 
     #[test]
-    fn head_key_format() {
+    fn prefix_preserved_for_remote_keys() {
         let cfg = test_config();
-        let expected = format!("{}MDAG_HEAD", cfg.prefix);
-        assert_eq!(expected, "yata/MDAG_HEAD");
+        assert_eq!(cfg.prefix, "yata/");
     }
 
     #[test]
@@ -675,8 +655,7 @@ mod tests {
             prefix: "".into(),
             eager: false,
         };
-        let head_key = format!("{}MDAG_HEAD", cfg.prefix);
-        assert_eq!(head_key, "MDAG_HEAD");
+        assert_eq!(cfg.prefix, "");
     }
 }
 

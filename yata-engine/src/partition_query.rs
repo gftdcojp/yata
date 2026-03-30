@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 
+use crate::memory_bridge;
 use crate::partition_router;
 use yata_grin::*;
 use yata_store::MutableCsrStore;
@@ -268,13 +269,15 @@ fn execute_on_partition_mut(
     params: &[(String, String)],
 ) -> Result<Vec<Vec<(String, String)>>, String> {
     let g = store.to_full_memory_graph();
-    let mut qg = yata_graph::QueryableGraph(g);
-    let rows = qg
-        .query(cypher, params)
+    let mut graph = g;
+    let rows = memory_bridge::execute_query(&mut graph, cypher, params)
         .map_err(|e| format!("cypher error: {e}"))?;
 
     // Rebuild CSR from mutated graph
-    let new_csr = crate::loader::rebuild_csr_from_graph(&qg);
+    let new_csr = memory_bridge::rebuild_csr_from_memory_graph_with_partition(
+        &graph,
+        yata_core::PartitionId::from(0),
+    );
     *store = new_csr;
 
     Ok(rows)

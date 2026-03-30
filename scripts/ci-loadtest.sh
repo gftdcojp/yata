@@ -266,7 +266,7 @@ FLUSH_BYTES=$(echo "$FLUSH" | python3 -c "import sys,json; print(json.load(sys.s
 echo "  walFlush: $((T1 - T0))ms (bytes=$FLUSH_BYTES)"
 check "flush_bytes > 0" "$FLUSH_BYTES > 0"
 
-# WAL checkpoint (YataFragment)
+# WAL checkpoint (Lance-backed state)
 T0=$(python3 -c "import time; print(int(time.time()*1000))")
 CP=$(curl -s -X POST "$WRITE_URL/xrpc/ai.gftd.yata.walCheckpoint" \
   -H 'Content-Type: application/json' -d '{}')

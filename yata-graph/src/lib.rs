@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 //! Graph store with Cypher query engine and vector search.
 //!
-//! In-memory MemoryGraph + yata-vex vector index. MDAG CAS is sole persistence.
+//! In-memory MemoryGraph + yata-vex vector index.
 
 pub mod cache;
 pub mod coordinator;
@@ -170,7 +170,7 @@ pub mod graph_arrow {
 
 /// In-memory graph store with Cypher query engine and vector search.
 ///
-/// In-memory graph store. MDAG CAS is the sole persistence path.
+/// In-memory graph store.
 /// Vector search uses `yata_vex`.
 pub struct GraphStore {
     pub schema: GraphSchema,
@@ -281,7 +281,7 @@ impl GraphStore {
     }
 
     /// Return a clone of the cached CSR MemoryGraph.
-    /// On cold start, returns an empty graph (MDAG CAS restore happens externally).
+    /// On cold start, returns an empty graph.
     pub async fn to_memory_graph_cached(&self) -> GraphResult<QueryableGraph> {
         let cache = self.cache.read().await;
         if let Some(csr) = cache.get_csr() {

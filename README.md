@@ -1,6 +1,6 @@
 # yata
 
-Arrow-native graph database and event store with Raft consensus.
+Lance-backed graph database and event store with Raft consensus.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -14,7 +14,7 @@ Arrow-native graph database and event store with Raft consensus.
 │  yata-coordinator (label-based partitioning, Rayon)         │
 ├─────────────────────────────────────────────────────────────┤
 │                  Layer 4: Graph Engine                      │
-│  yata-engine  yata-gie  yata-mdag                          │
+│  yata-engine  yata-gie                                     │
 │  yata-bolt (Bolt v4)                                        │
 ├─────────────────────────────────────────────────────────────┤
 │                   Layer 4: Server                            │
@@ -47,19 +47,16 @@ Arrow-native graph database and event store with Raft consensus.
 | **yata-graph** | Graph store with CSR cache, yata-vex vector search |
 | **yata-gie** | Graph Interactive Engine (IR operators, push-based executor) |
 | **yata-engine** | TieredGraphEngine — Lance-backed cold start, WAL projection, partition routing |
+| **yata-lance** | Lance-table-compatible persistence (fragments, manifests, typed Arrow schema) |
 | **yata-s3** | S3/R2 adapter (sync ureq+rustls, SigV4) |
 | **yata-vex** | Vector index (IVF_PQ + DiskANN) |
 | **yata-server** | XRPC API server (Cypher, mergeRecord, triggerSnapshot) |
 | **yata-bench** | Benchmarks + trillion-scale test |
-| **yata-engine** | Tiered HTAP engine: HOT (CSR) + MDAG CAS persistence |
-| **yata-mdag** | Merkle DAG graph sync (CBOR blocks, time-travel checkout) |
 | **yata-bolt** | Bolt v4 wire protocol (Neo4j driver compatible) |
 | **yata-coordinator** | Label-based graph partitioning with Rayon parallel execution |
-| **yata-server** | Embedded broker with Raft consensus and Prometheus metrics |
 | **yata-at** | AT Protocol types, Firehose client, bridge |
 | **yata-gateway** | Standalone query gateway: Bolt + Neo4j Query API v2 |
 | **yata-cli** | CLI tool for broker administration |
-| **yata-bench** | Integration benchmarks |
 
 ## Quick Start
 

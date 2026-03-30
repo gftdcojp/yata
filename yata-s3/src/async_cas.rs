@@ -59,25 +59,6 @@ impl AsyncS3CasStore {
         self.committed_lsn.load(Ordering::Acquire)
     }
 
-    /// Push MDAG HEAD CID to well-known key `{prefix}MDAG_HEAD`.
-    pub async fn push_head(&self, head_cid: &Blake3Hash) {
-        let key = format!("{}MDAG_HEAD", self.prefix);
-        let data = Bytes::from(head_cid.hex());
-        s3_put_with_retry(&self.remote, &key, data).await;
-    }
-
-    /// Restore MDAG HEAD CID from well-known key.
-    pub async fn restore_head(&self) -> Option<Blake3Hash> {
-        let key = format!("{}MDAG_HEAD", self.prefix);
-        match self.remote.get(&key).await {
-            Ok(Some(data)) => {
-                let hex = std::str::from_utf8(&data).ok()?.trim();
-                Blake3Hash::from_hex(hex).ok()
-            }
-            _ => None,
-        }
-    }
-
     /// Flush: close the channel and await the background task completion.
     /// Call during graceful shutdown.
     pub async fn flush(&mut self) {

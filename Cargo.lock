@@ -6122,7 +6122,6 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
- "chrono",
  "http-body-util",
  "metrics",
  "metrics-exporter-prometheus",
@@ -6135,16 +6134,9 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
- "uuid",
- "yata-arrow",
- "yata-core",
  "yata-engine",
  "yata-gie",
- "yata-graph",
  "yata-grin",
- "yata-object",
- "yata-s3",
- "yata-store",
 ]
 
 [[package]]

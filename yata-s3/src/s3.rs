@@ -319,8 +319,8 @@ mod tests {
     fn url_basic() {
         let c = test_client();
         assert_eq!(
-            c.url("snap/fragment/meta.json"),
-            "https://abc123.r2.cloudflarestorage.com/my-bucket/snap/fragment/meta.json"
+            c.url("lance/vertices/0/manifest-18446744073709551615.json"),
+            "https://abc123.r2.cloudflarestorage.com/my-bucket/lance/vertices/0/manifest-18446744073709551615.json"
         );
     }
 
@@ -513,11 +513,11 @@ mod tests {
     #[test]
     fn parse_list_response_single_object() {
         let xml = r#"<ListBucketResult>
-            <Contents><Key>snap/fragment/meta.json</Key><Size>1024</Size></Contents>
+            <Contents><Key>lance/vertices/0/manifest-18446744073709551615.json</Key><Size>1024</Size></Contents>
         </ListBucketResult>"#;
         let (objects, next) = parse_list_response(xml);
         assert_eq!(objects.len(), 1);
-        assert_eq!(objects[0].key, "snap/fragment/meta.json");
+        assert_eq!(objects[0].key, "lance/vertices/0/manifest-18446744073709551615.json");
         assert_eq!(objects[0].size, 1024);
         assert!(next.is_none());
     }

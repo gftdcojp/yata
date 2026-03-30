@@ -1,8 +1,4 @@
-//! MDAG CRDT peer sync — AT Protocol-style federation via Merkle diff.
-//!
-//! Each node maintains an independent MDAG commit chain persisted to R2.
-//! Sync merges peer commits into the local graph via content-addressed
-//! block transfer + LWW conflict resolution.
+//! Peer CSR sync helpers for test and federation stubs.
 
 use yata_grin::{Mutable, PropValue, Property, Scannable, Topology};
 use yata_store::MutableCsrStore;

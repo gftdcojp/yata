@@ -158,14 +158,14 @@
   <rect x="400" y="290" width="300" height="100" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
   <text x="420" y="313" fill="#e2e8f0" font-size="13" font-weight="bold">yata-object</text>
   <text x="590" y="313" fill="#64748b" font-size="9">~800 LOC</text>
-  <text x="420" y="332" fill="#94a3b8" font-size="10">LocalObjectStore (CAS + MDAG)</text>
+  <text x="420" y="332" fill="#94a3b8" font-size="10">LocalObjectStore (CAS)</text>
   <text x="420" y="347" fill="#94a3b8" font-size="10">chunk_size=128MB, inline=256KB</text>
   <text x="420" y="362" fill="#94a3b8" font-size="10">Blake3 hash directory layout</text>
   <text x="420" y="377" fill="#475569" font-size="9">deps: core, async-trait, ciborium</text>
 
-  <!-- yata-format -->
+  <!-- yata-lance -->
   <rect x="740" y="290" width="340" height="100" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="2"/>
-  <text x="760" y="313" fill="#22c55e" font-size="13" font-weight="bold">yata-format</text>
+  <text x="760" y="313" fill="#22c55e" font-size="13" font-weight="bold">yata-lance</text>
   <text x="960" y="313" fill="#64748b" font-size="9">~1,500 LOC</text>
   <text x="760" y="332" fill="#94a3b8" font-size="10">Lance TableManifest + fragments (Arrow IPC)</text>
   <text x="760" y="347" fill="#94a3b8" font-size="10">COO sorted + sparse index (query engine)</text>
@@ -196,7 +196,7 @@
   <text x="420" y="487" fill="#94a3b8" font-size="10">Sorted COO Store (in-memory, GRIN impl)</text>
   <text x="420" y="502" fill="#94a3b8" font-size="10">DiskBlobCache/MmapBlobCache (LRU cache)</text>
   <text x="420" y="517" fill="#94a3b8" font-size="10">GraphStoreEnum dispatch, PartitionedStore</text>
-  <text x="420" y="532" fill="#475569" font-size="9">deps: grin, cypher, format, core, memmap2</text>
+  <text x="420" y="532" fill="#475569" font-size="9">deps: grin, cypher, lance, core, memmap2</text>
 
   <rect x="780" y="445" width="300" height="100" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
   <text x="800" y="468" fill="#e2e8f0" font-size="13" font-weight="bold">yata-graph</text>
@@ -231,7 +231,7 @@
   <text x="440" y="657" fill="#94a3b8" font-size="10">RwLock&lt;GraphStoreEnum&gt;, QueryCache</text>
   <text x="440" y="672" fill="#4ade80" font-size="10">Per-label delta compaction [PRODUCTION]</text>
   <text x="440" y="687" fill="#4ade80" font-size="10">drain_dirty_labels / manifest v2 [NEW]</text>
-  <text x="440" y="702" fill="#475569" font-size="9">deps: core,grin,store,cypher,gie,graph,s3,format</text>
+  <text x="440" y="702" fill="#475569" font-size="9">deps: core,grin,store,cypher,gie,graph,s3,lance</text>
 
   <rect x="860" y="600" width="300" height="55" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
   <text x="880" y="623" fill="#e2e8f0" font-size="13" font-weight="bold">yata-vex</text>
@@ -256,7 +256,7 @@
   <text x="220" y="788" fill="#60a5fa" font-size="13" font-weight="bold">yata-server (ENTRY)</text>
   <text x="470" y="788" fill="#64748b" font-size="9">~1,000+ LOC</text>
   <text x="220" y="807" fill="#94a3b8" font-size="10">/xrpc/ai.gftd.yata.cypher (unified R/W)</text>
-  <text x="220" y="822" fill="#94a3b8" font-size="10">Broker (engine + objects + CAS), Prometheus</text>
+  <text x="220" y="822" fill="#94a3b8" font-size="10">REST API + Prometheus</text>
   <text x="220" y="842" fill="#475569" font-size="9">deps: engine, graph, s3, object, axum, tokio, metrics</text>
 
   <line x1="620" y1="710" x2="400" y2="763" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow)"/>
@@ -1583,7 +1583,7 @@
   <text x="590" y="7411" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="bold">yata-grin</text>
   <text x="590" y="7425" text-anchor="middle" fill="#64748b" font-size="8">⊥₂  313 LOC</text>
 
-  <!-- Layer 1: arrow, object, format -->
+  <!-- Layer 1: arrow, object, lance -->
   <rect x="140" y="7310" width="110" height="32" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
   <text x="195" y="7331" text-anchor="middle" fill="#e2e8f0" font-size="10">yata-arrow</text>
   <text x="195" y="7343" text-anchor="middle" fill="#64748b" font-size="8">639 LOC</text>
@@ -1595,7 +1595,7 @@
   <line x1="365" y1="7342" x2="410" y2="7390" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
 
   <rect x="500" y="7310" width="120" height="32" rx="6" fill="#1e293b" stroke="#22c55e" stroke-width="2"/>
-  <text x="560" y="7331" text-anchor="middle" fill="#22c55e" font-size="10">yata-format</text>
+  <text x="560" y="7331" text-anchor="middle" fill="#22c55e" font-size="10">yata-lance</text>
   <text x="560" y="7343" text-anchor="middle" fill="#64748b" font-size="8">2,046 LOC</text>
   <line x1="540" y1="7342" x2="410" y2="7390" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
   <line x1="560" y1="7342" x2="590" y2="7390" stroke="#334155" stroke-width="1" marker-end="url(#arrow)"/>
@@ -1670,7 +1670,7 @@
   <text x="770" y="7180" fill="#f59e0b" font-size="10">yata-vex → merge into yata-engine</text>
   <text x="770" y="7195" fill="#94a3b8" font-size="9">IVF_PQ + DiskANN; single consumer (yata-graph only)</text>
   <text x="770" y="7215" fill="#f59e0b" font-size="10">yata-object → merge into yata-s3</text>
-  <text x="770" y="7230" fill="#94a3b8" font-size="9">LocalObjectStore (CAS+MDAG); 2 consumers (s3, server)</text>
+  <text x="770" y="7230" fill="#94a3b8" font-size="9">LocalObjectStore (CAS); used by S3 sync only</text>
 
   <!-- Optimal lattice after merge -->
   <rect x="750" y="7270" width="380" height="90" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="1" stroke-opacity="0.5"/>

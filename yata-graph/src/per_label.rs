@@ -1,6 +1,6 @@
 //! Per-label graph store — thin delegation to GraphStore.
 //!
-//! No-op wrapper since graph data lives in-memory (MDAG CAS is sole persistence).
+//! No-op wrapper since graph data lives in-memory.
 
 /// Per-label store (no-op wrapper).
 pub struct PerLabelStore;

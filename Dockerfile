@@ -43,8 +43,7 @@ RUN for d in yata-core yata-arrow yata-log yata-object yata-ocel \
     mkdir -p yata-bench/src && \
     echo 'fn main(){}' > yata-bench/src/main.rs && \
     echo 'fn main(){}' > yata-bench/src/cypher_bench.rs && \
-    echo 'fn main(){}' > yata-bench/src/cypher_transport_bench.rs && \
-    echo 'fn main(){}' > yata-bench/src/cypher_storage_bench.rs
+    echo 'fn main(){}' > yata-bench/src/cypher_transport_bench.rs
 
 RUN cargo build --release -p yata-bench 2>&1 | tail -5 || true
 

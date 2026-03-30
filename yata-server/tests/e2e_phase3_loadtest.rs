@@ -2,7 +2,7 @@
 //!
 //! Tests:
 //!   1. Seed multi-label graph (Person, Company, Post, Like, Review)
-//!   2. Trigger chunked snapshot → MinIO
+//!   2. Trigger chunked Lance compaction → MinIO
 //!   3. Cold restart → verify 3-tier page-in (disk → MinIO)
 //!   4. Label-selective 2-hop query load (Person→KNOWS→Person→WORKS_AT→Company)
 //!   5. Incremental label enrichment (query new label → enrich stubs)
@@ -168,11 +168,11 @@ fn t02_seed_multi_label_graph() {
 }
 
 #[test]
-fn t03_chunked_snapshot() {
+fn t03_chunked_compaction() {
     let start = Instant::now();
     let result = trigger_compaction();
     let elapsed = start.elapsed();
-    eprintln!("t03: snapshot in {:?} — {}", elapsed, serde_json::to_string_pretty(&result).unwrap());
+    eprintln!("t03: compaction in {:?} — {}", elapsed, serde_json::to_string_pretty(&result).unwrap());
 }
 
 #[test]
@@ -251,11 +251,11 @@ fn t06_mixed_read_write_load() {
 }
 
 #[test]
-fn t07_snapshot_after_load() {
+fn t07_compaction_after_load() {
     let start = Instant::now();
     let result = trigger_compaction();
     let elapsed = start.elapsed();
-    eprintln!("t07: post-load snapshot in {:?} — {}", elapsed, serde_json::to_string_pretty(&result).unwrap());
+    eprintln!("t07: post-load compaction in {:?} — {}", elapsed, serde_json::to_string_pretty(&result).unwrap());
 
     // Verify total graph
     let persons = count_label("Person");

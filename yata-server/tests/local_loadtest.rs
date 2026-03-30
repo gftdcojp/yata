@@ -1,4 +1,4 @@
-//! Local load test + partition simulation + YataFragment roundtrip.
+//! Local load test + partition simulation for the Lance-backed engine.
 //!
 //! Usage:
 //!   cargo test -p yata-server --test local_loadtest -- --nocapture
