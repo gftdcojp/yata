@@ -230,6 +230,7 @@ async fn current_manifest_path(
     object_store: &ObjectStore,
     base: &Path,
 ) -> Result<ManifestLocation> {
+    #[cfg(not(target_arch = "wasm32"))]
     if object_store.is_local() {
         if let Ok(Some(location)) = current_manifest_local(base) {
             return Ok(location);
@@ -330,6 +331,7 @@ async fn current_manifest_path(
 // This is an optimized function that searches for the latest manifest. In
 // object_store, list operations lookup metadata for each file listed. This
 // method only gets the metadata for the found latest manifest.
+#[cfg(not(target_arch = "wasm32"))]
 fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocation>> {
     let path = lance_io::local::to_local_path(&base.child(VERSIONS_DIR));
     let entries = std::fs::read_dir(path)?;

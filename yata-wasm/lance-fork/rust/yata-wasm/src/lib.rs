@@ -6,13 +6,14 @@ use bytes::{BufMut, Bytes, BytesMut};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_encoding::decoder::PageEncoding;
 use lance_encoding::encoder::{
-    default_encoding_strategy, encode_batch, EncodedBatch, EncodingOptions,
+    default_encoding_strategy, encode_batch, EncodingOptions,
 };
 use lance_encoding::version::LanceFileVersion;
 use prost::Message;
 use prost_types::Any;
 use std::sync::Arc;
 
+/// Generated protobuf types for Lance file format v2
 mod pbfile {
     #![allow(clippy::all, non_camel_case_types, unused)]
     include!(concat!(env!("OUT_DIR"), "/lance.file.v2.rs"));
@@ -23,11 +24,10 @@ const MAGIC: &[u8; 4] = b"LANC";
 
 #[wasm_bindgen]
 pub fn probe() -> String {
-    "lance-core + lance-encoding + lance-file-assembly wasm ok".to_string()
+    "lance-core+encoding+io+file+table wasm ok".to_string()
 }
 
 /// Encode a RecordBatch to a complete Lance v2 file (in memory).
-/// Returns the full file bytes including data pages, column metadata, and footer.
 fn encode_to_lance_file(batch: &RecordBatch) -> Result<Bytes, String> {
     let schema = batch.schema();
     let lance_schema =
@@ -43,23 +43,23 @@ fn encode_to_lance_file(batch: &RecordBatch) -> Result<Bytes, String> {
 
     let encoded = futures::executor::block_on(encode_batch(
         batch,
-        Arc::new(lance_schema.clone()),
+        Arc::new(lance_schema),
         strategy.as_ref(),
         &options,
     ))
     .map_err(|e| e.to_string())?;
 
-    // Assemble full Lance v2 file: data + schema + column metadata + footer
-    concat_lance_footer(&encoded, &lance_schema)
+    concat_lance_footer(&encoded)
 }
 
-/// Assemble a complete Lance v2 file from EncodedBatch.
-/// Logic ported from lance-file/src/v2/writer.rs `concat_lance_footer`.
-fn concat_lance_footer(batch: &EncodedBatch, _lance_schema: &LanceSchema) -> Result<Bytes, String> {
-    let mut data = BytesMut::with_capacity(batch.data.len() + 1024 * 1024);
+/// Assemble a complete Lance v2 file from EncodedBatch (mini lance — no schema).
+fn concat_lance_footer(
+    batch: &lance_encoding::encoder::EncodedBatch,
+) -> Result<Bytes, String> {
+    let mut data = BytesMut::with_capacity(batch.data.len() + 64 * 1024);
     data.put(batch.data.clone());
 
-    // No global buffers (mini lance mode — schema provided externally)
+    // No global buffers (mini lance mode)
     let global_buffers: Vec<(u64, u64)> = vec![];
 
     // Write column metadata
@@ -91,9 +91,7 @@ fn concat_lance_footer(batch: &EncodedBatch, _lance_schema: &LanceSchema) -> Res
                     buffer_sizes,
                     encoding: Some(pbfile::Encoding {
                         location: Some(pbfile::encoding::Location::Direct(
-                            pbfile::DirectEncoding {
-                                encoding: encoded_encoding,
-                            },
+                            pbfile::DirectEncoding { encoding: encoded_encoding },
                         )),
                     }),
                     length: page_info.num_rows,
@@ -114,9 +112,7 @@ fn concat_lance_footer(batch: &EncodedBatch, _lance_schema: &LanceSchema) -> Res
             buffer_sizes,
             encoding: Some(pbfile::Encoding {
                 location: Some(pbfile::encoding::Location::Direct(
-                    pbfile::DirectEncoding {
-                        encoding: encoded_col_encoding,
-                    },
+                    pbfile::DirectEncoding { encoding: encoded_col_encoding },
                 )),
             }),
         };
@@ -157,8 +153,7 @@ fn concat_lance_footer(batch: &EncodedBatch, _lance_schema: &LanceSchema) -> Res
 
 // ── wasm-bindgen API ──
 
-/// Encode vertex data to a complete Lance v2 file.
-/// Returns full file bytes ready for R2 PUT.
+/// Encode vertex data to a Lance v2 file.
 #[wasm_bindgen]
 pub fn encode_vertex_lance(
     labels: Vec<String>,
@@ -192,14 +187,11 @@ pub fn encode_vertex_lance(
     )
     .map_err(|e| JsValue::from_str(&format!("{e}")))?;
 
-    let file_bytes = encode_to_lance_file(&batch)
-        .map_err(|e| JsValue::from_str(&e))?;
-
+    let file_bytes = encode_to_lance_file(&batch).map_err(|e| JsValue::from_str(&e))?;
     Ok(file_bytes.to_vec())
 }
 
-/// Get the Lance file footer from raw file bytes.
-/// Returns JSON with version info and metadata offsets.
+/// Read the Lance v2 footer from raw file bytes.
 #[wasm_bindgen]
 pub fn read_lance_footer(file_bytes: &[u8]) -> Result<String, JsValue> {
     if file_bytes.len() < 40 {
@@ -207,8 +199,6 @@ pub fn read_lance_footer(file_bytes: &[u8]) -> Result<String, JsValue> {
     }
 
     let footer = &file_bytes[file_bytes.len() - 40..];
-
-    // Check magic
     if &footer[36..40] != MAGIC {
         return Err(JsValue::from_str("not a Lance file (missing LANC magic)"));
     }
@@ -230,5 +220,13 @@ pub fn read_lance_footer(file_bytes: &[u8]) -> Result<String, JsValue> {
         "major_version": major,
         "minor_version": minor,
         "file_size": file_bytes.len(),
-    }).to_string())
+    })
+    .to_string())
+}
+
+/// Generate a Lance Dataset fragment path (UUID-based, LanceDB standard layout).
+#[wasm_bindgen]
+pub fn generate_fragment_path() -> String {
+    let uuid = uuid::Uuid::new_v4();
+    format!("data/{}.lance", uuid)
 }

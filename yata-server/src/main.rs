@@ -3,6 +3,10 @@ use tracing_subscriber::EnvFilter;
 use yata_engine::{TieredGraphEngine, config::TieredEngineConfig};
 use yata_server::rest;
 
+// AVX-512 linker stub for zig cross-compile (lance-linalg FlatIndex)
+#[path = "avx512_stub.rs"]
+mod avx512_stub;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
