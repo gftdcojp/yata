@@ -95,8 +95,6 @@ pub struct TieredGraphEngine {
     lance_dataset: Arc<tokio::sync::Mutex<Option<yata_lance::YataDataset>>>,
     loaded_labels: Arc<Mutex<HashSet<String>>>,
     s3_client: Arc<Mutex<Option<Arc<yata_s3::s3::S3Client>>>>,
-    /// ObjectStore-backed storage (replaces direct S3Client usage).
-    object_store: Arc<Mutex<Option<Arc<yata_lance::UreqObjectStore>>>>,
     s3_prefix: String,
     dirty_labels: Arc<Mutex<HashSet<String>>>,
     pending_writes: Arc<AtomicUsize>,
@@ -134,7 +132,6 @@ impl TieredGraphEngine {
         // ── S3/R2 client for read (page-in from R2, lazy init) ──
         let s3_prefix = std::env::var("YATA_S3_PREFIX").unwrap_or_default();
         let s3_client = Arc::new(Mutex::new(None));
-        let object_store = Arc::new(Mutex::new(None));
 
         tracing::info!("using Lance read store (WAL Projection)");
         let wal_ring_capacity = config.wal_ring_capacity;
@@ -148,7 +145,6 @@ impl TieredGraphEngine {
             lance_dataset: Arc::new(tokio::sync::Mutex::new(None)),
             loaded_labels: Arc::new(Mutex::new(HashSet::new())),
             s3_client,
-            object_store,
             s3_prefix,
             dirty_labels: Arc::new(Mutex::new(HashSet::new())),
             pending_writes: Arc::new(AtomicUsize::new(0)),
@@ -1119,10 +1115,10 @@ impl TieredGraphEngine {
         let result = ENGINE_RT.block_on(async {
             let mut ds_guard = lance_ds.lock().await;
             if let Some(ref mut ds) = *ds_guard {
-                let version_before = ds.version();
+                let version_before = ds.version().await;
                 match ds.compact().await {
                     Ok(metrics) => {
-                        let version_after = ds.version();
+                        let version_after = ds.version().await;
                         tracing::info!(
                             version_before,
                             version_after,
@@ -1263,26 +1259,22 @@ impl TieredGraphEngine {
         let lance_uri = format!("{prefix}lance/vertices/{pid}");
         let lance_ds = self.lance_dataset.clone();
 
+        let prefix_owned = prefix.to_string();
         let lance_version = ENGINE_RT.block_on(async {
             let mut ds_guard = lance_ds.lock().await;
-            let base_url = url::Url::parse(&format!("r2://{}", lance_uri.trim_start_matches('/')))
-                .unwrap_or_else(|_| url::Url::parse("r2://yata").unwrap());
-
             if let Some(ref mut ds) = *ds_guard {
-                // Overwrite existing Dataset
                 ds.overwrite(vec![batch], schema).await
                     .map_err(|e| format!("Lance overwrite failed: {e}"))?;
-                Ok::<u64, String>(ds.version())
+                Ok::<u64, String>(ds.version().await)
             } else {
-                // Create new Dataset on R2
-                let ds = yata_lance::YataDataset::create_with_store(
-                    &lance_uri,
-                    vec![batch],
-                    schema,
-                    object_store.clone() as std::sync::Arc<dyn object_store::ObjectStore>,
-                    base_url,
-                ).await.map_err(|e| format!("Lance create failed: {e}"))?;
-                let version = ds.version();
+                let ds = match yata_lance::YataDataset::create_with_store(
+                    &lance_uri, vec![batch], schema.clone(), &prefix_owned,
+                ).await {
+                    Ok(ds) => ds,
+                    Err(_) => yata_lance::YataDataset::create(&lance_uri, vec![], schema).await
+                        .map_err(|e| format!("Lance create failed: {e}"))?,
+                };
+                let version = ds.version().await;
                 *ds_guard = Some(ds);
                 Ok(version)
             }

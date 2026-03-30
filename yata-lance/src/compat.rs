@@ -147,6 +147,7 @@ pub struct CompactMetrics {
 }
 
 /// Compat stub: replaces the old vector store.
+/// Vector search will be re-implemented using lancedb Table::search() in next phase.
 pub struct YataVectorStore;
 
 impl YataVectorStore {
@@ -154,13 +155,27 @@ impl YataVectorStore {
         Self
     }
 
-    pub fn search(
+    pub async fn write_vertices_with_embeddings(
         &self,
-        _query: &[f32],
-        _k: usize,
-        _filter: Option<&str>,
-    ) -> Vec<(String, f32)> {
-        Vec::new()
+        _nodes: &[yata_cypher::NodeRef],
+        _embedding_key: &str,
+        _dim: usize,
+    ) -> Result<(), String> {
+        Ok(()) // stub — lancedb table.add() will replace
+    }
+
+    pub async fn vector_search_vertices(
+        &self,
+        _query: Vec<f32>,
+        _limit: usize,
+        _label_filter: Option<&str>,
+        _prop_filter: Option<&str>,
+    ) -> Result<Vec<(yata_cypher::NodeRef, f32)>, String> {
+        Ok(Vec::new()) // stub — lancedb table.search().nearest_to() will replace
+    }
+
+    pub async fn create_embedding_index(&self) -> Result<(), String> {
+        Ok(()) // stub — lancedb table.create_index() will replace
     }
 }
 
