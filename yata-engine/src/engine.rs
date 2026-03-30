@@ -112,6 +112,8 @@ pub struct TieredGraphEngine {
     /// Loaded once on first query, then ensure_labels() fetches individual labels on-demand.
     /// Multi-node: each node loads manifest independently from R2 (shared source of truth).
     manifest_cache: Arc<Mutex<Option<crate::compaction::CompactionManifest>>>,
+    /// Lance TableManifest (primary cold start source). Fragment-level page-in.
+    lance_manifest_cache: Arc<Mutex<Option<yata_lance::table::TableManifest>>>,
     loaded_labels: Arc<Mutex<HashSet<String>>>,
     blob_cache: Arc<dyn BlobCache>,
     s3_client: Arc<Mutex<Option<Arc<yata_s3::s3::S3Client>>>>,
