@@ -1,6 +1,6 @@
 # packages/rust/yata
 
-yata — Rust Cypher graph engine. `[PRODUCTION]` Container × N partition (**multi-container/multi-node 前提 CRITICAL**)。Workers RPC coordinator。GraphScope parity 21/25 (14 PRODUCTION + 7 IMPLEMENTED)。GIE push-based + Design E SecurityScope + **LanceDB-style append-only write** (tombstone old + append new, per-write `commit_labels_only`, full commit deferred to compaction) + **LanceDB-style demand-paged cold start** (manifest-only → per-label on-demand page-in, cold start 2.2s) + per-label delta compaction (dirty labels only) + adaptive √N fan-out + CpmStats + cypherBatch + **immutable versioned manifest** (`manifest-{inverted:020}.json`) + **Range GET** (`get_range_sync`) + **concurrent cold start guard** (`cold_starting` AtomicBool)。設計: `docs/260329-yata-coo-sorted-design.md`
+yata — Rust Cypher graph engine on LanceDB。`[PRODUCTION]` Container × N partition。`lancedb` 0.27 (lance 4.0)。**No persistent CSR** — ephemeral `build_read_store()` per query from LanceDB scan。**No WAL ring** — `merge_record()` → `table.add()` direct。**No in-memory cache** — Cloudflare edge cache。GIE push-based + Design E SecurityScope。engine.rs 1,712行。
 
 ## CRITICAL: Multi-Container/Multi-Node 前提 (MUST)
 
@@ -16,33 +16,14 @@ yata — Rust Cypher graph engine. `[PRODUCTION]` Container × N partition (**mu
 ## Architecture (CRITICAL)
 
 ```
-Write model: Pipeline.send() (durable) + YATA_RPC.mergeRecord() (LanceDB-style append-only)
-  → Pipeline: AT Protocol commit chain + MST (durable, 0 data loss)
-  → mergeRecord: tombstone old vertex + append new vertex (immutable write, O(1))
-  → commit_labels_only(): label_index + label_bitmap + btree rebuild (lightweight, O(V_l log V_l))
-  → full commit() deferred to L0_COMPACT_THRESHOLD (10,000 writes)
-  → dirty_labels.insert(label)
+Write: PDS → mergeRecord() → WalEntry batch → table.add(batch) [LanceDB] → R2
+Read:  PDS → cypher() → build_read_store(labels) → table.scan_filter() [LanceDB]
+         → ephemeral LanceReadStore → Cypher parse → GIE execute → response
+Cold:  ensure_lance() → db.open_table("vertices") [LanceDB handles R2]
+Store: LanceDB (lancedb 0.27, lance 4.0) — S3/R2 built-in, versioning + fragments auto-managed
 
-Read model: yata Container (pure read)
-  Workers RPC (YataRPC) → hierarchical coordinator (√N fan-out)
-    → N × Container (Rust, standard-1, 4GB RAM, 8GB disk)
-      Each Container:
-        R2 (Arrow IPC sorted COO segments) → DiskBlobCache/MmapBlobCache → CooStore
-        TieredGraphEngine → yata-cypher / yata-gie (sparse index binary search)
-
-Storage: Sorted COO (Coordinate format) + Sparse Index
-  COO triples sorted by (label, src, dst) in Arrow IPC segments (~32MB each)
-  R2 = Source of Truth (per-label sorted segments: log/coo/{pid}/label/{label}/{range}.arrow)
-  Sparse index: per-label (every 256th src → segment offset) → O(log 256) traversal
-  L0 = unsorted append buffer (in-memory) → L1 = sorted segments (LSM compaction)
-  DiskBlobCache = Container ephemeral disk cache (segment-level LRU)
-  MmapBlobCache = zero-copy mmap (segment-level)
-
-Key properties (vs CSR):
-  Write: O(1) append (CSR was O(V) offsets rebuild per dirty label)
-  Snapshot: eliminated (sorted segments ARE persistent format, no commit() rebuild)
-  Page-in: (label, src_range) granular (CSR was full label)
-  Traversal: O(log 256 + degree) via sparse index (CSR was O(1) + O(degree))
+No persistent CSR. No WAL ring. No in-memory cache. No dirty_labels.
+No S3Client. No compaction.rs. No manifest.rs.
 ```
 
 Deploy/config/ops details: `infra/cloudflare/container/yata/CLAUDE.md`
@@ -54,36 +35,20 @@ Write (LanceDB-style append-only, NO page-in):
   App → PDS_RPC.createRecord(repo, collection, record)
     → Pipeline.send(): AT commit + MST update → ACK (~1ms, durable)
     → YATA_RPC.mergeRecord(): tombstone old vertex + append new vertex (immutable, O(1))
-    → commit_labels_only(): label_index + label_bitmap + btree rebuild (O(V_l log V_l))
-    → full commit() (columnar/prop_eq) deferred to L0_COMPACT_THRESHOLD (10,000 writes)
-    → dirty_labels.insert(label)
+    → table.add(batch) [LanceDB] → R2 Lance fragments
 
   yata への直接 mutate は mergeRecord からのみ (app 直接禁止)
-  既存 vertex の in-place props 上書きは禁止 (LanceDB: immutable data + deletion vector)
 
-Lance WAL Flush (wal_flush_segment, primary path = Lance Dataset::append):
-  wal_flush_segment():
-    → WAL ring entries → RecordBatch (Arrow columnar)
-    → Lance Dataset::append(batch) — Lance handles versioning + fragment management
-    → Fallback: if Lance unavailable → raw Arrow IPC segment → R2 PUT (legacy path)
+Read:
+  PDS → YATA_RPC.cypher → build_read_store(labels)
+    → table.scan_filter("label='Post'") [LanceDB] → ephemeral LanceReadStore
+    → Cypher parse → GIE execute → response
 
-Lance Compaction (size-based L0_COMPACT_THRESHOLD, dirty_labels gated):
-  trigger_compaction():
-    → wal_flush_segment() (Lance append)
-    → drain_dirty_labels() → dirty set
-    → dirty empty? → skip
-    → Lance Dataset::compact() — built-in fragment merge (replaces custom PK-dedup pipeline)
-    → Lance handles manifest versioning internally
+Compact:
+  trigger_compaction() → table.compact() [LanceDB built-in fragment merge]
 
-Read (cold start: Lance manifest → fragment-level demand page-in):
-  PDS_RPC.query / listRecords / getTimeline
-    → YATA_RPC.cypher → TieredGraphEngine
-    → ensure_labels(vertex_labels) → hot_initialized == false?
-      → cold_start(): Lance TableManifest load (R2 list O(1)) → hot_initialized = true → WAL tail replay
-    → ensure_labels(["Post"]) → Lance manifest → matching fragments → 3-tier (disk → R2 → Blake3 verify → cache)
-    → wal_apply(entries) → LanceReadStore → sparse index binary search + scan
-
-PDS Container (Rust) は不要 — 全て TS Worker + Pipeline + YATA_RPC。
+Cold start:
+  ensure_lance() → db.open_table("vertices") [LanceDB handles R2 connection]
 ```
 
 ## Workers RPC API (CRITICAL)

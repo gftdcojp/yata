@@ -1,148 +1,109 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1400" viewBox="0 0 1200 1400" font-family="'SF Mono','Menlo','Monaco',monospace" font-size="11">
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="820" viewBox="0 0 1100 820" font-family="'SF Mono','Menlo','Monaco',monospace" font-size="11">
   <defs>
-    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" style="stop-color:#0a0e17;stop-opacity:1"/>
-      <stop offset="100%" style="stop-color:#111827;stop-opacity:1"/>
-    </linearGradient>
-    <linearGradient id="lanceGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#8b5cf6;stop-opacity:0.18"/>
-      <stop offset="100%" style="stop-color:#6366f1;stop-opacity:0.06"/>
-    </linearGradient>
-    <linearGradient id="csrGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#22c55e;stop-opacity:0.15"/>
-      <stop offset="100%" style="stop-color:#10b981;stop-opacity:0.06"/>
-    </linearGradient>
-    <linearGradient id="coldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#3b82f6;stop-opacity:0.12"/>
-      <stop offset="100%" style="stop-color:#06b6d4;stop-opacity:0.06"/>
-    </linearGradient>
-    <marker id="a" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#6b7280"/></marker>
-    <marker id="aP" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#8b5cf6"/></marker>
-    <marker id="aG" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#22c55e"/></marker>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" style="stop-color:#0a0e17"/><stop offset="100%" style="stop-color:#111827"/></linearGradient>
+    <linearGradient id="lc" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" style="stop-color:#8b5cf6;stop-opacity:0.18"/><stop offset="100%" style="stop-color:#6366f1;stop-opacity:0.06"/></linearGradient>
+    <linearGradient id="gr" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" style="stop-color:#22c55e;stop-opacity:0.15"/><stop offset="100%" style="stop-color:#10b981;stop-opacity:0.06"/></linearGradient>
+    <linearGradient id="bl" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" style="stop-color:#3b82f6;stop-opacity:0.12"/><stop offset="100%" style="stop-color:#06b6d4;stop-opacity:0.06"/></linearGradient>
+    <marker id="a" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><path d="M0,0 L7,2.5 L0,5" fill="#6b7280"/></marker>
+    <marker id="ap" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><path d="M0,0 L7,2.5 L0,5" fill="#8b5cf6"/></marker>
+    <marker id="ag" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><path d="M0,0 L7,2.5 L0,5" fill="#22c55e"/></marker>
   </defs>
+  <rect width="1100" height="820" fill="url(#bg)"/>
 
-  <rect width="1200" height="1400" fill="url(#bgGrad)"/>
+  <text x="550" y="30" text-anchor="middle" fill="#f8fafc" font-size="18" font-weight="bold">yata — LanceDB Graph Engine</text>
+  <text x="550" y="48" text-anchor="middle" fill="#94a3b8" font-size="10">lancedb 0.27 | No CSR | No WAL | No S3 | No cache | Cypher + GIE on ephemeral scan</text>
 
-  <text x="600" y="35" text-anchor="middle" fill="#f8fafc" font-size="20" font-weight="bold">yata — LanceDB Graph Engine</text>
-  <text x="600" y="55" text-anchor="middle" fill="#94a3b8" font-size="11">lancedb 0.27 (lance 4.0) | Cypher + CSR 3.8M QPS | No WAL | No S3 | No cache</text>
+  <!-- Data Flow -->
+  <g transform="translate(50, 70)">
+    <rect x="330" y="0" width="340" height="30" rx="5" fill="url(#bl)" stroke="#3b82f6" stroke-width="0.5"/>
+    <text x="500" y="20" text-anchor="middle" fill="#93c5fd" font-size="12" font-weight="bold">PDS Worker</text>
 
-  <!-- ==================== DATA FLOW ==================== -->
-  <g transform="translate(60, 85)">
+    <line x1="400" y1="30" x2="250" y2="55" stroke="#f59e0b" stroke-width="1" marker-end="url(#a)"/>
+    <text x="290" y="45" fill="#f59e0b" font-size="9">mergeRecord</text>
+    <line x1="600" y1="30" x2="750" y2="55" stroke="#22c55e" stroke-width="1" marker-end="url(#ag)"/>
+    <text x="660" y="45" fill="#22c55e" font-size="9">cypher</text>
 
-    <!-- PDS -->
-    <rect x="350" y="0" width="380" height="35" rx="6" fill="url(#coldGrad)" stroke="#3b82f6" stroke-width="0.5"/>
-    <text x="540" y="22" text-anchor="middle" fill="#93c5fd" font-size="13" font-weight="bold">PDS Worker (TS)</text>
+    <!-- Write -->
+    <rect x="50" y="55" width="400" height="90" rx="6" fill="#111827" stroke="#4b5563" stroke-width="0.5"/>
+    <text x="65" y="73" fill="#f59e0b" font-size="12" font-weight="bold">Write</text>
+    <rect x="65" y="80" width="170" height="30" rx="4" fill="url(#lc)" stroke="#8b5cf6" stroke-width="0.5"/>
+    <text x="75" y="99" fill="#c4b5fd" font-size="10">table.add(batch)</text>
+    <rect x="250" y="80" width="185" height="30" rx="4" fill="url(#lc)" stroke="#8b5cf6" stroke-width="0.4"/>
+    <text x="260" y="99" fill="#c4b5fd" font-size="10">table.compact()</text>
+    <text x="260" y="110" fill="#6b7280" font-size="8">@ 10K threshold</text>
+    <text x="65" y="135" fill="#6b7280" font-size="9">No WAL ring. No CSR merge. Direct LanceDB write.</text>
 
-    <!-- Write arrow -->
-    <line x1="440" y1="35" x2="270" y2="70" stroke="#f59e0b" stroke-width="1.2" marker-end="url(#a)"/>
-    <text x="310" y="55" fill="#f59e0b" font-size="9">mergeRecord()</text>
-
-    <!-- Read arrow -->
-    <line x1="640" y1="35" x2="810" y2="70" stroke="#22c55e" stroke-width="1.2" marker-end="url(#aG)"/>
-    <text x="710" y="55" fill="#22c55e" font-size="9">cypher()</text>
-
-    <!-- ==================== WRITE SIDE ==================== -->
-    <rect x="60" y="70" width="420" height="140" rx="8" fill="#111827" stroke="#4b5563" stroke-width="0.5"/>
-    <text x="75" y="90" fill="#f59e0b" font-size="13" font-weight="bold">Write</text>
-
-    <!-- L0 CSR -->
-    <rect x="80" y="100" width="180" height="50" rx="5" fill="url(#csrGrad)" stroke="#22c55e" stroke-width="0.5"/>
-    <text x="90" y="118" fill="#86efac" font-size="11" font-weight="bold">L0 CSR (in-memory)</text>
-    <text x="90" y="133" fill="#94a3b8" font-size="9">merge_vertex_by_pk()</text>
-    <text x="90" y="144" fill="#6b7280" font-size="8">instant, 0.3us, 3.8M QPS</text>
-
-    <!-- Compact -->
-    <rect x="280" y="100" width="180" height="50" rx="5" fill="url(#lanceGrad)" stroke="#8b5cf6" stroke-width="0.5"/>
-    <text x="290" y="118" fill="#c4b5fd" font-size="11" font-weight="bold">table.compact()</text>
-    <text x="290" y="133" fill="#94a3b8" font-size="9">@ 10K writes threshold</text>
-    <text x="290" y="144" fill="#6b7280" font-size="8">LanceDB fragment merge</text>
-
-    <line x1="260" y1="125" x2="280" y2="125" stroke="#8b5cf6" stroke-width="1" marker-end="url(#aP)"/>
+    <!-- Read -->
+    <rect x="550" y="55" width="400" height="90" rx="6" fill="#111827" stroke="#4b5563" stroke-width="0.5"/>
+    <text x="565" y="73" fill="#22c55e" font-size="12" font-weight="bold">Read</text>
+    <rect x="565" y="80" width="175" height="30" rx="4" fill="url(#lc)" stroke="#8b5cf6" stroke-width="0.5"/>
+    <text x="575" y="99" fill="#c4b5fd" font-size="10">table.scan_filter()</text>
+    <text x="575" y="110" fill="#6b7280" font-size="8">ephemeral per-query</text>
+    <rect x="755" y="80" width="180" height="30" rx="4" fill="url(#gr)" stroke="#22c55e" stroke-width="0.5"/>
+    <text x="765" y="99" fill="#86efac" font-size="10">Cypher → GIE exec</text>
+    <text x="765" y="110" fill="#6b7280" font-size="8">on ephemeral ReadStore</text>
+    <line x1="740" y1="95" x2="755" y2="95" stroke="#22c55e" stroke-width="0.8" marker-end="url(#ag)"/>
+    <text x="565" y="135" fill="#6b7280" font-size="9">No persistent CSR. build_read_store() per query.</text>
 
     <!-- R2 -->
-    <rect x="280" y="165" width="180" height="30" rx="5" fill="url(#coldGrad)" stroke="#06b6d4" stroke-width="0.5"/>
-    <text x="370" y="184" text-anchor="middle" fill="#67e8f9" font-size="10">R2 (Lance fragments)</text>
-    <line x1="370" y1="150" x2="370" y2="165" stroke="#06b6d4" stroke-width="1" marker-end="url(#a)"/>
-
-    <!-- ==================== READ SIDE ==================== -->
-    <rect x="600" y="70" width="420" height="140" rx="8" fill="#111827" stroke="#4b5563" stroke-width="0.5"/>
-    <text x="615" y="90" fill="#22c55e" font-size="13" font-weight="bold">Read</text>
-
-    <!-- LanceDB scan -->
-    <rect x="620" y="100" width="180" height="50" rx="5" fill="url(#lanceGrad)" stroke="#8b5cf6" stroke-width="0.5"/>
-    <text x="630" y="118" fill="#c4b5fd" font-size="11" font-weight="bold">table.scan_filter()</text>
-    <text x="630" y="133" fill="#94a3b8" font-size="9">per-label demand page-in</text>
-    <text x="630" y="144" fill="#6b7280" font-size="8">on cache miss only</text>
-
-    <!-- CSR query -->
-    <rect x="820" y="100" width="180" height="50" rx="5" fill="url(#csrGrad)" stroke="#22c55e" stroke-width="0.5"/>
-    <text x="830" y="118" fill="#86efac" font-size="11" font-weight="bold">Cypher → GIE → CSR</text>
-    <text x="830" y="133" fill="#94a3b8" font-size="9">3.8M QPS warm</text>
-    <text x="830" y="144" fill="#6b7280" font-size="8">graph traversal O(1)</text>
-
-    <line x1="800" y1="125" x2="820" y2="125" stroke="#22c55e" stroke-width="1" marker-end="url(#aG)"/>
-
-    <!-- R2 read -->
-    <rect x="620" y="165" width="180" height="30" rx="5" fill="url(#coldGrad)" stroke="#06b6d4" stroke-width="0.5"/>
-    <text x="710" y="184" text-anchor="middle" fill="#67e8f9" font-size="10">R2 (Lance fragments)</text>
-    <line x1="710" y1="165" x2="710" y2="150" stroke="#06b6d4" stroke-width="1" marker-end="url(#a)"/>
+    <rect x="300" y="155" width="400" height="25" rx="4" fill="url(#bl)" stroke="#06b6d4" stroke-width="0.5"/>
+    <text x="500" y="172" text-anchor="middle" fill="#67e8f9" font-size="10">R2 — Lance fragments (LanceDB auto-managed)</text>
+    <line x1="250" y1="120" x2="400" y2="155" stroke="#06b6d4" stroke-width="0.8" marker-end="url(#a)"/>
+    <line x1="650" y1="120" x2="600" y2="155" stroke="#06b6d4" stroke-width="0.8" marker-end="url(#a)"/>
   </g>
 
-  <!-- ==================== COLD START ==================== -->
-  <g transform="translate(60, 310)">
-    <rect x="280" y="0" width="520" height="35" rx="6" fill="url(#lanceGrad)" stroke="#8b5cf6" stroke-width="0.5"/>
-    <text x="540" y="22" text-anchor="middle" fill="#c4b5fd" font-size="12" font-weight="bold">Cold start: db.open_table("vertices") → hot = true → labels on-demand</text>
+  <!-- Perf -->
+  <g transform="translate(50, 310)">
+    <text x="0" y="0" fill="#f59e0b" font-size="13" font-weight="bold">Production (2026-03-31)</text>
+    <rect x="0" y="12" width="480" height="105" rx="5" fill="#1e293b" fill-opacity="0.5" stroke="#4b5563" stroke-width="0.5"/>
+    <text x="12" y="32" fill="#22c55e" font-size="10">S-grade (8/14): p50 = 9.0ms  |  Timeline: 15s→653ms (23x)</text>
+    <text x="12" y="48" fill="#22c55e" font-size="10">DiscoverFeed: 10.5s→704ms (15x)  |  AuthorFeed: 1560→512ms</text>
+    <text x="12" y="68" fill="#94a3b8" font-size="10">Warm (in-process CSR): 3.8M QPS — now ephemeral per query</text>
+    <text x="12" y="84" fill="#94a3b8" font-size="10">Cold start: ~50ms (db.open_table)</text>
+    <text x="12" y="104" fill="#6b7280" font-size="9">Production: ~100 RPS actual. LanceDB scan (~1ms) sufficient.</text>
+
+    <rect x="500" y="12" width="480" height="105" rx="5" fill="#1e293b" fill-opacity="0.5" stroke="#4b5563" stroke-width="0.5"/>
+    <text x="512" y="32" fill="#ef4444" font-size="11" font-weight="bold">Total Deleted (~6,400 lines)</text>
+    <text x="512" y="50" fill="#6b7280" font-size="10">yata-s3 crate (1,620) | compaction.rs (831) | cache.rs (188)</text>
+    <text x="512" y="65" fill="#6b7280" font-size="10">store/manifest/catalog/writer/vector/compat (1,850)</text>
+    <text x="512" y="80" fill="#6b7280" font-size="10">WAL ring + flush + apply + tail (480) | L0 CSR (1,038)</text>
+    <text x="512" y="95" fill="#6b7280" font-size="10">7 deps removed. 1 crate deleted. 12 files deleted.</text>
+    <text x="512" y="110" fill="#22c55e" font-size="10">Replaced by: lancedb = "0.27" (1 dep)</text>
   </g>
 
-  <!-- ==================== PERF ==================== -->
-  <g transform="translate(60, 370)">
-    <text x="0" y="0" fill="#f59e0b" font-size="14" font-weight="bold">Production (lancedb 0.27, 2026-03-31)</text>
+  <!-- Crates -->
+  <g transform="translate(50, 440)">
+    <text x="0" y="0" fill="#06b6d4" font-size="13" font-weight="bold">Crates (5,129 lines total)</text>
+    <rect x="0" y="14" width="200" height="35" rx="4" fill="url(#lc)" stroke="#8b5cf6" stroke-width="0.5"/>
+    <text x="10" y="34" fill="#c4b5fd" font-size="11" font-weight="bold">yata-lance</text><text x="105" y="34" fill="#94a3b8" font-size="9">1,074</text>
+    <text x="10" y="44" fill="#6b7280" font-size="8">lancedb 0.27 | YataDb + YataTable</text>
 
-    <rect x="0" y="15" width="520" height="150" rx="6" fill="#1e293b" fill-opacity="0.5" stroke="#4b5563" stroke-width="0.5"/>
-    <text x="15" y="38" fill="#22c55e" font-size="11">S-grade (8 endpoints):  p50 = 9.0-9.5ms, ~104 RPS</text>
-    <text x="15" y="58" fill="#22c55e" font-size="11">GetTimeline:    15s → 653ms (23x) — WAL replay 除去効果</text>
-    <text x="15" y="78" fill="#22c55e" font-size="11">GetDiscoverFeed: 10.5s → 704ms (15x)</text>
-    <text x="15" y="98" fill="#e2e8f0" font-size="11">GetAuthorFeed:  1560ms → 512ms (3x)</text>
-    <text x="15" y="118" fill="#e2e8f0" font-size="11">ListRecords:    879ms → 478ms (1.8x)</text>
-    <text x="15" y="143" fill="#94a3b8" font-size="10">Warm CSR: 3.3-3.8M QPS (unchanged)</text>
-    <text x="15" y="158" fill="#94a3b8" font-size="10">Cold start: ~50ms (LanceDB open_table)</text>
+    <rect x="210" y="14" width="200" height="35" rx="4" fill="#1e293b" stroke="#ef4444" stroke-width="0.5"/>
+    <text x="220" y="34" fill="#fca5a5" font-size="11" font-weight="bold">yata-engine</text><text x="330" y="34" fill="#94a3b8" font-size="9">1,712</text>
+    <text x="220" y="44" fill="#6b7280" font-size="8">no CSR | no WAL | no cache</text>
 
-    <rect x="540" y="15" width="520" height="150" rx="6" fill="#1e293b" fill-opacity="0.5" stroke="#4b5563" stroke-width="0.5"/>
-    <text x="555" y="38" fill="#ef4444" font-size="11" font-weight="bold">Deleted (~5,400 lines)</text>
-    <text x="555" y="58" fill="#6b7280" font-size="10">yata-s3 crate (1,620) — LanceDB S3 内蔵</text>
-    <text x="555" y="73" fill="#6b7280" font-size="10">compaction.rs (831) — table.compact()</text>
-    <text x="555" y="88" fill="#6b7280" font-size="10">cache.rs (188) — CF edge cache</text>
-    <text x="555" y="103" fill="#6b7280" font-size="10">WAL ring + flush + apply + tail (480)</text>
-    <text x="555" y="118" fill="#6b7280" font-size="10">store/manifest/catalog/writer/vector/compat (1,850)</text>
-    <text x="555" y="133" fill="#6b7280" font-size="10">7 deps (lance-*, object_store, blake3)</text>
-    <text x="555" y="158" fill="#22c55e" font-size="10">Replaced by: lancedb = "0.27" (1 dep)</text>
+    <rect x="420" y="14" width="200" height="35" rx="4" fill="url(#bl)" stroke="#3b82f6" stroke-width="0.5"/>
+    <text x="430" y="34" fill="#93c5fd" font-size="11" font-weight="bold">yata-cypher</text><text x="540" y="34" fill="#94a3b8" font-size="9">10,475</text>
+    <text x="430" y="44" fill="#6b7280" font-size="8">Cypher parser + CSR exec</text>
+
+    <rect x="630" y="14" width="170" height="35" rx="4" fill="url(#bl)" stroke="#3b82f6" stroke-width="0.5"/>
+    <text x="640" y="34" fill="#93c5fd" font-size="11" font-weight="bold">yata-gie</text><text x="720" y="34" fill="#94a3b8" font-size="9">6,316</text>
+    <text x="640" y="44" fill="#6b7280" font-size="8">GIE + SecurityFilter</text>
+
+    <rect x="810" y="14" width="170" height="35" rx="4" fill="#1e293b" stroke="#4b5563" stroke-width="0.5"/>
+    <text x="820" y="34" fill="#94a3b8" font-size="11">yata-server</text>
+    <text x="820" y="44" fill="#6b7280" font-size="8">XRPC + JWT</text>
   </g>
 
-  <!-- ==================== CRATE MAP ==================== -->
-  <g transform="translate(60, 560)">
-    <text x="0" y="0" fill="#06b6d4" font-size="14" font-weight="bold">Crate Map</text>
-
-    <rect x="0" y="18" width="170" height="35" rx="5" fill="url(#lanceGrad)" stroke="#8b5cf6" stroke-width="0.5"/>
-    <text x="10" y="40" fill="#c4b5fd" font-size="12" font-weight="bold">yata-lance</text>
-    <text x="10" y="48" fill="#94a3b8" font-size="8">1,074 lines | lancedb 0.27</text>
-
-    <rect x="190" y="18" width="170" height="35" rx="5" fill="url(#csrGrad)" stroke="#22c55e" stroke-width="0.5"/>
-    <text x="200" y="40" fill="#86efac" font-size="12" font-weight="bold">yata-engine</text>
-    <text x="200" y="48" fill="#94a3b8" font-size="8">4,055 lines | no WAL/cache</text>
-
-    <rect x="380" y="18" width="170" height="35" rx="5" fill="url(#coldGrad)" stroke="#3b82f6" stroke-width="0.5"/>
-    <text x="390" y="40" fill="#93c5fd" font-size="12" font-weight="bold">yata-cypher</text>
-    <text x="390" y="48" fill="#94a3b8" font-size="8">10,475 lines | CSR + parser</text>
-
-    <rect x="570" y="18" width="170" height="35" rx="5" fill="url(#coldGrad)" stroke="#3b82f6" stroke-width="0.5"/>
-    <text x="580" y="40" fill="#93c5fd" font-size="12" font-weight="bold">yata-gie</text>
-    <text x="580" y="48" fill="#94a3b8" font-size="8">6,316 lines | GIE + Security</text>
-
-    <rect x="760" y="18" width="170" height="35" rx="5" fill="#1e293b" stroke="#4b5563" stroke-width="0.5"/>
-    <text x="770" y="40" fill="#94a3b8" font-size="12">yata-server</text>
-    <text x="770" y="48" fill="#6b7280" font-size="8">XRPC API + JWT</text>
+  <!-- Architecture summary -->
+  <g transform="translate(50, 510)">
+    <rect x="0" y="0" width="980" height="85" rx="5" fill="url(#lc)" stroke="#8b5cf6" stroke-width="0.5"/>
+    <text x="15" y="20" fill="#e2e8f0" font-size="10">Write:   merge_record() → WalEntry batch → table.add(batch) [LanceDB] → R2 fragments</text>
+    <text x="15" y="36" fill="#e2e8f0" font-size="10">Read:    Cypher → build_read_store(labels) → table.scan_filter() → ephemeral LanceReadStore → GIE execute</text>
+    <text x="15" y="52" fill="#e2e8f0" font-size="10">Cold:    ensure_lance() → db.open_table("vertices") [LanceDB handles R2 connection]</text>
+    <text x="15" y="68" fill="#e2e8f0" font-size="10">Vector:  table.search().nearest_to() [LanceDB ANN]  |  Compact: table.compact() [LanceDB fragment merge]</text>
+    <text x="15" y="80" fill="#6b7280" font-size="8">Durability: Pipeline WAL (R2 JSON) = source of truth. LanceDB = projection for query.</text>
   </g>
 
-  <!-- Footer -->
-  <text x="600" y="660" text-anchor="middle" fill="#4b5563" font-size="10">yata | lancedb 0.27 | 2026-03-31 | Write: L0 CSR + compact | Read: LanceDB scan + CSR query</text>
+  <text x="550" y="808" text-anchor="middle" fill="#4b5563" font-size="9">yata | lancedb 0.27 | no persistent CSR | no WAL | engine.rs 1,712 lines | 2026-03-31</text>
 </svg>
