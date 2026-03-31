@@ -85,7 +85,14 @@ pub fn decode_lance_fragment(file_bytes: &[u8]) -> Result<String, JsValue> {
             return Err(JsValue::from_str("no schema in file descriptor"));
         }
     } else {
-        return Err(JsValue::from_str("no global buffers (schema missing)"));
+        // Fallback: default vertex schema (for fragments written before global buffer was added)
+        Arc::new(Schema::new(vec![
+            Field::new("label", DataType::Utf8, false),
+            Field::new("pk_value", DataType::Utf8, false),
+            Field::new("repo", DataType::Utf8, true),
+            Field::new("rkey", DataType::Utf8, true),
+            Field::new("props_json", DataType::Utf8, true),
+        ]))
     };
 
     let lance_schema = Arc::new(

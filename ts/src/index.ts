@@ -168,9 +168,25 @@ export type {
   LabelData,
 } from "./r2-reader.js";
 
-// Workers read path (unified router)
+// Workers read+write path (unified router)
 export { WorkersReader, createWorkersReader } from "./workers-read.js";
 export type { WorkersReadConfig, WorkersReadStats } from "./workers-read.js";
+
+// Workers direct R2 write
+export {
+  buildArrowSegment,
+  createR2WalWriter,
+  loadPendingWal,
+  loadWalIndex,
+  appendWalIndex,
+  mergeLabelData,
+} from "./workers-write.js";
+export type {
+  WorkersWriteEntry,
+  R2WalWriter,
+  WalIndex,
+  WalIndexEntry,
+} from "./workers-write.js";
 
 // Helpers
 export {

@@ -18,6 +18,12 @@ import {
   type LabelData,
 } from "./r2-reader.js";
 import type { CypherResult, YataRPC } from "./types.js";
+import {
+  type R2WalWriter,
+  type WorkersWriteEntry,
+  loadPendingWal,
+  mergeLabelData,
+} from "./workers-write.js";
 
 // ── Workers Read Router ──
 
@@ -25,11 +31,18 @@ export interface WorkersReadConfig {
   store: FragmentStore;
   container: YataRPC;
   partitionId?: number;
+  /** Optional R2 WAL writer for direct write support. */
+  walWriter?: R2WalWriter;
+  /** Optional R2 bucket for loading pending WAL segments. */
+  walBucket?: import("./manifest.js").R2BucketLike;
+  /** R2 prefix (default: "yata/"). */
+  prefix?: string;
 }
 
 export interface WorkersReadStats {
   workersHit: number;
   containerFallback: number;
+  pendingWalMerged: number;
 }
 
 /**
@@ -43,15 +56,22 @@ export class WorkersReader {
   private store: FragmentStore;
   private container: YataRPC;
   private pid: number;
+  private walWriter: R2WalWriter | null;
+  private walBucket: import("./manifest.js").R2BucketLike | null;
+  private prefix: string;
   private manifest: CompactionManifest | null = null;
   private labelCache: Map<string, LabelData> = new Map();
   private edgeCache: Map<string, LabelData> = new Map();
-  readonly stats: WorkersReadStats = { workersHit: 0, containerFallback: 0 };
+  private pendingWalCache: Map<string, LabelData> | null = null;
+  readonly stats: WorkersReadStats = { workersHit: 0, containerFallback: 0, pendingWalMerged: 0 };
 
   constructor(config: WorkersReadConfig) {
     this.store = config.store;
     this.container = config.container;
     this.pid = config.partitionId ?? 0;
+    this.walWriter = config.walWriter ?? null;
+    this.walBucket = config.walBucket ?? null;
+    this.prefix = config.prefix ?? "yata/";
   }
 
   /**
@@ -103,6 +123,31 @@ export class WorkersReader {
     return this.container.mutate(statement, appId, parameters);
   }
 
+  // ── Write API (R2 direct) ──
+
+  /**
+   * Write a record directly to R2 as a pending WAL segment.
+   * The record is immediately queryable via this WorkersReader
+   * (pending WAL is merged during read).
+   */
+  async writeRecord(entry: WorkersWriteEntry): Promise<string> {
+    if (!this.walWriter) throw new Error("walWriter not configured");
+    const key = await this.walWriter.writeSegment([entry]);
+    // Invalidate pending WAL cache so next read picks up the write
+    this.pendingWalCache = null;
+    return key;
+  }
+
+  /**
+   * Write multiple records as a single R2 segment (batch).
+   */
+  async writeRecords(entries: WorkersWriteEntry[]): Promise<string> {
+    if (!this.walWriter) throw new Error("walWriter not configured");
+    const key = await this.walWriter.writeSegment(entries);
+    this.pendingWalCache = null;
+    return key;
+  }
+
   /**
    * Refresh manifest from R2 (call on cache miss or periodically).
    */
@@ -117,9 +162,22 @@ export class WorkersReader {
   invalidateLabels(): void {
     this.labelCache.clear();
     this.edgeCache.clear();
+    this.pendingWalCache = null;
   }
 
   // ── Internal ──
+
+  /** Load pending WAL segments from R2 (cached per request lifecycle). */
+  private async ensurePendingWal(): Promise<Map<string, LabelData>> {
+    if (this.pendingWalCache) return this.pendingWalCache;
+    if (!this.walBucket) {
+      this.pendingWalCache = new Map();
+      return this.pendingWalCache;
+    }
+    this.pendingWalCache = await loadPendingWal(this.walBucket, this.prefix);
+    if (this.pendingWalCache.size > 0) this.stats.pendingWalMerged++;
+    return this.pendingWalCache;
+  }
 
   private async execLocal(
     ast: CypherAST,
@@ -136,11 +194,28 @@ export class WorkersReader {
     const neededVertex = extractVertexLabels(ast);
     const neededEdge = extractEdgeLabels(ast);
 
-    // Load missing vertex labels
+    // Load pending WAL segments (R2 direct writes)
+    const pendingWal = await this.ensurePendingWal();
+
+    // Load missing vertex labels + merge with pending WAL
     const missingVertex = neededVertex.filter(l => !this.labelCache.has(l));
     if (missingVertex.length > 0) {
       const loaded = await loadLabels(this.store, this.manifest, missingVertex);
-      for (const [k, v] of loaded) this.labelCache.set(k, v);
+      for (const label of missingVertex) {
+        const compacted = loaded.get(label);
+        const pending = pendingWal.get(label);
+        const merged = mergeLabelData(compacted, pending);
+        if (merged) this.labelCache.set(label, merged);
+      }
+    } else {
+      // Even if compacted labels are cached, merge any new pending WAL
+      for (const label of neededVertex) {
+        const pending = pendingWal.get(label);
+        if (pending && this.labelCache.has(label)) {
+          const merged = mergeLabelData(this.labelCache.get(label), pending);
+          if (merged) this.labelCache.set(label, merged);
+        }
+      }
     }
 
     // Load missing edge labels

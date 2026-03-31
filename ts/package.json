@@ -20,7 +20,8 @@
     "./cypher-parse": "./src/cypher-parse.ts",
     "./cypher-exec": "./src/cypher-exec.ts",
     "./r2-reader": "./src/r2-reader.ts",
-    "./workers-read": "./src/workers-read.ts"
+    "./workers-read": "./src/workers-read.ts",
+    "./workers-write": "./src/workers-write.ts"
   },
   "files": [
     "src"

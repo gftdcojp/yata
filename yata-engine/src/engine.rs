@@ -683,8 +683,6 @@ impl TieredGraphEngine {
         }
     }
 
-    pub fn wal_head_seq(&self) -> u64 { 0 }
-
     /// LanceDB compaction.
     pub fn trigger_compaction(&self) -> Result<CompactionResult, String> {
         self.ensure_lance();
