@@ -268,7 +268,7 @@ pub fn create_manifest(
             name: name.clone(),
             id,
             parent_id: -1,
-            logical_type: "utf8".to_string(),
+            logical_type: "string".to_string(),
             ..Default::default()
         })
         .collect();

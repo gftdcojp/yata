@@ -133,9 +133,6 @@ pub fn router<G: GraphQueryExecutor>(state: YataRestState<G>) -> Router {
         // WAL Projection API
         .route("/xrpc/ai.gftd.yata.walTail", post(wal_tail_handler::<G>))
         .route("/xrpc/ai.gftd.yata.walApply", post(wal_apply_handler::<G>))
-        // Phase 5: Arrow IPC binary transport (zero JSON overhead)
-        .route("/xrpc/ai.gftd.yata.walTailArrow", post(wal_tail_arrow_handler::<G>))
-        .route("/xrpc/ai.gftd.yata.walApplyArrow", post(wal_apply_arrow_handler::<G>))
         .route("/xrpc/ai.gftd.yata.walFlushSegment", post(wal_flush_segment_handler::<G>))
         .route("/xrpc/ai.gftd.yata.walColdStart", post(wal_cold_start_handler::<G>))
         .route("/xrpc/ai.gftd.yata.compact", post(compact_handler::<G>))
@@ -466,77 +463,6 @@ async fn wal_apply_handler<G: GraphQueryExecutor>(
     }
 }
 
-// ── Phase 5: Arrow IPC binary WAL transport (zero JSON overhead) ──
-
-/// POST /xrpc/ai.gftd.yata.walTailArrow — Read WAL tail as Arrow IPC bytes.
-///
-/// Request: JSON `{"after_seq": N, "limit": N}`
-/// Response: `application/vnd.apache.arrow.ipc` body (Arrow IPC File format).
-/// Header `X-Wal-Head-Seq` contains the current WAL head sequence.
-///
-/// Zero-copy path: WAL entries → Arrow IPC serialize → HTTP body.
-/// No JSON encode for entry props. Read replica deserializes Arrow directly.
-async fn wal_tail_arrow_handler<G: GraphQueryExecutor>(
-    State(state): State<YataRestState<G>>,
-    Json(req): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let after_seq = req.get("after_seq").and_then(|v| v.as_u64()).unwrap_or(0);
-    let limit = req.get("limit").and_then(|v| v.as_u64()).unwrap_or(1000) as usize;
-    let graph = state.graph.clone();
-    let result = tokio::task::spawn_blocking(move || graph.wal_tail(after_seq, limit)).await;
-    match result {
-        Ok(Ok(entries)) => {
-            let head_seq = state.graph.wal_head_seq();
-            match yata_engine::arrow_wal::serialize_segment_arrow(&entries) {
-                Ok(arrow_bytes) => {
-                    axum::response::Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "application/vnd.apache.arrow.ipc")
-                        .header("x-wal-head-seq", head_seq.to_string())
-                        .header("x-wal-count", entries.len().to_string())
-                        .body(axum::body::Body::from(arrow_bytes.to_vec()))
-                        .unwrap()
-                }
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("Arrow serialize failed: {e}")})),
-                ).into_response(),
-            }
-        }
-        Ok(Err(e)) => (StatusCode::CONFLICT, Json(serde_json::json!({"error": e}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
-    }
-}
-
-/// POST /xrpc/ai.gftd.yata.walApplyArrow — Apply WAL entries from Arrow IPC body.
-///
-/// Request: `application/vnd.apache.arrow.ipc` body (Arrow IPC File format).
-/// Response: JSON `{"applied": N}`
-///
-/// Zero-copy path: HTTP body → Arrow IPC deserialize → typed WalEntry → wal_apply.
-/// No JSON parse for entry props.
-async fn wal_apply_arrow_handler<G: GraphQueryExecutor>(
-    State(state): State<YataRestState<G>>,
-    body: axum::body::Bytes,
-) -> impl IntoResponse {
-    if body.is_empty() {
-        return (StatusCode::OK, Json(serde_json::json!({"applied": 0})));
-    }
-    let entries = match yata_engine::arrow_wal::deserialize_segment_arrow(&body) {
-        Ok(e) => e,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Arrow deserialize failed: {e}")}))),
-    };
-    if entries.is_empty() {
-        return (StatusCode::OK, Json(serde_json::json!({"applied": 0})));
-    }
-    let graph = state.graph.clone();
-    let result = tokio::task::spawn_blocking(move || graph.wal_apply(&entries)).await;
-    match result {
-        Ok(Ok(applied)) => (StatusCode::OK, Json(serde_json::json!({"applied": applied}))),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
-    }
-}
 
 /// POST /xrpc/ai.gftd.yata.walFlushSegment — Flush WAL to R2 segment.
 /// Write Container only.

@@ -28,6 +28,7 @@ Cold:  ensure_lance() → db.open_table("vertices") [LanceDB handles R2]
 - **LanceDB 以外の persistence path 新規追加禁止**
 - **persistent CSR 再導入禁止** — ephemeral `build_read_store()` per query
 - **WAL ring buffer 再導入禁止** — `merge_record()` → `table.add()` 直接
+- **Arrow IPC transport 再導入禁止** — `walTailArrow`/`walApplyArrow` 除去済み。`arrow-ipc` dep 除去済み
 - **in-memory query cache 再導入禁止** — Cloudflare edge cache に委譲
 - **`RUSTC_WRAPPER=sccache` 禁止** — `cargo zigbuild` + `avx512_stub.rs`
 

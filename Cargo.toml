@@ -45,10 +45,9 @@ yata-lance = { path = "yata-lance" }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 # Arrow (aligned with lance 3.0.1)
-arrow = { version = "57", features = ["ipc"] }
+arrow = "57"
 arrow-array = "57"
 arrow-schema = "57"
-arrow-ipc = "57"
 arrow-cast = "57"
 
 # Async runtime
