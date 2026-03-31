@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use yata_cypher::Graph;
 use yata_grin::{Predicate, PropValue, Property, Scannable};
 
 use crate::config::TieredEngineConfig;
+use crate::memory_bridge;
 use crate::router;
 
 /// Compaction result (LanceDB-native).
@@ -394,8 +394,13 @@ impl TieredGraphEngine {
                     let rows = yata_gie::executor::result_to_rows(&records, &plan);
                     return Ok(rows);
                 }
-                // GIE transpile failed (CONTAINS, UNION, UNWIND, etc.) → fall through to MemoryGraph
+                // GIE transpile failed (CONTAINS, UNION, UNWIND, etc.) → MemoryGraph read-only executor
             }
+            // MemoryGraph fallback for unsupported read-only patterns
+            let store = self.build_read_store(&vl_refs)?;
+            let mut g = memory_bridge::memory_graph_from_store(&store);
+            return memory_bridge::execute_query(&mut g, cypher, params)
+                .map_err(|e| e.to_string());
         }
 
         // Direct Lance mutation: translate Cypher AST → merge_record/delete_record
@@ -419,10 +424,7 @@ impl TieredGraphEngine {
         let param_map: HashMap<String, String> = params.iter().cloned().collect();
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-        // Variable bindings: var_name → (label, node_id) for cross-clause references
         let mut var_bindings: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        // Deferred edges: (src_id, rel_type, dst_id, edge_props)
-        let mut deferred_edges: Vec<(String, String, String, Vec<(String, yata_grin::PropValue)>)> = Vec::new();
 
         for clause in &ast.clauses {
             match clause {
@@ -552,7 +554,7 @@ impl TieredGraphEngine {
         let vids = store.scan_vertices_by_label(label);
         let mut matched = Vec::new();
         for vid in vids {
-            // Check inline props (e.g., {tid: 'delete-me'})
+            // Check inline props (e.g., {tid: 'remove-me'})
             let mut all_match = true;
             for (k, expr) in &np.props {
                 let expected = match expr {
@@ -1057,7 +1059,6 @@ impl TieredGraphEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory_bridge;
     use yata_grin::{Property, Scannable, Topology};
 
     fn make_engine(dir: &tempfile::TempDir) -> TieredGraphEngine {
@@ -1928,14 +1929,14 @@ mod tests {
     fn test_persist_cypher_delete_removes_from_lance() {
         let dir = tempfile::tempdir().unwrap();
         let e = make_engine(&dir);
-        run_query(&e, "CREATE (n:Temp {tid: 'delete-me'})", &[], None).unwrap();
+        run_query(&e, "CREATE (n:Temp {tid: 'remove-me'})", &[], None).unwrap();
 
         // Verify created
         let rows1 = run_query(&e, "MATCH (n:Temp) RETURN n.tid AS tid LIMIT 10", &[], None).unwrap();
         assert_eq!(rows1.len(), 1);
 
         // Delete via Cypher
-        run_query(&e, "MATCH (n:Temp {tid: 'delete-me'}) DELETE n", &[], None).unwrap();
+        run_query(&e, "MATCH (n:Temp {tid: 'remove-me'}) DELETE n", &[], None).unwrap();
 
         // Verify deleted
         let rows2 = run_query(&e, "MATCH (n:Temp) RETURN n.tid AS tid LIMIT 10", &[], None).unwrap();
