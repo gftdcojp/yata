@@ -151,7 +151,6 @@ export type {
 //   @gftd/yata/cypher-exec
 //   @gftd/yata/r2-reader
 //   @gftd/yata/workers-read
-//   @gftd/yata/workers-write
 
 // Helpers
 export {
