@@ -180,9 +180,14 @@ pub fn decode_lance_fragment(file_bytes: &[u8]) -> Result<String, JsValue> {
     let plugins = Arc::new(DecoderPlugins::default());
     let cache = Arc::new(FileMetadataCache::with_capacity(1024 * 1024, CapacityMode::Bytes));
 
-    let batch = futures::executor::block_on(lance_decode(
-        &encoded, &filter, plugins, false, LanceFileVersion::V2_1, Some(cache),
-    )).map_err(|e| JsValue::from_str(&format!("decode: {e}")))?;
+    // Use futures LocalPool (no tokio runtime — avoids Instant::now panic in WASM)
+    let batch = {
+        let mut pool = futures::executor::LocalPool::new();
+        let spawner = pool.spawner();
+        pool.run_until(lance_decode(
+            &encoded, &filter, plugins, false, LanceFileVersion::V2_1, Some(cache),
+        ))
+    }.map_err(|e| JsValue::from_str(&format!("decode: {e}")))?;
 
     // 5. Convert RecordBatch → JSON rows
     let mut rows = Vec::new();

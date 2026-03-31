@@ -1495,6 +1495,7 @@ impl BatchDecodeStream {
             let next_task = next_task.transpose().map(|next_task| {
                 let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
+                #[cfg(not(target_arch = "wasm32"))]
                 let task = tokio::spawn(
                     (async move {
                         let next_task = next_task?;
@@ -1502,10 +1503,18 @@ impl BatchDecodeStream {
                     })
                     .in_current_span(),
                 );
+                #[cfg(target_arch = "wasm32")]
+                let task = async move {
+                    let next_task = next_task?;
+                    next_task.into_batch(emitted_batch_size_warning)
+                }.boxed();
                 (task, num_rows)
             });
             next_task.map(|(task, num_rows)| {
+                #[cfg(not(target_arch = "wasm32"))]
                 let task = task.map(|join_wrapper| join_wrapper.unwrap()).boxed();
+                #[cfg(target_arch = "wasm32")]
+                let task = task;
                 // This should be true since batch size is u32
                 debug_assert!(num_rows <= u32::MAX as u64);
                 let next_task = ReadBatchTask {
@@ -1822,14 +1831,23 @@ impl StructuralBatchDecodeStream {
             let next_task = next_task.transpose().map(|next_task| {
                 let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
+                #[cfg(not(target_arch = "wasm32"))]
                 let task = tokio::spawn(async move {
                     let next_task = next_task?;
                     next_task.into_batch(emitted_batch_size_warning)
                 });
+                #[cfg(target_arch = "wasm32")]
+                let task = async move {
+                    let next_task = next_task?;
+                    next_task.into_batch(emitted_batch_size_warning)
+                }.boxed();
                 (task, num_rows)
             });
             next_task.map(|(task, num_rows)| {
+                #[cfg(not(target_arch = "wasm32"))]
                 let task = task.map(|join_wrapper| join_wrapper.unwrap()).boxed();
+                #[cfg(target_arch = "wasm32")]
+                let task = task;
                 // This should be true since batch size is u32
                 debug_assert!(num_rows <= u32::MAX as u64);
                 let next_task = ReadBatchTask {
@@ -1970,6 +1988,7 @@ fn create_scheduler_decoder(
         rx,
     );
 
+    #[cfg(not(target_arch = "wasm32"))]
     let scheduler_handle = tokio::task::spawn(async move {
         let mut decode_scheduler = match DecodeBatchScheduler::try_new(
             target_schema.as_ref(),
@@ -2001,7 +2020,30 @@ fn create_scheduler_decoder(
         }
     });
 
-    Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
+    #[cfg(target_arch = "wasm32")]
+    {
+        use futures::executor::block_on;
+        let mut decode_scheduler = block_on(DecodeBatchScheduler::try_new(
+            target_schema.as_ref(),
+            &column_indices,
+            &column_infos,
+            &vec![],
+            num_rows,
+            config.decoder_plugins,
+            config.io.clone(),
+            config.cache,
+            &filter,
+        )).map_err(|e| { let _ = tx.send(Err(lance_core::Error::io(e.to_string(), snafu::location!()))); e })?;
+        match requested_rows {
+            RequestedRows::Ranges(ranges) => decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io),
+            RequestedRows::Indices(indices) => decode_scheduler.schedule_take(&indices, &filter, tx, config.io),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    return Ok(check_scheduler_on_drop(decode_stream, scheduler_handle));
+    #[cfg(target_arch = "wasm32")]
+    return Ok(decode_stream);
 }
 
 /// Launches a scheduler on a dedicated (spawned) task and creates a decoder to
