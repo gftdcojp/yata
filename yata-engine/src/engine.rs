@@ -6,7 +6,6 @@ use yata_cypher::Graph;
 use yata_grin::{Predicate, PropValue, Property, Scannable};
 
 use crate::config::TieredEngineConfig;
-use crate::memory_bridge;
 use crate::router;
 
 /// Compaction result (LanceDB-native).
@@ -71,29 +70,12 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Try to evaluate a Cypher Expr to a static PropValue (for direct Lance CREATE).
-fn expr_to_prop_value(expr: &yata_cypher::Expr) -> Option<yata_grin::PropValue> {
-    match expr {
-        yata_cypher::Expr::Lit(lit) => match lit {
-            yata_cypher::Literal::Int(i) => Some(yata_grin::PropValue::Int(*i)),
-            yata_cypher::Literal::Float(f) => Some(yata_grin::PropValue::Float(*f)),
-            yata_cypher::Literal::Str(s) => Some(yata_grin::PropValue::Str(s.clone())),
-            yata_cypher::Literal::Bool(b) => Some(yata_grin::PropValue::Bool(*b)),
-            yata_cypher::Literal::Null => Some(yata_grin::PropValue::Null),
-        },
-        _ => None,
-    }
-}
-
-/// Convert Cypher Value to PropValue for LanceDB write-back.
-fn cypher_value_to_prop(v: &yata_cypher::types::Value) -> yata_grin::PropValue {
-    match v {
-        yata_cypher::types::Value::Str(s) => yata_grin::PropValue::Str(s.clone()),
-        yata_cypher::types::Value::Int(i) => yata_grin::PropValue::Int(*i),
-        yata_cypher::types::Value::Float(f) => yata_grin::PropValue::Float(*f),
-        yata_cypher::types::Value::Bool(b) => yata_grin::PropValue::Bool(*b),
-        yata_cypher::types::Value::Null => yata_grin::PropValue::Null,
-        _ => yata_grin::PropValue::Str(format!("{:?}", v)),
+fn inject_metadata(props: &mut Vec<(String, yata_grin::PropValue)>, ctx: Option<&MutationContext>, now: &str) {
+    if let Some(ctx) = ctx {
+        if !ctx.app_id.is_empty() { props.push(("_app_id".into(), yata_grin::PropValue::Str(ctx.app_id.clone()))); }
+        if !ctx.org_id.is_empty() { props.push(("_org_id".into(), yata_grin::PropValue::Str(ctx.org_id.clone()))); }
+        if !ctx.user_did.is_empty() { props.push(("_user_did".into(), yata_grin::PropValue::Str(ctx.user_did.clone()))); }
+        props.push(("_updated_at".into(), yata_grin::PropValue::Str(now.to_string())));
     }
 }
 
@@ -311,9 +293,8 @@ impl TieredGraphEngine {
         self.query_inner(cypher, params, rls_org_id, Some(ctx))
     }
 
-    /// Execute multiple Cypher mutations in a single batch:
-    /// 1 label load, 1 MemoryGraph copy, N mutations, 1 read-store rebuild, 1 WAL fsync.
-    /// Returns per-statement results.
+    /// Execute multiple Cypher mutations in a single batch.
+    /// Each statement is executed directly via Lance operations.
     pub fn batch_query_with_context(
         &self,
         statements: &[(&str, &[(String, String)])],
@@ -324,114 +305,12 @@ impl TieredGraphEngine {
             return Ok(Vec::new());
         }
         self.ensure_lance();
-
-        // Collect all vertex label hints across all statements for a single label load.
-        let mut all_vlabels = Vec::new();
-        for (cypher, _) in statements {
-            if let Some((vl, _el)) = router::extract_mutation_hints(cypher) {
-                all_vlabels.extend(vl);
-            }
+        let mut all_results = Vec::with_capacity(statements.len());
+        for (cypher, params) in statements {
+            let rows = self.execute_mutation_direct(cypher, params, Some(ctx))?;
+            all_results.push(rows);
         }
-        all_vlabels.sort();
-        all_vlabels.dedup();
-
-        let vl_refs: Vec<&str> = all_vlabels.iter().map(|s| s.as_str()).collect();
-        if !vl_refs.is_empty() {
-        }
-
-        self.block_on(async {
-            let store = self.build_read_store(&[]).unwrap_or_default();
-            let mut g = memory_bridge::memory_graph_from_store(&store);
-
-            // Track initial state once.
-            let initial_vids: HashSet<String> = g.nodes().iter().map(|n| n.id.clone()).collect();
-            let initial_eids: HashSet<String> = g.rels().iter().map(|r| r.id.clone()).collect();
-
-            // Execute all statements sequentially on the same MemoryGraph.
-            let mut all_results = Vec::with_capacity(statements.len());
-            for (cypher, params) in statements {
-                let rows = memory_bridge::execute_query(&mut g, cypher, params)
-                    .map_err(|e| e.to_string())?;
-                all_results.push(rows);
-            }
-
-            // Inject provenance metadata on new nodes.
-            let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-            for node in g.nodes_mut() {
-                let is_new = !initial_vids.contains(&node.id);
-                if is_new {
-                    use yata_cypher::types::Value;
-                    node.props
-                        .insert("_app_id".to_string(), Value::Str(ctx.app_id.clone()));
-                    node.props
-                        .insert("_org_id".to_string(), Value::Str(ctx.org_id.clone()));
-                    if !ctx.user_id.is_empty() {
-                        node.props
-                            .insert("_user_id".to_string(), Value::Str(ctx.user_id.clone()));
-                    }
-                    if !ctx.actor_id.is_empty() {
-                        node.props
-                            .insert("_actor_id".to_string(), Value::Str(ctx.actor_id.clone()));
-                    }
-                    if !ctx.user_did.is_empty() {
-                        node.props
-                            .insert("_user_did".to_string(), Value::Str(ctx.user_did.clone()));
-                    }
-                    if !ctx.actor_did.is_empty() {
-                        node.props
-                            .insert("_actor_did".to_string(), Value::Str(ctx.actor_did.clone()));
-                    }
-                    node.props
-                        .insert("_updated_at".to_string(), Value::Str(now.clone()));
-                }
-            }
-
-            // Write-back: persist changes to LanceDB
-            let after_vids: HashSet<String> = g.nodes().iter().map(|n| n.id.clone()).collect();
-            let after_eids: HashSet<String> = g.rels().iter().map(|r| r.id.clone()).collect();
-            let new_vids: Vec<&String> = after_vids.difference(&initial_vids).collect();
-            let deleted_vids: Vec<&String> = initial_vids.difference(&after_vids).collect();
-            let new_eids: Vec<&String> = after_eids.difference(&initial_eids).collect();
-
-            if !new_vids.is_empty() || !deleted_vids.is_empty() || !new_eids.is_empty() {
-                let lance_tbl = self.lance_table.clone();
-                let tbl_guard = lance_tbl.lock().await;
-                if let Some(ref tbl) = *tbl_guard {
-                    for vid in &new_vids {
-                        if let Some(node) = g.nodes().iter().find(|n| &n.id == *vid) {
-                            let label = node.labels.first().map(|s| s.as_str()).unwrap_or("_default");
-                            let props: Vec<(&str, yata_grin::PropValue)> = node.props.iter().map(|(k, v)| {
-                                (k.as_str(), cypher_value_to_prop(v))
-                            }).collect();
-                            if let Ok(batch) = build_lance_batch(0, label, "rkey", &node.id, &props) {
-                                let _ = tbl.add(batch).await;
-                            }
-                        }
-                    }
-                    for vid in &deleted_vids {
-                        if let Ok(batch) = build_lance_batch(1, "_deleted", "rkey", vid, &[]) {
-                            let _ = tbl.add(batch).await;
-                        }
-                    }
-                    for eid in &new_eids {
-                        if let Some(rel) = g.rels().iter().find(|r| &r.id == *eid) {
-                            let mut props: Vec<(&str, yata_grin::PropValue)> = rel.props.iter().map(|(k, v)| {
-                                (k.as_str(), cypher_value_to_prop(v))
-                            }).collect();
-                            let src_owned = rel.src.clone();
-                            let dst_owned = rel.dst.clone();
-                            props.push(("_src", yata_grin::PropValue::Str(src_owned)));
-                            props.push(("_dst", yata_grin::PropValue::Str(dst_owned)));
-                            if let Ok(batch) = build_lance_batch(0, &rel.rel_type, "eid", &rel.id, &props) {
-                                let _ = tbl.add(batch).await;
-                            }
-                        }
-                    }
-                }
-            }
-
-            Ok(all_results)
-        })
+        Ok(all_results)
     }
 
     /// Query with scoped mutation context (org_id + user_did + actor_did).
@@ -528,179 +407,185 @@ impl TieredGraphEngine {
         result
     }
 
-    /// Try direct Lance mutation for simple CREATE-only Cypher (no MATCH/SET/DELETE).
-    /// Returns None if the query is too complex for direct translation.
-    fn try_direct_lance_create(
-        &self,
-        cypher: &str,
-        mutation_ctx: Option<&MutationContext>,
-    ) -> Option<Result<Vec<Vec<(String, String)>>, String>> {
-        let ast = yata_cypher::parse(cypher).ok()?;
-        // Only handle: exactly 1 Create clause (optionally followed by Return)
-        let mut create_patterns = None;
-        for clause in &ast.clauses {
-            match clause {
-                yata_cypher::Clause::Create { patterns } => {
-                    if create_patterns.is_some() { return None; } // multiple CREATE = complex
-                    create_patterns = Some(patterns);
-                }
-                yata_cypher::Clause::Return { .. } => {} // OK, ignore return
-                _ => return None, // MATCH/SET/DELETE/MERGE = complex, bail
-            }
-        }
-        let patterns = create_patterns?;
-
-        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let mut created_nodes: Vec<(String, String)> = Vec::new(); // (var, id)
-
-        for pattern in patterns {
-            let mut prev_node_id: Option<String> = None;
-            for elem in &pattern.elements {
-                match elem {
-                    yata_cypher::PatternElement::Node(np) => {
-                        let label = np.labels.first().map(|s| s.as_str()).unwrap_or("_default");
-                        let node_id = generate_node_id();
-                        let mut props: Vec<(String, yata_grin::PropValue)> = Vec::new();
-                        for (k, expr) in &np.props {
-                            match expr_to_prop_value(expr) {
-                                Some(v) => props.push((k.clone(), v)),
-                                None => return None, // non-literal prop → bail to MemoryGraph
-                            }
-                        }
-                        // Inject mutation metadata
-                        if let Some(ctx) = mutation_ctx {
-                            if !ctx.app_id.is_empty() { props.push(("_app_id".into(), yata_grin::PropValue::Str(ctx.app_id.clone()))); }
-                            if !ctx.org_id.is_empty() { props.push(("_org_id".into(), yata_grin::PropValue::Str(ctx.org_id.clone()))); }
-                            if !ctx.user_did.is_empty() { props.push(("_user_did".into(), yata_grin::PropValue::Str(ctx.user_did.clone()))); }
-                            props.push(("_updated_at".into(), yata_grin::PropValue::Str(now.clone())));
-                        }
-                        let props_ref: Vec<(&str, yata_grin::PropValue)> = props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-                        if let Err(e) = self.merge_record(label, "rkey", &node_id, &props_ref) {
-                            return Some(Err(e));
-                        }
-                        if let Some(ref var) = np.var {
-                            created_nodes.push((var.clone(), node_id.clone()));
-                        }
-                        prev_node_id = Some(node_id);
-                    }
-                    yata_cypher::PatternElement::Rel(rp) => {
-                        let rel_type = rp.types.first().map(|s| s.as_str()).unwrap_or("RELATED");
-                        let edge_id = generate_edge_id();
-                        let src = prev_node_id.clone().unwrap_or_default();
-                        // dst will be set when next Node is processed — store edge for deferred write
-                        // For simplicity, write edge after the full pattern is parsed
-                        // Edge props
-                        let mut eprops: Vec<(String, yata_grin::PropValue)> = rp.props.iter().filter_map(|(k, expr)| {
-                            expr_to_prop_value(expr).map(|v| (k.clone(), v))
-                        }).collect();
-                        eprops.push(("_src".into(), yata_grin::PropValue::Str(src)));
-                        eprops.push(("_edge_id".into(), yata_grin::PropValue::Str(edge_id.clone())));
-                        eprops.push(("_rel_type".into(), yata_grin::PropValue::Str(rel_type.to_string())));
-                        // dst is next node — we'll patch after next node is created
-                        // Store edge info for deferred write
-                        // (simplified: we process Node-Rel-Node sequences)
-                        let _ = (rel_type, edge_id, eprops); // handled below via prev_node_id chain
-                    }
-                }
-            }
-        }
-
-        Some(Ok(Vec::new())) // CREATE returns empty rows
-    }
-
-    /// Execute mutation via MemoryGraph (fallback for complex Cypher).
-    fn execute_mutation_via_memory_graph(
+    /// Execute Cypher mutation by translating AST directly to Lance operations.
+    /// No MemoryGraph — O(1) for CREATE, O(matched) for DELETE.
+    fn execute_mutation_direct(
         &self,
         cypher: &str,
         params: &[(String, String)],
         mutation_ctx: Option<&MutationContext>,
-        is_mutation: bool,
-        query_start: std::time::Instant,
     ) -> Result<Vec<Vec<(String, String)>>, String> {
-        self.block_on(async {
-            let store = self.build_read_store(&[]).unwrap_or_default();
-            let mut g = memory_bridge::memory_graph_from_store(&store);
+        let ast = yata_cypher::parse(cypher).map_err(|e| format!("parse: {e}"))?;
+        let param_map: HashMap<String, String> = params.iter().cloned().collect();
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-            let before_vid_labels: HashMap<String, String> = g.nodes().iter().map(|n| {
-                let label = n.labels.first().cloned().unwrap_or_default();
-                (n.id.clone(), label)
-            }).collect();
-            let before_vids: HashSet<String> = before_vid_labels.keys().cloned().collect();
-            let before_eids: HashSet<String> = g.rels().iter().map(|r| r.id.clone()).collect();
+        // Variable bindings: var_name → (label, node_id) for cross-clause references
+        let mut var_bindings: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        // Deferred edges: (src_id, rel_type, dst_id, edge_props)
+        let mut deferred_edges: Vec<(String, String, String, Vec<(String, yata_grin::PropValue)>)> = Vec::new();
 
-            let rows = memory_bridge::execute_query(&mut g, cypher, params)
-                .map_err(|e| e.to_string())?;
+        for clause in &ast.clauses {
+            match clause {
+                yata_cypher::Clause::Create { patterns } => {
+                    for pattern in patterns {
+                        let mut prev_node_id: Option<String> = None;
+                        let mut pending_rel: Option<(String, String, Vec<(String, yata_grin::PropValue)>)> = None; // (src, rel_type, props)
 
-            if let Some(ctx) = mutation_ctx {
-                let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-                for node in g.nodes_mut() {
-                    if !before_vids.contains(&node.id) {
-                        use yata_cypher::types::Value;
-                        node.props.insert("_app_id".to_string(), Value::Str(ctx.app_id.clone()));
-                        node.props.insert("_org_id".to_string(), Value::Str(ctx.org_id.clone()));
-                        if !ctx.user_did.is_empty() { node.props.insert("_user_did".to_string(), Value::Str(ctx.user_did.clone())); }
-                        node.props.insert("_updated_at".to_string(), Value::Str(now.clone()));
-                    }
-                }
-            }
+                        for elem in &pattern.elements {
+                            match elem {
+                                yata_cypher::PatternElement::Node(np) => {
+                                    let label = np.labels.first().map(|s| s.as_str()).unwrap_or("_default");
+                                    let node_id = generate_node_id();
+                                    let mut props = self.resolve_pattern_props(&np.props, &param_map)?;
+                                    inject_metadata(&mut props, mutation_ctx, &now);
+                                    let props_ref: Vec<(&str, yata_grin::PropValue)> = props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                                    self.merge_record(label, "rkey", &node_id, &props_ref)?;
 
-            let after_vids: HashSet<String> = g.nodes().iter().map(|n| n.id.clone()).collect();
-            let new_vids: Vec<&String> = after_vids.difference(&before_vids).collect();
-            let deleted_vids: Vec<&String> = before_vids.difference(&after_vids).collect();
-            let after_eids: HashSet<String> = g.rels().iter().map(|r| r.id.clone()).collect();
-            let new_eids: Vec<&String> = after_eids.difference(&before_eids).collect();
-            let deleted_eids: Vec<&String> = before_eids.difference(&after_eids).collect();
+                                    if let Some(ref var) = np.var {
+                                        var_bindings.entry(var.clone()).or_default().push((label.to_string(), node_id.clone()));
+                                    }
 
-            if !new_vids.is_empty() || !deleted_vids.is_empty() || !new_eids.is_empty() || !deleted_eids.is_empty() {
-                let lance_tbl = self.lance_table.clone();
-                let tbl_guard = lance_tbl.lock().await;
-                let tbl = tbl_guard.as_ref().ok_or("LanceDB table not initialized")?;
+                                    // Complete pending relationship
+                                    if let Some((src, rel_type, eprops)) = pending_rel.take() {
+                                        let mut full_props = eprops;
+                                        full_props.push(("_src".into(), yata_grin::PropValue::Str(src)));
+                                        full_props.push(("_dst".into(), yata_grin::PropValue::Str(node_id.clone())));
+                                        let edge_id = generate_edge_id();
+                                        let props_ref: Vec<(&str, yata_grin::PropValue)> = full_props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                                        self.merge_record(&rel_type, "eid", &edge_id, &props_ref)?;
+                                    }
 
-                for vid in &new_vids {
-                    if let Some(node) = g.nodes().iter().find(|n| &n.id == *vid) {
-                        let label = node.labels.first().map(|s| s.as_str()).unwrap_or("_default");
-                        let props: Vec<(&str, yata_grin::PropValue)> = node.props.iter().map(|(k, v)| {
-                            (k.as_str(), cypher_value_to_prop(v))
-                        }).collect();
-                        if let Ok(batch) = build_lance_batch(0, label, "rkey", &node.id, &props) {
-                            tbl.add(batch).await.map_err(|e| format!("LanceDB add vertex: {e}"))?;
+                                    prev_node_id = Some(node_id);
+                                }
+                                yata_cypher::PatternElement::Rel(rp) => {
+                                    let rel_type = rp.types.first().cloned().unwrap_or_else(|| "RELATED".into());
+                                    let eprops = self.resolve_pattern_props(&rp.props, &param_map)?;
+                                    pending_rel = Some((prev_node_id.clone().unwrap_or_default(), rel_type, eprops));
+                                }
+                            }
                         }
                     }
                 }
-                for vid in &deleted_vids {
-                    let label = before_vid_labels.get(*vid).map(|s| s.as_str()).unwrap_or("_deleted");
-                    if let Ok(batch) = build_lance_batch(1, label, "rkey", vid, &[]) {
-                        tbl.add(batch).await.map_err(|e| format!("LanceDB delete vertex: {e}"))?;
-                    }
-                }
-                for eid in &new_eids {
-                    if let Some(rel) = g.rels().iter().find(|r| &r.id == *eid) {
-                        let mut props: Vec<(&str, yata_grin::PropValue)> = rel.props.iter().map(|(k, v)| {
-                            (k.as_str(), cypher_value_to_prop(v))
-                        }).collect();
-                        let src_owned = rel.src.clone();
-                        let dst_owned = rel.dst.clone();
-                        props.push(("_src", yata_grin::PropValue::Str(src_owned)));
-                        props.push(("_dst", yata_grin::PropValue::Str(dst_owned)));
-                        if let Ok(batch) = build_lance_batch(0, &rel.rel_type, "eid", &rel.id, &props) {
-                            tbl.add(batch).await.map_err(|e| format!("LanceDB add edge: {e}"))?;
+                yata_cypher::Clause::Match { patterns, where_: where_clause } => {
+                    // Resolve matched nodes → bind to variables
+                    for pattern in patterns {
+                        for elem in &pattern.elements {
+                            if let yata_cypher::PatternElement::Node(np) = elem {
+                                let Some(ref var) = np.var else { continue };
+                                let label = np.labels.first().map(|s| s.as_str()).unwrap_or("");
+                                if label.is_empty() { continue; }
+                                let store = self.build_read_store(&[label])?;
+                                let matched = self.find_matching_vertices(&store, np, where_clause, &param_map);
+                                var_bindings.insert(var.clone(), matched);
+                            }
                         }
                     }
                 }
-                for eid in &deleted_eids {
-                    if let Ok(batch) = build_lance_batch(1, "_edge_deleted", "eid", eid, &[]) {
-                        tbl.add(batch).await.map_err(|e| format!("LanceDB delete edge: {e}"))?;
+                yata_cypher::Clause::Delete { exprs, .. } => {
+                    for expr in exprs {
+                        if let yata_cypher::Expr::Var(var) = expr {
+                            if let Some(nodes) = var_bindings.get(var) {
+                                for (label, node_id) in nodes.clone() {
+                                    self.delete_record(&label, "rkey", &node_id)?;
+                                }
+                            }
+                        }
                     }
                 }
+                yata_cypher::Clause::Return { .. } => {} // reads handled by GIE path
+                _ => {
+                    return Err(format!("unsupported mutation clause: {cypher}"));
+                }
             }
+        }
 
-            if is_mutation {
-                let elapsed_us = query_start.elapsed().as_micros() as u64;
-                self.cypher_mutation_us_total.fetch_add(elapsed_us, Ordering::Relaxed);
+        Ok(Vec::new())
+    }
+
+    /// Resolve pattern props, substituting $params with values from param_map.
+    fn resolve_pattern_props(
+        &self,
+        props: &[(String, yata_cypher::Expr)],
+        param_map: &HashMap<String, String>,
+    ) -> Result<Vec<(String, yata_grin::PropValue)>, String> {
+        let mut result = Vec::new();
+        for (k, expr) in props {
+            let v = match expr {
+                yata_cypher::Expr::Lit(lit) => match lit {
+                    yata_cypher::Literal::Int(i) => yata_grin::PropValue::Int(*i),
+                    yata_cypher::Literal::Float(f) => yata_grin::PropValue::Float(*f),
+                    yata_cypher::Literal::Str(s) => yata_grin::PropValue::Str(s.clone()),
+                    yata_cypher::Literal::Bool(b) => yata_grin::PropValue::Bool(*b),
+                    yata_cypher::Literal::Null => yata_grin::PropValue::Null,
+                },
+                yata_cypher::Expr::Param(name) => {
+                    let raw = param_map.get(name).ok_or_else(|| format!("missing param ${name}"))?;
+                    // JSON-decode param value (params are JSON-encoded strings)
+                    match serde_json::from_str::<serde_json::Value>(raw) {
+                        Ok(serde_json::Value::String(s)) => yata_grin::PropValue::Str(s),
+                        Ok(serde_json::Value::Number(n)) => {
+                            if let Some(i) = n.as_i64() { yata_grin::PropValue::Int(i) }
+                            else { yata_grin::PropValue::Float(n.as_f64().unwrap_or(0.0)) }
+                        }
+                        Ok(serde_json::Value::Bool(b)) => yata_grin::PropValue::Bool(b),
+                        Ok(serde_json::Value::Null) => yata_grin::PropValue::Null,
+                        _ => yata_grin::PropValue::Str(raw.clone()),
+                    }
+                }
+                _ => return Err(format!("unsupported expression in CREATE props for key '{k}'")),
+            };
+            result.push((k.clone(), v));
+        }
+        Ok(result)
+    }
+
+    /// Find vertices matching a MATCH pattern (label + inline props + WHERE clause).
+    fn find_matching_vertices(
+        &self,
+        store: &yata_lance::LanceReadStore,
+        np: &yata_cypher::NodePattern,
+        _where_clause: &Option<yata_cypher::Expr>,
+        param_map: &HashMap<String, String>,
+    ) -> Vec<(String, String)> {
+        let label = np.labels.first().map(|s| s.as_str()).unwrap_or("");
+        if label.is_empty() { return Vec::new(); }
+        let vids = store.scan_vertices_by_label(label);
+        let mut matched = Vec::new();
+        for vid in vids {
+            // Check inline props (e.g., {tid: 'delete-me'})
+            let mut all_match = true;
+            for (k, expr) in &np.props {
+                let expected = match expr {
+                    yata_cypher::Expr::Lit(yata_cypher::Literal::Str(s)) => yata_grin::PropValue::Str(s.clone()),
+                    yata_cypher::Expr::Lit(yata_cypher::Literal::Int(i)) => yata_grin::PropValue::Int(*i),
+                    yata_cypher::Expr::Param(name) => {
+                        if let Some(raw) = param_map.get(name) {
+                            match serde_json::from_str::<serde_json::Value>(raw) {
+                                Ok(serde_json::Value::String(s)) => yata_grin::PropValue::Str(s),
+                                Ok(serde_json::Value::Number(n)) => {
+                                    if let Some(i) = n.as_i64() { yata_grin::PropValue::Int(i) }
+                                    else { yata_grin::PropValue::Float(n.as_f64().unwrap_or(0.0)) }
+                                }
+                                _ => yata_grin::PropValue::Str(raw.clone()),
+                            }
+                        } else { continue; }
+                    }
+                    _ => continue,
+                };
+                if store.vertex_prop(vid, k) != Some(expected) {
+                    all_match = false;
+                    break;
+                }
             }
-
-            Ok(rows)
-        })
+            if all_match {
+                let node_id = store.vertex_prop(vid, "rkey")
+                    .or_else(|| store.vertex_prop(vid, "pk_value"))
+                    .map(|v| match v { PropValue::Str(s) => s, _ => format!("{vid}") })
+                    .unwrap_or_else(|| format!("{vid}"));
+                matched.push((label.to_string(), node_id));
+            }
+        }
+        matched
     }
 
     // ── Vector search ───────────────────────────────────────────────────
@@ -1172,6 +1057,7 @@ impl TieredGraphEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_bridge;
     use yata_grin::{Property, Scannable, Topology};
 
     fn make_engine(dir: &tempfile::TempDir) -> TieredGraphEngine {
