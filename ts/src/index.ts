@@ -55,11 +55,6 @@ export type {
   YataOpenedTables,
 } from "./lance.js";
 export {
-  arrowJsFactory,
-  createArrowSchema,
-  createEmptyYataGraphTablesWithArrow,
-} from "./lance-arrow.js";
-export {
   createGraphManifest,
   createFetchManifestStore,
   createLatestPointer,
@@ -150,43 +145,13 @@ export type {
   Expr,
 } from "./cypher-parse.js";
 
-// Cypher executor (Workers-side Arrow execution)
-export { execCypher } from "./cypher-exec.js";
-export type { ExecContext } from "./cypher-exec.js";
-
-// R2 fragment reader (Workers-side Arrow IPC)
-export {
-  createR2FragmentStore,
-  createFetchFragmentStore,
-  loadLabels,
-  loadAllLabels,
-} from "./r2-reader.js";
-export type {
-  CompactionManifest,
-  LabelSegmentState,
-  FragmentStore,
-  LabelData,
-} from "./r2-reader.js";
-
-// Workers read+write path (unified router)
-export { WorkersReader, createWorkersReader } from "./workers-read.js";
-export type { WorkersReadConfig, WorkersReadStats } from "./workers-read.js";
-
-// Workers direct R2 write
-export {
-  buildArrowSegment,
-  createR2WalWriter,
-  loadPendingWal,
-  loadWalIndex,
-  appendWalIndex,
-  mergeLabelData,
-} from "./workers-write.js";
-export type {
-  WorkersWriteEntry,
-  R2WalWriter,
-  WalIndex,
-  WalIndexEntry,
-} from "./workers-write.js";
+// Legacy Arrow/Workers modules are intentionally excluded from root exports.
+// Import explicitly via subpaths:
+//   @gftd/yata/lance-arrow
+//   @gftd/yata/cypher-exec
+//   @gftd/yata/r2-reader
+//   @gftd/yata/workers-read
+//   @gftd/yata/workers-write
 
 // Helpers
 export {

@@ -5,8 +5,8 @@
  * falls back to Rust Container via YataRPC for complex/unsupported queries.
  *
  * Architecture:
- *   Workers (TS) ──→ R2 Arrow IPC (simple read)
- *   Workers (TS) ──→ Container (Rust, YataRPC) (write + complex read)
+ *   Workers (TS) ──→ R2 Arrow IPC compacted segments (simple read)
+ *   Workers (TS) ──→ Container (Rust, YataRPC) (complex read fallback)
  */
 
 import { tryParseCypher, type CypherAST } from "./cypher-parse.js";
@@ -19,10 +19,7 @@ import {
 } from "./r2-reader.js";
 import type { CypherResult, YataRPC } from "./types.js";
 import {
-  type R2WalWriter,
   type WorkersWriteEntry,
-  loadPendingWal,
-  mergeLabelData,
 } from "./workers-write.js";
 
 // ── Workers Read Router ──
@@ -31,10 +28,10 @@ export interface WorkersReadConfig {
   store: FragmentStore;
   container: YataRPC;
   partitionId?: number;
-  /** Optional R2 WAL writer for direct write support. */
-  walWriter?: R2WalWriter;
-  /** Optional R2 bucket for loading pending WAL segments. */
-  walBucket?: import("./manifest.js").R2BucketLike;
+  /** Legacy option (ignored in Lance-only mode). */
+  walWriter?: unknown;
+  /** Legacy option (ignored in Lance-only mode). */
+  walBucket?: unknown;
   /** R2 prefix (default: "yata/"). */
   prefix?: string;
 }
@@ -42,6 +39,7 @@ export interface WorkersReadConfig {
 export interface WorkersReadStats {
   workersHit: number;
   containerFallback: number;
+  /** Legacy metric; always 0 in Lance-only mode. */
   pendingWalMerged: number;
 }
 
@@ -50,19 +48,19 @@ export interface WorkersReadStats {
  *
  * - Caches CompactionManifest + loaded label data per partition.
  * - Routes parseable queries to TS executor, others to Container.
- * - Write operations always go to Container.
+ * - Lance-only read: no pending WAL merge path.
  */
 export class WorkersReader {
   private store: FragmentStore;
   private container: YataRPC;
   private pid: number;
-  private walWriter: R2WalWriter | null;
-  private walBucket: import("./manifest.js").R2BucketLike | null;
+  // Legacy fields retained for API compatibility, not used in Lance-only mode.
+  private walWriter: unknown;
+  private walBucket: unknown;
   private prefix: string;
   private manifest: CompactionManifest | null = null;
   private labelCache: Map<string, LabelData> = new Map();
   private edgeCache: Map<string, LabelData> = new Map();
-  private pendingWalCache: Map<string, LabelData> | null = null;
   readonly stats: WorkersReadStats = { workersHit: 0, containerFallback: 0, pendingWalMerged: 0 };
 
   constructor(config: WorkersReadConfig) {
@@ -126,26 +124,20 @@ export class WorkersReader {
   // ── Write API (R2 direct) ──
 
   /**
-   * Write a record directly to R2 as a pending WAL segment.
-   * The record is immediately queryable via this WorkersReader
-   * (pending WAL is merged during read).
+   * Legacy API kept for compatibility.
+   * Writes through pending WAL have been removed in Lance-only mode.
    */
   async writeRecord(entry: WorkersWriteEntry): Promise<string> {
-    if (!this.walWriter) throw new Error("walWriter not configured");
-    const key = await this.walWriter.writeSegment([entry]);
-    // Invalidate pending WAL cache so next read picks up the write
-    this.pendingWalCache = null;
-    return key;
+    void entry;
+    throw new Error("WorkersReader.writeRecord is disabled: use direct Lance fragment writes");
   }
 
   /**
    * Write multiple records as a single R2 segment (batch).
    */
   async writeRecords(entries: WorkersWriteEntry[]): Promise<string> {
-    if (!this.walWriter) throw new Error("walWriter not configured");
-    const key = await this.walWriter.writeSegment(entries);
-    this.pendingWalCache = null;
-    return key;
+    void entries;
+    throw new Error("WorkersReader.writeRecords is disabled: use direct Lance fragment writes");
   }
 
   /**
@@ -162,22 +154,9 @@ export class WorkersReader {
   invalidateLabels(): void {
     this.labelCache.clear();
     this.edgeCache.clear();
-    this.pendingWalCache = null;
   }
 
   // ── Internal ──
-
-  /** Load pending WAL segments from R2 (cached per request lifecycle). */
-  private async ensurePendingWal(): Promise<Map<string, LabelData>> {
-    if (this.pendingWalCache) return this.pendingWalCache;
-    if (!this.walBucket) {
-      this.pendingWalCache = new Map();
-      return this.pendingWalCache;
-    }
-    this.pendingWalCache = await loadPendingWal(this.walBucket, this.prefix);
-    if (this.pendingWalCache.size > 0) this.stats.pendingWalMerged++;
-    return this.pendingWalCache;
-  }
 
   private async execLocal(
     ast: CypherAST,
@@ -194,27 +173,13 @@ export class WorkersReader {
     const neededVertex = extractVertexLabels(ast);
     const neededEdge = extractEdgeLabels(ast);
 
-    // Load pending WAL segments (R2 direct writes)
-    const pendingWal = await this.ensurePendingWal();
-
-    // Load missing vertex labels + merge with pending WAL
+    // Load missing vertex labels
     const missingVertex = neededVertex.filter(l => !this.labelCache.has(l));
     if (missingVertex.length > 0) {
       const loaded = await loadLabels(this.store, this.manifest, missingVertex);
       for (const label of missingVertex) {
         const compacted = loaded.get(label);
-        const pending = pendingWal.get(label);
-        const merged = mergeLabelData(compacted, pending);
-        if (merged) this.labelCache.set(label, merged);
-      }
-    } else {
-      // Even if compacted labels are cached, merge any new pending WAL
-      for (const label of neededVertex) {
-        const pending = pendingWal.get(label);
-        if (pending && this.labelCache.has(label)) {
-          const merged = mergeLabelData(this.labelCache.get(label), pending);
-          if (merged) this.labelCache.set(label, merged);
-        }
+        if (compacted) this.labelCache.set(label, compacted);
       }
     }
 
