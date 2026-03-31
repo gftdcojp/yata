@@ -115,6 +115,18 @@ export type {
   VertexPipelineMutation,
 } from "./pipeline.js";
 
+// Coordinator (Ballista 4-Stage Pipeline logic — used by Container Worker)
+export {
+  extractQueryMeta,
+  mergeResults,
+  pushdownLimit,
+  labelToPartition,
+  cypherEsc,
+  buildMergeCypher,
+  buildDeleteCypher,
+} from "./coordinator.js";
+export type { QueryMeta } from "./coordinator.js";
+
 // Cypher builder
 export { G, buildLabelCypher } from "./cypher.js";
 export type { CypherQuery } from "./cypher.js";

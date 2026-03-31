@@ -23,18 +23,22 @@ export const CROSS_PARTITION = "" as AppId;
 // ── YataRPC interface (Workers RPC service binding) ──
 
 export interface YataRPC {
-  // Core
-  cypher(statement: string, appId?: string, parameters?: Record<string, unknown>): Promise<CypherResult>;
-  query(statement: string, appId?: string, parameters?: Record<string, unknown>): Promise<CypherResult>;
-  mutate(statement: string, appId?: string, parameters?: Record<string, unknown>): Promise<CypherResult>;
+  // Core (LanceDB append-only — all writes via Cypher MERGE/DELETE)
+  cypher(statement: string, appId?: string, parameters?: Record<string, unknown>, authJwt?: string): Promise<CypherResult>;
+  query(statement: string, appId?: string, parameters?: Record<string, unknown>, authJwt?: string): Promise<CypherResult>;
   mergeRecord(label: string, pkKey: string, pkValue: string, props: Record<string, string>, appId?: string): Promise<{ vid: number }>;
   deleteRecord(label: string, pkKey: string, pkValue: string, appId?: string): Promise<{ deleted: boolean }>;
   cypherBatch(statements: string[], appId?: string): Promise<CypherResult[]>;
+  cypherBatchRead(statements: Array<{ statement: string; parameters?: Record<string, unknown> }>, authJwt?: string): Promise<CypherResult[]>;
+
+  // Compaction
+  compact(): Promise<{ compacted_seq: number; labels_compacted: number }>;
 
   // Lifecycle
   health(): Promise<string>;
   ping(): Promise<string>;
   warmup(): Promise<string>;
+  stats(): Promise<Record<string, unknown>>;
 }
 
 // ── Merge Props ──

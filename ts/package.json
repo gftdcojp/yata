@@ -1,7 +1,7 @@
 {
   "name": "@gftd/yata",
   "version": "1.0.0",
-  "description": "yata graph engine TS client — types, Cypher builder, WAL, helpers",
+  "description": "yata graph engine TS client — types, Cypher builder, coordinator, helpers",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
@@ -13,6 +13,7 @@
     "./pipeline": "./src/pipeline.ts",
     "./schema": "./src/schema.ts",
     "./types": "./src/types.ts",
+    "./coordinator": "./src/coordinator.ts",
     "./cypher": "./src/cypher.ts",
     "./wal": "./src/wal.ts",
     "./writer": "./src/writer.ts",
