@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use arrow::array::{Array, BooleanArray, StringArray};
+use arrow::array::{Array, BooleanArray, StringArray, UInt8Array};
 use arrow::record_batch::RecordBatch;
 use yata_grin::{GraphStore, Mutable, Neighbor, Predicate, PropValue, Property, Scannable, Schema, Topology};
 
@@ -136,6 +136,71 @@ impl LanceReadStore {
         Ok(store)
     }
 
+    /// Build read store from Lance-schema batches.
+    /// Schema: seq(u64), op(u8), label(utf8), pk_key(utf8), pk_value(utf8), timestamp_ms(u64), props_json(utf8)
+    pub fn from_lance_batches(batches: &[RecordBatch]) -> Result<Self, String> {
+        let mut store = Self::default();
+        // PK-dedup: last-writer-wins by (label, pk_key, pk_value) triple
+        let mut pk_map: HashMap<(String, String, String), usize> = HashMap::new();
+
+        for batch in batches {
+            if batch.num_columns() < 7 { continue; }
+            let op_col = batch.column(1).as_any().downcast_ref::<UInt8Array>()
+                .ok_or("column 1 (op) is not UInt8")?;
+            let labels = str_col(batch, 2)?;
+            let pk_keys = str_col(batch, 3)?;
+            let pk_values = str_col(batch, 4)?;
+            let props_json = optional_str_col(batch, 6)?;
+
+            for row in 0..batch.num_rows() {
+                let op = op_col.value(row);
+                let label = labels.value(row).to_string();
+                let pk_key = pk_keys.value(row).to_string();
+                let pk_value = pk_values.value(row).to_string();
+                let is_alive = op == 0; // 0=upsert, 1=delete
+
+                let dedup_key = (label.clone(), pk_key.clone(), pk_value.clone());
+                if let Some(&existing_idx) = pk_map.get(&dedup_key) {
+                    // Overwrite existing entry (last-writer-wins)
+                    store.vertex_alive[existing_idx] = is_alive;
+                    let mut props = parse_props_json(props_json[row].as_deref())?;
+                    props.entry(pk_key.clone()).or_insert(PropValue::Str(pk_value.clone()));
+                    props.entry("pk_value".to_string()).or_insert(PropValue::Str(pk_value));
+                    store.vertex_props[existing_idx] = props;
+                    continue;
+                }
+
+                let local_vid = store.vertex_alive.len();
+                pk_map.insert(dedup_key, local_vid);
+                store.vertex_alive.push(is_alive);
+                store.vertex_labels_by_vid.push(vec![label.clone()]);
+
+                if !store.known_vertex_labels.contains(&label) {
+                    store.known_vertex_labels.push(label.clone());
+                }
+                store.vertex_pk.entry(label.clone()).or_insert(pk_key.clone());
+
+                let mut props = parse_props_json(props_json[row].as_deref())?;
+                props.entry(pk_key).or_insert(PropValue::Str(pk_value.clone()));
+                props.entry("pk_value".to_string()).or_insert(PropValue::Str(pk_value));
+                store.vertex_props.push(props);
+            }
+        }
+
+        // Rebuild label_index from final alive state (after PK dedup)
+        for (vid, (labels, alive)) in store.vertex_labels_by_vid.iter().zip(store.vertex_alive.iter()).enumerate() {
+            if *alive {
+                for label in labels {
+                    store.label_index.entry(label.clone()).or_default().push(vid as u32);
+                }
+            }
+        }
+
+        store.out_adj = vec![Vec::new(); store.vertex_alive.len()];
+        store.in_adj = vec![Vec::new(); store.vertex_alive.len()];
+        Ok(store)
+    }
+
     pub fn merge_vertex_by_pk(
         &mut self,
         label: &str,
@@ -226,7 +291,7 @@ impl LanceReadStore {
         });
     }
 
-    fn find_vertex_by_pk(&self, label: &str, pk_key: &str, pk_value: &PropValue) -> Option<u32> {
+    pub fn find_vertex_by_pk(&self, label: &str, pk_key: &str, pk_value: &PropValue) -> Option<u32> {
         self.label_index.get(label)?.iter().copied().find(|&vid| {
             self.vertex_alive.get(vid as usize).copied().unwrap_or(false)
                 && self

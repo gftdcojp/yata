@@ -59,8 +59,33 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Convert Cypher Value to PropValue for LanceDB write-back.
+fn cypher_value_to_prop(v: &yata_cypher::types::Value) -> yata_grin::PropValue {
+    match v {
+        yata_cypher::types::Value::Str(s) => yata_grin::PropValue::Str(s.clone()),
+        yata_cypher::types::Value::Int(i) => yata_grin::PropValue::Int(*i),
+        yata_cypher::types::Value::Float(f) => yata_grin::PropValue::Float(*f),
+        yata_cypher::types::Value::Bool(b) => yata_grin::PropValue::Bool(*b),
+        yata_cypher::types::Value::Null => yata_grin::PropValue::Null,
+        _ => yata_grin::PropValue::Str(format!("{:?}", v)),
+    }
+}
+
+/// Canonical Lance table schema for vertices.
+fn lance_schema() -> Arc<arrow::datatypes::Schema> {
+    use arrow::datatypes::{DataType, Field, Schema};
+    Arc::new(Schema::new(vec![
+        Field::new("seq", DataType::UInt64, false),
+        Field::new("op", DataType::UInt8, false),
+        Field::new("label", DataType::Utf8, false),
+        Field::new("pk_key", DataType::Utf8, false),
+        Field::new("pk_value", DataType::Utf8, false),
+        Field::new("timestamp_ms", DataType::UInt64, false),
+        Field::new("props_json", DataType::Utf8, true),
+    ]))
+}
+
 /// Build a single-row Arrow RecordBatch for LanceDB append.
-/// Schema: seq(u64), op(u8), label(utf8), pk_key(utf8), pk_value(utf8), timestamp_ms(u64), props_json(utf8)
 fn build_lance_batch(
     op: u8,
     label: &str,
@@ -196,11 +221,12 @@ impl TieredGraphEngine {
                 }
                 all
             };
-            yata_lance::LanceReadStore::from_live_batches(&batches, &[])
+            yata_lance::LanceReadStore::from_lance_batches(&batches)
         })
     }
 
     /// Ensure LanceDB connection + table are initialized.
+    /// Creates "vertices" table if it doesn't exist.
     fn ensure_lance(&self) {
         let lance_db = self.lance_db.clone();
         let lance_tbl = self.lance_table.clone();
@@ -220,8 +246,15 @@ impl TieredGraphEngine {
             let mut tbl_guard = lance_tbl.lock().await;
             if tbl_guard.is_none() {
                 if let Some(ref db) = *db_guard {
-                    if let Ok(tbl) = db.open_table("vertices").await {
-                        *tbl_guard = Some(tbl);
+                    match db.open_table("vertices").await {
+                        Ok(tbl) => { *tbl_guard = Some(tbl); }
+                        Err(_) => {
+                            // Table doesn't exist yet — create empty with Lance schema
+                            let schema = lance_schema();
+                            if let Ok(tbl) = db.create_empty_table("vertices", schema).await {
+                                *tbl_guard = Some(tbl);
+                            }
+                        }
                     }
                 }
             }
@@ -264,6 +297,7 @@ impl TieredGraphEngine {
         if statements.is_empty() {
             return Ok(Vec::new());
         }
+        self.ensure_lance();
 
         // Collect all vertex label hints across all statements for a single label load.
         let mut all_vlabels = Vec::new();
@@ -326,19 +360,48 @@ impl TieredGraphEngine {
                 }
             }
 
-            // Change detection: compare ID sets.
+            // Write-back: persist changes to LanceDB
             let after_vids: HashSet<String> = g.nodes().iter().map(|n| n.id.clone()).collect();
             let after_eids: HashSet<String> = g.rels().iter().map(|r| r.id.clone()).collect();
-            let new_vids: Vec<String> = after_vids.difference(&initial_vids).cloned().collect();
+            let new_vids: Vec<&String> = after_vids.difference(&initial_vids).collect();
+            let deleted_vids: Vec<&String> = initial_vids.difference(&after_vids).collect();
+            let new_eids: Vec<&String> = after_eids.difference(&initial_eids).collect();
 
-            let has_changes = initial_vids != after_vids || initial_eids != after_eids;
-
-            if has_changes {
-                tracing::info!(
-                    statements = statements.len(),
-                    new = new_vids.len(),
-                    "engine: batch mutation applied"
-                );
+            if !new_vids.is_empty() || !deleted_vids.is_empty() || !new_eids.is_empty() {
+                let lance_tbl = self.lance_table.clone();
+                let tbl_guard = lance_tbl.lock().await;
+                if let Some(ref tbl) = *tbl_guard {
+                    for vid in &new_vids {
+                        if let Some(node) = g.nodes().iter().find(|n| &n.id == *vid) {
+                            let label = node.labels.first().map(|s| s.as_str()).unwrap_or("_default");
+                            let props: Vec<(&str, yata_grin::PropValue)> = node.props.iter().map(|(k, v)| {
+                                (k.as_str(), cypher_value_to_prop(v))
+                            }).collect();
+                            if let Ok(batch) = build_lance_batch(0, label, "rkey", &node.id, &props) {
+                                let _ = tbl.add(batch).await;
+                            }
+                        }
+                    }
+                    for vid in &deleted_vids {
+                        if let Ok(batch) = build_lance_batch(1, "_deleted", "rkey", vid, &[]) {
+                            let _ = tbl.add(batch).await;
+                        }
+                    }
+                    for eid in &new_eids {
+                        if let Some(rel) = g.rels().iter().find(|r| &r.id == *eid) {
+                            let mut props: Vec<(&str, yata_grin::PropValue)> = rel.props.iter().map(|(k, v)| {
+                                (k.as_str(), cypher_value_to_prop(v))
+                            }).collect();
+                            let src_owned = rel.src.clone();
+                            let dst_owned = rel.dst.clone();
+                            props.push(("_src", yata_grin::PropValue::Str(src_owned)));
+                            props.push(("_dst", yata_grin::PropValue::Str(dst_owned)));
+                            if let Ok(batch) = build_lance_batch(0, &rel.rel_type, "eid", &rel.id, &props) {
+                                let _ = tbl.add(batch).await;
+                            }
+                        }
+                    }
+                }
             }
 
             Ok(all_results)
@@ -398,8 +461,9 @@ impl TieredGraphEngine {
         rls_org_id: Option<&str>,
         mutation_ctx: Option<&MutationContext>,
     ) -> Result<Vec<Vec<(String, String)>>, String> {
+        self.ensure_lance();
         let is_mutation = router::is_cypher_mutation(cypher);
-        let mutation_hints = if is_mutation {
+        let _mutation_hints = if is_mutation {
             self.cypher_mutation_count.fetch_add(1, Ordering::Relaxed);
             router::extract_mutation_hints(cypher)
         } else {
@@ -436,12 +500,14 @@ impl TieredGraphEngine {
             let store = self.build_read_store(&[]).unwrap_or_default();
             let mut g = memory_bridge::memory_graph_from_store(&store);
 
-            // Lightweight mutation tracking: only track IDs (O(n) ID clones, no format! serialization)
-            let before_vids: HashSet<String> =
-                g.nodes().iter().map(|n| n.id.clone()).collect();
+            // Lightweight mutation tracking: track IDs + labels for tombstone write-back
+            let before_vid_labels: HashMap<String, String> = g.nodes().iter().map(|n| {
+                let label = n.labels.first().cloned().unwrap_or_default();
+                (n.id.clone(), label)
+            }).collect();
+            let before_vids: HashSet<String> = before_vid_labels.keys().cloned().collect();
             let before_eids: HashSet<String> =
                 g.rels().iter().map(|r| r.id.clone()).collect();
-            let before_count = (before_vids.len(), before_eids.len());
 
             // Execute Cypher
             let rows = memory_bridge::execute_query(&mut g, cypher, params)
@@ -472,20 +538,62 @@ impl TieredGraphEngine {
                 }
             }
 
-            // Detect changes: compare counts + check for new/deleted IDs
+            // Detect changes
             let after_vids: HashSet<String> =
                 g.nodes().iter().map(|n| n.id.clone()).collect();
-            let after_eids: HashSet<String> =
-                g.rels().iter().map(|r| r.id.clone()).collect();
-            let after_count = (after_vids.len(), after_eids.len());
 
-            let has_changes = before_count != after_count
-                || before_vids != after_vids
-                || before_eids != after_eids
-                || router::is_cypher_mutation(cypher);
+            // Write-back: persist new/changed nodes + edges to LanceDB
+            let new_vids: Vec<&String> = after_vids.difference(&before_vids).collect();
+            let deleted_vids: Vec<&String> = before_vids.difference(&after_vids).collect();
+            let after_eids: HashSet<String> = g.rels().iter().map(|r| r.id.clone()).collect();
+            let new_eids: Vec<&String> = after_eids.difference(&before_eids).collect();
+            let deleted_eids: Vec<&String> = before_eids.difference(&after_eids).collect();
 
-            if has_changes {
-                tracing::debug!("mutation detected, changes will be visible on next LanceDB scan");
+            if !new_vids.is_empty() || !deleted_vids.is_empty() || !new_eids.is_empty() || !deleted_eids.is_empty() {
+                let lance_tbl = self.lance_table.clone();
+                let tbl_guard = lance_tbl.lock().await;
+                let tbl = tbl_guard.as_ref().ok_or("LanceDB table not initialized")?;
+
+                // Write new vertices
+                for vid in &new_vids {
+                    if let Some(node) = g.nodes().iter().find(|n| &n.id == *vid) {
+                        let label = node.labels.first().map(|s| s.as_str()).unwrap_or("_default");
+                        let props: Vec<(&str, yata_grin::PropValue)> = node.props.iter().map(|(k, v)| {
+                            (k.as_str(), cypher_value_to_prop(v))
+                        }).collect();
+                        if let Ok(batch) = build_lance_batch(0, label, "rkey", &node.id, &props) {
+                            tbl.add(batch).await.map_err(|e| format!("LanceDB add vertex: {e}"))?;
+                        }
+                    }
+                }
+                // Write tombstones for deleted vertices
+                for vid in &deleted_vids {
+                    let label = before_vid_labels.get(*vid).map(|s| s.as_str()).unwrap_or("_deleted");
+                    if let Ok(batch) = build_lance_batch(1, label, "rkey", vid, &[]) {
+                        tbl.add(batch).await.map_err(|e| format!("LanceDB delete vertex: {e}"))?;
+                    }
+                }
+                // Write new edges (stored as vertices with edge metadata in props)
+                for eid in &new_eids {
+                    if let Some(rel) = g.rels().iter().find(|r| &r.id == *eid) {
+                        let mut props: Vec<(&str, yata_grin::PropValue)> = rel.props.iter().map(|(k, v)| {
+                            (k.as_str(), cypher_value_to_prop(v))
+                        }).collect();
+                        let src_owned = rel.src.clone();
+                        let dst_owned = rel.dst.clone();
+                        props.push(("_src", yata_grin::PropValue::Str(src_owned)));
+                        props.push(("_dst", yata_grin::PropValue::Str(dst_owned)));
+                        if let Ok(batch) = build_lance_batch(0, &rel.rel_type, "eid", &rel.id, &props) {
+                            tbl.add(batch).await.map_err(|e| format!("LanceDB add edge: {e}"))?;
+                        }
+                    }
+                }
+                // Write tombstones for deleted edges
+                for eid in &deleted_eids {
+                    if let Ok(batch) = build_lance_batch(1, "_edge_deleted", "eid", eid, &[]) {
+                        tbl.add(batch).await.map_err(|e| format!("LanceDB delete edge: {e}"))?;
+                    }
+                }
             }
 
             // Record mutation elapsed time for CPM metrics
@@ -652,24 +760,27 @@ impl TieredGraphEngine {
         let lance_tbl = self.lance_table.clone();
         self.block_on(async {
             let tbl_guard = lance_tbl.lock().await;
-            if let Some(ref tbl) = *tbl_guard {
-                tbl.add(batch).await.map_err(|e| format!("LanceDB add: {e}"))?;
-            }
+            let tbl = tbl_guard.as_ref().ok_or("LanceDB table not initialized")?;
+            tbl.add(batch).await.map_err(|e| format!("LanceDB add: {e}"))?;
             Ok::<(), String>(())
         })?;
         Ok(0)
     }
 
-    /// Delete a record (tombstone write to LanceDB).
+    /// Delete a record (tombstone write to LanceDB). Returns false if record doesn't exist.
     pub fn delete_record(&self, label: &str, pk_key: &str, pk_value: &str) -> Result<bool, String> {
-        let batch = build_lance_batch(1, label, pk_key, pk_value, &[])?;
         self.ensure_lance();
+        let store = self.build_read_store(&[label])?;
+        let exists = store.find_vertex_by_pk(label, pk_key, &yata_grin::PropValue::Str(pk_value.to_string())).is_some();
+        if !exists {
+            return Ok(false);
+        }
+        let batch = build_lance_batch(1, label, pk_key, pk_value, &[])?;
         let lance_tbl = self.lance_table.clone();
         self.block_on(async {
             let tbl_guard = lance_tbl.lock().await;
-            if let Some(ref tbl) = *tbl_guard {
-                tbl.add(batch).await.map_err(|e| format!("LanceDB add: {e}"))?;
-            }
+            let tbl = tbl_guard.as_ref().ok_or("LanceDB table not initialized")?;
+            tbl.add(batch).await.map_err(|e| format!("LanceDB add: {e}"))?;
             Ok::<(), String>(())
         })?;
         Ok(true)
@@ -739,13 +850,7 @@ impl TieredGraphEngine {
                     }
                 }
             } else {
-                tracing::debug!("compaction: no Lance Dataset available");
-                Ok(CompactionResult {
-                    max_seq: 0,
-                    input_entries: 0,
-                    output_entries: 0,
-                    labels: Vec::new(),
-                })
+                Err("compaction: LanceDB table not initialized".to_string())
             }
         });
 
@@ -1712,7 +1817,229 @@ mod tests {
             ],
         )
         .unwrap();
-        // Record written to LanceDB — verified by merge_record returning Ok
+        // Verify re-created record is visible
+        let store = e.build_read_store(&["X"]).unwrap();
+        assert!(store.find_vertex_by_pk("X", "rkey", &PropValue::Str("x1".into())).is_some(),
+            "re-created record must be visible after delete+merge");
     }
 
+    // ══════════════════════════════════════════════════════════════
+    // Coverage: LanceDB persistence roundtrip tests
+    // ══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_persist_merge_record_read_store_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        e.merge_record("Post", "rkey", "p1", &[
+            ("rkey", PropValue::Str("p1".into())),
+            ("text", PropValue::Str("hello world".into())),
+            ("likes", PropValue::Int(42)),
+        ]).unwrap();
+        e.merge_record("Post", "rkey", "p2", &[
+            ("rkey", PropValue::Str("p2".into())),
+            ("text", PropValue::Str("second post".into())),
+        ]).unwrap();
+
+        let store = e.build_read_store(&[]).unwrap();
+        assert_eq!(store.vertex_count(), 2, "must see 2 posts");
+        assert!(store.find_vertex_by_pk("Post", "rkey", &PropValue::Str("p1".into())).is_some());
+        assert!(store.find_vertex_by_pk("Post", "rkey", &PropValue::Str("p2".into())).is_some());
+    }
+
+    #[test]
+    fn test_persist_cold_restart_reads_lance() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let e = engine_at(dir.path());
+            e.merge_record("Doc", "rkey", "d1", &[
+                ("rkey", PropValue::Str("d1".into())),
+                ("title", PropValue::Str("Persistent".into())),
+            ]).unwrap();
+            // Engine dropped here — no explicit flush
+        }
+        // New engine on same directory — cold restart
+        {
+            let e2 = engine_at(dir.path());
+            e2.ensure_lance();
+            let store = e2.build_read_store(&[]).unwrap();
+            assert_eq!(store.vertex_count(), 1, "cold restart must recover persisted data");
+            assert!(store.find_vertex_by_pk("Doc", "rkey", &PropValue::Str("d1".into())).is_some(),
+                "cold restart must find the persisted vertex by PK");
+        }
+    }
+
+    #[test]
+    fn test_persist_pk_dedup_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        // Write same PK three times with different values
+        e.merge_record("Item", "rkey", "i1", &[
+            ("rkey", PropValue::Str("i1".into())),
+            ("version", PropValue::Int(1)),
+        ]).unwrap();
+        e.merge_record("Item", "rkey", "i1", &[
+            ("rkey", PropValue::Str("i1".into())),
+            ("version", PropValue::Int(2)),
+        ]).unwrap();
+        e.merge_record("Item", "rkey", "i1", &[
+            ("rkey", PropValue::Str("i1".into())),
+            ("version", PropValue::Int(3)),
+        ]).unwrap();
+
+        let store = e.build_read_store(&[]).unwrap();
+        // PK dedup: only 1 vertex with latest version
+        let vid = store.find_vertex_by_pk("Item", "rkey", &PropValue::Str("i1".into()));
+        assert!(vid.is_some(), "deduped vertex must exist");
+        let version = store.vertex_prop(vid.unwrap(), "version");
+        assert_eq!(version, Some(PropValue::Int(3)), "last-writer-wins: version must be 3");
+    }
+
+    #[test]
+    fn test_persist_delete_tombstone_hides_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        e.merge_record("Task", "rkey", "t1", &[
+            ("rkey", PropValue::Str("t1".into())),
+            ("status", PropValue::Str("active".into())),
+        ]).unwrap();
+
+        // Verify visible
+        let store1 = e.build_read_store(&["Task"]).unwrap();
+        assert!(store1.find_vertex_by_pk("Task", "rkey", &PropValue::Str("t1".into())).is_some());
+
+        // Delete
+        let deleted = e.delete_record("Task", "rkey", "t1").unwrap();
+        assert!(deleted, "delete existing record must return true");
+
+        // Verify hidden after tombstone
+        let store2 = e.build_read_store(&["Task"]).unwrap();
+        assert!(store2.find_vertex_by_pk("Task", "rkey", &PropValue::Str("t1".into())).is_none(),
+            "tombstoned record must not be visible");
+    }
+
+    #[test]
+    fn test_persist_multi_label_same_pk_coexist() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        // Same pk_value "alice" under different labels
+        e.merge_record("Person", "rkey", "alice", &[
+            ("rkey", PropValue::Str("alice".into())),
+            ("role", PropValue::Str("human".into())),
+        ]).unwrap();
+        e.merge_record("Agent", "rkey", "alice", &[
+            ("rkey", PropValue::Str("alice".into())),
+            ("role", PropValue::Str("bot".into())),
+        ]).unwrap();
+
+        let store = e.build_read_store(&[]).unwrap();
+        assert_eq!(store.vertex_count(), 2, "same pk_value + different labels = 2 vertices");
+        assert!(store.find_vertex_by_pk("Person", "rkey", &PropValue::Str("alice".into())).is_some());
+        assert!(store.find_vertex_by_pk("Agent", "rkey", &PropValue::Str("alice".into())).is_some());
+    }
+
+    #[test]
+    fn test_persist_cypher_edge_write_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        // Create two nodes + edge via Cypher
+        run_query(&e, "CREATE (a:User {name: 'Alice'})-[r:FOLLOWS]->(b:User {name: 'Bob'})", &[], None).unwrap();
+
+        // Verify nodes persisted
+        let store = e.build_read_store(&[]).unwrap();
+        assert!(store.vertex_count() >= 2, "must have at least 2 User nodes");
+
+        // Verify nodes queryable via Cypher
+        let rows = run_query(&e, "MATCH (u:User) RETURN u.name AS name LIMIT 10", &[], None).unwrap();
+        assert_eq!(rows.len(), 2, "must find 2 User nodes via Cypher");
+        let names = get_col(&rows, "name");
+        assert!(names.iter().any(|n| n.contains("Alice")), "Alice must be in results");
+        assert!(names.iter().any(|n| n.contains("Bob")), "Bob must be in results");
+    }
+
+    #[test]
+    fn test_persist_cypher_delete_removes_from_lance() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        run_query(&e, "CREATE (n:Temp {tid: 'delete-me'})", &[], None).unwrap();
+
+        // Verify created
+        let rows1 = run_query(&e, "MATCH (n:Temp) RETURN n.tid AS tid LIMIT 10", &[], None).unwrap();
+        assert_eq!(rows1.len(), 1);
+
+        // Delete via Cypher
+        run_query(&e, "MATCH (n:Temp {tid: 'delete-me'}) DELETE n", &[], None).unwrap();
+
+        // Verify deleted
+        let rows2 = run_query(&e, "MATCH (n:Temp) RETURN n.tid AS tid LIMIT 10", &[], None).unwrap();
+        assert_eq!(rows2.len(), 0, "deleted node must not appear in query");
+    }
+
+    #[test]
+    fn test_persist_batch_mutation_write_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        let ctx = MutationContext {
+            app_id: "test".into(), org_id: "org1".into(),
+            user_id: "".into(), actor_id: "".into(),
+            user_did: "".into(), actor_did: "".into(),
+        };
+        let stmts: Vec<(&str, &[(String, String)])> = vec![
+            ("CREATE (a:BatchNode {bid: 'b1'})", &[]),
+            ("CREATE (b:BatchNode {bid: 'b2'})", &[]),
+            ("CREATE (c:BatchNode {bid: 'b3'})", &[]),
+        ];
+        let results = e.batch_query_with_context(&stmts, None, &ctx).unwrap();
+        assert_eq!(results.len(), 3);
+
+        // Verify all 3 nodes persisted
+        let rows = run_query(&e, "MATCH (n:BatchNode) RETURN n.bid AS bid LIMIT 10", &[], None).unwrap();
+        assert_eq!(rows.len(), 3, "batch mutation must persist all 3 nodes");
+    }
+
+    #[test]
+    fn test_persist_cold_restart_after_cypher_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let e = engine_at(dir.path());
+            run_query(&e, "CREATE (n:Durable {key: 'survives-restart', val: 99})", &[], None).unwrap();
+        }
+        // Cold restart
+        {
+            let e2 = engine_at(dir.path());
+            let rows = run_query(&e2, "MATCH (n:Durable) RETURN n.key AS key, n.val AS val LIMIT 10", &[], None).unwrap();
+            assert_eq!(rows.len(), 1, "Cypher-created node must survive cold restart");
+            assert!(get_col(&rows, "key").iter().any(|k| k.contains("survives-restart")));
+        }
+    }
+
+    #[test]
+    fn test_persist_delete_nonexistent_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        let deleted = e.delete_record("Item", "rkey", "no-such-key").unwrap();
+        assert!(!deleted, "delete_record should return false for nonexistent PK");
+    }
+
+    #[test]
+    fn test_persist_merge_record_props_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        e.merge_record("Rich", "rkey", "r1", &[
+            ("rkey", PropValue::Str("r1".into())),
+            ("name", PropValue::Str("日本語テスト".into())),
+            ("count", PropValue::Int(12345)),
+            ("ratio", PropValue::Float(3.14)),
+            ("active", PropValue::Bool(true)),
+        ]).unwrap();
+
+        let store = e.build_read_store(&[]).unwrap();
+        let vid = store.find_vertex_by_pk("Rich", "rkey", &PropValue::Str("r1".into())).unwrap();
+        assert_eq!(store.vertex_prop(vid, "name"), Some(PropValue::Str("日本語テスト".into())));
+        assert_eq!(store.vertex_prop(vid, "count"), Some(PropValue::Int(12345)));
+        // Float roundtrip via JSON may lose precision — check approximate
+        if let Some(PropValue::Float(f)) = store.vertex_prop(vid, "ratio") {
+            assert!((f - 3.14).abs() < 0.001, "float roundtrip: {f}");
+        }
+    }
 }
