@@ -43,6 +43,168 @@ pub fn probe() -> String {
     "lance-core+encoding+io+file+table wasm ok".to_string()
 }
 
+/// Decode a Lance v2 file → JSON rows.
+#[wasm_bindgen]
+pub fn decode_lance_fragment(file_bytes: &[u8]) -> Result<String, JsValue> {
+    use lance_encoding::decoder::{
+        decode_batch as lance_decode, ColumnInfo as DecColumnInfo, PageInfo as DecPageInfo,
+        DecoderPlugins, FilterExpression, PageEncoding,
+    };
+    use lance_encoding::format::pb as enc_pb;
+    use lance_core::cache::{CapacityMode, FileMetadataCache};
+
+    if file_bytes.len() < 40 {
+        return Err(JsValue::from_str("file too small"));
+    }
+
+    // 1. Parse footer (last 40 bytes)
+    let footer = &file_bytes[file_bytes.len() - 40..];
+    if &footer[36..40] != MAGIC {
+        return Err(JsValue::from_str("not a Lance file"));
+    }
+    let col_metadata_start = u64::from_le_bytes(footer[0..8].try_into().unwrap()) as usize;
+    let cmo_table_start = u64::from_le_bytes(footer[8..16].try_into().unwrap()) as usize;
+    let gbo_table_start = u64::from_le_bytes(footer[16..24].try_into().unwrap()) as usize;
+    let num_global_buffers = u32::from_le_bytes(footer[24..28].try_into().unwrap()) as usize;
+    let num_columns = u32::from_le_bytes(footer[28..32].try_into().unwrap()) as usize;
+
+    // 2. Read schema from global buffer (first global buffer = FileDescriptor)
+    let schema = if num_global_buffers > 0 {
+        let gbo_pos = u64::from_le_bytes(file_bytes[gbo_table_start..gbo_table_start + 8].try_into().unwrap()) as usize;
+        let gbo_len = u64::from_le_bytes(file_bytes[gbo_table_start + 8..gbo_table_start + 16].try_into().unwrap()) as usize;
+        let descriptor = pb::FileDescriptor::decode(&file_bytes[gbo_pos..gbo_pos + gbo_len])
+            .map_err(|e| JsValue::from_str(&format!("descriptor: {e}")))?;
+        if let Some(schema_pb) = descriptor.schema {
+            let fields: Vec<arrow_schema::Field> = schema_pb.fields.iter().map(|f| {
+                let dt = lance_core::datatypes::LogicalType::from(f.logical_type.as_str());
+                let arrow_dt = arrow_schema::DataType::try_from(&dt).unwrap_or(arrow_schema::DataType::Utf8);
+                arrow_schema::Field::new(&f.name, arrow_dt, f.nullable)
+            }).collect();
+            Arc::new(arrow_schema::Schema::new(fields))
+        } else {
+            return Err(JsValue::from_str("no schema in file descriptor"));
+        }
+    } else {
+        return Err(JsValue::from_str("no global buffers (schema missing)"));
+    };
+
+    let lance_schema = Arc::new(
+        LanceSchema::try_from(schema.as_ref()).map_err(|e| JsValue::from_str(&e.to_string()))?
+    );
+
+    // 3. Parse column metadata → build page_table
+    let data = Bytes::copy_from_slice(&file_bytes[..col_metadata_start]);
+    let mut page_table: Vec<Arc<DecColumnInfo>> = Vec::new();
+    let mut total_rows = 0u64;
+
+    for col_idx in 0..num_columns {
+        let off = cmo_table_start + col_idx * 16;
+        let meta_pos = u64::from_le_bytes(file_bytes[off..off + 8].try_into().unwrap()) as usize;
+        let meta_len = u64::from_le_bytes(file_bytes[off + 8..off + 16].try_into().unwrap()) as usize;
+        let col_meta = pbfile::ColumnMetadata::decode(&file_bytes[meta_pos..meta_pos + meta_len])
+            .map_err(|e| JsValue::from_str(&format!("col meta {col_idx}: {e}")))?;
+
+        let mut page_infos = Vec::new();
+        for page in &col_meta.pages {
+            let buf_off_sizes: Vec<(u64, u64)> = page.buffer_offsets.iter()
+                .zip(page.buffer_sizes.iter())
+                .map(|(&o, &s)| (o, s))
+                .collect();
+
+            let encoding = if let Some(enc) = &page.encoding {
+                if let Some(pbfile::encoding::Location::Direct(direct)) = &enc.location {
+                    // direct.encoding is Any-wrapped protobuf: decode Any first, then inner message
+                    let any = Any::decode(direct.encoding.as_slice())
+                        .map_err(|e| JsValue::from_str(&format!("Any decode: {e}")))?;
+                    if any.type_url.contains("PageLayout") {
+                        let layout = enc_pb::PageLayout::decode(any.value.as_slice())
+                            .map_err(|e| JsValue::from_str(&format!("PageLayout: {e}")))?;
+                        PageEncoding::Structural(layout)
+                    } else if any.type_url.contains("ArrayEncoding") {
+                        let arr = enc_pb::ArrayEncoding::decode(any.value.as_slice())
+                            .map_err(|e| JsValue::from_str(&format!("ArrayEncoding: {e}")))?;
+                        PageEncoding::Legacy(arr)
+                    } else {
+                        return Err(JsValue::from_str(&format!("unknown encoding type_url: {}", any.type_url)));
+                    }
+                } else {
+                    return Err(JsValue::from_str("deferred encoding unsupported"));
+                }
+            } else {
+                return Err(JsValue::from_str("missing page encoding"));
+            };
+
+            if col_idx == 0 { total_rows += page.length; }
+            page_infos.push(DecPageInfo {
+                num_rows: page.length,
+                priority: page.priority,
+                encoding,
+                buffer_offsets_and_sizes: Arc::from(buf_off_sizes),
+            });
+        }
+
+        let col_buf_off_sizes: Vec<(u64, u64)> = col_meta.buffer_offsets.iter()
+            .zip(col_meta.buffer_sizes.iter())
+            .map(|(&o, &s)| (o, s))
+            .collect();
+
+        let col_encoding = if let Some(enc) = &col_meta.encoding {
+            if let Some(pbfile::encoding::Location::Direct(direct)) = &enc.location {
+                // Column encoding is also Any-wrapped
+                if let Ok(any) = Any::decode(direct.encoding.as_slice()) {
+                    enc_pb::ColumnEncoding::decode(any.value.as_slice()).unwrap_or_default()
+                } else {
+                    enc_pb::ColumnEncoding::decode(direct.encoding.as_slice()).unwrap_or_default()
+                }
+            } else { enc_pb::ColumnEncoding::default() }
+        } else { enc_pb::ColumnEncoding::default() };
+
+        page_table.push(Arc::new(DecColumnInfo::new(
+            col_idx as u32,
+            Arc::from(page_infos),
+            col_buf_off_sizes,
+            col_encoding,
+        )));
+    }
+
+    // 4. Build EncodedBatch and decode
+    let encoded = lance_encoding::encoder::EncodedBatch {
+        data,
+        page_table,
+        schema: lance_schema,
+        top_level_columns: (0..num_columns as u32).collect(),
+        num_rows: total_rows,
+    };
+
+    let filter = FilterExpression::no_filter();
+    let plugins = Arc::new(DecoderPlugins::default());
+    let cache = Arc::new(FileMetadataCache::with_capacity(1024 * 1024, CapacityMode::Bytes));
+
+    let batch = futures::executor::block_on(lance_decode(
+        &encoded, &filter, plugins, false, LanceFileVersion::V2_1, Some(cache),
+    )).map_err(|e| JsValue::from_str(&format!("decode: {e}")))?;
+
+    // 5. Convert RecordBatch → JSON rows
+    let mut rows = Vec::new();
+    for i in 0..batch.num_rows() {
+        let mut row = serde_json::Map::new();
+        for (ci, field) in batch.schema().fields().iter().enumerate() {
+            let col = batch.column(ci);
+            if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+                use arrow_array::Array;
+                row.insert(field.name().clone(), if arr.is_null(i) {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(arr.value(i).to_string())
+                });
+            }
+        }
+        rows.push(serde_json::Value::Object(row));
+    }
+
+    Ok(serde_json::to_string(&rows).unwrap())
+}
+
 /// Encode a RecordBatch to a complete Lance v2 file (in memory).
 fn encode_to_lance_file(batch: &RecordBatch) -> Result<Bytes, String> {
     let schema = batch.schema();

@@ -2,6 +2,7 @@
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
 export const probe: () => [number, number];
+export const decode_lance_fragment: (a: number, b: number) => [number, number, number, number];
 export const encode_vertex_lance: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number, number];
 export const read_lance_footer: (a: number, b: number) => [number, number, number, number];
 export const generate_fragment_path: () => [number, number];
