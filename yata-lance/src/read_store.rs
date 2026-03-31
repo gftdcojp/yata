@@ -573,6 +573,181 @@ fn optional_str_col(batch: &RecordBatch, idx: usize) -> Result<Vec<Option<String
         .collect())
 }
 
+// ── ArrowStore: zero-copy LanceDB read store ──────────────────────────
+// Holds Arrow RecordBatches directly. No eager props_json parsing.
+// Dedup index built in O(N) scanning only label/pk_value/op columns.
+// Props parsed lazily on vertex_prop() access.
+
+/// Row location within batches.
+#[derive(Clone, Copy)]
+struct RowLoc {
+    batch: u16,
+    row: u32,
+}
+
+/// Zero-copy read store backed by Arrow RecordBatches from LanceDB.
+pub struct ArrowStore {
+    batches: Vec<RecordBatch>,
+    /// vid → row location (only alive, after PK dedup)
+    rows: Vec<RowLoc>,
+    label_index: HashMap<String, Vec<u32>>,
+    vertex_labels: Vec<String>,
+    known_labels: Vec<String>,
+    pk_keys: HashMap<String, String>,
+    /// Lazy props cache: vid → parsed props
+    props_cache: std::sync::Mutex<HashMap<u32, HashMap<String, PropValue>>>,
+}
+
+impl ArrowStore {
+    /// Build from Lance-schema batches. O(N) scan of label/pk_value/op columns only.
+    /// No props_json parsing during init — deferred to access time.
+    pub fn from_batches(batches: Vec<RecordBatch>) -> Result<Self, String> {
+        let mut dedup: HashMap<(String, String, String), (u16, u32, bool)> = HashMap::new();
+        for (bi, batch) in batches.iter().enumerate() {
+            if batch.num_columns() < 7 { continue; }
+            let op_col = batch.column(1).as_any().downcast_ref::<UInt8Array>()
+                .ok_or("column 1 (op) is not UInt8")?;
+            let label_col = str_col(batch, 2)?;
+            let pk_key_col = str_col(batch, 3)?;
+            let pk_val_col = str_col(batch, 4)?;
+
+            for row in 0..batch.num_rows() {
+                let key = (
+                    label_col.value(row).to_string(),
+                    pk_key_col.value(row).to_string(),
+                    pk_val_col.value(row).to_string(),
+                );
+                dedup.insert(key, (bi as u16, row as u32, op_col.value(row) == 0));
+            }
+        }
+
+        let mut rows = Vec::new();
+        let mut label_index: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut vertex_labels = Vec::new();
+        let mut known_labels = Vec::new();
+        let mut pk_keys: HashMap<String, String> = HashMap::new();
+
+        for ((label, pk_key, _), (bi, ri, alive)) in &dedup {
+            if !*alive { continue; }
+            let vid = rows.len() as u32;
+            rows.push(RowLoc { batch: *bi, row: *ri });
+            vertex_labels.push(label.clone());
+            label_index.entry(label.clone()).or_default().push(vid);
+            if !known_labels.contains(label) { known_labels.push(label.clone()); }
+            pk_keys.entry(label.clone()).or_insert_with(|| pk_key.clone());
+        }
+
+        Ok(Self {
+            batches,
+            rows,
+            label_index,
+            vertex_labels,
+            known_labels,
+            pk_keys,
+            props_cache: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn col_str(&self, vid: u32, col_idx: usize) -> Option<String> {
+        let loc = self.rows.get(vid as usize)?;
+        let batch = self.batches.get(loc.batch as usize)?;
+        let col = batch.column(col_idx).as_any().downcast_ref::<StringArray>()?;
+        Some(col.value(loc.row as usize).to_string())
+    }
+
+    fn ensure_props(&self, vid: u32) -> Option<()> {
+        if self.props_cache.lock().unwrap().contains_key(&vid) { return Some(()); }
+        let loc = self.rows.get(vid as usize)?;
+        let batch = self.batches.get(loc.batch as usize)?;
+        let col = batch.column(6).as_any().downcast_ref::<StringArray>()?;
+        let parsed = parse_props_json(Some(col.value(loc.row as usize))).ok()?;
+        self.props_cache.lock().unwrap().insert(vid, parsed);
+        Some(())
+    }
+
+    pub fn vertex_count(&self) -> usize { self.rows.len() }
+
+    pub fn find_vertex_by_pk(&self, label: &str, _pk_key: &str, pk_value: &PropValue) -> Option<u32> {
+        let expected = match pk_value { PropValue::Str(s) => s.as_str(), _ => return None };
+        self.label_index.get(label)?.iter().copied().find(|&vid| {
+            // Check pk_value from Arrow column 4 (zero-copy, no JSON parse)
+            self.col_str(vid, 4).as_deref() == Some(expected)
+        })
+    }
+}
+
+impl Topology for ArrowStore {
+    fn vertex_count(&self) -> usize { self.rows.len() }
+    fn edge_count(&self) -> usize { 0 }
+    fn has_vertex(&self, vid: u32) -> bool { (vid as usize) < self.rows.len() }
+    fn out_degree(&self, _vid: u32) -> usize { 0 }
+    fn in_degree(&self, _vid: u32) -> usize { 0 }
+    fn out_neighbors(&self, _vid: u32) -> Vec<Neighbor> { Vec::new() }
+    fn in_neighbors(&self, _vid: u32) -> Vec<Neighbor> { Vec::new() }
+    fn out_neighbors_by_label(&self, _vid: u32, _edge_label: &str) -> Vec<Neighbor> { Vec::new() }
+    fn in_neighbors_by_label(&self, _vid: u32, _edge_label: &str) -> Vec<Neighbor> { Vec::new() }
+}
+
+impl Property for ArrowStore {
+    fn vertex_labels(&self, vid: u32) -> Vec<String> {
+        self.vertex_labels.get(vid as usize).into_iter().cloned().collect()
+    }
+
+    fn vertex_prop(&self, vid: u32, key: &str) -> Option<PropValue> {
+        // Fast path: direct Arrow column access (no JSON parse)
+        match key {
+            "rkey" | "pk_value" => return self.col_str(vid, 4).map(PropValue::Str),
+            "pk_key" => return self.col_str(vid, 3).map(PropValue::Str),
+            "label" => return self.col_str(vid, 2).map(PropValue::Str),
+            _ => {}
+        }
+        // Slow path: parse props_json (cached per-vid)
+        self.ensure_props(vid);
+        self.props_cache.lock().unwrap().get(&vid)?.get(key).cloned()
+    }
+
+    fn edge_prop(&self, _edge_id: u32, _key: &str) -> Option<PropValue> { None }
+
+    fn vertex_prop_keys(&self, label: &str) -> Vec<String> {
+        let mut keys = HashSet::new();
+        for &vid in self.label_index.get(label).into_iter().flatten() {
+            self.ensure_props(vid);
+            if let Some(props) = self.props_cache.lock().unwrap().get(&vid) {
+                keys.extend(props.keys().cloned());
+            }
+        }
+        keys.into_iter().collect()
+    }
+
+    fn edge_prop_keys(&self, _label: &str) -> Vec<String> { Vec::new() }
+
+    fn vertex_all_props(&self, vid: u32) -> HashMap<String, PropValue> {
+        self.ensure_props(vid);
+        self.props_cache.lock().unwrap().get(&vid).cloned().unwrap_or_default()
+    }
+}
+
+impl Schema for ArrowStore {
+    fn vertex_labels(&self) -> Vec<String> { self.known_labels.clone() }
+    fn edge_labels(&self) -> Vec<String> { Vec::new() }
+    fn vertex_primary_key(&self, label: &str) -> Option<String> { self.pk_keys.get(label).cloned() }
+}
+
+impl Scannable for ArrowStore {
+    fn scan_vertices(&self, label: &str, predicate: &Predicate) -> Vec<u32> {
+        self.scan_vertices_by_label(label)
+            .into_iter()
+            .filter(|&vid| predicate_matches_vertex(self, vid, predicate))
+            .collect()
+    }
+    fn scan_vertices_by_label(&self, label: &str) -> Vec<u32> {
+        self.label_index.get(label).cloned().unwrap_or_default()
+    }
+    fn scan_all_vertices(&self) -> Vec<u32> {
+        (0..self.rows.len() as u32).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

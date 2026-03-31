@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 use yata_grin::{Predicate, PropValue, Property, Scannable};
 
 use crate::config::TieredEngineConfig;
-use crate::memory_bridge;
 use crate::router;
 
 /// Compaction result (LanceDB-native).
@@ -208,15 +207,15 @@ impl TieredGraphEngine {
         }
     }
 
-    /// Build an ephemeral LanceReadStore from LanceDB table (scans needed labels).
-    /// This replaces the persistent L0 CSR — each query builds a fresh read store.
-    fn build_read_store(&self, labels: &[&str]) -> Result<yata_lance::LanceReadStore, String> {
+    /// Build an ArrowStore from LanceDB (zero-copy, lazy props).
+    /// Label pushdown: only scans fragments matching requested labels.
+    fn build_read_store(&self, labels: &[&str]) -> Result<yata_lance::ArrowStore, String> {
         let lance_tbl = self.lance_table.clone();
         self.block_on(async {
             let tbl_guard = lance_tbl.lock().await;
             let tbl = match tbl_guard.as_ref() {
                 Some(t) => t,
-                None => return Ok(yata_lance::LanceReadStore::default()),
+                None => return yata_lance::ArrowStore::from_batches(Vec::new()),
             };
             let batches = if labels.is_empty() {
                 tbl.scan_all().await.map_err(|e| format!("LanceDB scan: {e}"))?
@@ -229,7 +228,7 @@ impl TieredGraphEngine {
                 }
                 all
             };
-            yata_lance::LanceReadStore::from_lance_batches(&batches)
+            yata_lance::ArrowStore::from_batches(batches)
         })
     }
 
@@ -394,13 +393,9 @@ impl TieredGraphEngine {
                     let rows = yata_gie::executor::result_to_rows(&records, &plan);
                     return Ok(rows);
                 }
-                // GIE transpile failed (CONTAINS, UNION, UNWIND, etc.) → MemoryGraph read-only executor
+                return Err(format!("GIE transpile failed for query: {cypher}"));
             }
-            // MemoryGraph fallback for unsupported read-only patterns
-            let store = self.build_read_store(&vl_refs)?;
-            let mut g = memory_bridge::memory_graph_from_store(&store);
-            return memory_bridge::execute_query(&mut g, cypher, params)
-                .map_err(|e| e.to_string());
+            return Err(format!("Cypher parse failed for query: {cypher}"));
         }
 
         // Direct Lance mutation: translate Cypher AST → merge_record/delete_record
@@ -544,7 +539,7 @@ impl TieredGraphEngine {
     /// Find vertices matching a MATCH pattern (label + inline props + WHERE clause).
     fn find_matching_vertices(
         &self,
-        store: &yata_lance::LanceReadStore,
+        store: &yata_lance::ArrowStore,
         np: &yata_cypher::NodePattern,
         _where_clause: &Option<yata_cypher::Expr>,
         param_map: &HashMap<String, String>,
@@ -940,7 +935,7 @@ impl TieredGraphEngine {
         let mut collection_scopes: Vec<String> = Vec::new();
         let mut allowed_owner_hashes: Vec<u32> = Vec::new();
 
-        { let store = self.build_read_store(&[]).unwrap_or_default(); {
+        { let store = self.build_read_store(&[]).unwrap_or_else(|_| yata_lance::ArrowStore::from_batches(Vec::new()).unwrap()); {
                 let did_val = PropValue::Str(did.to_string());
 
                 // ClearanceAssignment: scan by did → extract level
@@ -1028,7 +1023,7 @@ impl TieredGraphEngine {
     /// Resolve DID's P-256 public key multibase string from DIDDocument vertex.
     /// Returns the raw multibase string (z-prefix base58btc) or None.
     pub fn resolve_did_pubkey_multibase(&self, did: &str) -> Option<String> {
-        { let store = self.build_read_store(&[]).unwrap_or_default(); {
+        { let store = self.build_read_store(&[]).unwrap_or_else(|_| yata_lance::ArrowStore::from_batches(Vec::new()).unwrap()); {
                 let did_val = PropValue::Str(did.to_string());
                 let vids = store.scan_vertices("DIDDocument", &Predicate::Eq("did".to_string(), did_val));
                 let vid = *vids.first()?;
@@ -1265,32 +1260,7 @@ mod tests {
 
     // ── UNWIND / UNION (cypher via engine) ──────────────────────────
 
-    #[test]
-    fn test_unwind_list() {
-        let dir = tempfile::tempdir().unwrap();
-        let e = make_engine(&dir);
-        let rows = run_query(&e, "UNWIND [1, 2, 3] AS x RETURN x", &[], None).unwrap();
-        assert_eq!(rows.len(), 3);
-    }
-
-    #[test]
-    fn test_union_dedup() {
-        let dir = tempfile::tempdir().unwrap();
-        let e = make_engine(&dir);
-        run_query(&e, "CREATE (n:U {v: 'a'})", &[], None).unwrap();
-        run_query(&e, "CREATE (n:U {v: 'b'})", &[], None).unwrap();
-        // UNION should dedup identical rows
-        let rows = run_query(
-            &e,
-            "MATCH (n:U) RETURN n.v AS v UNION MATCH (n:U) RETURN n.v AS v",
-            &[],
-            None,
-        )
-        .unwrap();
-        assert_eq!(rows.len(), 2, "UNION should deduplicate identical rows");
-    }
-
-    // ── GIE cache invalidation end-to-end ───────────────────────────
+    // ── GIE read path ───────────────────────────────────────────────
 
     #[test]
     fn test_where_eq_filter() {
@@ -1431,62 +1401,6 @@ mod tests {
         .unwrap();
         assert_eq!(rows.len(), 3);
         assert!(get_col(&rows, "v").iter().any(|s| s == "10"));
-    }
-
-    #[test]
-    fn test_cypher_vector_search() {
-        // Cypher CALL db.index.vector.queryNodes on MemoryGraph directly
-        // (PropValue has no List variant, so embedding must be set via set_node_embedding)
-        use yata_cypher::{Graph, MemoryGraph, NodeRef, Value};
-
-        let mut g = MemoryGraph::new();
-        let mut props_a = indexmap::IndexMap::new();
-        props_a.insert("name".into(), Value::Str("alpha".into()));
-        g.add_node(NodeRef {
-            id: "a".into(),
-            labels: vec!["Doc".into()],
-            props: props_a,
-        });
-        g.set_node_embedding("a", &[1.0, 0.0, 0.0]);
-
-        let mut props_b = indexmap::IndexMap::new();
-        props_b.insert("name".into(), Value::Str("beta".into()));
-        g.add_node(NodeRef {
-            id: "b".into(),
-            labels: vec!["Doc".into()],
-            props: props_b,
-        });
-        g.set_node_embedding("b", &[0.0, 1.0, 0.0]);
-
-        let mut props_c = indexmap::IndexMap::new();
-        props_c.insert("name".into(), Value::Str("gamma".into()));
-        g.add_node(NodeRef {
-            id: "c".into(),
-            labels: vec!["Doc".into()],
-            props: props_c,
-        });
-        g.set_node_embedding("c", &[0.9, 0.1, 0.0]);
-
-        let rows = memory_bridge::execute_query(
-            &mut g,
-            "CALL db.index.vector.queryNodes('Doc', 'embedding', [1.0, 0.0, 0.0], 2) YIELD node, score RETURN node.name AS name, score",
-            &[],
-        ).unwrap();
-
-        assert_eq!(
-            rows.len(),
-            2,
-            "should return top 2 results, got {}",
-            rows.len()
-        );
-        let names: Vec<&str> = rows
-            .iter()
-            .filter_map(|r| r.iter().find(|(c, _)| c == "name").map(|(_, v)| v.as_str()))
-            .collect();
-        assert!(
-            names.iter().any(|n| n.contains("alpha")),
-            "alpha should be in results, got: {names:?}"
-        );
     }
 
     #[test]
@@ -1699,37 +1613,6 @@ mod tests {
             serde_json::from_str::<String>(m["ko"]).unwrap(),
             "반도체 시장 성장"
         );
-    }
-
-    #[test]
-    fn test_utf8_where_contains() {
-        let dir = tempfile::tempdir().unwrap();
-        let e = make_engine(&dir);
-        run_query(
-            &e,
-            r#"CREATE (n:News {id: "n1", title: "AI半導体の最新動向"})"#,
-            &[],
-            None,
-        )
-        .unwrap();
-        run_query(
-            &e,
-            r#"CREATE (n:News {id: "n2", title: "ゲーム業界ニュース"})"#,
-            &[],
-            None,
-        )
-        .unwrap();
-        let params = vec![("keyword".to_string(), "\"半導体\"".to_string())];
-        let rows = run_query(
-            &e,
-            "MATCH (n:News) WHERE n.title CONTAINS $keyword RETURN n.id AS id",
-            &params,
-            None,
-        )
-        .unwrap();
-        assert_eq!(rows.len(), 1);
-        let id: String = serde_json::from_str(&rows[0][0].1).unwrap();
-        assert_eq!(id, "n1");
     }
 
     // Snapshot persistence tests removed (write path moved to PDS Pipeline).

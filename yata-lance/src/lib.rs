@@ -9,7 +9,7 @@ pub mod read_store;
 pub mod schema;
 
 pub use dataset::{YataDb, YataTable};
-pub use read_store::LanceReadStore;
+pub use read_store::{ArrowStore, LanceReadStore};
 pub use schema::{
     EDGE_LIVE_IN_TABLE,
     EDGE_LIVE_OUT_TABLE,
