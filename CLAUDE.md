@@ -1,6 +1,6 @@
 # packages/rust/yata
 
-yata — Rust Cypher graph engine on LanceDB。`[PRODUCTION]` Container。`lancedb` 0.27 (lance 4.0)。No CSR。No WAL。No MemoryGraph。No cache。
+yata — Rust Cypher graph engine on LanceDB。`lancedb` 0.27 (lance 4.0)。No CSR。No WAL。No MemoryGraph。No cache。
 
 ## Architecture
 
