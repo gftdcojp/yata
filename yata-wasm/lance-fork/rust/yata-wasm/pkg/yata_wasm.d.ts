@@ -19,10 +19,10 @@ export function generate_fragment_path(): string;
  */
 export function create_manifest(fragment_path: string, num_rows: number, field_names: string[], field_ids: Int32Array): Uint8Array;
 /**
- * Add a fragment to an existing manifest. Returns updated manifest bytes.
+ * Add a fragment to an existing manifest. Returns updated manifest file bytes.
  * Increments version, assigns new fragment ID.
  */
-export function add_fragment_to_manifest(manifest_bytes: Uint8Array, fragment_path: string, num_rows: number, field_ids: Int32Array): Uint8Array;
+export function add_fragment_to_manifest(manifest_file_bytes: Uint8Array, fragment_path: string, num_rows: number, field_ids: Int32Array): Uint8Array;
 /**
  * Get the manifest version path (V2 naming scheme: {version:020}.manifest).
  */

@@ -3,6 +3,7 @@
 pub mod arrow_wal;
 pub mod config;
 pub mod engine;
+pub mod hints;
 pub mod memory_bridge;
 pub mod router;
 pub mod wal;

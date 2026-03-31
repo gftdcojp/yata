@@ -51,8 +51,7 @@ pub fn infer_activity(cypher: &str) -> String {
 /// Extract label + rel_type hints from Cypher AST for query pushdown.
 /// Returns (node_labels, rel_types, is_read_only) or None if no pushdown possible.
 pub fn extract_pushdown_hints(cypher: &str) -> Option<(Vec<String>, Vec<String>)> {
-    let query = yata_cypher::parse(cypher).ok()?;
-    let hints = crate::hints::QueryHints::extract(&query);
+    let hints = crate::hints::QueryHints::extract(cypher);
     if !hints.is_read_only {
         return None;
     }
@@ -65,8 +64,7 @@ pub fn extract_pushdown_hints(cypher: &str) -> Option<(Vec<String>, Vec<String>)
 /// Extract label hints from a mutation Cypher (CREATE/MERGE/MATCH patterns).
 /// Used to load only the referenced labels instead of the entire graph.
 pub fn extract_mutation_hints(cypher: &str) -> Option<(Vec<String>, Vec<String>)> {
-    let query = yata_cypher::parse(cypher).ok()?;
-    let hints = crate::hints::QueryHints::extract(&query);
+    let hints = crate::hints::QueryHints::extract(cypher);
     if hints.node_labels.is_empty() && hints.rel_types.is_empty() {
         return None;
     }

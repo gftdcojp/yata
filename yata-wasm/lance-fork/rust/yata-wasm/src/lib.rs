@@ -302,23 +302,24 @@ pub fn create_manifest(
         ..Default::default()
     };
 
-    let bytes = manifest.encode_to_vec();
-    Ok(bytes)
+    let file_bytes = wrap_manifest_file(&manifest);
+    Ok(file_bytes)
 }
 
-/// Add a fragment to an existing manifest. Returns updated manifest bytes.
+/// Add a fragment to an existing manifest. Returns updated manifest file bytes.
 /// Increments version, assigns new fragment ID.
 #[wasm_bindgen]
 pub fn add_fragment_to_manifest(
-    manifest_bytes: &[u8],
+    manifest_file_bytes: &[u8],
     fragment_path: &str,
     num_rows: u32,
     field_ids: Vec<i32>,
 ) -> Result<Vec<u8>, JsValue> {
     use prost::Message;
 
-    let mut manifest = pbtable::Manifest::decode(manifest_bytes)
-        .map_err(|e| JsValue::from_str(&format!("manifest decode error: {e}")))?;
+    // Parse manifest from file format (skip to protobuf after length prefix)
+    let mut manifest = parse_manifest_file(manifest_file_bytes)
+        .map_err(|e| JsValue::from_str(&e))?;
 
     let new_fragment_id = manifest.max_fragment_id + 1;
     manifest.max_fragment_id = new_fragment_id;
@@ -337,7 +338,56 @@ pub fn add_fragment_to_manifest(
         ..Default::default()
     });
 
-    Ok(manifest.encode_to_vec())
+    Ok(wrap_manifest_file(&manifest))
+}
+
+/// Wrap a protobuf Manifest into the Lance manifest file format:
+/// [u32: len] [protobuf bytes] [i64: position] [i16: major=0] [i16: minor=1] [b"LANC"]
+fn wrap_manifest_file(manifest: &pbtable::Manifest) -> Vec<u8> {
+    use prost::Message;
+    let proto_bytes = manifest.encode_to_vec();
+    let proto_len = proto_bytes.len() as u32;
+    let manifest_pos = 0i64; // position of the u32 length prefix
+
+    let mut buf = Vec::with_capacity(proto_bytes.len() + 4 + 16);
+    buf.extend_from_slice(&proto_len.to_le_bytes());  // u32 length
+    buf.extend_from_slice(&proto_bytes);               // protobuf
+    buf.extend_from_slice(&manifest_pos.to_le_bytes()); // i64 position
+    buf.extend_from_slice(&0i16.to_le_bytes());        // major version
+    buf.extend_from_slice(&1i16.to_le_bytes());        // minor version
+    buf.extend_from_slice(b"LANC");                    // magic
+    buf
+}
+
+/// Parse a Lance manifest file: read footer to find protobuf, then decode.
+fn parse_manifest_file(file_bytes: &[u8]) -> Result<pbtable::Manifest, String> {
+    use prost::Message;
+
+    if file_bytes.len() < 16 {
+        // Might be raw protobuf (old format without file wrapper)
+        return pbtable::Manifest::decode(file_bytes)
+            .map_err(|e| format!("manifest decode: {e}"));
+    }
+
+    // Check for LANC magic at end
+    let footer_start = file_bytes.len() - 16;
+    let magic = &file_bytes[file_bytes.len() - 4..];
+    if magic == b"LANC" {
+        // New format: read footer
+        let pos = i64::from_le_bytes(file_bytes[footer_start..footer_start + 8].try_into().unwrap()) as usize;
+        let proto_len = u32::from_le_bytes(file_bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let proto_start = pos + 4;
+        let proto_end = proto_start + proto_len;
+        if proto_end > file_bytes.len() {
+            return Err("manifest protobuf extends beyond file".to_string());
+        }
+        pbtable::Manifest::decode(&file_bytes[proto_start..proto_end])
+            .map_err(|e| format!("manifest decode: {e}"))
+    } else {
+        // Fallback: raw protobuf
+        pbtable::Manifest::decode(file_bytes)
+            .map_err(|e| format!("manifest decode (raw): {e}"))
+    }
 }
 
 /// Get the manifest version path (V2 naming scheme: {version:020}.manifest).
@@ -351,8 +401,8 @@ pub fn manifest_path(version: u32) -> String {
 pub fn read_manifest(manifest_bytes: &[u8]) -> Result<String, JsValue> {
     use prost::Message;
 
-    let manifest = pbtable::Manifest::decode(manifest_bytes)
-        .map_err(|e| JsValue::from_str(&format!("manifest decode error: {e}")))?;
+    let manifest = parse_manifest_file(manifest_bytes)
+        .map_err(|e| JsValue::from_str(&e))?;
 
     let fragments: Vec<serde_json::Value> = manifest
         .fragments

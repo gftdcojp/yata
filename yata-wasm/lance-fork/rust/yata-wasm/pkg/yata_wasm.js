@@ -256,16 +256,16 @@ export function create_manifest(fragment_path, num_rows, field_names, field_ids)
 }
 
 /**
- * Add a fragment to an existing manifest. Returns updated manifest bytes.
+ * Add a fragment to an existing manifest. Returns updated manifest file bytes.
  * Increments version, assigns new fragment ID.
- * @param {Uint8Array} manifest_bytes
+ * @param {Uint8Array} manifest_file_bytes
  * @param {string} fragment_path
  * @param {number} num_rows
  * @param {Int32Array} field_ids
  * @returns {Uint8Array}
  */
-export function add_fragment_to_manifest(manifest_bytes, fragment_path, num_rows, field_ids) {
-    const ptr0 = passArray8ToWasm0(manifest_bytes, wasm.__wbindgen_malloc);
+export function add_fragment_to_manifest(manifest_file_bytes, fragment_path, num_rows, field_ids) {
+    const ptr0 = passArray8ToWasm0(manifest_file_bytes, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(fragment_path, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
