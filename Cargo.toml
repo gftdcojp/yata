@@ -4,9 +4,6 @@ members = [
     # Layer 0: zero deps
     "yata-core",
     "yata-grin",
-    # Layer 1: core primitives
-    "yata-arrow",
-    "yata-object",
     # Layer 2: graph
     "yata-cypher",
     # Layer 3: graph engine
@@ -17,8 +14,6 @@ members = [
     "yata-server",
     # Layer 5: dev
     "yata-bench",
-    # Layer 5: Python bindings (Hayate V5 training/inference bridge)
-    "yata-hayate",
 ]
 
 [workspace.package]
@@ -42,12 +37,10 @@ hmac = "0.12"
 # Internal crate refs (workspace path deps)
 yata-core = { path = "yata-core" }
 yata-grin = { path = "yata-grin" }
-yata-object = { path = "yata-object" }
 yata-cypher = { path = "yata-cypher" }
 yata-engine = { path = "yata-engine" }
 yata-gie = { path = "yata-gie" }
 yata-server = { path = "yata-server" }
-yata-arrow = { path = "yata-arrow" }
 yata-lance = { path = "yata-lance" }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
