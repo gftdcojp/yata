@@ -1416,6 +1416,12 @@ fn write_page_to_data_buffer(page: EncodedPage, data_buffer: &mut BytesMut) -> P
     let buffers = page.data;
     let mut buffer_offsets_and_sizes = Vec::with_capacity(buffers.len());
     for buffer in buffers {
+        // Align buffer start to 64-byte boundary (required by V2.1 reader)
+        let misalign = data_buffer.len() % 64;
+        if misalign != 0 {
+            let padding = 64 - misalign;
+            data_buffer.extend_from_slice(&vec![0u8; padding]);
+        }
         let buffer_offset = data_buffer.len() as u64;
         data_buffer.extend_from_slice(&buffer);
         let size = data_buffer.len() as u64 - buffer_offset;

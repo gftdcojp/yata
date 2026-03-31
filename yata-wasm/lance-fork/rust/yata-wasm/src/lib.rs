@@ -75,8 +75,38 @@ fn concat_lance_footer(
     let mut data = BytesMut::with_capacity(batch.data.len() + 64 * 1024);
     data.put(batch.data.clone());
 
-    // No global buffers (mini lance mode)
-    let global_buffers: Vec<(u64, u64)> = vec![];
+    // Write global buffer: FileDescriptor with schema (required by V2 reader)
+    // Align to 64 bytes (V2.1 requirement)
+    let misalign = data.len() % 64;
+    if misalign != 0 {
+        let padding = 64 - misalign;
+        data.extend_from_slice(&vec![0u8; padding]);
+    }
+    let schema_start = data.len() as u64;
+    let lance_schema = LanceSchema::try_from(batch.schema.as_ref()).map_err(|e| e.to_string())?;
+    // Convert schema fields to protobuf
+    let pb_fields: Vec<pb::Field> = lance_schema.fields.iter().enumerate().map(|(i, f)| {
+        pb::Field {
+            name: f.name.clone(),
+            id: i as i32,
+            parent_id: -1,
+            logical_type: lance_core::datatypes::LogicalType::try_from(&f.data_type())
+                .map(|lt| lt.to_string())
+                .unwrap_or_else(|_| "string".to_string()),
+            ..Default::default()
+        }
+    }).collect();
+    let descriptor = pb::FileDescriptor {
+        schema: Some(pb::Schema {
+            fields: pb_fields,
+            metadata: Default::default(),
+        }),
+        length: batch.num_rows,
+    };
+    let descriptor_bytes = descriptor.encode_to_vec();
+    let descriptor_len = descriptor_bytes.len() as u64;
+    data.put(descriptor_bytes.as_slice());
+    let global_buffers = vec![(schema_start, descriptor_len)];
 
     // Write column metadata
     let col_metadata_start = data.len() as u64;
@@ -244,7 +274,7 @@ pub fn read_lance_footer(file_bytes: &[u8]) -> Result<String, JsValue> {
 #[wasm_bindgen]
 pub fn generate_fragment_path() -> String {
     let uuid = uuid::Uuid::new_v4();
-    format!("data/{}.lance", uuid)
+    format!("{}.lance", uuid)
 }
 
 // ── Manifest Operations ──
@@ -276,6 +306,9 @@ pub fn create_manifest(
     let data_file = pbtable::DataFile {
         path: fragment_path.to_string(),
         fields: field_ids.clone(),
+        column_indices: (0..field_ids.len() as i32).collect(),
+        file_major_version: 2,
+        file_minor_version: 1,
         ..Default::default()
     };
 
@@ -327,7 +360,10 @@ pub fn add_fragment_to_manifest(
 
     let data_file = pbtable::DataFile {
         path: fragment_path.to_string(),
-        fields: field_ids,
+        fields: field_ids.clone(),
+        column_indices: (0..field_ids.len() as i32).collect(),
+        file_major_version: 2,
+        file_minor_version: 1,
         ..Default::default()
     };
 
