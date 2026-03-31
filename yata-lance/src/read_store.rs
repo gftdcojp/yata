@@ -600,21 +600,32 @@ pub struct ArrowStore {
 
 impl ArrowStore {
     /// Build from Lance-schema batches. O(N) scan of label/pk_value/op columns only.
-    /// No props_json parsing during init — deferred to access time.
+    ///
+    /// Supports both legacy 7-col schema (seq, op, label, pk_key, pk_value, ts, props_json)
+    /// and new 10-col Format D schema (op, label, pk_value, ts, repo, owner_did, name, app_id, rkey, val_json).
+    /// Auto-detects schema by column count and first column type.
     pub fn from_batches(batches: Vec<RecordBatch>) -> Result<Self, String> {
-        let mut dedup: HashMap<(String, String, String), (u16, u32, bool)> = HashMap::new();
+        let mut dedup: HashMap<(String, String), (u16, u32, bool)> = HashMap::new();
         for (bi, batch) in batches.iter().enumerate() {
-            if batch.num_columns() < 7 { continue; }
-            let op_col = batch.column(1).as_any().downcast_ref::<UInt8Array>()
-                .ok_or("column 1 (op) is not UInt8")?;
-            let label_col = str_col(batch, 2)?;
-            let pk_key_col = str_col(batch, 3)?;
-            let pk_val_col = str_col(batch, 4)?;
+            if batch.num_columns() < 3 { continue; }
+
+            // Detect schema: Format D has op(UInt8) at col 0, legacy has seq(UInt64) at col 0
+            let is_format_d = batch.schema().field(0).data_type() == &arrow::datatypes::DataType::UInt8;
+
+            let (op_idx, label_idx, pk_val_idx) = if is_format_d {
+                (0usize, 1usize, 2usize) // Format D: op=0, label=1, pk_value=2
+            } else {
+                (1usize, 2usize, 4usize) // Legacy: seq=0, op=1, label=2, pk_key=3, pk_value=4
+            };
+
+            let op_col = batch.column(op_idx).as_any().downcast_ref::<UInt8Array>()
+                .ok_or(format!("column {op_idx} (op) is not UInt8"))?;
+            let label_col = str_col(batch, label_idx)?;
+            let pk_val_col = str_col(batch, pk_val_idx)?;
 
             for row in 0..batch.num_rows() {
                 let key = (
                     label_col.value(row).to_string(),
-                    pk_key_col.value(row).to_string(),
                     pk_val_col.value(row).to_string(),
                 );
                 dedup.insert(key, (bi as u16, row as u32, op_col.value(row) == 0));
@@ -627,14 +638,14 @@ impl ArrowStore {
         let mut known_labels = Vec::new();
         let mut pk_keys: HashMap<String, String> = HashMap::new();
 
-        for ((label, pk_key, _), (bi, ri, alive)) in &dedup {
+        for ((label, _), (bi, ri, alive)) in &dedup {
             if !*alive { continue; }
             let vid = rows.len() as u32;
             rows.push(RowLoc { batch: *bi, row: *ri });
             vertex_labels.push(label.clone());
             label_index.entry(label.clone()).or_default().push(vid);
             if !known_labels.contains(label) { known_labels.push(label.clone()); }
-            pk_keys.entry(label.clone()).or_insert_with(|| pk_key.clone());
+            pk_keys.entry(label.clone()).or_insert_with(|| "rkey".to_string());
         }
 
         Ok(Self {
@@ -659,7 +670,15 @@ impl ArrowStore {
         if self.props_cache.lock().unwrap().contains_key(&vid) { return Some(()); }
         let loc = self.rows.get(vid as usize)?;
         let batch = self.batches.get(loc.batch as usize)?;
-        let col = batch.column(6).as_any().downcast_ref::<StringArray>()?;
+        // Format D: val_json at col 9. Legacy: props_json at col 6.
+        let is_format_d = batch.schema().field(0).data_type() == &arrow::datatypes::DataType::UInt8;
+        let json_col_idx = if is_format_d { 9 } else { 6 };
+        if json_col_idx >= batch.num_columns() { return Some(()); }
+        let col = batch.column(json_col_idx).as_any().downcast_ref::<StringArray>()?;
+        if col.is_null(loc.row as usize) {
+            self.props_cache.lock().unwrap().insert(vid, HashMap::new());
+            return Some(());
+        }
         let parsed = parse_props_json(Some(col.value(loc.row as usize))).ok()?;
         self.props_cache.lock().unwrap().insert(vid, parsed);
         Some(())
@@ -670,8 +689,12 @@ impl ArrowStore {
     pub fn find_vertex_by_pk(&self, label: &str, _pk_key: &str, pk_value: &PropValue) -> Option<u32> {
         let expected = match pk_value { PropValue::Str(s) => s.as_str(), _ => return None };
         self.label_index.get(label)?.iter().copied().find(|&vid| {
-            // Check pk_value from Arrow column 4 (zero-copy, no JSON parse)
-            self.col_str(vid, 4).as_deref() == Some(expected)
+            // Detect schema to find pk_value column index
+            let loc = match self.rows.get(vid as usize) { Some(l) => l, None => return false };
+            let batch = match self.batches.get(loc.batch as usize) { Some(b) => b, None => return false };
+            let is_format_d = batch.schema().field(0).data_type() == &arrow::datatypes::DataType::UInt8;
+            let pk_col = if is_format_d { 2 } else { 4 }; // Format D: pk_value=2, Legacy: pk_value=4
+            self.col_str(vid, pk_col).as_deref() == Some(expected)
         })
     }
 }
@@ -694,14 +717,32 @@ impl Property for ArrowStore {
     }
 
     fn vertex_prop(&self, vid: u32, key: &str) -> Option<PropValue> {
-        // Fast path: direct Arrow column access (no JSON parse)
-        match key {
-            "rkey" | "pk_value" => return self.col_str(vid, 4).map(PropValue::Str),
-            "pk_key" => return self.col_str(vid, 3).map(PropValue::Str),
-            "label" => return self.col_str(vid, 2).map(PropValue::Str),
-            _ => {}
+        // Detect schema: Format D has op(UInt8) at col 0
+        let loc = self.rows.get(vid as usize)?;
+        let batch = self.batches.get(loc.batch as usize)?;
+        let is_format_d = batch.schema().field(0).data_type() == &arrow::datatypes::DataType::UInt8;
+
+        if is_format_d {
+            // Format D: op=0, label=1, pk_value=2, ts=3, repo=4, owner_did=5, name=6, app_id=7, rkey=8, val_json=9
+            match key {
+                "pk_value" | "rkey" => return self.col_str(vid, 2).map(PropValue::Str), // pk_value is rkey
+                "label" => return self.col_str(vid, 1).map(PropValue::Str),
+                "repo" => return self.col_str(vid, 4).map(PropValue::Str),
+                "owner_did" => return self.col_str(vid, 5).map(PropValue::Str),
+                "name" => return self.col_str(vid, 6).map(PropValue::Str),
+                "app_id" | "_app_id" => return self.col_str(vid, 7).map(PropValue::Str),
+                _ => {}
+            }
+        } else {
+            // Legacy 7-col: seq=0, op=1, label=2, pk_key=3, pk_value=4, ts=5, props_json=6
+            match key {
+                "rkey" | "pk_value" => return self.col_str(vid, 4).map(PropValue::Str),
+                "pk_key" => return self.col_str(vid, 3).map(PropValue::Str),
+                "label" => return self.col_str(vid, 2).map(PropValue::Str),
+                _ => {}
+            }
         }
-        // Slow path: parse props_json (cached per-vid)
+        // Slow path: parse val_json/props_json (cached per-vid)
         self.ensure_props(vid);
         self.props_cache.lock().unwrap().get(&vid)?.get(key).cloned()
     }
