@@ -18,9 +18,6 @@ import {
   type LabelData,
 } from "./r2-reader.js";
 import type { CypherResult, YataRPC } from "./types.js";
-import {
-  type WorkersWriteEntry,
-} from "./workers-write.js";
 
 // ── Workers Read Router ──
 
@@ -28,19 +25,11 @@ export interface WorkersReadConfig {
   store: FragmentStore;
   container: YataRPC;
   partitionId?: number;
-  /** Legacy option (ignored in Lance-only mode). */
-  walWriter?: unknown;
-  /** Legacy option (ignored in Lance-only mode). */
-  walBucket?: unknown;
-  /** R2 prefix (default: "yata/"). */
-  prefix?: string;
 }
 
 export interface WorkersReadStats {
   workersHit: number;
   containerFallback: number;
-  /** Legacy metric; always 0 in Lance-only mode. */
-  pendingWalMerged: number;
 }
 
 /**
@@ -54,22 +43,15 @@ export class WorkersReader {
   private store: FragmentStore;
   private container: YataRPC;
   private pid: number;
-  // Legacy fields retained for API compatibility, not used in Lance-only mode.
-  private walWriter: unknown;
-  private walBucket: unknown;
-  private prefix: string;
   private manifest: CompactionManifest | null = null;
   private labelCache: Map<string, LabelData> = new Map();
   private edgeCache: Map<string, LabelData> = new Map();
-  readonly stats: WorkersReadStats = { workersHit: 0, containerFallback: 0, pendingWalMerged: 0 };
+  readonly stats: WorkersReadStats = { workersHit: 0, containerFallback: 0 };
 
   constructor(config: WorkersReadConfig) {
     this.store = config.store;
     this.container = config.container;
     this.pid = config.partitionId ?? 0;
-    this.walWriter = config.walWriter ?? null;
-    this.walBucket = config.walBucket ?? null;
-    this.prefix = config.prefix ?? "yata/";
   }
 
   /**
@@ -119,25 +101,6 @@ export class WorkersReader {
     parameters?: Record<string, unknown>,
   ): Promise<CypherResult> {
     return this.container.mutate(statement, appId, parameters);
-  }
-
-  // ── Write API (R2 direct) ──
-
-  /**
-   * Legacy API kept for compatibility.
-   * Writes through pending WAL have been removed in Lance-only mode.
-   */
-  async writeRecord(entry: WorkersWriteEntry): Promise<string> {
-    void entry;
-    throw new Error("WorkersReader.writeRecord is disabled: use direct Lance fragment writes");
-  }
-
-  /**
-   * Write multiple records as a single R2 segment (batch).
-   */
-  async writeRecords(entries: WorkersWriteEntry[]): Promise<string> {
-    void entries;
-    throw new Error("WorkersReader.writeRecords is disabled: use direct Lance fragment writes");
   }
 
   /**
