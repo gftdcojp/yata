@@ -17,6 +17,8 @@ members = [
     "yata-server",
     # Layer 5: dev
     "yata-bench",
+    # Layer 5: Python bindings (Hayate V5 training/inference bridge)
+    "yata-hayate",
 ]
 
 [workspace.package]
