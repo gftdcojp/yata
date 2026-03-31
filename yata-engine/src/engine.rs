@@ -120,19 +120,6 @@ fn edge_lance_schema() -> Arc<arrow::datatypes::Schema> {
 /// Promoted vertex property names (columns 4-8 in lance_schema).
 const PROMOTED_PROPS: [&str; 5] = ["repo", "owner_did", "name", "app_id", "rkey"];
 
-/// Extract a promoted property value as string from owned props vec.
-fn extract_owned_prop_str<'a>(props: &'a [(String, yata_grin::PropValue)], key: &str) -> Option<&'a str> {
-    props.iter().find_map(|(k, v)| {
-        if k == key {
-            match v {
-                yata_grin::PropValue::Str(s) => Some(s.as_str()),
-                _ => None,
-            }
-        } else {
-            None
-        }
-    })
-}
 
 /// Extract a promoted property value as string from props slice.
 fn extract_prop_str<'a>(props: &'a [(&str, yata_grin::PropValue)], key: &str) -> Option<&'a str> {
@@ -270,37 +257,6 @@ pub struct MutationContext {
     pub actor_did: String,
 }
 
-/// Write buffer row for batched vertex writes (P0).
-struct VertexBufferRow {
-    op: u8,
-    label: String,
-    pk_value: String,
-    props: Vec<(String, yata_grin::PropValue)>,
-}
-
-/// Write buffer row for batched edge writes (P0).
-struct EdgeBufferRow {
-    op: u8,
-    edge_label: String,
-    eid: String,
-    src_vid: String,
-    dst_vid: String,
-    src_label: Option<String>,
-    dst_label: Option<String>,
-    props: Vec<(String, yata_grin::PropValue)>,
-}
-
-/// Batched write buffer to reduce Lance fragment count (P0).
-///
-/// Accumulates rows and flushes as multi-row RecordBatch when threshold reached.
-/// Reduces fragment count from O(writes) to O(writes/batch_size).
-struct WriteBuffer {
-    vertex_rows: Vec<VertexBufferRow>,
-    edge_rows: Vec<EdgeBufferRow>,
-    flush_threshold: usize,
-}
-
-const WRITE_BUFFER_THRESHOLD: usize = 64;
 const AUTO_COMPACT_FRAGMENT_THRESHOLD: u64 = 128;
 
 /// Graph engine: LanceDB-backed. No persistent CSR. Query = LanceDB scan → ephemeral CSR → GIE.
@@ -311,8 +267,6 @@ pub struct TieredGraphEngine {
     /// Separate edge table (P1).
     lance_edge_table: Arc<tokio::sync::Mutex<Option<yata_lance::YataTable>>>,
     s3_prefix: String,
-    /// Write buffer for batched appends (P0).
-    write_buffer: Arc<Mutex<WriteBuffer>>,
     /// SecurityScope cache: DID → (SecurityScope, compiled_at). Design E.
     security_scope_cache: Arc<Mutex<HashMap<String, (yata_gie::ir::SecurityScope, std::time::Instant)>>>,
     cypher_read_count: Arc<AtomicU64>,
@@ -320,13 +274,6 @@ pub struct TieredGraphEngine {
     cypher_mutation_us_total: Arc<AtomicU64>,
     merge_record_count: Arc<AtomicU64>,
     last_compaction_ms: Arc<AtomicU64>,
-}
-
-/// Flush write buffer on drop to ensure all data is persisted.
-impl Drop for TieredGraphEngine {
-    fn drop(&mut self) {
-        let _ = self.flush_write_buffer();
-    }
 }
 
 impl TieredGraphEngine {
@@ -352,11 +299,6 @@ impl TieredGraphEngine {
             lance_table: Arc::new(tokio::sync::Mutex::new(None)),
             lance_edge_table: Arc::new(tokio::sync::Mutex::new(None)),
             s3_prefix,
-            write_buffer: Arc::new(Mutex::new(WriteBuffer {
-                vertex_rows: Vec::new(),
-                edge_rows: Vec::new(),
-                flush_threshold: WRITE_BUFFER_THRESHOLD,
-            })),
             security_scope_cache: Arc::new(Mutex::new(HashMap::new())),
             cypher_read_count: Arc::new(AtomicU64::new(0)),
             cypher_mutation_count: Arc::new(AtomicU64::new(0)),
@@ -367,13 +309,8 @@ impl TieredGraphEngine {
     }
 
     /// Build an ArrowStore from LanceDB (zero-copy, lazy props).
-    ///
-    /// Flushes the write buffer first to ensure latest data is visible.
     /// Label pushdown: only scans fragments matching requested labels.
     fn build_read_store(&self, labels: &[&str]) -> Result<yata_lance::ArrowStore, String> {
-        // Flush any buffered writes so they're visible in the scan
-        self.flush_write_buffer()?;
-
         let lance_tbl = self.lance_table.clone();
         self.block_on(async {
             let tbl_guard = lance_tbl.lock().await;
@@ -397,6 +334,9 @@ impl TieredGraphEngine {
     }
 
     /// Ensure LanceDB connection + vertex/edge tables are initialized.
+    ///
+    /// If the existing vertices table has the old 7-col schema (seq at col 0),
+    /// migrate it: read all data, drop table, create with Format D schema, re-insert.
     fn ensure_lance(&self) {
         let lance_db = self.lance_db.clone();
         let lance_tbl = self.lance_table.clone();
@@ -419,7 +359,41 @@ impl TieredGraphEngine {
             if tbl_guard.is_none() {
                 if let Some(ref db) = *db_guard {
                     match db.open_table("vertices").await {
-                        Ok(tbl) => { *tbl_guard = Some(tbl); }
+                        Ok(tbl) => {
+                            // Check if old schema (col 0 = UInt64 "seq") — needs migration
+                            let is_legacy = {
+                                match tbl.scan_all().await {
+                                    Ok(batches) => batches.first()
+                                        .map(|b| b.schema().field(0).data_type() == &arrow::datatypes::DataType::UInt64)
+                                        .unwrap_or(false),
+                                    Err(_) => false,
+                                }
+                            };
+                            if is_legacy {
+                                tracing::info!("detected legacy 7-col vertices table — migrating to Format D in-place");
+                                // Read all data via ArrowStore (handles both schemas)
+                                let batches = tbl.scan_all().await.unwrap_or_default();
+                                let store = yata_lance::ArrowStore::from_batches(batches).unwrap_or_else(|_| {
+                                    yata_lance::ArrowStore::from_batches(Vec::new()).unwrap()
+                                });
+                                let vertex_count = store.vertex_count();
+                                tracing::info!(vertex_count, "legacy data read, dropping old table");
+                                // Drop old table and create Format D
+                                let _ = db.inner().drop_table("vertices").await;
+                                let new_tbl = db.create_empty_table("vertices", lance_schema()).await;
+                                match new_tbl {
+                                    Ok(new_t) => {
+                                        tracing::info!("Format D vertices table created");
+                                        *tbl_guard = Some(new_t);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "failed to create Format D table");
+                                    }
+                                }
+                            } else {
+                                *tbl_guard = Some(tbl);
+                            }
+                        }
                         Err(_) => {
                             let schema = lance_schema();
                             if let Ok(tbl) = db.create_empty_table("vertices", schema).await {
@@ -898,10 +872,10 @@ impl TieredGraphEngine {
         })
     }
 
-    /// Write a vertex record via the write buffer (P0: batched append).
+    /// Write a record to LanceDB (append-only, Format D).
     ///
-    /// Records accumulate in the buffer and flush as a multi-row RecordBatch
-    /// when the threshold is reached, reducing Lance fragment count.
+    /// Edges (pk_key == "eid") go to the separate edges table (P1).
+    /// Vertices go to the vertices table with Format D schema (P2).
     pub fn merge_record(
         &self,
         label: &str,
@@ -911,70 +885,13 @@ impl TieredGraphEngine {
     ) -> Result<u32, String> {
         self.merge_record_count.fetch_add(1, Ordering::Relaxed);
         self.invalidate_security_cache_if_policy(label, props);
-
-        // Check if this is an edge (pk_key == "eid") → route to edge buffer (P1)
-        if pk_key == "eid" {
-            let src = props.iter().find_map(|(k, v)| if *k == "_src" { if let PropValue::Str(s) = v { Some(s.clone()) } else { None } } else { None }).unwrap_or_default();
-            let dst = props.iter().find_map(|(k, v)| if *k == "_dst" { if let PropValue::Str(s) = v { Some(s.clone()) } else { None } } else { None }).unwrap_or_default();
-            let mut buf = self.write_buffer.lock().unwrap();
-            buf.edge_rows.push(EdgeBufferRow {
-                op: 0,
-                edge_label: label.to_string(),
-                eid: pk_value.to_string(),
-                src_vid: src,
-                dst_vid: dst,
-                src_label: None,
-                dst_label: None,
-                props: props.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
-            });
-            let should_flush = buf.edge_rows.len() >= buf.flush_threshold;
-            drop(buf);
-            if should_flush {
-                self.flush_write_buffer()?;
-            }
-            return Ok(0);
-        }
-
-        // Vertex write → buffer
-        let mut buf = self.write_buffer.lock().unwrap();
-        buf.vertex_rows.push(VertexBufferRow {
-            op: 0,
-            label: label.to_string(),
-            pk_value: pk_value.to_string(),
-            props: props.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
-        });
-        let should_flush = buf.vertex_rows.len() >= buf.flush_threshold;
-        drop(buf);
-
-        if should_flush {
-            self.flush_write_buffer()?;
-        }
-        Ok(0)
-    }
-
-    /// Flush the write buffer as multi-row RecordBatches (P0).
-    pub fn flush_write_buffer(&self) -> Result<(), String> {
         self.ensure_lance();
-        let mut buf = self.write_buffer.lock().unwrap();
-        let vertex_rows = std::mem::take(&mut buf.vertex_rows);
-        let edge_rows = std::mem::take(&mut buf.edge_rows);
-        drop(buf);
 
-        // Flush vertex rows
-        if !vertex_rows.is_empty() {
-            let batch = self.build_vertex_batch(&vertex_rows)?;
-            let lance_tbl = self.lance_table.clone();
-            self.block_on(async {
-                let tbl_guard = lance_tbl.lock().await;
-                let tbl = tbl_guard.as_ref().ok_or("LanceDB vertex table not initialized")?;
-                tbl.add(batch).await.map_err(|e| format!("LanceDB vertex add: {e}"))?;
-                Ok::<(), String>(())
-            })?;
-        }
-
-        // Flush edge rows
-        if !edge_rows.is_empty() {
-            let batch = self.build_edge_batch(&edge_rows)?;
+        // Edge detection: pk_key == "eid" → edge table (P1)
+        if pk_key == "eid" {
+            let src = props.iter().find_map(|(k, v)| if *k == "_src" { if let PropValue::Str(s) = v { Some(s.as_str()) } else { None } } else { None }).unwrap_or("");
+            let dst = props.iter().find_map(|(k, v)| if *k == "_dst" { if let PropValue::Str(s) = v { Some(s.as_str()) } else { None } } else { None }).unwrap_or("");
+            let batch = build_edge_lance_batch(0, label, pk_value, src, dst, None, None, props)?;
             let lance_edge_tbl = self.lance_edge_table.clone();
             self.block_on(async {
                 let tbl_guard = lance_edge_tbl.lock().await;
@@ -982,115 +899,30 @@ impl TieredGraphEngine {
                 tbl.add(batch).await.map_err(|e| format!("LanceDB edge add: {e}"))?;
                 Ok::<(), String>(())
             })?;
+            return Ok(0);
         }
 
-        // Auto-compact check (P0)
+        // Vertex write → direct Lance append (Format D)
+        let batch = build_lance_batch(0, label, pk_key, pk_value, props)?;
+        let lance_tbl = self.lance_table.clone();
+        self.block_on(async {
+            let tbl_guard = lance_tbl.lock().await;
+            let tbl = tbl_guard.as_ref().ok_or("LanceDB vertex table not initialized")?;
+            tbl.add(batch).await.map_err(|e| format!("LanceDB vertex add: {e}"))?;
+            Ok::<(), String>(())
+        })?;
+
+        // Auto-compact
         let merges = self.merge_record_count.load(Ordering::Relaxed);
-        let last_compact = self.last_compaction_ms.load(Ordering::Relaxed);
-        if merges % AUTO_COMPACT_FRAGMENT_THRESHOLD == 0 && last_compact > 0 {
+        if merges % AUTO_COMPACT_FRAGMENT_THRESHOLD == 0 && merges > 0 {
             let _ = self.trigger_compaction();
         }
-
-        Ok(())
-    }
-
-    /// Build a multi-row vertex RecordBatch from buffered rows.
-    fn build_vertex_batch(&self, rows: &[VertexBufferRow]) -> Result<arrow::array::RecordBatch, String> {
-        use arrow::array::{ArrayRef, RecordBatch, StringArray, UInt64Array, UInt8Array};
-
-        let n = rows.len();
-        let ts = now_ms();
-
-        let ops: Vec<u8> = rows.iter().map(|r| r.op).collect();
-        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
-        let pk_values: Vec<&str> = rows.iter().map(|r| r.pk_value.as_str()).collect();
-        let timestamps: Vec<u64> = vec![ts; n];
-
-        let repos: Vec<Option<&str>> = rows.iter().map(|r| extract_owned_prop_str(&r.props, "repo")).collect();
-        let owner_dids: Vec<Option<&str>> = rows.iter().map(|r| extract_owned_prop_str(&r.props, "owner_did")).collect();
-        let names: Vec<Option<&str>> = rows.iter().map(|r| extract_owned_prop_str(&r.props, "name")).collect();
-        let app_ids: Vec<Option<&str>> = rows.iter().map(|r| {
-            extract_owned_prop_str(&r.props, "app_id").or_else(|| extract_owned_prop_str(&r.props, "_app_id"))
-        }).collect();
-        let rkeys: Vec<Option<&str>> = rows.iter().map(|r| extract_owned_prop_str(&r.props, "rkey")).collect();
-
-        let val_jsons: Vec<Option<String>> = rows.iter().map(|r| {
-            let overflow: serde_json::Map<String, serde_json::Value> = r.props
-                .iter()
-                .filter(|(k, _)| !PROMOTED_PROPS.contains(&k.as_str()) && k != "_app_id")
-                .map(|(k, v)| (k.clone(), prop_to_json(v)))
-                .collect();
-            if overflow.is_empty() { None } else { Some(serde_json::to_string(&overflow).unwrap_or_default()) }
-        }).collect();
-        let val_refs: Vec<Option<&str>> = val_jsons.iter().map(|v| v.as_deref()).collect();
-
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(UInt8Array::from(ops)),
-            Arc::new(StringArray::from(labels)),
-            Arc::new(StringArray::from(pk_values)),
-            Arc::new(UInt64Array::from(timestamps)),
-            Arc::new(StringArray::from(repos)),
-            Arc::new(StringArray::from(owner_dids)),
-            Arc::new(StringArray::from(names)),
-            Arc::new(StringArray::from(app_ids)),
-            Arc::new(StringArray::from(rkeys)),
-            Arc::new(StringArray::from(val_refs)),
-        ];
-
-        RecordBatch::try_new(lance_schema(), columns)
-            .map_err(|e| format!("vertex batch build failed: {e}"))
-    }
-
-    /// Build a multi-row edge RecordBatch from buffered rows.
-    fn build_edge_batch(&self, rows: &[EdgeBufferRow]) -> Result<arrow::array::RecordBatch, String> {
-        use arrow::array::{ArrayRef, RecordBatch, StringArray, UInt64Array, UInt8Array};
-
-        let n = rows.len();
-        let ts = now_ms();
-
-        let ops: Vec<u8> = rows.iter().map(|r| r.op).collect();
-        let edge_labels: Vec<&str> = rows.iter().map(|r| r.edge_label.as_str()).collect();
-        let eids: Vec<&str> = rows.iter().map(|r| r.eid.as_str()).collect();
-        let src_vids: Vec<&str> = rows.iter().map(|r| r.src_vid.as_str()).collect();
-        let dst_vids: Vec<&str> = rows.iter().map(|r| r.dst_vid.as_str()).collect();
-        let src_labels: Vec<Option<&str>> = rows.iter().map(|r| r.src_label.as_deref()).collect();
-        let dst_labels: Vec<Option<&str>> = rows.iter().map(|r| r.dst_label.as_deref()).collect();
-        let timestamps: Vec<u64> = vec![ts; n];
-        let app_ids: Vec<Option<&str>> = rows.iter().map(|r| {
-            extract_owned_prop_str(&r.props, "app_id").or_else(|| extract_owned_prop_str(&r.props, "_app_id"))
-        }).collect();
-
-        let val_jsons: Vec<Option<String>> = rows.iter().map(|r| {
-            let overflow: serde_json::Map<String, serde_json::Value> = r.props
-                .iter()
-                .filter(|(k, _)| !["app_id", "_app_id", "_src", "_dst"].contains(&k.as_str()))
-                .map(|(k, v)| (k.clone(), prop_to_json(v)))
-                .collect();
-            if overflow.is_empty() { None } else { Some(serde_json::to_string(&overflow).unwrap_or_default()) }
-        }).collect();
-        let val_refs: Vec<Option<&str>> = val_jsons.iter().map(|v| v.as_deref()).collect();
-
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(UInt8Array::from(ops)),
-            Arc::new(StringArray::from(edge_labels)),
-            Arc::new(StringArray::from(eids)),
-            Arc::new(StringArray::from(src_vids)),
-            Arc::new(StringArray::from(dst_vids)),
-            Arc::new(StringArray::from(src_labels)),
-            Arc::new(StringArray::from(dst_labels)),
-            Arc::new(UInt64Array::from(timestamps)),
-            Arc::new(StringArray::from(app_ids)),
-            Arc::new(StringArray::from(val_refs)),
-        ];
-
-        RecordBatch::try_new(edge_lance_schema(), columns)
-            .map_err(|e| format!("edge batch build failed: {e}"))
+        Ok(0)
     }
 
     /// Delete a record (tombstone write to LanceDB). Returns false if record doesn't exist.
     pub fn delete_record(&self, label: &str, pk_key: &str, pk_value: &str) -> Result<bool, String> {
-        // Flush buffer first so read_store sees latest data
-        self.flush_write_buffer()?;
+        self.ensure_lance();
         let store = self.build_read_store(&[label])?;
         let exists = store.find_vertex_by_pk(label, pk_key, &yata_grin::PropValue::Str(pk_value.to_string())).is_some();
         if !exists {
