@@ -1,13 +1,15 @@
 # packages/rust/yata
 
-yata — Rust Cypher graph engine on LanceDB。`[PRODUCTION]` Container。`lancedb` 0.27 (lance 4.0)。No persistent CSR。No WAL。No cache。No S3Client。engine.rs 1,712行。
+yata — Rust Cypher graph engine on LanceDB。`[PRODUCTION]` Container。`lancedb` 0.27 (lance 4.0)。No persistent CSR。No WAL。No cache。No S3Client。
 
 ## Architecture
 
 ```
-Write: mergeRecord() → WalEntry batch → table.add(batch) [LanceDB] → R2
-Read:  cypher() → build_read_store(labels) → table.scan_filter() → ephemeral LanceReadStore → GIE
-Cold:  ensure_lance() → db.open_table("vertices") [LanceDB handles R2]
+Write: merge_record() → build_lance_batch() → table.add(batch) [LanceDB append-only]
+       Cypher CREATE (literal) → try_direct_lance_create() → merge_record() O(1)
+       Cypher MATCH+SET/DELETE → MemoryGraph fallback → write-back → table.add()
+Read:  cypher() → build_read_store(labels) → table.scan_filter() → from_lance_batches() → GIE
+Cold:  ensure_lance() → db.open_table("vertices") or create_empty_table()
 ```
 
 ## Crate Roles
@@ -16,30 +18,19 @@ Cold:  ensure_lance() → db.open_table("vertices") [LanceDB handles R2]
 |---|---|
 | `yata-core` | GlobalVid, LocalVid, PartitionId |
 | `yata-grin` | GRIN trait (Topology, Property, Schema, Scannable, Mutable) |
-| `yata-engine` | TieredGraphEngine (1,712行)。LanceDB write/read/compact。SecurityScope (Design E) |
+| `yata-engine` | TieredGraphEngine。LanceDB write/read/compact。SecurityScope (Design E) |
 | `yata-cypher` | Cypher parser + CSR executor |
 | `yata-gie` | GIE push-based executor + SecurityFilter |
-| `yata-lance` | LanceDB wrapper (1,074行)。YataDb + YataTable + LanceReadStore + Arrow schema |
+| `yata-lance` | LanceDB wrapper。YataDb + YataTable + LanceReadStore (from_lance_batches) |
 | `yata-server` | XRPC API + JWT auth |
-| `yata-hayate` | Hayate V5 Python bridge (PyO3, workspace excluded — deps on deleted crates) |
 
 ## 禁止事項
 
 - **LanceDB 以外の persistence path 新規追加禁止**
 - **persistent CSR 再導入禁止** — ephemeral `build_read_store()` per query
-- **WAL ring buffer 再導入禁止** — `merge_record()` → `table.add()` 直接
-- **Arrow IPC transport 再導入禁止** — `walTailArrow`/`walApplyArrow` 除去済み。`arrow-ipc` dep 除去済み
+- **WAL 再導入禁止** — Lance は append-only。WAL は Shannon 冗長
 - **in-memory query cache 再導入禁止** — Cloudflare edge cache に委譲
 - **`RUSTC_WRAPPER=sccache` 禁止** — `cargo zigbuild` + `avx512_stub.rs`
-
-## Production (2026-03-31, lancedb 0.27)
-
-| Endpoint | p50 | Grade |
-|---|---|---|
-| SearchPosts | 9.0ms | S |
-| GetProfile | 9.3ms | S |
-| GetTimeline | 653ms | D (was 15s F) |
-| GetDiscoverFeed | 704ms | D (was 10.5s F) |
 
 ## Build
 

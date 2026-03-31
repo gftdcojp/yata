@@ -24,15 +24,6 @@ impl LanceReadStore {
         Self::default()
     }
 
-    pub async fn from_tables(
-        vertex_live: &crate::YataTable,
-        edge_live_out: &crate::YataTable,
-    ) -> Result<Self, String> {
-        let vertex_batches = vertex_live.scan_all().await.map_err(|e| e.to_string())?;
-        let edge_batches = edge_live_out.scan_all().await.map_err(|e| e.to_string())?;
-        Self::from_live_batches(&vertex_batches, &edge_batches)
-    }
-
     pub fn from_live_batches(
         vertex_batches: &[RecordBatch],
         edge_out_batches: &[RecordBatch],

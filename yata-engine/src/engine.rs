@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use yata_cypher::Graph;
-use yata_grin::{Predicate, PropValue, Property, Scannable, Topology};
+use yata_grin::{Predicate, PropValue, Property, Scannable};
 
 use crate::config::TieredEngineConfig;
 use crate::memory_bridge;
@@ -80,7 +80,6 @@ fn expr_to_prop_value(expr: &yata_cypher::Expr) -> Option<yata_grin::PropValue> 
             yata_cypher::Literal::Str(s) => Some(yata_grin::PropValue::Str(s.clone())),
             yata_cypher::Literal::Bool(b) => Some(yata_grin::PropValue::Bool(*b)),
             yata_cypher::Literal::Null => Some(yata_grin::PropValue::Null),
-            _ => None,
         },
         _ => None,
     }
@@ -485,18 +484,16 @@ impl TieredGraphEngine {
         &self,
         cypher: &str,
         params: &[(String, String)],
-        rls_org_id: Option<&str>,
+        _rls_org_id: Option<&str>,
         mutation_ctx: Option<&MutationContext>,
     ) -> Result<Vec<Vec<(String, String)>>, String> {
         self.ensure_lance();
         let is_mutation = router::is_cypher_mutation(cypher);
-        let _mutation_hints = if is_mutation {
+        if is_mutation {
             self.cypher_mutation_count.fetch_add(1, Ordering::Relaxed);
-            router::extract_mutation_hints(cypher)
         } else {
             self.cypher_read_count.fetch_add(1, Ordering::Relaxed);
-            None
-        };
+        }
         let query_start = std::time::Instant::now();
 
         if !is_mutation {
@@ -522,17 +519,13 @@ impl TieredGraphEngine {
             }
         }
 
-        // Fast path: simple CREATE-only → direct Lance merge_record (no MemoryGraph, O(1))
-        if let Some(result) = self.try_direct_lance_create(cypher, mutation_ctx) {
-            if is_mutation {
-                let elapsed_us = query_start.elapsed().as_micros() as u64;
-                self.cypher_mutation_us_total.fetch_add(elapsed_us, Ordering::Relaxed);
-            }
-            return result;
+        // Direct Lance mutation: translate Cypher AST → merge_record/delete_record
+        let result = self.execute_mutation_direct(cypher, params, mutation_ctx);
+        if is_mutation {
+            let elapsed_us = query_start.elapsed().as_micros() as u64;
+            self.cypher_mutation_us_total.fetch_add(elapsed_us, Ordering::Relaxed);
         }
-
-        // Slow path: complex mutations (MATCH+SET/DELETE, MERGE) → MemoryGraph fallback
-        self.execute_mutation_via_memory_graph(cypher, params, mutation_ctx, is_mutation, query_start)
+        result
     }
 
     /// Try direct Lance mutation for simple CREATE-only Cypher (no MATCH/SET/DELETE).
@@ -792,7 +785,6 @@ impl TieredGraphEngine {
         _prop_filter: Option<&str>,
     ) -> Result<Vec<(yata_cypher::NodeRef, f32)>, String> {
         let lance_db = self.lance_db.clone();
-        let prefix_owned = self.s3_prefix.clone();
 
         self.block_on(async {
             let db_guard = lance_db.lock().await;
@@ -844,11 +836,7 @@ impl TieredGraphEngine {
         })
     }
 
-    /// L0 compact threshold: trigger compaction when pending_writes exceeds this.
-    /// Size-based (workload-adaptive), replaces time-based cron.
-    const L0_COMPACT_THRESHOLD: usize = 10_000;
-
-    /// Append-only merge record (LanceDB-style: tombstone old + append new fragment).
+    /// Write a record to LanceDB (append-only).
     /// Write a record to LanceDB (append-only). No persistent CSR — next query scans from LanceDB.
     pub fn merge_record(
         &self,
@@ -921,7 +909,7 @@ impl TieredGraphEngine {
 
         // Primary: use Lance built-in compaction to merge fragments
         let result = self.block_on(async {
-            let mut ds_guard = lance_ds.lock().await;
+            let ds_guard = lance_ds.lock().await;
             if let Some(ref ds) = *ds_guard {
                 let version_before = ds.version().await.unwrap_or(0);
                 match ds.compact().await {
@@ -1135,18 +1123,7 @@ impl TieredGraphEngine {
         params: &[(String, String)],
         scope: yata_gie::ir::SecurityScope,
     ) -> Result<Vec<Vec<(String, String)>>, String> {
-        let is_mutation = router::is_cypher_mutation(cypher);
-        if is_mutation {
-            if let Some((labels, _)) = router::extract_mutation_hints(cypher) {
-            } else {
-            }
-        }
-
-        // Cache lookup (reads only, scope-aware key)
-        if !is_mutation {
-            let (hints_labels, _) = router::extract_pushdown_hints(cypher).unwrap_or_default();
-            let vl_refs: Vec<&str> = hints_labels.iter().map(|s| s.as_str()).collect();
-
+        if !router::is_cypher_mutation(cypher) {
             if let Ok(ast) = yata_cypher::parse(cypher) {
                 let plan = yata_gie::transpile::transpile_secured(&ast, scope)
                     .map_err(|e| format!("GIE transpile: {}", e))?;
@@ -1195,7 +1172,7 @@ impl TieredGraphEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yata_grin::{Property, Scannable};
+    use yata_grin::{Property, Scannable, Topology};
 
     fn make_engine(dir: &tempfile::TempDir) -> TieredGraphEngine {
         TieredGraphEngine::new(TieredEngineConfig::default(), dir.path().to_str().unwrap())

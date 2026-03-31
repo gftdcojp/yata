@@ -134,51 +134,6 @@ pub fn execute_query(
     Ok(rows)
 }
 
-pub fn rebuild_read_store_from_memory_graph(graph: &MemoryGraph) -> yata_lance::LanceReadStore {
-    let nodes = graph.nodes();
-    let rels = graph.rels();
-    let mut store = yata_lance::LanceReadStore::default();
-    let mut vid_map: HashMap<String, u32> = HashMap::new();
-
-    for node in &nodes {
-        let props: Vec<(&str, PropValue)> = node
-            .props
-            .iter()
-            .map(|(k, v)| (k.as_str(), cypher_to_prop(v)))
-            .collect();
-        let label = node.labels.first().map(String::as_str).unwrap_or("Node");
-        let pk_key = if node.props.contains_key("rkey") { "rkey" } else { "_vid" };
-        let pk_value = node
-            .props
-            .get(pk_key)
-            .map(cypher_to_prop)
-            .unwrap_or_else(|| PropValue::Str(node.id.clone()));
-        let vid = store.merge_vertex_by_pk(label, pk_key, &pk_value, &props);
-        vid_map.insert(node.id.clone(), vid);
-    }
-
-    for rel in &rels {
-        let (Some(&src), Some(&dst)) = (vid_map.get(&rel.src), vid_map.get(&rel.dst)) else {
-            continue;
-        };
-        let edge_id = store.edge_count() as u32;
-        let props: HashMap<String, PropValue> = rel
-            .props
-            .iter()
-            .map(|(k, v)| (k.clone(), cypher_to_prop(v)))
-            .collect();
-        store.add_edge_cache_entry(
-            src,
-            dst,
-            edge_id,
-            rel.rel_type.clone(),
-            props,
-        );
-    }
-
-    store
-}
-
 pub fn memory_graph_from_store<S: GraphStore>(store: &S) -> MemoryGraph {
     let mut graph = MemoryGraph::new();
     let mut ids = HashMap::<u32, String>::new();

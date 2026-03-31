@@ -11,7 +11,6 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -96,7 +95,7 @@ pub fn router<G: GraphQueryExecutor>(state: YataRestState<G>) -> Router {
         // XRPC — primary API (Workers RPC only)
         .route("/xrpc/ai.gftd.yata.cypher", post(xrpc_cypher::<G>))
         .route("/xrpc/ai.gftd.yata.cypherBatch", post(xrpc_cypher_batch::<G>))
-        // WAL Projection API
+        // LanceDB lifecycle
         .route("/xrpc/ai.gftd.yata.coldStart", post(cold_start_handler::<G>))
         .route("/xrpc/ai.gftd.yata.compact", post(compact_handler::<G>))
         .route("/xrpc/ai.gftd.yata.stats", get(stats_handler::<G>))
