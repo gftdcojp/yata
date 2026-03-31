@@ -219,7 +219,7 @@ mod tests {
     use arrow::array::{StringArray, UInt64Array, UInt8Array};
     use arrow::datatypes::{DataType, Field, Schema};
 
-    fn wal_schema() -> Arc<Schema> {
+    fn lance_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("seq", DataType::UInt64, false),
             Field::new("op", DataType::UInt8, false),
@@ -258,7 +258,7 @@ mod tests {
         let db = YataDb::connect_local(tmpdir.path().to_str().unwrap())
             .await
             .unwrap();
-        let schema = wal_schema();
+        let schema = lance_schema();
         let batch = test_batch(&schema, &[1, 2, 3], &["Post", "Like", "Post"], &["a", "b", "c"]);
 
         let table = db.create_table("vertices", batch).await.unwrap();
@@ -270,7 +270,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().unwrap();
         let path = tmpdir.path().to_str().unwrap();
         let db = YataDb::connect_local(path).await.unwrap();
-        let schema = wal_schema();
+        let schema = lance_schema();
 
         let table = db
             .create_table(
@@ -299,7 +299,7 @@ mod tests {
         let db = YataDb::connect_local(tmpdir.path().to_str().unwrap())
             .await
             .unwrap();
-        let schema = wal_schema();
+        let schema = lance_schema();
         let batch = test_batch(&schema, &[1, 2, 3], &["Post", "Like", "Post"], &["a", "b", "c"]);
 
         let table = db.create_table("vertices", batch).await.unwrap();

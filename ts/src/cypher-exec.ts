@@ -164,15 +164,15 @@ function filterRows(
   params: Record<string, unknown>,
   rowCount: number,
 ): number[] {
-  // Pre-filter: only alive vertices (vertex_live: alive column, WAL: op column where 0=upsert)
+  // Pre-filter: only alive vertices (vertex_live: alive column, Lance: op column where 0=upsert)
   const aliveCol = table.getChild("alive");
-  const opCol = !aliveCol ? table.getChild("op") : null; // WAL schema fallback
+  const opCol = !aliveCol ? table.getChild("op") : null; // Lance schema fallback
 
   if (!where) {
     const result: number[] = [];
     for (let i = 0; i < rowCount; i++) {
       if (aliveCol && !aliveCol.get(i)) continue;
-      if (opCol && opCol.get(i) === 1) continue; // WAL: op=1 is delete
+      if (opCol && opCol.get(i) === 1) continue; // op=1 is delete tombstone
       result.push(i);
     }
     return result;
@@ -250,8 +250,8 @@ function getProps(table: Table, row: number): Record<string, unknown> {
   }
 }
 
-// WAL schema → vertex_live field aliases
-const WAL_FIELD_ALIASES: Record<string, string> = {
+// Lance schema → vertex_live field aliases
+const LANCE_FIELD_ALIASES: Record<string, string> = {
   rkey: "pk_value",
   repo: "repo",              // props_json fallback
   collection: "collection",  // props_json fallback
@@ -270,13 +270,13 @@ function resolveValue(
   // 1. Try direct column first
   const col = table.getChild(prop.field);
   if (col) return col.get(row);
-  // 2. Try WAL field alias (e.g. rkey → pk_value)
-  const aliasField = WAL_FIELD_ALIASES[prop.field];
+  // 2. Try Lance field alias (e.g. rkey → pk_value)
+  const aliasField = LANCE_FIELD_ALIASES[prop.field];
   if (aliasField) {
     const aliasCol = table.getChild(aliasField);
     if (aliasCol) return aliasCol.get(row);
   }
-  // 3. Fallback: look inside props_json (WAL schema has flattened props here)
+  // 3. Fallback: look inside props_json (Lance schema has flattened props here)
   const props = getProps(table, row);
   return props[prop.field];
 }

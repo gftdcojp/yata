@@ -13,39 +13,6 @@ export interface CypherResult {
   org_id?: string;
 }
 
-// ── WAL Entry (Kafka-style projection) ──
-
-export interface WalEntry {
-  seq: number;
-  op: "upsert" | "delete";
-  label: string;
-  pk_key: string;
-  pk_value: string;
-  props: Record<string, unknown>;
-  timestamp_ms: number;
-}
-
-export interface WalTailResult {
-  entries: WalEntry[];
-  head_seq: number;
-  count: number;
-}
-
-export interface WalFlushResult {
-  seq_start: number;
-  seq_end: number;
-  bytes: number;
-}
-
-export interface WalCheckpointResult {
-  vertices: number;
-  edges: number;
-}
-
-export interface WalColdStartResult {
-  checkpoint_seq: number;
-}
-
 // ── AppId (branded type for partition routing) ──
 
 export type AppId = string & { readonly __brand: "AppId" };
@@ -63,12 +30,6 @@ export interface YataRPC {
   mergeRecord(label: string, pkKey: string, pkValue: string, props: Record<string, string>, appId?: string): Promise<{ vid: number }>;
   deleteRecord(label: string, pkKey: string, pkValue: string, appId?: string): Promise<{ deleted: boolean }>;
   cypherBatch(statements: string[], appId?: string): Promise<CypherResult[]>;
-
-  // WAL Projection
-  walTail(pid: number, afterSeq: number, limit?: number): Promise<WalTailResult>;
-  walFlushSegments(): Promise<{ flushed: number }>;
-  walCheckpoint(): Promise<WalCheckpointResult>;
-  walColdStartReplicas(): Promise<{ started: number }>;
 
   // Lifecycle
   health(): Promise<string>;

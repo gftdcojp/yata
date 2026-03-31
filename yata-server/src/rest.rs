@@ -56,12 +56,12 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
         Err("execute_fragment_step not implemented".into())
     }
 
-    /// Cold start from R2 compacted segments + WAL segment replay.
-    fn wal_cold_start(&self) -> Result<u64, String> {
-        Err("wal_cold_start not implemented".to_string())
+    /// Cold start: open LanceDB table.
+    fn cold_start(&self) -> Result<u64, String> {
+        Err("cold_start not implemented".to_string())
     }
 
-    /// L1 Compaction: PK-dedup WAL segments → compacted Arrow IPC segment.
+    /// L1 Compaction: PK-dedup Lance fragments.
     fn trigger_compaction(&self) -> Result<yata_engine::engine::CompactionResult, String> {
         Err("trigger_compaction not implemented".to_string())
     }
@@ -69,18 +69,6 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
     /// CPM metrics: read/mutation/mergeRecord counters.
     fn cpm_stats(&self) -> Option<yata_engine::engine::CpmStats> {
         None
-    }
-
-    /// Merge record and return the WAL entry for pushing to read replicas.
-    fn merge_record_with_wal(
-        &self,
-        label: &str,
-        pk_key: &str,
-        pk_value: &str,
-        props: &[(&str, yata_grin::PropValue)],
-    ) -> Result<(u32, Option<yata_engine::WalEntry>), String> {
-        let _ = (label, pk_key, pk_value, props);
-        Err("merge_record_with_wal not implemented".to_string())
     }
 }
 
@@ -109,9 +97,8 @@ pub fn router<G: GraphQueryExecutor>(state: YataRestState<G>) -> Router {
         .route("/xrpc/ai.gftd.yata.cypher", post(xrpc_cypher::<G>))
         .route("/xrpc/ai.gftd.yata.cypherBatch", post(xrpc_cypher_batch::<G>))
         // WAL Projection API
-        .route("/xrpc/ai.gftd.yata.walColdStart", post(wal_cold_start_handler::<G>))
+        .route("/xrpc/ai.gftd.yata.coldStart", post(cold_start_handler::<G>))
         .route("/xrpc/ai.gftd.yata.compact", post(compact_handler::<G>))
-        .route("/xrpc/ai.gftd.yata.mergeRecordWal", post(merge_record_wal_handler::<G>))
         .route("/xrpc/ai.gftd.yata.stats", get(stats_handler::<G>))
         // Phase 5: Distributed GIE fragment execution
         .route("/xrpc/ai.gftd.yata.executeFragment", post(execute_fragment_handler::<G>))
@@ -384,22 +371,13 @@ async fn xrpc_cypher_batch<G: GraphQueryExecutor>(
     (StatusCode::OK, Json(serde_json::json!({"results": results})))
 }
 
-// ── DO R2 proxy snapshot endpoints ────────────────────────────────────────
-//
-// These endpoints allow the MagatamaContainer DO (TypeScript) to proxy
-// snapshot data between R2 and the Container's Vineyard store.
-// Legacy endpoints removed: triggerSnapshot, rebuild, exportSnapshot, mergeRecord (Cypher MERGE).
-// WAL Projection: mergeRecordWal + walApply + walCheckpoint.
 
-// ── WAL Projection handlers ────────────────────────────────────────────
-
-/// POST /xrpc/ai.gftd.yata.walColdStart — Cold start from R2 checkpoint + WAL replay.
-/// Read Container only.
-async fn wal_cold_start_handler<G: GraphQueryExecutor>(
+/// POST /xrpc/ai.gftd.yata.coldStart — Open LanceDB table from R2.
+async fn cold_start_handler<G: GraphQueryExecutor>(
     State(state): State<YataRestState<G>>,
 ) -> impl IntoResponse {
     let graph = state.graph.clone();
-    let result = tokio::task::spawn_blocking(move || graph.wal_cold_start()).await;
+    let result = tokio::task::spawn_blocking(move || graph.cold_start()).await;
     match result {
         Ok(Ok(checkpoint_seq)) => (StatusCode::OK, Json(serde_json::json!({"checkpoint_seq": checkpoint_seq}))),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
@@ -407,8 +385,7 @@ async fn wal_cold_start_handler<G: GraphQueryExecutor>(
     }
 }
 
-/// POST /xrpc/ai.gftd.yata.compact — L1 Compaction: PK-dedup WAL segments.
-/// Write Container only.
+/// POST /xrpc/ai.gftd.yata.compact — L1 Compaction: PK-dedup Lance fragments.
 async fn compact_handler<G: GraphQueryExecutor>(
     State(state): State<YataRestState<G>>,
 ) -> impl IntoResponse {
@@ -428,74 +405,6 @@ async fn compact_handler<G: GraphQueryExecutor>(
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
     }
 }
-
-/// POST /xrpc/ai.gftd.yata.mergeRecordWal — Merge record AND return WAL entry.
-/// Write Container only. Coordinator uses this to get the WAL entry for pushing to read replicas.
-async fn merge_record_wal_handler<G: GraphQueryExecutor>(
-    State(state): State<YataRestState<G>>,
-    headers: HeaderMap,
-    Json(req): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    if state.readonly {
-        return (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"error": "read-only container"})));
-    }
-    match authorize(&headers, &state) {
-        Ok(AuthResult::Internal) => {} // allow
-        Ok(AuthResult::Authenticated { .. }) => {} // allow authenticated writes
-        _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "unauthorized"}))),
-    };
-
-    let label = req.get("label").and_then(|v| v.as_str()).unwrap_or("");
-    let pk_key = req.get("pk_key").and_then(|v| v.as_str()).unwrap_or("rkey");
-    let pk_value = req.get("pk_value").and_then(|v| v.as_str()).unwrap_or("");
-    let props_val = req.get("props").cloned().unwrap_or(serde_json::Value::Object(Default::default()));
-
-    if label.is_empty() || pk_value.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "label and pk_value required"})));
-    }
-
-    // Convert JSON props to PropValue pairs
-    let mut prop_pairs: Vec<(String, yata_grin::PropValue)> = Vec::new();
-    if let Some(obj) = props_val.as_object() {
-        for (k, v) in obj {
-            let pv = match v {
-                serde_json::Value::String(s) => {
-                    // Detect base64-encoded binary with "b64:" prefix.
-                    if let Some(encoded) = s.strip_prefix("b64:") {
-                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) {
-                            yata_grin::PropValue::Binary(bytes)
-                        } else {
-                            yata_grin::PropValue::Str(s.clone())
-                        }
-                    } else {
-                        yata_grin::PropValue::Str(s.clone())
-                    }
-                }
-                serde_json::Value::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        yata_grin::PropValue::Int(i)
-                    } else {
-                        yata_grin::PropValue::Float(n.as_f64().unwrap_or(0.0))
-                    }
-                }
-                serde_json::Value::Bool(b) => yata_grin::PropValue::Bool(*b),
-                _ => yata_grin::PropValue::Str(v.to_string()),
-            };
-            prop_pairs.push((k.clone(), pv));
-        }
-    }
-    let props_ref: Vec<(&str, yata_grin::PropValue)> = prop_pairs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-
-    match state.graph.merge_record_with_wal(label, pk_key, pk_value, &props_ref) {
-        Ok((vid, wal_entry)) => (StatusCode::OK, Json(serde_json::json!({
-            "ok": true,
-            "vid": vid,
-            "wal_entry": wal_entry,
-        }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
-    }
-}
-
 
 // ── TieredGraphEngine GraphQueryExecutor impl (standalone yata-server, no magatama-engine) ──
 
@@ -523,22 +432,12 @@ impl GraphQueryExecutor for yata_engine::TieredGraphEngine {
         crate::jwt::resolve_multibase_p256_key(&multibase)
     }
 
-    fn wal_cold_start(&self) -> Result<u64, String> {
-        self.wal_cold_start()
+    fn cold_start(&self) -> Result<u64, String> {
+        self.cold_start()
     }
 
     fn trigger_compaction(&self) -> Result<yata_engine::engine::CompactionResult, String> {
         self.trigger_compaction()
-    }
-
-    fn merge_record_with_wal(
-        &self,
-        label: &str,
-        pk_key: &str,
-        pk_value: &str,
-        props: &[(&str, yata_grin::PropValue)],
-    ) -> Result<(u32, Option<yata_engine::WalEntry>), String> {
-        self.merge_record_with_wal(label, pk_key, pk_value, props)
     }
 
     fn cpm_stats(&self) -> Option<yata_engine::engine::CpmStats> {
@@ -593,22 +492,12 @@ mod tests {
             self.engine.query(cypher, params, rls_org_id)
         }
 
-        fn wal_cold_start(&self) -> Result<u64, String> {
-            self.engine.wal_cold_start()
+        fn cold_start(&self) -> Result<u64, String> {
+            self.engine.cold_start()
         }
 
         fn trigger_compaction(&self) -> Result<yata_engine::engine::CompactionResult, String> {
             self.engine.trigger_compaction()
-        }
-
-        fn merge_record_with_wal(
-            &self,
-            label: &str,
-            pk_key: &str,
-            pk_value: &str,
-            props: &[(&str, yata_grin::PropValue)],
-        ) -> Result<(u32, Option<yata_engine::WalEntry>), String> {
-            self.engine.merge_record_with_wal(label, pk_key, pk_value, props)
         }
 
         fn cpm_stats(&self) -> Option<yata_engine::engine::CpmStats> {

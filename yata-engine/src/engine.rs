@@ -52,16 +52,66 @@ fn fnv1a_32(data: &[u8]) -> u32 {
     hash
 }
 
-/// Convert borrowed PropValue slice to owned Vec for WalEntry storage.
-fn props_to_owned(props: &[(&str, yata_grin::PropValue)]) -> Vec<(String, yata_grin::PropValue)> {
-    props.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
-}
-
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Build a single-row Arrow RecordBatch for LanceDB append.
+/// Schema: seq(u64), op(u8), label(utf8), pk_key(utf8), pk_value(utf8), timestamp_ms(u64), props_json(utf8)
+fn build_lance_batch(
+    op: u8,
+    label: &str,
+    pk_key: &str,
+    pk_value: &str,
+    props: &[(&str, yata_grin::PropValue)],
+) -> Result<arrow::array::RecordBatch, String> {
+    use arrow::array::{ArrayRef, RecordBatch, StringArray, UInt64Array, UInt8Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("seq", DataType::UInt64, false),
+        Field::new("op", DataType::UInt8, false),
+        Field::new("label", DataType::Utf8, false),
+        Field::new("pk_key", DataType::Utf8, false),
+        Field::new("pk_value", DataType::Utf8, false),
+        Field::new("timestamp_ms", DataType::UInt64, false),
+        Field::new("props_json", DataType::Utf8, true),
+    ]));
+
+    let props_map: serde_json::Map<String, serde_json::Value> = props
+        .iter()
+        .map(|(k, v)| {
+            let val = match v {
+                yata_grin::PropValue::Str(s) => serde_json::Value::String(s.clone()),
+                yata_grin::PropValue::Int(i) => serde_json::json!(*i),
+                yata_grin::PropValue::Float(f) => serde_json::json!(*f),
+                yata_grin::PropValue::Bool(b) => serde_json::Value::Bool(*b),
+                yata_grin::PropValue::Binary(b) => {
+                    use base64::Engine;
+                    serde_json::Value::String(format!("b64:{}", base64::engine::general_purpose::STANDARD.encode(b)))
+                }
+                yata_grin::PropValue::Null => serde_json::Value::Null,
+            };
+            (k.to_string(), val)
+        })
+        .collect();
+    let props_json = serde_json::to_string(&props_map).unwrap_or_default();
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(UInt64Array::from(vec![0u64])),
+        Arc::new(UInt8Array::from(vec![op])),
+        Arc::new(StringArray::from(vec![label])),
+        Arc::new(StringArray::from(vec![pk_key])),
+        Arc::new(StringArray::from(vec![pk_value])),
+        Arc::new(UInt64Array::from(vec![now_ms()])),
+        Arc::new(StringArray::from(vec![props_json.as_str()])),
+    ];
+
+    RecordBatch::try_new(schema, columns)
+        .map_err(|e| format!("Arrow RecordBatch build failed: {e}"))
 }
 
 
@@ -587,9 +637,7 @@ impl TieredGraphEngine {
     const L0_COMPACT_THRESHOLD: usize = 10_000;
 
     /// Append-only merge record (LanceDB-style: tombstone old + append new fragment).
-    /// WAL append + read-store append. No per-write commit() — index rebuild deferred
-    /// to compaction (size-based trigger at L0_COMPACT_THRESHOLD).
-    /// Write a record to LanceDB. No persistent CSR — next query will scan from LanceDB.
+    /// Write a record to LanceDB (append-only). No persistent CSR — next query scans from LanceDB.
     pub fn merge_record(
         &self,
         label: &str,
@@ -599,16 +647,7 @@ impl TieredGraphEngine {
     ) -> Result<u32, String> {
         self.merge_record_count.fetch_add(1, Ordering::Relaxed);
         self.invalidate_security_cache_if_policy(label, props);
-        // Build a WAL entry batch and add to LanceDB
-        let entry = crate::wal::WalEntry {
-            seq: 0, op: crate::wal::WalOp::Upsert,
-            label: label.to_string(), pk_key: pk_key.to_string(),
-            pk_value: pk_value.to_string(),
-            props: props.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
-            timestamp_ms: now_ms(),
-        };
-        let batch = crate::arrow_wal::wal_entries_to_batch(&[entry])
-            .map_err(|e| format!("batch: {e}"))?;
+        let batch = build_lance_batch(0, label, pk_key, pk_value, props)?;
         self.ensure_lance();
         let lance_tbl = self.lance_table.clone();
         self.block_on(async {
@@ -621,25 +660,9 @@ impl TieredGraphEngine {
         Ok(0)
     }
 
-    /// Write a record. Returns (vid, None).
-    pub fn merge_record_with_wal(
-        &self, label: &str, pk_key: &str, pk_value: &str,
-        props: &[(&str, yata_grin::PropValue)],
-    ) -> Result<(u32, Option<crate::wal::WalEntry>), String> {
-        let vid = self.merge_record(label, pk_key, pk_value, props)?;
-        Ok((vid, None))
-    }
-
     /// Delete a record (tombstone write to LanceDB).
     pub fn delete_record(&self, label: &str, pk_key: &str, pk_value: &str) -> Result<bool, String> {
-        let entry = crate::wal::WalEntry {
-            seq: 0, op: crate::wal::WalOp::Delete,
-            label: label.to_string(), pk_key: pk_key.to_string(),
-            pk_value: pk_value.to_string(), props: Vec::new(),
-            timestamp_ms: now_ms(),
-        };
-        let batch = crate::arrow_wal::wal_entries_to_batch(&[entry])
-            .map_err(|e| format!("batch: {e}"))?;
+        let batch = build_lance_batch(1, label, pk_key, pk_value, &[])?;
         self.ensure_lance();
         let lance_tbl = self.lance_table.clone();
         self.block_on(async {
@@ -650,13 +673,6 @@ impl TieredGraphEngine {
             Ok::<(), String>(())
         })?;
         Ok(true)
-    }
-
-    /// Delete a record. Returns (deleted, None).
-    pub fn delete_record_with_wal(&self, label: &str, pk_key: &str, pk_value: &str,
-    ) -> Result<(bool, Option<crate::wal::WalEntry>), String> {
-        let deleted = self.delete_record(label, pk_key, pk_value)?;
-        Ok((deleted, None))
     }
 
     /// CPM metrics.
@@ -737,10 +753,9 @@ impl TieredGraphEngine {
         result
     }
 
-    /// LanceDB cold start. Downloads Lance TableManifest + WAL tail only.
-    /// Sets hot_initialized = true immediately — labels are loaded on-demand by ensure_labels().
-    /// Multi-node safe: each node loads manifest independently, builds its own label subset.
-    fn wal_cold_start_manifest_only(&self) -> Result<u64, String> {
+    /// LanceDB cold start. Opens Lance table (manifest + fragments from R2).
+    /// Labels are loaded on-demand by ensure_labels().
+    fn cold_start_lance(&self) -> Result<u64, String> {
         let lance_tbl = self.lance_table.clone();
         let lance_db = self.lance_db.clone();
         let prefix_owned = self.s3_prefix.clone();
@@ -783,10 +798,8 @@ impl TieredGraphEngine {
     }
 
     /// Cold start entrypoint used by the REST API.
-    /// Legacy compacted-segment preload has been removed; this now uses the
-    /// Lance manifest-only path and replays the WAL tail.
-    pub fn wal_cold_start(&self) -> Result<u64, String> {
-        self.wal_cold_start_manifest_only()
+    pub fn cold_start(&self) -> Result<u64, String> {
+        self.cold_start_lance()
     }
 
     // ── Design E: SecurityScope compilation from graph policy vertices ──
@@ -969,11 +982,6 @@ impl TieredGraphEngine {
     }
 }
 
-// Write-path standalone functions removed:
-// - extract_dirty_vertex_labels, extract_dirty_edge_labels
-// - upload_blobs_async
-// - build_durable_wal_ops_fast, build_durable_wal_ops
-// Write path: Pipeline.send() + mergeRecord() (PDS Worker).
 
 #[cfg(test)]
 mod tests {

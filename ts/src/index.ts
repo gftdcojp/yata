@@ -1,22 +1,17 @@
 /**
  * @gftd/yata — yata graph engine TS client.
  *
- * Single Source of Truth for all yata TS types, Cypher builder, WAL, and helpers.
+ * Single Source of Truth for all yata TS types, Cypher builder, and helpers.
  * PDS, dispatcher, and apps import from this package.
  *
  * @example
- *   import { G, CypherResult, collectionToLabel, sendWalAndProject } from "@gftd/yata";
+ *   import { G, CypherResult, collectionToLabel } from "@gftd/yata";
  *   const { cypher, params } = new G("Post", "p").where("repo", did).limit(50).build();
  */
 
 // Types
 export type {
   CypherResult,
-  WalEntry,
-  WalTailResult,
-  WalFlushResult,
-  WalCheckpointResult,
-  WalColdStartResult,
   AppId,
   YataRPC,
   MergeProps,
@@ -107,8 +102,6 @@ export {
   stringifyGraphPipelineEnvelope,
   toGraphProjectedRecord,
   toGraphProjectedRecords,
-  walRecordToProjectedRecords,
-  walRecordToVertexEnvelopes,
 } from "./pipeline.js";
 export type {
   EdgePipelineMutation,
@@ -118,9 +111,6 @@ export type {
   GraphPipelineEnvelopeBase,
   GraphProjectedRecord,
   GraphVertexPipelineEnvelope,
-  PipelineWalOp,
-  PipelineWalRecordLike,
-  PipelineWalVertexDefaults,
   PipelineWriterLike,
   VertexPipelineMutation,
 } from "./pipeline.js";
@@ -167,9 +157,3 @@ export {
   mapCypherRows,
 } from "./helpers.js";
 
-// WAL Projection
-export {
-  buildWalRecord,
-  sendWalAndProject,
-  sendWalAndProjectFireAndForget,
-} from "./wal.js";

@@ -37,7 +37,7 @@ export interface WorkersReadStats {
  *
  * - Caches CompactionManifest + loaded label data per partition.
  * - Routes parseable queries to TS executor, others to Container.
- * - Lance-only read: no pending WAL merge path.
+ * - Lance-only read: append-only fragments from R2.
  */
 export class WorkersReader {
   private store: FragmentStore;
