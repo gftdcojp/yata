@@ -255,8 +255,8 @@ const LANCE_FIELD_ALIASES: Record<string, string> = {
   rkey: "pk_value",
   repo: "repo",              // props_json fallback
   collection: "collection",  // props_json fallback
-  'value_b64': "value_b64",   // props_json fallback
-  'updated_at': "timestamp_ms",
+  'valueB64': "valueB64",   // props_json fallback
+  'updatedAt': "timestamp_ms",
 };
 
 function resolveValue(

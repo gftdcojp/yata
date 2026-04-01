@@ -10,7 +10,7 @@
 export interface CypherResult {
   columns: string[];
   rows: unknown[][];
-  org_id?: string;
+  orgId?: string;
 }
 
 // ── AppId (branded type for partition routing) ──
@@ -45,7 +45,7 @@ export interface YataRPC {
 
 export interface MergeProps {
   collection: string;
-  'value_b64': string;
+  'valueB64': string;
   repo: string;
   'sensitivity_ord': string;
   'owner_hash': string;

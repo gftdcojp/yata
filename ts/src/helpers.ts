@@ -26,7 +26,7 @@ export function multiDidFilter(field: string, did: string): string {
 
 // ── Decoding ──
 
-/** Decode base64-encoded value_b64 to a record object. Returns {} on failure. */
+/** Decode base64-encoded valueB64 to a record object. Returns {} on failure. */
 export function tryDecodeRecord(b64: unknown): Record<string, unknown> {
   if (!b64 || typeof b64 !== "string") return {};
   try {
@@ -51,11 +51,11 @@ export function buildMergeProps(
 ): MergeProps {
   return {
     collection,
-    'value_b64': toBase64(json),
+    'valueB64': toBase64(json),
     repo,
     'sensitivity_ord': "0",
     'owner_hash': String(fnv1a32(repo)),
-    'updated_at': String(Date.now()),
+    'updatedAt': String(Date.now()),
   };
 }
 

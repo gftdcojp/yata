@@ -25,27 +25,27 @@ describe("cypher-parse", () => {
 
     it("parses default RETURN columns from G builder output", () => {
       const ast = parseCypher(
-        "MATCH (r:Post) WHERE r.repo = $p0 RETURN r.rkey AS rkey, r.collection AS collection, r.value_b64 AS value_b64, r.updated_at AS updated_at, r.repo AS repo LIMIT 50",
+        "MATCH (r:Post) WHERE r.repo = $p0 RETURN r.rkey AS rkey, r.collection AS collection, r.valueB64 AS valueB64, r.updatedAt AS updatedAt, r.repo AS repo LIMIT 50",
       );
       expect(ast.returns).toHaveLength(5);
       expect(ast.returns.map(r => r.alias)).toEqual([
-        "rkey", "collection", "value_b64", "updated_at", "repo",
+        "rkey", "collection", "valueB64", "updatedAt", "repo",
       ]);
     });
 
     it("parses ORDER BY DESC", () => {
       const ast = parseCypher(
-        "MATCH (r:Post) WHERE r.repo = $p0 RETURN r.text AS text ORDER BY r.updated_at DESC LIMIT 50",
+        "MATCH (r:Post) WHERE r.repo = $p0 RETURN r.text AS text ORDER BY r.updatedAt DESC LIMIT 50",
       );
-      expect(ast.orderBy).toBe("r.updated_at");
+      expect(ast.orderBy).toBe("r.updatedAt");
       expect(ast.orderDesc).toBe(true);
     });
 
     it("parses ORDER BY ASC (default)", () => {
       const ast = parseCypher(
-        "MATCH (r:Post) RETURN r.text AS text ORDER BY r.updated_at LIMIT 10",
+        "MATCH (r:Post) RETURN r.text AS text ORDER BY r.updatedAt LIMIT 10",
       );
-      expect(ast.orderBy).toBe("r.updated_at");
+      expect(ast.orderBy).toBe("r.updatedAt");
       expect(ast.orderDesc).toBe(false);
     });
   });

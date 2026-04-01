@@ -73,7 +73,7 @@ export class G {
     return this;
   }
 
-  /** RETURN columns. Default: rkey, collection, value_b64, updated_at, repo. */
+  /** RETURN columns. Default: rkey, collection, valueB64, updatedAt, repo. */
   ret(...cols: string[]): this {
     this.returnCols = cols;
     return this;
@@ -103,7 +103,7 @@ export class G {
     const retCols =
       this.returnCols.length > 0
         ? this.returnCols.join(", ")
-        : `${a}.rkey AS rkey, ${a}.collection AS collection, ${a}.value_b64 AS value_b64, ${a}.updated_at AS updated_at, ${a}.repo AS repo`;
+        : `${a}.rkey AS rkey, ${a}.collection AS collection, ${a}.valueB64 AS valueB64, ${a}.updatedAt AS updatedAt, ${a}.repo AS repo`;
     const isCount =
       this.returnCols.length === 1 && this.returnCols[0].includes("count(");
     if (this.limitVal <= 0 && !isCount) {
@@ -137,5 +137,5 @@ export function buildLabelCypher(
   filter = ""
 ): string {
   const where = filter ? ` WHERE ${filter}` : "";
-  return `MATCH (r:${label})${where} RETURN r.rkey AS rkey, r.collection AS collection, r.value_b64 AS value_b64, r.updated_at AS updated_at, r.repo AS repo ORDER BY r.updated_at DESC LIMIT ${limit}`;
+  return `MATCH (r:${label})${where} RETURN r.rkey AS rkey, r.collection AS collection, r.valueB64 AS valueB64, r.updatedAt AS updatedAt, r.repo AS repo ORDER BY r.updatedAt DESC LIMIT ${limit}`;
 }
