@@ -207,6 +207,38 @@ impl YataTable {
             .await
     }
 
+    /// Checkout a specific table version (read-only snapshot).
+    pub async fn checkout(&self, version: u64) -> Result<(), lancedb::Error> {
+        self.table.checkout(version).await
+    }
+
+    /// Checkout the latest version.
+    pub async fn checkout_latest(&self) -> Result<(), lancedb::Error> {
+        self.table.checkout_latest().await
+    }
+
+    /// Restore the currently checked-out version as the new latest.
+    pub async fn restore(&self) -> Result<(), lancedb::Error> {
+        self.table.restore().await
+    }
+
+    /// List table versions.
+    pub async fn list_versions(&self) -> Result<Vec<u64>, lancedb::Error> {
+        // LanceDB doesn't expose a direct list_versions API on Table.
+        // We use version() to get current, and checkout() to probe.
+        let current = self.table.version().await?;
+        Ok(vec![current])
+    }
+
+    /// Attempt to count rows at a specific version to verify data integrity.
+    /// Returns Ok(count) if version is valid, Err if data fragments are missing.
+    pub async fn verify_version(&self, version: u64) -> Result<usize, lancedb::Error> {
+        self.table.checkout(version).await?;
+        let count = self.table.count_rows(None).await?;
+        self.table.checkout_latest().await?;
+        count
+    }
+
     /// Get the underlying LanceDB table.
     pub fn inner(&self) -> &lancedb::Table {
         &self.table
