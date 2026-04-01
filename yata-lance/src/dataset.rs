@@ -222,21 +222,36 @@ impl YataTable {
         self.table.restore().await
     }
 
-    /// List table versions.
+    /// List all table versions with their version numbers.
     pub async fn list_versions(&self) -> Result<Vec<u64>, lancedb::Error> {
-        // LanceDB doesn't expose a direct list_versions API on Table.
-        // We use version() to get current, and checkout() to probe.
-        let current = self.table.version().await?;
-        Ok(vec![current])
+        let versions = self.table.list_versions().await?;
+        Ok(versions.iter().map(|v| v.version).collect())
     }
 
-    /// Attempt to count rows at a specific version to verify data integrity.
-    /// Returns Ok(count) if version is valid, Err if data fragments are missing.
-    pub async fn verify_version(&self, version: u64) -> Result<usize, lancedb::Error> {
-        self.table.checkout(version).await?;
-        let count = self.table.count_rows(None).await?;
-        self.table.checkout_latest().await?;
-        count
+    /// Repair: find the newest version with valid data and restore it.
+    /// Returns (restored_version, row_count) on success.
+    pub async fn repair(&self) -> Result<(u64, usize), lancedb::Error> {
+        let versions = self.table.list_versions().await?;
+        let mut sorted: Vec<u64> = versions.iter().map(|v| v.version).collect();
+        sorted.sort_unstable_by(|a, b| b.cmp(a)); // newest first
+
+        for ver in &sorted {
+            self.table.checkout(*ver).await?;
+            match self.table.count_rows(None).await {
+                Ok(count) => {
+                    tracing::info!(version = ver, rows = count, "repair: version OK, restoring");
+                    self.table.restore().await?;
+                    return Ok((*ver, count));
+                }
+                Err(e) => {
+                    tracing::warn!(version = ver, error = %e, "repair: version has missing fragments, skipping");
+                    continue;
+                }
+            }
+        }
+        Err(lancedb::Error::Runtime {
+            message: "repair: no valid version found".into(),
+        })
     }
 
     /// Get the underlying LanceDB table.

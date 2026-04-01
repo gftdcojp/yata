@@ -1104,6 +1104,22 @@ impl TieredGraphEngine {
         self.cold_start_lance()
     }
 
+    /// Repair corrupted Lance table by rolling back to a valid version.
+    /// Finds the newest version with intact data fragments and restores it.
+    pub fn repair_lance(&self) -> Result<(u64, usize), String> {
+        self.ensure_lance();
+        let lance_tbl = self.lance_table.clone();
+
+        self.block_on(async {
+            let guard = lance_tbl.lock().await;
+            if let Some(ref tbl) = *guard {
+                tbl.repair().await.map_err(|e| format!("repair failed: {e}"))
+            } else {
+                Err("repair: LanceDB table not initialized".to_string())
+            }
+        })
+    }
+
     // ── Design E: SecurityScope compilation from graph policy vertices ──
 
     const POLICY_LABELS: [&'static str; 5] = [

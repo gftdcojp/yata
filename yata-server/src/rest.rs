@@ -69,6 +69,11 @@ pub trait GraphQueryExecutor: Send + Sync + 'static {
     fn cpm_stats(&self) -> Option<yata_engine::engine::CpmStats> {
         None
     }
+
+    /// Repair corrupted Lance table by rolling back to a valid version.
+    fn repair_lance(&self) -> Result<(u64, usize), String> {
+        Err("repair_lance not implemented".to_string())
+    }
 }
 
 pub struct YataRestState<G: GraphQueryExecutor> {
@@ -98,6 +103,7 @@ pub fn router<G: GraphQueryExecutor>(state: YataRestState<G>) -> Router {
         // LanceDB lifecycle
         .route("/xrpc/ai.gftd.yata.coldStart", post(cold_start_handler::<G>))
         .route("/xrpc/ai.gftd.yata.compact", post(compact_handler::<G>))
+        .route("/xrpc/ai.gftd.yata.repair", post(repair_handler::<G>))
         .route("/xrpc/ai.gftd.yata.stats", get(stats_handler::<G>))
         // Phase 5: Distributed GIE fragment execution
         .route("/xrpc/ai.gftd.yata.executeFragment", post(execute_fragment_handler::<G>))
@@ -405,6 +411,23 @@ async fn compact_handler<G: GraphQueryExecutor>(
     }
 }
 
+/// POST /xrpc/ai.gftd.yata.repair — Repair corrupted Lance table by version rollback.
+async fn repair_handler<G: GraphQueryExecutor>(
+    State(state): State<YataRestState<G>>,
+) -> impl IntoResponse {
+    let graph = state.graph.clone();
+    let result = tokio::task::spawn_blocking(move || graph.repair_lance()).await;
+    match result {
+        Ok(Ok((version, rows))) => (StatusCode::OK, Json(serde_json::json!({
+            "status": "repaired",
+            "restored_version": version,
+            "row_count": rows,
+        }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
 // ── TieredGraphEngine GraphQueryExecutor impl (standalone yata-server, no magatama-engine) ──
 
 impl GraphQueryExecutor for yata_engine::TieredGraphEngine {
@@ -441,6 +464,10 @@ impl GraphQueryExecutor for yata_engine::TieredGraphEngine {
 
     fn cpm_stats(&self) -> Option<yata_engine::engine::CpmStats> {
         Some(self.cpm_stats())
+    }
+
+    fn repair_lance(&self) -> Result<(u64, usize), String> {
+        self.repair_lance()
     }
 
     fn execute_fragment_step(
