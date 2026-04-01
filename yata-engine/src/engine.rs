@@ -379,7 +379,7 @@ impl TieredGraphEngine {
                                 let vertex_count = store.vertex_count();
                                 tracing::info!(vertex_count, "legacy data read, dropping old table");
                                 // Drop old table and create Format D
-                                let _ = db.inner().drop_table("vertices").await;
+                                let _ = db.inner().drop_table("vertices", &[]).await;
                                 let new_tbl = db.create_empty_table("vertices", lance_schema()).await;
                                 match new_tbl {
                                     Ok(new_t) => {
