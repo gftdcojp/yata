@@ -8,27 +8,27 @@ import { makeVertexTable, makeArrowBuffer } from "./test-helpers.js";
 
 function makeTestManifest(): CompactionManifest {
   return {
-    partition_id: 0,
+    'partition_id': 0,
     version: 2,
-    compacted_segment_key: "",
-    compacted_seq: 100,
-    entry_count: 5,
+    'compacted_segment_key': "",
+    'compacted_seq': 100,
+    'entry_count': 5,
     labels: ["Post", "Profile"],
-    created_at_ms: Date.now(),
-    segment_bytes: 1024,
-    label_segments: {
+    'created_at_ms': Date.now(),
+    'segment_bytes': 1024,
+    'label_segments': {
       Post: {
         key: "yata/log/compacted/0/label/Post.arrow",
-        max_seq: 100,
-        entry_count: 3,
-        segment_bytes: 512,
+        'max_seq': 100,
+        'entry_count': 3,
+        'segment_bytes': 512,
         blake3_hex: "abc",
       },
       Profile: {
         key: "yata/log/compacted/0/label/Profile.arrow",
-        max_seq: 80,
-        entry_count: 2,
-        segment_bytes: 256,
+        'max_seq': 80,
+        'entry_count': 2,
+        'segment_bytes': 256,
         blake3_hex: "def",
       },
     },
@@ -37,8 +37,8 @@ function makeTestManifest(): CompactionManifest {
 
 function makeTestArrowBuffer(): ArrayBuffer {
   const table = makeVertexTable([
-    { vid: "v1", repo: "did:web:alice", rkey: "r1", updated_at_ms: 1000 },
-    { vid: "v2", repo: "did:web:bob", rkey: "r2", updated_at_ms: 2000 },
+    { vid: "v1", repo: "did:web:alice", rkey: "r1", 'updated_at_ms': 1000 },
+    { vid: "v2", repo: "did:web:bob", rkey: "r2", 'updated_at_ms': 2000 },
   ]);
   return makeArrowBuffer(table);
 }
@@ -104,7 +104,7 @@ describe("r2-reader", () => {
     const manifest: CompactionManifest = {
       ...makeTestManifest(),
       version: 1,
-      label_segments: {},
+      'label_segments': {},
     };
 
     const result = await loadLabels(store, manifest, ["Post"]);

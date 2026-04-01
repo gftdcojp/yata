@@ -46,19 +46,19 @@ export type YataGraphTableName =
   | typeof EDGE_LIVE_IN_TABLE;
 
 export interface YataCreatedTables<TTable = unknown> {
-  yata_vertex_log: TTable;
-  yata_edge_log: TTable;
-  yata_vertex_live: TTable;
-  yata_edge_live_out: TTable;
-  yata_edge_live_in: TTable;
+  'yata_vertex_log': TTable;
+  'yata_edge_log': TTable;
+  'yata_vertex_live': TTable;
+  'yata_edge_live_out': TTable;
+  'yata_edge_live_in': TTable;
 }
 
 export interface YataOpenedTables<TTable = unknown> {
-  vertex_log: TTable;
-  edge_log: TTable;
-  vertex_live: TTable;
-  edge_live_out: TTable;
-  edge_live_in: TTable;
+  'vertex_log': TTable;
+  'edge_log': TTable;
+  'vertex_live': TTable;
+  'edge_live_out': TTable;
+  'edge_live_in': TTable;
 }
 
 function mapScalarType<TType>(kind: YataScalarType, factory: ArrowSchemaFactory<unknown, TType, unknown>): TType {

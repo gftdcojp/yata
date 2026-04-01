@@ -8,18 +8,18 @@ import {
 } from "./schema.js";
 
 export interface GraphManifestTableRef {
-  table_name: string;
+  'table_name': string;
   uri: string;
   version?: number;
   etag?: string | null;
 }
 
 export interface GraphManifestTables {
-  vertex_log: GraphManifestTableRef;
-  edge_log: GraphManifestTableRef;
-  vertex_live: GraphManifestTableRef;
-  edge_live_out: GraphManifestTableRef;
-  edge_live_in: GraphManifestTableRef;
+  'vertex_log': GraphManifestTableRef;
+  'edge_log': GraphManifestTableRef;
+  'vertex_live': GraphManifestTableRef;
+  'edge_live_out': GraphManifestTableRef;
+  'edge_live_in': GraphManifestTableRef;
 }
 
 export interface GraphManifestSeqRange {
@@ -28,12 +28,12 @@ export interface GraphManifestSeqRange {
 }
 
 export interface GraphManifest {
-  manifest_version: number;
-  graph_format: typeof GRAPH_FORMAT;
-  contract_version: number;
-  partition_id: number;
+  'manifest_version': number;
+  'graph_format': typeof GRAPH_FORMAT;
+  'contract_version': number;
+  'partition_id': number;
   version: number;
-  key_layout: GraphManifestKeyLayout;
+  'key_layout': GraphManifestKeyLayout;
   tables: GraphManifestTables;
   seq: GraphManifestSeqRange;
   dirty_labels?: string[];
@@ -41,18 +41,18 @@ export interface GraphManifest {
 }
 
 export interface GraphManifestKeyLayout {
-  manifest_prefix: string;
-  latest_key: string;
-  pointer_key: string;
-  versioned_key: string;
+  'manifest_prefix': string;
+  'latest_key': string;
+  'pointer_key': string;
+  'versioned_key': string;
 }
 
 export interface GraphManifestLatestPointer {
-  graph_format: typeof GRAPH_FORMAT;
-  contract_version: number;
-  partition_id: number;
+  'graph_format': typeof GRAPH_FORMAT;
+  'contract_version': number;
+  'partition_id': number;
   version: number;
-  versioned_key: string;
+  'versioned_key': string;
   etag?: string | null;
   updated_at_ms?: number;
 }
@@ -75,7 +75,7 @@ export interface R2BucketLike {
   ): Promise<unknown>;
 }
 
-export function makeManifestTableRef(table_name: string, uri: string): GraphManifestTableRef {
+export function makeManifestTableRef('table_name': string, uri: string): GraphManifestTableRef {
   return { table_name, uri };
 }
 
@@ -87,18 +87,18 @@ export function createGraphManifest(
 ): GraphManifest {
   const base = baseUri.replace(/\/+$/, "");
   return {
-    manifest_version: 1,
-    graph_format: GRAPH_FORMAT,
-    contract_version: 1,
-    partition_id: partitionId,
+    'manifest_version': 1,
+    'graph_format': GRAPH_FORMAT,
+    'contract_version': 1,
+    'partition_id': partitionId,
     version,
-    key_layout: createManifestKeyLayout(partitionId, version),
+    'key_layout': createManifestKeyLayout(partitionId, version),
     tables: {
-      vertex_log: makeManifestTableRef(VERTEX_LOG_TABLE, `${base}/${VERTEX_LOG_TABLE}`),
-      edge_log: makeManifestTableRef(EDGE_LOG_TABLE, `${base}/${EDGE_LOG_TABLE}`),
-      vertex_live: makeManifestTableRef(VERTEX_LIVE_TABLE, `${base}/${VERTEX_LIVE_TABLE}`),
-      edge_live_out: makeManifestTableRef(EDGE_LIVE_OUT_TABLE, `${base}/${EDGE_LIVE_OUT_TABLE}`),
-      edge_live_in: makeManifestTableRef(EDGE_LIVE_IN_TABLE, `${base}/${EDGE_LIVE_IN_TABLE}`),
+      'vertex_log': makeManifestTableRef(VERTEX_LOG_TABLE, `${base}/${VERTEX_LOG_TABLE}`),
+      'edge_log': makeManifestTableRef(EDGE_LOG_TABLE, `${base}/${EDGE_LOG_TABLE}`),
+      'vertex_live': makeManifestTableRef(VERTEX_LIVE_TABLE, `${base}/${VERTEX_LIVE_TABLE}`),
+      'edge_live_out': makeManifestTableRef(EDGE_LIVE_OUT_TABLE, `${base}/${EDGE_LIVE_OUT_TABLE}`),
+      'edge_live_in': makeManifestTableRef(EDGE_LIVE_IN_TABLE, `${base}/${EDGE_LIVE_IN_TABLE}`),
     },
     seq,
   };
@@ -111,9 +111,9 @@ export function createManifestKeyLayout(
   const manifest_prefix = `manifests/partitions/${partitionId}`;
   return {
     manifest_prefix,
-    latest_key: `${manifest_prefix}/latest.json`,
-    pointer_key: `${manifest_prefix}/latest.json`,
-    versioned_key: `${manifest_prefix}/manifest-${String(version).padStart(20, "0")}.json`,
+    'latest_key': `${manifest_prefix}/latest.json`,
+    'pointer_key': `${manifest_prefix}/latest.json`,
+    'versioned_key': `${manifest_prefix}/manifest-${String(version).padStart(20, "0")}.json`,
   };
 }
 
@@ -172,13 +172,13 @@ export function createLatestPointer(
   manifest: GraphManifest,
 ): GraphManifestLatestPointer {
   return {
-    graph_format: GRAPH_FORMAT,
-    contract_version: manifest.contract_version,
-    partition_id: manifest.partition_id,
+    'graph_format': GRAPH_FORMAT,
+    'contract_version': manifest.contract_version,
+    'partition_id': manifest.partition_id,
     version: manifest.version,
-    versioned_key: manifest.key_layout.versioned_key,
+    'versioned_key': manifest.key_layout.versioned_key,
     etag: manifest.tables.vertex_live.etag ?? manifest.tables.edge_live_out.etag,
-    updated_at_ms: manifest.generated_at_ms,
+    'updated_at_ms': manifest.generated_at_ms,
   };
 }
 

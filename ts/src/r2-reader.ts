@@ -16,22 +16,22 @@ import type { R2BucketLike } from "./manifest.js";
 
 export interface LabelSegmentState {
   key: string;
-  max_seq: number;
-  entry_count: number;
-  segment_bytes: number;
+  'max_seq': number;
+  'entry_count': number;
+  'segment_bytes': number;
   blake3_hex: string;
 }
 
 export interface CompactionManifest {
-  partition_id: number;
+  'partition_id': number;
   version: number;
-  compacted_segment_key: string;
-  compacted_seq: number;
-  entry_count: number;
+  'compacted_segment_key': string;
+  'compacted_seq': number;
+  'entry_count': number;
   labels: string[];
-  created_at_ms: number;
-  segment_bytes: number;
-  label_segments: Record<string, LabelSegmentState>;
+  'created_at_ms': number;
+  'segment_bytes': number;
+  'label_segments': Record<string, LabelSegmentState>;
 }
 
 // ── R2 Fragment Store ──

@@ -56,35 +56,35 @@ function buildTable(schema: Schema, columns: Record<string, unknown[]>): Table {
 
 export function makeVertexTable(rows: Record<string, unknown>[]): Table {
   return buildTable(VERTEX_SCHEMA, {
-    partition_id: rows.map(() => 0),
+    'partition_id': rows.map(() => 0),
     label: rows.map(r => String(r.label ?? "")),
-    pk_key: rows.map(r => String(r.pk_key ?? "rkey")),
-    pk_value: rows.map(r => String(r.pk_value ?? "")),
+    'pk_key': rows.map(r => String(r.pk_key ?? "rkey")),
+    'pk_value': rows.map(r => String(r.pk_value ?? "")),
     vid: rows.map(r => String(r.vid ?? "")),
     alive: rows.map(r => r.alive !== false),
-    latest_seq: rows.map(r => BigInt(r.latest_seq ?? 0)),
+    'latest_seq': rows.map(r => BigInt(r.latest_seq ?? 0)),
     repo: rows.map(r => String(r.repo ?? "")),
     rkey: rows.map(r => String(r.rkey ?? "")),
-    updated_at_ms: rows.map(r => BigInt(r.updated_at_ms ?? 0)),
-    props_json: rows.map(r => String(r.props_json ?? "{}")),
+    'updated_at_ms': rows.map(r => BigInt(r.updated_at_ms ?? 0)),
+    'props_json': rows.map(r => String(r.props_json ?? "{}")),
   });
 }
 
 export function makeEdgeTable(
-  rows: { src_vid: string; dst_vid: string; alive?: boolean }[],
+  rows: { 'src_vid': string; 'dst_vid': string; alive?: boolean }[],
 ): Table {
   return buildTable(EDGE_SCHEMA, {
-    partition_id: rows.map(() => 0),
-    edge_label: rows.map(() => "FOLLOW"),
-    pk_key: rows.map((_, i) => `pk_${i}`),
-    pk_value: rows.map((_, i) => `pv_${i}`),
+    'partition_id': rows.map(() => 0),
+    'edge_label': rows.map(() => "FOLLOW"),
+    'pk_key': rows.map((_, i) => `pk_${i}`),
+    'pk_value': rows.map((_, i) => `pv_${i}`),
     eid: rows.map((_, i) => `e_${i}`),
-    src_vid: rows.map(r => r.src_vid),
-    dst_vid: rows.map(r => r.dst_vid),
+    'src_vid': rows.map(r => r.src_vid),
+    'dst_vid': rows.map(r => r.dst_vid),
     alive: rows.map(r => r.alive !== false),
-    latest_seq: rows.map(() => 1n),
-    updated_at_ms: rows.map(() => 1000n),
-    props_json: rows.map(() => "{}"),
+    'latest_seq': rows.map(() => 1n),
+    'updated_at_ms': rows.map(() => 1000n),
+    'props_json': rows.map(() => "{}"),
   });
 }
 

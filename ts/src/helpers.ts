@@ -51,11 +51,11 @@ export function buildMergeProps(
 ): MergeProps {
   return {
     collection,
-    value_b64: toBase64(json),
+    'value_b64': toBase64(json),
     repo,
-    sensitivity_ord: "0",
-    owner_hash: String(fnv1a32(repo)),
-    updated_at: String(Date.now()),
+    'sensitivity_ord': "0",
+    'owner_hash': String(fnv1a32(repo)),
+    'updated_at': String(Date.now()),
   };
 }
 

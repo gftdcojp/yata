@@ -164,7 +164,7 @@ function filterRows(
   params: Record<string, unknown>,
   rowCount: number,
 ): number[] {
-  // Pre-filter: only alive vertices (vertex_live: alive column, Lance: op column where 0=upsert)
+  // Pre-filter: only alive vertices ('vertex_live': alive column, Lance: op column where 0=upsert)
   const aliveCol = table.getChild("alive");
   const opCol = !aliveCol ? table.getChild("op") : null; // Lance schema fallback
 
@@ -255,8 +255,8 @@ const LANCE_FIELD_ALIASES: Record<string, string> = {
   rkey: "pk_value",
   repo: "repo",              // props_json fallback
   collection: "collection",  // props_json fallback
-  value_b64: "value_b64",   // props_json fallback
-  updated_at: "timestamp_ms",
+  'value_b64': "value_b64",   // props_json fallback
+  'updated_at': "timestamp_ms",
 };
 
 function resolveValue(

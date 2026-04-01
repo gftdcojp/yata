@@ -32,7 +32,7 @@ export interface YataRPC {
   cypherBatchRead(statements: Array<{ statement: string; parameters?: Record<string, unknown> }>, authJwt?: string): Promise<CypherResult[]>;
 
   // Compaction
-  compact(): Promise<{ compacted_seq: number; labels_compacted: number }>;
+  compact(): Promise<{ 'compacted_seq': number; 'labels_compacted': number }>;
 
   // Lifecycle
   health(): Promise<string>;
@@ -45,9 +45,9 @@ export interface YataRPC {
 
 export interface MergeProps {
   collection: string;
-  value_b64: string;
+  'value_b64': string;
   repo: string;
-  sensitivity_ord: string;
-  owner_hash: string;
+  'sensitivity_ord': string;
+  'owner_hash': string;
   [key: string]: string;
 }

@@ -26,9 +26,9 @@ export default {
 
         return Response.json({
           ok: true,
-          lance_file_bytes: lance_bytes.length,
+          'lance_file_bytes': lance_bytes.length,
           footer,
-          has_magic: true,
+          'has_magic': true,
         });
       } catch (e: any) {
         return Response.json({ error: e.message || String(e) }, { status: 500 });
