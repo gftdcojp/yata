@@ -5,12 +5,22 @@ yata — Rust Cypher graph engine on LanceDB。`lancedb` 0.27 (lance 4.0)。No C
 ## Architecture
 
 ```
-Write: merge_record() → build_lance_batch() → table.add() [LanceDB append-only, O(1)]
-       Cypher CREATE → execute_mutation_direct() → merge_record() per node/edge
+Schema: Format D (10-col typed vertex, 10-col edge, no props_json)
+  Vertex: op, label, pk_value, timestamp_ms, repo, owner_did, name, app_id, rkey, val_json
+  Edge:   op, edge_label, eid, src_vid, dst_vid, src_label, dst_label, timestamp_ms, app_id, val_json
+
+Write: merge_record() → build_lance_batch() (Format D) → table.add() [LanceDB append-only, O(1)]
+       Edge detection (pk_key=="eid") → edge table (separate)
+       Cypher CREATE/MERGE → execute_mutation_direct() → merge_record() per node/edge
        Cypher MATCH+DELETE → scan ArrowStore → delete_record() per matched
-Read:  query_inner() → build_read_store() → ArrowStore (zero-copy Arrow, lazy props)
+       Auto-compact: every 32 merges
+
+Read:  query_inner() → build_read_store() → ArrowStore (zero-copy, lazy val_json)
        → GIE push-based executor (Topology/Property/Scannable on Arrow columns)
-Cold:  ensure_lance() → open_table("vertices") or create_empty_table()
+       ArrowStore auto-detects Format D (10-col) vs legacy (7-col) schema
+
+Cold:  ensure_lance() → open_table("vertices") + open_table("edges")
+       Legacy 7-col table → auto drop + recreate as Format D
 ```
 
 ## Crate Roles
@@ -19,10 +29,10 @@ Cold:  ensure_lance() → open_table("vertices") or create_empty_table()
 |---|---|
 | `yata-core` | GlobalVid, LocalVid, PartitionId |
 | `yata-grin` | GRIN trait (Topology, Property, Schema, Scannable, Mutable) |
-| `yata-engine` | TieredGraphEngine。LanceDB write/read/compact。SecurityScope (Design E)。55 tests |
+| `yata-engine` | TieredGraphEngine。Format D write/read/compact。Edge separation。MERGE clause。SecurityScope (Design E)。55 tests |
 | `yata-cypher` | Cypher parser + executor。286 tests |
 | `yata-gie` | GIE push-based executor + SecurityFilter。208 tests |
-| `yata-lance` | LanceDB wrapper。YataDb + YataTable + ArrowStore (zero-copy, lazy props) |
+| `yata-lance` | LanceDB wrapper。YataDb + YataTable + ArrowStore (zero-copy, Format D auto-detect) |
 | `yata-server` | XRPC API + JWT auth |
 
 ## 禁止事項
@@ -30,8 +40,9 @@ Cold:  ensure_lance() → open_table("vertices") or create_empty_table()
 - **LanceDB 以外の persistence path 新規追加禁止**
 - **MemoryGraph 再導入禁止** — mutation は execute_mutation_direct (Lance 直接)。read は ArrowStore (zero-copy)
 - **WAL 再導入禁止** — Lance は append-only。WAL は Shannon 冗長
-- **eager props parse 禁止** — ArrowStore は lazy parse。from_lance_batches (eager) は LanceReadStore 用 legacy
-- **in-memory query cache 再導入禁止** — Cloudflare edge cache に委譲
+- **props_json 再導入禁止** — Format D は val_json (overflow のみ)。core 6 property は個別 column
+- **eager props parse 禁止** — ArrowStore は lazy parse
+- **in-memory query cache 再導入禁止** — PDS KV + Cloudflare edge cache に委譲
 - **`RUSTC_WRAPPER=sccache` 禁止** — `cargo zigbuild` + `avx512_stub.rs`
 
 ## Build
