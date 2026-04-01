@@ -35,6 +35,10 @@ Cold:  ensure_lance() → open_table("vertices") + open_table("edges")
 | `yata-lance` | LanceDB wrapper。YataDb + YataTable + ArrowStore (zero-copy, Format D auto-detect) |
 | `yata-server` | XRPC API + JWT auth |
 
+## TS Wrapper snake_case Policy
+
+**`yata/ts/` の interface property 名は Rust Arrow schema (`yata-lance/src/schema.rs`) と 1:1 一致必須。** `partition_id`, `edge_label`, `updated_at_ms`, `dirty_labels`, `generated_at_ms` 等は Lance DB カラム名であり snake_case 維持。TS ローカル変数・パラメータ名は camelCase を使用する (例: `manifestPrefix`)
+
 ## 禁止事項
 
 - **LanceDB 以外の persistence path 新規追加禁止**
