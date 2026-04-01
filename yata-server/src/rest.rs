@@ -11,6 +11,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -271,23 +272,33 @@ async fn xrpc_cypher<G: GraphQueryExecutor>(
     let stmt = req.statement;
     let graph = state.graph.clone();
 
+    const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
     let result = match auth {
         AuthResult::Internal => {
-            // Bypass: internal requests (coordinator, PDS) skip SecurityFilter
-            tokio::task::spawn_blocking(move || graph.query(&stmt, &params, None)).await
+            tokio::time::timeout(QUERY_TIMEOUT,
+                tokio::task::spawn_blocking(move || graph.query(&stmt, &params, None))
+            ).await
         }
         AuthResult::Authenticated { did } => {
-            // Design E: DID-based SecurityScope compiled from policy vertices
-            tokio::task::spawn_blocking(move || graph.query_with_did(&stmt, &params, &did)).await
+            tokio::time::timeout(QUERY_TIMEOUT,
+                tokio::task::spawn_blocking(move || graph.query_with_did(&stmt, &params, &did))
+            ).await
         }
         AuthResult::Public => {
-            // Public: only sensitivity_ord=0 data visible
-            tokio::task::spawn_blocking(move || graph.query_with_did(&stmt, &params, "")).await
+            tokio::time::timeout(QUERY_TIMEOUT,
+                tokio::task::spawn_blocking(move || graph.query_with_did(&stmt, &params, ""))
+            ).await
         }
     };
 
     match result {
-        Ok(Ok(raw_rows)) => {
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({"code":"timeout","message":"query exceeded 5s timeout"})),
+            );
+        }
+        Ok(Ok(Ok(raw_rows))) => {
             let columns: Vec<String> = if let Some(first) = raw_rows.first() {
                 first.iter().map(|(col, _)| col.clone()).collect()
             } else {
@@ -313,11 +324,11 @@ async fn xrpc_cypher<G: GraphQueryExecutor>(
                 })),
             )
         }
-        Ok(Err(e)) => (
+        Ok(Ok(Err(e))) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"code":"internal","message":e})),
         ),
-        Err(e) => (
+        Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"code":"internal","message":e.to_string()})),
         ),
@@ -382,11 +393,15 @@ async fn cold_start_handler<G: GraphQueryExecutor>(
     State(state): State<YataRestState<G>>,
 ) -> impl IntoResponse {
     let graph = state.graph.clone();
-    let result = tokio::task::spawn_blocking(move || graph.cold_start()).await;
+    const COLD_START_TIMEOUT: Duration = Duration::from_secs(30);
+    let result = tokio::time::timeout(COLD_START_TIMEOUT,
+        tokio::task::spawn_blocking(move || graph.cold_start())
+    ).await;
     match result {
-        Ok(Ok(checkpoint_seq)) => (StatusCode::OK, Json(serde_json::json!({"checkpoint_seq": checkpoint_seq}))),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({"error": "cold start exceeded 30s timeout"}))),
+        Ok(Ok(Ok(checkpoint_seq))) => (StatusCode::OK, Json(serde_json::json!({"checkpoint_seq": checkpoint_seq}))),
+        Ok(Ok(Err(e))) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
     }
 }
 
@@ -398,16 +413,20 @@ async fn compact_handler<G: GraphQueryExecutor>(
         return (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"error": "read-only container"})));
     }
     let graph = state.graph.clone();
-    let result = tokio::task::spawn_blocking(move || graph.trigger_compaction()).await;
+    const COMPACT_TIMEOUT: Duration = Duration::from_secs(60);
+    let result = tokio::time::timeout(COMPACT_TIMEOUT,
+        tokio::task::spawn_blocking(move || graph.trigger_compaction())
+    ).await;
     match result {
-        Ok(Ok(r)) => (StatusCode::OK, Json(serde_json::json!({
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({"error": "compaction exceeded 60s timeout"}))),
+        Ok(Ok(Ok(r))) => (StatusCode::OK, Json(serde_json::json!({
             "input_entries": r.input_entries,
             "output_entries": r.output_entries,
             "compacted_seq": r.max_seq,
             "labels": r.labels,
         }))),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+        Ok(Ok(Err(e))) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
     }
 }
 
@@ -416,15 +435,19 @@ async fn repair_handler<G: GraphQueryExecutor>(
     State(state): State<YataRestState<G>>,
 ) -> impl IntoResponse {
     let graph = state.graph.clone();
-    let result = tokio::task::spawn_blocking(move || graph.repair_lance()).await;
+    const REPAIR_TIMEOUT: Duration = Duration::from_secs(60);
+    let result = tokio::time::timeout(REPAIR_TIMEOUT,
+        tokio::task::spawn_blocking(move || graph.repair_lance())
+    ).await;
     match result {
-        Ok(Ok((version, rows))) => (StatusCode::OK, Json(serde_json::json!({
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({"error": "repair exceeded 60s timeout"}))),
+        Ok(Ok(Ok((version, rows)))) => (StatusCode::OK, Json(serde_json::json!({
             "status": "repaired",
             "restored_version": version,
             "row_count": rows,
         }))),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+        Ok(Ok(Err(e))) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
     }
 }
 

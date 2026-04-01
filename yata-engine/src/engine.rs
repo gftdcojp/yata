@@ -32,8 +32,11 @@ pub struct CpmStats {
 
 /// Shared tokio runtime for all engine instances (avoids nested runtime issues).
 pub(crate) static ENGINE_RT: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(threads)
         .enable_all()
         .thread_name("yata-engine")
         .build()
@@ -946,10 +949,29 @@ impl TieredGraphEngine {
             Ok::<(), String>(())
         })?;
 
-        // Auto-compact
+        // Auto-compact: background spawn (never blocks write path)
         let merges = self.merge_record_count.load(Ordering::Relaxed);
         if merges % AUTO_COMPACT_FRAGMENT_THRESHOLD == 0 && merges > 0 {
-            let _ = self.trigger_compaction();
+            let lance_ds = self.lance_table.clone();
+            let last_compact_ms = self.last_compaction_ms.clone();
+            std::thread::spawn(move || {
+                ENGINE_RT.block_on(async {
+                    let ds_guard = lance_ds.lock().await;
+                    if let Some(ref ds) = *ds_guard {
+                        match ds.compact().await {
+                            Ok(stats) => {
+                                let removed = stats.compaction.as_ref().map(|c| c.fragments_removed).unwrap_or(0);
+                                let added = stats.compaction.as_ref().map(|c| c.fragments_added).unwrap_or(0);
+                                tracing::info!(removed, added, "background compaction complete");
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "background compaction failed");
+                            }
+                        }
+                    }
+                    last_compact_ms.store(now_ms(), Ordering::SeqCst);
+                });
+            });
         }
         Ok(0)
     }
