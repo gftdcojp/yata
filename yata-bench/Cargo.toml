@@ -17,17 +17,6 @@ path = "src/cypher_bench.rs"
 name = "cypher-transport-bench"
 path = "src/cypher_transport_bench.rs"
 
-[[bin]]
-name = "schema-bench"
-path = "src/schema_bench.rs"
-
-[[bin]]
-name = "schema-bench-v2"
-path = "src/schema_bench_v2.rs"
-
-[[bin]]
-name = "migrate-format-d"
-path = "src/migrate_format_d.rs"
 
 [dependencies]
 yata-core.workspace = true

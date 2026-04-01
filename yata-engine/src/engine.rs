@@ -645,27 +645,23 @@ impl TieredGraphEngine {
                 }
                 // MERGE treated as CREATE (Lance last-writer-wins dedup provides MERGE semantics)
                 yata_cypher::Clause::Merge { pattern, on_create, on_match } => {
-                    let mut prev_node_id: Option<String> = None;
                     for elem in &pattern.elements {
                         if let yata_cypher::PatternElement::Node(np) = elem {
                             let label = np.labels.first().map(|s| s.as_str()).unwrap_or("_default");
-                            // For MERGE: use inline pk_value (rkey) as node_id if available
                             let node_id = np.props.iter().find_map(|(k, v)| {
                                 if k == "rkey" { if let yata_cypher::Expr::Lit(yata_cypher::Literal::Str(s)) = v { Some(s.clone()) } else { None } } else { None }
                             }).unwrap_or_else(generate_node_id);
                             let mut props = self.resolve_pattern_props(&np.props, &param_map)?;
-                            // Apply SET items (on_create + on_match → all applied since we treat as upsert)
                             for set_item in on_create.iter().chain(on_match.iter()) {
-                                if let yata_cypher::SetItem::PropSet(lhs, rhs) = set_item {
-                                    // r += {key: value, ...} or r.key = value
+                                if let yata_cypher::SetItem::PropSet(_lhs, rhs) = set_item {
                                     if let yata_cypher::Expr::Map(map_entries) = rhs {
                                         for (k, v) in map_entries {
                                             if let yata_cypher::Expr::Lit(lit) = v {
                                                 let val = match lit {
                                                     yata_cypher::Literal::Str(s) => yata_grin::PropValue::Str(s.clone()),
-                                                    yata_cypher::Literal::Int(i) => yata_grin::PropValue::Int(i.clone()),
-                                                    yata_cypher::Literal::Float(f) => yata_grin::PropValue::Float(f.clone()),
-                                                    yata_cypher::Literal::Bool(b) => yata_grin::PropValue::Bool(b.clone()),
+                                                    yata_cypher::Literal::Int(i) => yata_grin::PropValue::Int(*i),
+                                                    yata_cypher::Literal::Float(f) => yata_grin::PropValue::Float(*f),
+                                                    yata_cypher::Literal::Bool(b) => yata_grin::PropValue::Bool(*b),
                                                     yata_cypher::Literal::Null => yata_grin::PropValue::Null,
                                                 };
                                                 props.push((k.clone(), val));
@@ -677,13 +673,10 @@ impl TieredGraphEngine {
                             inject_metadata(&mut props, mutation_ctx, &now);
                             let props_ref: Vec<(&str, yata_grin::PropValue)> = props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
                             self.merge_record(label, "rkey", &node_id, &props_ref)?;
-                            prev_node_id = Some(node_id);
                         }
                     }
                 }
-                yata_cypher::Clause::Set { items } => {
-                    // SET applied during MERGE handling above — standalone SET is a no-op
-                }
+                yata_cypher::Clause::Set { .. } => {}
                 yata_cypher::Clause::Return { .. } => {} // reads handled by GIE path
                 _ => {
                     return Err(format!("unsupported mutation clause: {cypher}"));
