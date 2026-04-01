@@ -13,7 +13,7 @@ Write: merge_record() → build_lance_batch() (Format D) → table.add() [LanceD
        Edge detection (pk_key=="eid") → edge table (separate)
        Cypher CREATE/MERGE → execute_mutation_direct() → merge_record() per node/edge
        Cypher MATCH+DELETE → scan ArrowStore → delete_record() per matched
-       Auto-compact: every 32 merges
+       Auto-compact: every 32 merges (background thread, non-blocking)
 
 Read:  query_inner() → build_read_store() → ArrowStore (zero-copy, lazy val_json)
        → GIE push-based executor (Topology/Property/Scannable on Arrow columns)
@@ -33,7 +33,7 @@ Cold:  ensure_lance() → open_table("vertices") + open_table("edges")
 | `yata-cypher` | Cypher parser + executor。286 tests |
 | `yata-gie` | GIE push-based executor + SecurityFilter。208 tests |
 | `yata-lance` | LanceDB wrapper。YataDb + YataTable + ArrowStore (zero-copy, Format D auto-detect) |
-| `yata-server` | XRPC API + JWT auth |
+| `yata-server` | XRPC API + JWT auth + operation timeouts (query 5s, cold start 30s, compact/repair 60s) |
 
 ## TS Wrapper snake_case Policy
 
@@ -46,7 +46,7 @@ Cold:  ensure_lance() → open_table("vertices") + open_table("edges")
 - **WAL 再導入禁止** — Lance は append-only。WAL は Shannon 冗長
 - **props_json 再導入禁止** — Format D は val_json (overflow のみ)。core 6 property は個別 column
 - **eager props parse 禁止** — ArrowStore は lazy parse
-- **in-memory query cache 再導入禁止** — PDS KV + Cloudflare edge cache に委譲
+- **in-memory query cache 再導入禁止** — PDS in-memory cache に委譲
 - **`RUSTC_WRAPPER=sccache` 禁止** — `cargo zigbuild` + `avx512_stub.rs`
 
 ## Build
