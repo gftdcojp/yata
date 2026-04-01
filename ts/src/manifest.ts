@@ -108,12 +108,12 @@ export function createManifestKeyLayout(
   partitionId: number,
   version: number,
 ): GraphManifestKeyLayout {
-  const manifest_prefix = `manifests/partitions/${partitionId}`;
+  const manifestPrefix = `manifests/partitions/${partitionId}`;
   return {
-    manifest_prefix,
-    'latest_key': `${manifest_prefix}/latest.json`,
-    'pointer_key': `${manifest_prefix}/latest.json`,
-    'versioned_key': `${manifest_prefix}/manifest-${String(version).padStart(20, "0")}.json`,
+    'manifest_prefix': manifestPrefix,
+    'latest_key': `${manifestPrefix}/latest.json`,
+    'pointer_key': `${manifestPrefix}/latest.json`,
+    'versioned_key': `${manifestPrefix}/manifest-${String(version).padStart(20, "0")}.json`,
   };
 }
 
