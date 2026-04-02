@@ -329,6 +329,21 @@ struct CachedPressureStat {
     at: std::time::Instant,
 }
 
+#[derive(Debug, Clone)]
+struct PlannerLabelStatsView {
+    label: Option<String>,
+    live_rows: usize,
+    dead_ratio: f64,
+    last_compacted_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PlannerTraversalStatsView {
+    source: PlannerLabelStatsView,
+    edge: PlannerLabelStatsView,
+    avg_out_degree: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TableKind {
     Vertices,
@@ -379,6 +394,16 @@ fn should_stage_traversal(
 
 fn sql_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn strip_explain_prefix(cypher: &str) -> Option<&str> {
+    let trimmed = cypher.trim_start();
+    let upper = trimmed.to_uppercase();
+    if upper.starts_with("EXPLAIN ") {
+        Some(trimmed[7..].trim_start())
+    } else {
+        None
+    }
 }
 
 fn expr_to_sql_literal(expr: &yata_cypher::ast::Expr, params: &HashMap<String, String>) -> Option<String> {
@@ -901,19 +926,216 @@ impl TieredGraphEngine {
         parts.join(" AND ")
     }
 
+    fn planner_label_stats_view(
+        &self,
+        kind: TableKind,
+        label: Option<&str>,
+    ) -> Option<PlannerLabelStatsView> {
+        let stat = self.estimate_table_pressure(kind, label)?;
+        Some(PlannerLabelStatsView {
+            label: label.map(str::to_string),
+            live_rows: stat.live_rows,
+            dead_ratio: stat.dead_ratio,
+            last_compacted_at_ms: self.last_compaction_ms.load(Ordering::Relaxed),
+        })
+    }
+
+    fn planner_traversal_stats_view(
+        &self,
+        source_label: Option<&str>,
+        edge_label: &str,
+    ) -> Option<PlannerTraversalStatsView> {
+        let source = self.planner_label_stats_view(TableKind::Vertices, source_label)?;
+        let edge = self.planner_label_stats_view(TableKind::Edges, Some(edge_label))?;
+        let avg_out_degree = if source.live_rows == 0 {
+            0.0
+        } else {
+            edge.live_rows as f64 / source.live_rows as f64
+        };
+        Some(PlannerTraversalStatsView {
+            source,
+            edge,
+            avg_out_degree,
+        })
+    }
+
+    fn explain_query_plan(
+        &self,
+        cypher: &str,
+        params: &[(String, String)],
+    ) -> Result<Vec<Vec<(String, String)>>, String> {
+        let ast = yata_cypher::parse(cypher).map_err(|e| format!("parse: {e}"))?;
+        let mut plan = yata_gie::transpile::transpile(&ast).map_err(|e| format!("transpile: {e}"))?;
+        let param_map: HashMap<String, String> = params.iter().cloned().collect();
+        let hints = crate::hints::QueryHints::extract(cypher);
+        self.refine_traversal_strategy_with_stats(&mut plan, &ast, &param_map, hints.limit);
+
+        let node_filters = collect_node_pushdown_filters(&ast, &param_map);
+        let mut rows = Vec::new();
+        for (idx, op) in plan.ops.iter().enumerate() {
+            match op {
+                yata_gie::ir::LogicalOp::Scan {
+                    label,
+                    alias,
+                    predicate,
+                } => {
+                    let mut row = vec![
+                        ("op_index".to_string(), idx.to_string()),
+                        ("op".to_string(), "Scan".to_string()),
+                        ("alias".to_string(), alias.clone()),
+                        ("label".to_string(), label.clone()),
+                    ];
+                    if let Some(predicate) = predicate {
+                        row.push(("predicate".to_string(), format!("{predicate:?}")));
+                    }
+                    if let Some(view) = self.planner_label_stats_view(TableKind::Vertices, Some(label)) {
+                        row.push(("live_rows".to_string(), view.live_rows.to_string()));
+                        row.push(("dead_ratio".to_string(), format!("{:.4}", view.dead_ratio)));
+                        row.push(("last_compacted_at_ms".to_string(), view.last_compacted_at_ms.to_string()));
+                    }
+                    rows.push(row);
+                }
+                yata_gie::ir::LogicalOp::Expand {
+                    src_alias,
+                    edge_label,
+                    dst_alias,
+                    direction,
+                    strategy,
+                    ..
+                }
+                | yata_gie::ir::LogicalOp::PathExpand {
+                    src_alias,
+                    edge_label,
+                    dst_alias,
+                    direction,
+                    strategy,
+                    ..
+                } => {
+                    let label = node_filters
+                        .get(src_alias)
+                        .and_then(|ctx| ctx.label.as_deref());
+                    let planner_view = self.planner_traversal_stats_view(label, edge_label);
+                    let mut row = vec![
+                        ("op_index".to_string(), idx.to_string()),
+                        ("op".to_string(), match op {
+                            yata_gie::ir::LogicalOp::Expand { .. } => "Expand".to_string(),
+                            _ => "PathExpand".to_string(),
+                        }),
+                        ("src_alias".to_string(), src_alias.clone()),
+                        ("dst_alias".to_string(), dst_alias.clone()),
+                        ("edge_label".to_string(), edge_label.clone()),
+                        ("direction".to_string(), format!("{direction:?}")),
+                        ("strategy".to_string(), format!("{strategy:?}")),
+                    ];
+                    if let yata_gie::ir::LogicalOp::PathExpand {
+                        min_hops,
+                        max_hops,
+                        ..
+                    } = op
+                    {
+                        row.push(("min_hops".to_string(), min_hops.to_string()));
+                        row.push(("max_hops".to_string(), max_hops.to_string()));
+                    }
+                    if let Some(view) = planner_view {
+                        row.push(("source_label".to_string(), view.source.label.unwrap_or_default()));
+                        row.push(("source_live_rows".to_string(), view.source.live_rows.to_string()));
+                        row.push(("source_dead_ratio".to_string(), format!("{:.4}", view.source.dead_ratio)));
+                        row.push(("edge_live_rows".to_string(), view.edge.live_rows.to_string()));
+                        row.push(("edge_dead_ratio".to_string(), format!("{:.4}", view.edge.dead_ratio)));
+                        row.push(("avg_out_degree".to_string(), format!("{:.4}", view.avg_out_degree)));
+                        row.push(("last_compacted_at_ms".to_string(), view.edge.last_compacted_at_ms.to_string()));
+                    }
+                    rows.push(row);
+                }
+                yata_gie::ir::LogicalOp::Filter { alias, predicate } => {
+                    let mut row = vec![
+                        ("op_index".to_string(), idx.to_string()),
+                        ("op".to_string(), "Filter".to_string()),
+                        ("predicate".to_string(), format!("{predicate:?}")),
+                    ];
+                    if let Some(alias) = alias {
+                        row.push(("alias".to_string(), alias.clone()));
+                    }
+                    rows.push(row);
+                }
+                yata_gie::ir::LogicalOp::Project { exprs } => {
+                    rows.push(vec![
+                        ("op_index".to_string(), idx.to_string()),
+                        ("op".to_string(), "Project".to_string()),
+                        ("exprs".to_string(), format!("{exprs:?}")),
+                    ]);
+                }
+                yata_gie::ir::LogicalOp::Aggregate { group_by, aggs } => {
+                    rows.push(vec![
+                        ("op_index".to_string(), idx.to_string()),
+                        ("op".to_string(), "Aggregate".to_string()),
+                        ("group_by".to_string(), format!("{group_by:?}")),
+                        ("aggs".to_string(), format!("{aggs:?}")),
+                    ]);
+                }
+                yata_gie::ir::LogicalOp::OrderBy { keys } => {
+                    rows.push(vec![
+                        ("op_index".to_string(), idx.to_string()),
+                        ("op".to_string(), "OrderBy".to_string()),
+                        ("keys".to_string(), format!("{keys:?}")),
+                    ]);
+                }
+                yata_gie::ir::LogicalOp::Limit { count, offset } => {
+                    rows.push(vec![
+                        ("op_index".to_string(), idx.to_string()),
+                        ("op".to_string(), "Limit".to_string()),
+                        ("count".to_string(), count.to_string()),
+                        ("offset".to_string(), offset.to_string()),
+                    ]);
+                }
+                yata_gie::ir::LogicalOp::Distinct { keys } => {
+                    rows.push(vec![
+                        ("op_index".to_string(), idx.to_string()),
+                        ("op".to_string(), "Distinct".to_string()),
+                        ("keys".to_string(), format!("{keys:?}")),
+                    ]);
+                }
+                yata_gie::ir::LogicalOp::SecurityFilter { aliases, .. } => {
+                    rows.push(vec![
+                        ("op_index".to_string(), idx.to_string()),
+                        ("op".to_string(), "SecurityFilter".to_string()),
+                        ("aliases".to_string(), format!("{aliases:?}")),
+                    ]);
+                }
+                yata_gie::ir::LogicalOp::Exchange { routing_key, kind } => {
+                    rows.push(vec![
+                        ("op_index".to_string(), idx.to_string()),
+                        ("op".to_string(), "Exchange".to_string()),
+                        ("routing_key".to_string(), format!("{routing_key:?}")),
+                        ("kind".to_string(), format!("{kind:?}")),
+                    ]);
+                }
+                yata_gie::ir::LogicalOp::Receive { source_partitions } => {
+                    rows.push(vec![
+                        ("op_index".to_string(), idx.to_string()),
+                        ("op".to_string(), "Receive".to_string()),
+                        ("source_partitions".to_string(), format!("{source_partitions:?}")),
+                    ]);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
     fn apply_pressure_penalty(
         &self,
         base_cost: usize,
         vertex_label: Option<&str>,
         edge_label: &str,
     ) -> usize {
-        let vertex_penalty = vertex_label
-            .and_then(|label| self.estimate_table_pressure(TableKind::Vertices, Some(label)))
-            .map(|stat| 1.0 + (stat.dead_ratio * 4.0))
+        let view = self.planner_traversal_stats_view(vertex_label, edge_label);
+        let vertex_penalty = view
+            .as_ref()
+            .map(|view| 1.0 + (view.source.dead_ratio * 4.0))
             .unwrap_or(1.0);
-        let edge_penalty = self
-            .estimate_table_pressure(TableKind::Edges, Some(edge_label))
-            .map(|stat| 1.0 + (stat.dead_ratio * 4.0))
+        let edge_penalty = view
+            .as_ref()
+            .map(|view| 1.0 + (view.edge.dead_ratio * 4.0))
             .unwrap_or(1.0);
         ((base_cost as f64) * vertex_penalty * edge_penalty).ceil() as usize
     }
@@ -949,9 +1171,10 @@ impl TieredGraphEngine {
                     let Some(source_cardinality) = self.estimate_vertex_filter_cardinality(&ctx.filter) else {
                         continue;
                     };
-                    if self
-                        .estimate_table_pressure(TableKind::Edges, Some(edge_label))
-                        .is_some_and(|stat| stat.dead_ratio > 0.5)
+                    let planner_view = self.planner_traversal_stats_view(ctx.label.as_deref(), edge_label);
+                    if planner_view
+                        .as_ref()
+                        .is_some_and(|view| view.edge.dead_ratio > 0.5)
                     {
                         *strategy = TraversalStrategy::PreferGie;
                         continue;
@@ -1002,9 +1225,10 @@ impl TieredGraphEngine {
                     let Some(source_cardinality) = self.estimate_vertex_filter_cardinality(&ctx.filter) else {
                         continue;
                     };
-                    if self
-                        .estimate_table_pressure(TableKind::Edges, Some(edge_label))
-                        .is_some_and(|stat| stat.dead_ratio > 0.5)
+                    let planner_view = self.planner_traversal_stats_view(ctx.label.as_deref(), edge_label);
+                    if planner_view
+                        .as_ref()
+                        .is_some_and(|view| view.edge.dead_ratio > 0.5)
                     {
                         *strategy = TraversalStrategy::PreferGie;
                         continue;
@@ -1982,6 +2206,9 @@ impl TieredGraphEngine {
         _rls_org_id: Option<&str>,
         mutation_ctx: Option<&MutationContext>,
     ) -> Result<Vec<Vec<(String, String)>>, String> {
+        if let Some(explain_cypher) = strip_explain_prefix(cypher) {
+            return self.explain_query_plan(explain_cypher, params);
+        }
         self.ensure_lance();
         let is_mutation = router::is_cypher_mutation(cypher);
         if is_mutation {
@@ -3967,6 +4194,55 @@ mod tests {
         let restored = e2.cached_pressure_stat(&key).unwrap();
         assert!(restored.dead_rows >= 1);
         assert!(restored.dead_ratio > 0.0);
+    }
+
+    #[test]
+    fn test_planner_traversal_stats_view_exposes_avg_out_degree_and_dead_ratio() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        run_query(&e, "CREATE (a:User {name: 'Alice'})-[:FOLLOWS]->(b:User {name: 'Bob'})", &[], None).unwrap();
+        run_query(&e, "CREATE (a:User {name: 'Alice'})-[:FOLLOWS]->(b:User {name: 'Carol'})", &[], None).unwrap();
+        e.delete_record("FOLLOWS", "eid", "missing-edge").ok(); // no-op path, keeps API covered
+
+        let view = e.planner_traversal_stats_view(Some("User"), "FOLLOWS").unwrap();
+        assert_eq!(view.source.label.as_deref(), Some("User"));
+        assert_eq!(view.edge.label.as_deref(), Some("FOLLOWS"));
+        assert!(view.source.live_rows >= 2);
+        assert!(view.edge.live_rows >= 2);
+        assert!(view.avg_out_degree >= 0.5);
+        assert_eq!(view.edge.last_compacted_at_ms, e.last_compaction_ms.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_explain_query_plan_returns_traversal_strategy_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        run_query(&e, "CREATE (a:User {name: 'Alice'})-[:FOLLOWS]->(b:User {name: 'Bob'})", &[], None).unwrap();
+
+        let rows = run_query(
+            &e,
+            "EXPLAIN MATCH (a:User)-[:FOLLOWS]->(b:User) WHERE a.name = 'Alice' RETURN b.name AS name LIMIT 10",
+            &[],
+            None,
+        ).unwrap();
+
+        assert!(rows.len() >= 4);
+        let ops: Vec<String> = rows
+            .iter()
+            .filter_map(|row| row.iter().find(|(k, _)| k == "op").map(|(_, v)| v.clone()))
+            .collect();
+        assert!(ops.iter().any(|op| op == "Scan"));
+        assert!(ops.iter().any(|op| op == "Expand"));
+        assert!(ops.iter().any(|op| op == "Project"));
+        assert!(ops.iter().any(|op| op == "Limit"));
+
+        let expand_row = rows.iter().find(|row| row.iter().any(|(k, v)| k == "op" && v == "Expand")).unwrap();
+        let strategy = expand_row.iter().find(|(k, _)| k == "strategy").map(|(_, v)| v.clone()).unwrap_or_default();
+        let edge_label = expand_row.iter().find(|(k, _)| k == "edge_label").map(|(_, v)| v.clone()).unwrap_or_default();
+        let avg_out_degree = expand_row.iter().find(|(k, _)| k == "avg_out_degree").map(|(_, v)| v.clone()).unwrap_or_default();
+        assert_eq!(edge_label, "FOLLOWS");
+        assert!(!strategy.is_empty());
+        assert!(!avg_out_degree.is_empty());
     }
 
     #[test]

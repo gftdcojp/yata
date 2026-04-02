@@ -26,7 +26,8 @@ Read:  query_inner() → build_read_store_pushdown() → ArrowStore (zero-copy, 
        Cypher source/destination predicates (inline props + simple WHERE comparisons) feed `src_vid` / `dst_vid` candidate extraction before edge scan
        GIE optimizer annotates traversal with `TraversalStrategy` (`PreferStaged` / `PreferGie` / `Auto`)
        Engine refines traversal strategy with Lance `count_rows(filter)` cardinality on source-node filters and `edge_label`/`src_label` edge spread
-       Engine keeps tombstone-aware pressure stats cache (`raw_rows`, `live_rows`, `dead_rows`, `dead_ratio`) for vertices/edges, globally and per label, and persists snapshots in Lance `stats_catalog`
+       Engine keeps tombstone-aware pressure stats cache (`raw_rows`, `live_rows`, `dead_rows`, `dead_ratio`) for vertices/edges, globally and per label, persists snapshots in Lance `stats_catalog`, and exposes planner aggregate view (`avg_out_degree`, `dead_ratio`, `last_compacted_at_ms`)
+       `EXPLAIN MATCH ...` returns annotated plan rows for all ops (`Scan`/`Filter`/`Expand`/`Project`/`Limit`...), including traversal strategy/debug fields (`strategy`, `avg_out_degree`, `source_live_rows`, `edge_dead_ratio`, etc.)
        Selective traversal ops are engine-led when hint + runtime frontier allow it: staged Expand/PathExpand scan edge frontier first, rebuild narrow ArrowStore, then resume GIE
        Chained traversals reuse touched alias vids across stages so later Expand/PathExpand keep prior bindings
        Cost gate: large frontier / over-limit intermediate sets fall back to normal GIE execution
