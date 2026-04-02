@@ -77,4 +77,4 @@ RUSTC_WRAPPER="" cargo zigbuild --manifest-path packages/server/yata/Cargo.toml 
   --release --target x86_64-unknown-linux-gnu -p yata-server
 ```
 
-Deploy: `infra/cloudflare/container/yata/CLAUDE.md`
+Deploy: kagami infra Worker (`infra/cloudflare/workers/kagami/`) が graph backend。yata Rust engine は kagami 内部で将来的に利用可能。
