@@ -601,30 +601,77 @@ pub struct TieredGraphEngine {
 }
 
 impl TieredGraphEngine {
+    fn cached_count_stat(&self, key: &str) -> Option<usize> {
+        let cache = self.count_stats_cache.lock().ok()?;
+        let entry = cache.get(key)?;
+        if entry.at.elapsed() < COUNT_STATS_CACHE_TTL {
+            Some(entry.count)
+        } else {
+            None
+        }
+    }
+
+    fn store_count_stat(&self, key: String, count: usize) {
+        if let Ok(mut cache) = self.count_stats_cache.lock() {
+            if cache.len() >= COUNT_STATS_CACHE_MAX {
+                cache.retain(|_, entry| entry.at.elapsed() < COUNT_STATS_CACHE_TTL);
+                if cache.len() >= COUNT_STATS_CACHE_MAX {
+                    cache.clear();
+                }
+            }
+            cache.insert(key, CachedCountStat {
+                count,
+                at: std::time::Instant::now(),
+            });
+        }
+    }
+
+    fn invalidate_count_stats_cache(&self) {
+        if let Ok(mut cache) = self.count_stats_cache.lock() {
+            cache.clear();
+        }
+    }
+
     fn estimate_vertex_filter_cardinality(&self, filter: &str) -> Option<usize> {
         if filter.is_empty() {
             return None;
         }
+        let cache_key = format!("vertex:{filter}");
+        if let Some(count) = self.cached_count_stat(&cache_key) {
+            return Some(count);
+        }
         self.ensure_lance();
         let lance_tbl = self.lance_table.clone();
-        self.block_on(async {
+        let count = self.block_on(async {
             let tbl_guard = lance_tbl.lock().await;
             let tbl = tbl_guard.as_ref()?;
             tbl.count_rows(Some(filter)).await.ok()
-        })
+        });
+        if let Some(count) = count {
+            self.store_count_stat(cache_key, count);
+        }
+        count
     }
 
     fn estimate_edge_filter_cardinality(&self, filter: &str) -> Option<usize> {
         if filter.is_empty() {
             return None;
         }
+        let cache_key = format!("edge:{filter}");
+        if let Some(count) = self.cached_count_stat(&cache_key) {
+            return Some(count);
+        }
         self.ensure_lance();
         let lance_tbl = self.lance_edge_table.clone();
-        self.block_on(async {
+        let count = self.block_on(async {
             let tbl_guard = lance_tbl.lock().await;
             let tbl = tbl_guard.as_ref()?;
             tbl.count_rows(Some(filter)).await.ok()
-        })
+        });
+        if let Some(count) = count {
+            self.store_count_stat(cache_key, count);
+        }
+        count
     }
 
     fn build_edge_cardinality_filter(&self, edge_label: &str, src_label: Option<&str>) -> String {
@@ -2176,6 +2223,7 @@ impl TieredGraphEngine {
                 tbl.add(batch).await.map_err(|e| format!("LanceDB edge add: {e}"))?;
                 Ok::<(), String>(())
             })?;
+            self.invalidate_count_stats_cache();
             self.maybe_schedule_compaction();
             return Ok(0);
         }
@@ -2190,6 +2238,7 @@ impl TieredGraphEngine {
             Ok::<(), String>(())
         })?;
 
+        self.invalidate_count_stats_cache();
         self.maybe_schedule_compaction();
         Ok(0)
     }
@@ -2206,6 +2255,7 @@ impl TieredGraphEngine {
                 tbl.add(batch).await.map_err(|e| format!("LanceDB edge tombstone add: {e}"))?;
                 Ok::<(), String>(())
             })?;
+            self.invalidate_count_stats_cache();
             self.maybe_schedule_compaction();
             return Ok(true);
         }
@@ -2222,6 +2272,7 @@ impl TieredGraphEngine {
             tbl.add(batch).await.map_err(|e| format!("LanceDB add: {e}"))?;
             Ok::<(), String>(())
         })?;
+        self.invalidate_count_stats_cache();
         self.maybe_schedule_compaction();
         Ok(true)
     }
@@ -3489,6 +3540,26 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn test_count_stats_cache_populates_and_invalidates_on_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        run_query(&e, "CREATE (a:User {name: 'Alice'})-[:FOLLOWS]->(b:User {name: 'Bob'})", &[], None).unwrap();
+
+        let vertex_filter = "label = 'User' AND name = 'Alice'";
+        let edge_filter = "edge_label = 'FOLLOWS' AND src_label = 'User'";
+
+        assert_eq!(e.estimate_vertex_filter_cardinality(vertex_filter), Some(1));
+        assert_eq!(e.estimate_edge_filter_cardinality(edge_filter), Some(1));
+        assert!(e.cached_count_stat(&format!("vertex:{vertex_filter}")).is_some());
+        assert!(e.cached_count_stat(&format!("edge:{edge_filter}")).is_some());
+
+        run_query(&e, "CREATE (a:User {name: 'Carol'})-[:FOLLOWS]->(b:User {name: 'Dave'})", &[], None).unwrap();
+
+        assert!(e.cached_count_stat(&format!("vertex:{vertex_filter}")).is_none());
+        assert!(e.cached_count_stat(&format!("edge:{edge_filter}")).is_none());
     }
 
     #[test]
