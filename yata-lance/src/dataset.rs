@@ -5,8 +5,11 @@
 
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
+use lancedb::index::scalar::{BTreeIndexBuilder, BitmapIndexBuilder};
+use lancedb::index::{Index, IndexType};
 use lancedb::query::{ExecutableQuery, QueryBase};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 /// LanceDB connection wrapper for yata graph persistence.
 pub struct YataDb {
@@ -18,10 +21,51 @@ pub struct YataTable {
     table: lancedb::Table,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarIndexKind {
+    BTree,
+    Bitmap,
+}
+
+static SHARED_SESSION: LazyLock<Arc<lancedb::Session>> = LazyLock::new(|| {
+    let index_cache_size = std::env::var("YATA_LANCE_INDEX_CACHE_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1024);
+    let metadata_cache_size = std::env::var("YATA_LANCE_METADATA_CACHE_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(32 * 1024 * 1024);
+    Arc::new(lancedb::Session::new(
+        index_cache_size,
+        metadata_cache_size,
+        Arc::new(lancedb::ObjectStoreRegistry::default()),
+    ))
+});
+
+fn read_consistency_interval_from_env() -> Option<Duration> {
+    let secs = std::env::var("YATA_LANCE_READ_CONSISTENCY_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())?;
+    Some(Duration::from_secs(secs))
+}
+
+fn apply_common_connect_options(
+    mut builder: lancedb::connection::ConnectBuilder,
+) -> lancedb::connection::ConnectBuilder {
+    builder = builder.session(SHARED_SESSION.clone());
+    if let Some(interval) = read_consistency_interval_from_env() {
+        builder = builder.read_consistency_interval(interval);
+    }
+    builder
+}
+
 impl YataDb {
     /// Connect to a local LanceDB database.
     pub async fn connect_local(path: &str) -> Result<Self, lancedb::Error> {
-        let db = lancedb::connect(path).execute().await?;
+        let db = apply_common_connect_options(lancedb::connect(path))
+            .execute()
+            .await?;
         Ok(Self { db })
     }
 
@@ -36,12 +80,27 @@ impl YataDb {
         secret_access_key: &str,
         region: &str,
     ) -> Result<Self, lancedb::Error> {
-        let db = lancedb::connect(uri)
+        let request_timeout =
+            std::env::var("YATA_LANCE_REQUEST_TIMEOUT").unwrap_or_else(|_| "120s".to_string());
+        let connect_timeout =
+            std::env::var("YATA_LANCE_CONNECT_TIMEOUT").unwrap_or_else(|_| "10s".to_string());
+        let download_retry_count = std::env::var("YATA_LANCE_DOWNLOAD_RETRY_COUNT")
+            .unwrap_or_else(|_| "8".to_string());
+        let client_max_retries =
+            std::env::var("YATA_LANCE_CLIENT_MAX_RETRIES").unwrap_or_else(|_| "20".to_string());
+        let client_retry_timeout = std::env::var("YATA_LANCE_CLIENT_RETRY_TIMEOUT")
+            .unwrap_or_else(|_| "300".to_string());
+        let db = apply_common_connect_options(lancedb::connect(uri))
             .storage_option("aws_access_key_id", access_key_id)
             .storage_option("aws_secret_access_key", secret_access_key)
             .storage_option("aws_endpoint", endpoint)
             .storage_option("aws_region", region)
             .storage_option("aws_virtual_hosted_style_request", "false")
+            .storage_option("request_timeout", request_timeout)
+            .storage_option("connect_timeout", connect_timeout)
+            .storage_option("download_retry_count", download_retry_count)
+            .storage_option("client_max_retries", client_max_retries)
+            .storage_option("client_retry_timeout", client_retry_timeout)
             .execute()
             .await?;
         Ok(Self { db })
@@ -198,6 +257,11 @@ impl YataTable {
             .await
     }
 
+    /// Run Lance's full optimization cycle: compaction, pruning, and index maintenance.
+    pub async fn optimize_all(&self) -> Result<lancedb::table::OptimizeStats, lancedb::Error> {
+        self.table.optimize(lancedb::table::OptimizeAction::All).await
+    }
+
     /// Get the current table version.
     pub async fn version(&self) -> Result<u64, lancedb::Error> {
         self.table.version().await
@@ -229,6 +293,41 @@ impl YataTable {
     pub async fn create_vector_index(&self) -> Result<(), lancedb::Error> {
         self.table
             .create_index(&["vector"], lancedb::index::Index::Auto)
+            .execute()
+            .await
+    }
+
+    /// Ensure a scalar index exists on a column.
+    pub async fn ensure_scalar_index(
+        &self,
+        column: &str,
+        kind: ScalarIndexKind,
+        name: &str,
+    ) -> Result<(), lancedb::Error> {
+        let existing = self.table.list_indices().await?;
+        let already_present = existing.iter().any(|idx| {
+            idx.name == name
+                || (idx.columns.len() == 1
+                    && idx.columns[0] == column
+                    && matches!(
+                        (kind, idx.index_type),
+                        (ScalarIndexKind::BTree, IndexType::BTree)
+                            | (ScalarIndexKind::Bitmap, IndexType::Bitmap)
+                    ))
+        });
+        if already_present {
+            return Ok(());
+        }
+        let train = self.table.count_rows(None).await.unwrap_or(0) > 0;
+        let index = match kind {
+            ScalarIndexKind::BTree => Index::BTree(BTreeIndexBuilder::default()),
+            ScalarIndexKind::Bitmap => Index::Bitmap(BitmapIndexBuilder::default()),
+        };
+        self.table
+            .create_index(&[column], index)
+            .name(name.to_string())
+            .replace(false)
+            .train(train)
             .execute()
             .await
     }
@@ -378,5 +477,29 @@ mod tests {
         let table = db.create_table("vertices", batch).await.unwrap();
         let posts = table.count_rows(Some("label = 'Post'")).await.unwrap();
         assert_eq!(posts, 2);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_scalar_indices() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db = YataDb::connect_local(tmpdir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let schema = lance_schema();
+        let batch = test_batch(&schema, &[1, 2, 3], &["Post", "Like", "Post"], &["a", "b", "c"]);
+        let table = db.create_table("vertices", batch).await.unwrap();
+
+        table
+            .ensure_scalar_index("pk_value", ScalarIndexKind::BTree, "vertices_pk_value_btree")
+            .await
+            .unwrap();
+        table
+            .ensure_scalar_index("label", ScalarIndexKind::Bitmap, "vertices_label_bitmap")
+            .await
+            .unwrap();
+
+        let indices = table.list_indices().await.unwrap();
+        assert!(indices.iter().any(|i| i.name == "vertices_pk_value_btree"));
+        assert!(indices.iter().any(|i| i.name == "vertices_label_bitmap"));
     }
 }
