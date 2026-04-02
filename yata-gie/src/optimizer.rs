@@ -11,7 +11,114 @@ use yata_grin::Predicate;
 pub fn optimize(plan: QueryPlan) -> QueryPlan {
     let plan = push_down_filters(plan);
     let plan = merge_adjacent_scans(plan);
-    plan
+    annotate_traversal_strategy(plan)
+}
+
+fn annotate_traversal_strategy(plan: QueryPlan) -> QueryPlan {
+    let has_limit = plan.ops.iter().any(|op| matches!(op, LogicalOp::Limit { .. }));
+    let original_ops = plan.ops.clone();
+    let ops = plan
+        .ops
+        .into_iter()
+        .enumerate()
+        .map(|(idx, op)| match op {
+            LogicalOp::Expand {
+                src_alias,
+                edge_label,
+                dst_alias,
+                direction,
+                ..
+            } => LogicalOp::Expand {
+                src_alias: src_alias.clone(),
+                edge_label: edge_label.clone(),
+                dst_alias: dst_alias.clone(),
+                direction,
+                strategy: classify_traversal(
+                    &QueryPlan {
+                        ops: original_ops.clone(),
+                    },
+                    idx,
+                    &src_alias,
+                    &edge_label,
+                    direction,
+                    false,
+                    has_limit,
+                ),
+            },
+            LogicalOp::PathExpand {
+                src_alias,
+                edge_label,
+                dst_alias,
+                min_hops,
+                max_hops,
+                direction,
+                ..
+            } => LogicalOp::PathExpand {
+                src_alias: src_alias.clone(),
+                edge_label: edge_label.clone(),
+                dst_alias: dst_alias.clone(),
+                min_hops,
+                max_hops,
+                direction,
+                strategy: classify_traversal(
+                    &QueryPlan {
+                        ops: original_ops.clone(),
+                    },
+                    idx,
+                    &src_alias,
+                    &edge_label,
+                    direction,
+                    true,
+                    has_limit,
+                ),
+            },
+            other => other,
+        })
+        .collect();
+    QueryPlan { ops }
+}
+
+fn classify_traversal(
+    plan: &QueryPlan,
+    op_index: usize,
+    src_alias: &str,
+    edge_label: &str,
+    direction: yata_grin::Direction,
+    is_path_expand: bool,
+    has_limit: bool,
+) -> TraversalStrategy {
+    if matches!(direction, yata_grin::Direction::Both) || edge_label.is_empty() {
+        return TraversalStrategy::PreferGie;
+    }
+    let has_selective_scan = plan.ops[..op_index].iter().any(|op| {
+        matches!(
+            op,
+            LogicalOp::Scan {
+                alias,
+                predicate: Some(_),
+                ..
+            } if alias == src_alias
+        )
+    });
+    let has_source_filter = plan.ops[..op_index].iter().any(|op| {
+        matches!(
+            op,
+            LogicalOp::Filter {
+                alias: Some(alias),
+                ..
+            } if alias == src_alias
+        )
+    });
+    if has_selective_scan || has_source_filter {
+        return TraversalStrategy::PreferStaged;
+    }
+    if is_path_expand && has_limit {
+        return TraversalStrategy::PreferStaged;
+    }
+    if has_limit && op_index == 1 {
+        return TraversalStrategy::PreferStaged;
+    }
+    TraversalStrategy::Auto
 }
 
 /// Move Filter ops before Expand/PathExpand when the filter only references the source alias.
@@ -138,6 +245,7 @@ mod tests {
                     edge_label: "KNOWS".into(),
                     dst_alias: "m".into(),
                     direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
                 },
                 LogicalOp::Filter {
                     alias: Some("n".into()),
@@ -171,6 +279,7 @@ mod tests {
                     min_hops: 1,
                     max_hops: 3,
                     direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
                 },
                 LogicalOp::Filter {
                     alias: Some("n".into()),
@@ -261,6 +370,7 @@ mod tests {
                     edge_label: "KNOWS".into(),
                     dst_alias: "m".into(),
                     direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
                 },
                 LogicalOp::Filter {
                     alias: Some("n".into()),
@@ -302,6 +412,7 @@ mod tests {
                     edge_label: "KNOWS".into(),
                     dst_alias: "m".into(),
                     direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
                 },
                 LogicalOp::Project {
                     exprs: vec![Expr::Var("m".into())],
@@ -350,6 +461,7 @@ mod tests {
                     edge_label: "KNOWS".into(),
                     dst_alias: "m".into(),
                     direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
                 },
                 LogicalOp::Filter {
                     alias: Some("n".into()),
@@ -395,6 +507,7 @@ mod tests {
                     edge_label: "KNOWS".into(),
                     dst_alias: "m".into(),
                     direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
                 },
                 LogicalOp::Project {
                     exprs: vec![Expr::Var("m".into())],
@@ -496,6 +609,7 @@ mod tests {
                     edge_label: "REPLIED_TO".into(),
                     dst_alias: "r".into(),
                     direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
                 },
                 LogicalOp::Filter {
                     alias: Some("n".into()),
@@ -525,6 +639,7 @@ mod tests {
                     edge_label: "KNOWS".into(),
                     dst_alias: "m".into(),
                     direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
                 },
                 LogicalOp::Filter {
                     alias: Some("m".into()),
@@ -560,6 +675,7 @@ mod tests {
                     min_hops: 1,
                     max_hops: 3,
                     direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
                 },
                 LogicalOp::Filter {
                     alias: Some("m".into()),
@@ -576,6 +692,64 @@ mod tests {
                 alias: Some(alias),
                 ..
             } if alias == "m"
+        ));
+    }
+
+    #[test]
+    fn test_selective_traversal_prefers_staged_strategy() {
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: Some(Predicate::Eq("name".into(), PropValue::Str("Alice".into()))),
+                },
+                LogicalOp::Expand {
+                    src_alias: "n".into(),
+                    edge_label: "KNOWS".into(),
+                    dst_alias: "m".into(),
+                    direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
+                },
+            ],
+        };
+
+        let optimized = optimize(plan);
+        assert!(matches!(
+            &optimized.ops[1],
+            LogicalOp::Expand {
+                strategy: TraversalStrategy::PreferStaged,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_bidirectional_traversal_prefers_gie_strategy() {
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: None,
+                },
+                LogicalOp::Expand {
+                    src_alias: "n".into(),
+                    edge_label: "KNOWS".into(),
+                    dst_alias: "m".into(),
+                    direction: yata_grin::Direction::Both,
+                    strategy: TraversalStrategy::Auto,
+                },
+            ],
+        };
+
+        let optimized = optimize(plan);
+        assert!(matches!(
+            &optimized.ops[1],
+            LogicalOp::Expand {
+                strategy: TraversalStrategy::PreferGie,
+                ..
+            }
         ));
     }
 }

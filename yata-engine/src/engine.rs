@@ -273,24 +273,45 @@ struct StagedPathRecord {
     values: Vec<PropValue>,
 }
 
+fn runtime_allows_staged_traversal(current_rows: usize, limit: Option<usize>) -> bool {
+    if current_rows == 0 || current_rows > PATH_EXPAND_FRONTIER_LIMIT {
+        return false;
+    }
+    let limit_ok = limit.is_none_or(|l| current_rows <= l.saturating_mul(4).max(32));
+    limit_ok
+}
+
 fn should_stage_traversal(
     op: &yata_gie::ir::LogicalOp,
     current_rows: usize,
     limit: Option<usize>,
 ) -> bool {
-    if current_rows == 0 || current_rows > PATH_EXPAND_FRONTIER_LIMIT {
-        return false;
-    }
-    let limit_ok = limit.is_none_or(|l| current_rows <= l.saturating_mul(4).max(32));
-    if !limit_ok {
-        return false;
-    }
-    match op {
-        yata_gie::ir::LogicalOp::Expand { direction, .. }
-        | yata_gie::ir::LogicalOp::PathExpand { direction, .. } => {
-            !matches!(direction, yata_grin::Direction::Both)
+    use yata_gie::ir::TraversalStrategy;
+
+    let strategy = match op {
+        yata_gie::ir::LogicalOp::Expand {
+            direction,
+            strategy,
+            ..
         }
-        _ => false,
+        | yata_gie::ir::LogicalOp::PathExpand {
+            direction,
+            strategy,
+            ..
+        } => {
+            if matches!(direction, yata_grin::Direction::Both) {
+                return false;
+            }
+            *strategy
+        }
+        _ => return false,
+    };
+
+    match strategy {
+        TraversalStrategy::PreferGie => false,
+        TraversalStrategy::PreferStaged | TraversalStrategy::Auto => {
+            runtime_allows_staged_traversal(current_rows, limit)
+        }
     }
 }
 
@@ -820,6 +841,7 @@ impl TieredGraphEngine {
             min_hops,
             max_hops,
             direction,
+            ..
         } = path_op else {
             return Err("expected PathExpand op".into());
         };
@@ -938,6 +960,7 @@ impl TieredGraphEngine {
             edge_label,
             dst_alias,
             direction,
+            ..
         } = expand_op else {
             return Err("expected Expand op".into());
         };

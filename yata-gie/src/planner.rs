@@ -37,6 +37,7 @@ pub fn plan_traversal(
         edge_label: edge_label.to_string(),
         dst_alias: dst_alias.to_string(),
         direction,
+        strategy: TraversalStrategy::Auto,
     });
     plan
 }
@@ -83,6 +84,7 @@ impl PlanBuilder {
             edge_label: edge_label.to_string(),
             dst_alias: dst_alias.to_string(),
             direction,
+            strategy: TraversalStrategy::Auto,
         });
         self
     }
@@ -103,6 +105,7 @@ impl PlanBuilder {
             min_hops,
             max_hops,
             direction,
+            strategy: TraversalStrategy::Auto,
         });
         self
     }

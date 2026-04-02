@@ -19,6 +19,17 @@ pub enum Expr {
     Alias(Box<Expr>, String),
 }
 
+/// Planner/optimizer hint for how traversal should execute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TraversalStrategy {
+    /// Let the engine decide at runtime.
+    Auto,
+    /// Prefer engine-led staged traversal on selective frontiers.
+    PreferStaged,
+    /// Prefer normal GIE execution on the current ArrowStore.
+    PreferGie,
+}
+
 /// Logical query plan operator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicalOp {
@@ -34,6 +45,7 @@ pub enum LogicalOp {
         edge_label: String,
         dst_alias: String,
         direction: Direction,
+        strategy: TraversalStrategy,
     },
     /// Variable-length path expansion.
     PathExpand {
@@ -43,6 +55,7 @@ pub enum LogicalOp {
         min_hops: u32,
         max_hops: u32,
         direction: Direction,
+        strategy: TraversalStrategy,
     },
     /// Filter rows by predicate, optionally scoped to a bound alias.
     Filter {
@@ -282,6 +295,7 @@ mod tests {
             edge_label: "KNOWS".into(),
             dst_alias: "m".into(),
             direction: Direction::Out,
+            strategy: TraversalStrategy::Auto,
         };
         match expand {
             LogicalOp::Expand {
@@ -305,6 +319,7 @@ mod tests {
             edge_label: "KNOWS".into(),
             dst_alias: "m".into(),
             direction: Direction::Out,
+            strategy: TraversalStrategy::Auto,
         });
         plan.push(LogicalOp::Filter {
             alias: Some("n".into()),
@@ -426,6 +441,7 @@ mod tests {
             edge_label: "KNOWS".into(),
             dst_alias: "m".into(),
             direction: Direction::Out,
+            strategy: TraversalStrategy::Auto,
         });
         plan.push(LogicalOp::Exchange {
             routing_key: Expr::Var("m".into()),

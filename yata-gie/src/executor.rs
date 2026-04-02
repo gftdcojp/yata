@@ -183,6 +183,7 @@ pub fn execute_op<S: GraphStore>(op: &LogicalOp, input: Vec<Record>, store: &S) 
             edge_label,
             dst_alias,
             direction,
+            ..
         } => {
             let mut output = Vec::new();
             for record in &input {
@@ -234,6 +235,7 @@ pub fn execute_op<S: GraphStore>(op: &LogicalOp, input: Vec<Record>, store: &S) 
             min_hops,
             max_hops,
             direction,
+            ..
         } => {
             let mut output = Vec::new();
             for record in &input {
@@ -1161,6 +1163,7 @@ mod tests {
                     edge_label: "KNOWS".into(),
                     dst_alias: "m".into(),
                     direction: Direction::Out,
+                    strategy: crate::ir::TraversalStrategy::Auto,
                 },
                 LogicalOp::Filter {
                     alias: Some("n".into()),
@@ -1200,6 +1203,7 @@ mod tests {
                     edge_label: "KNOWS".into(),
                     dst_alias: "m".into(),
                     direction: Direction::Out,
+                    strategy: crate::ir::TraversalStrategy::Auto,
                 },
                 LogicalOp::Filter {
                     alias: Some("m".into()),
