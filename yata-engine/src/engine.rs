@@ -261,6 +261,45 @@ pub struct MutationContext {
 }
 
 const AUTO_COMPACT_FRAGMENT_THRESHOLD: u64 = 8;
+const EDGE_SRC_VID_PUSHDOWN_LIMIT: usize = 256;
+const EDGE_SRC_SCAN_LIMIT: usize = 256;
+
+fn sql_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn expr_to_sql_literal(expr: &yata_cypher::ast::Expr, params: &HashMap<String, String>) -> Option<String> {
+    match expr {
+        yata_cypher::ast::Expr::Lit(yata_cypher::ast::Literal::Str(s)) => Some(sql_quote(s)),
+        yata_cypher::ast::Expr::Lit(yata_cypher::ast::Literal::Int(i)) => Some(i.to_string()),
+        yata_cypher::ast::Expr::Lit(yata_cypher::ast::Literal::Float(f)) => Some(f.to_string()),
+        yata_cypher::ast::Expr::Lit(yata_cypher::ast::Literal::Bool(b)) => Some(b.to_string()),
+        yata_cypher::ast::Expr::Param(name) => params.get(name).map(|v| sql_quote(v)),
+        _ => None,
+    }
+}
+
+fn build_vertex_pushdown_filter(
+    node: &yata_cypher::ast::NodePattern,
+    params: &HashMap<String, String>,
+) -> Option<String> {
+    let promoted = ["repo", "owner_did", "name", "app_id", "rkey"];
+    let mut parts = Vec::new();
+    if let Some(label) = node.labels.first() {
+        parts.push(format!("label = {}", sql_quote(label)));
+    }
+    for (key, expr) in &node.props {
+        if !promoted.contains(&key.as_str()) {
+            continue;
+        }
+        let literal = expr_to_sql_literal(expr, params)?;
+        parts.push(format!("{key} = {literal}"));
+    }
+    if parts.len() <= 1 {
+        return None;
+    }
+    Some(parts.join(" AND "))
+}
 
 fn edge_endpoint_labels(ast: &yata_cypher::ast::Query) -> (Vec<String>, Vec<String>) {
     let mut src_labels = Vec::new();
@@ -297,6 +336,92 @@ fn edge_endpoint_labels(ast: &yata_cypher::ast::Query) -> (Vec<String>, Vec<Stri
     dst_labels.sort();
     dst_labels.dedup();
     (src_labels, dst_labels)
+}
+
+fn edge_source_patterns<'a>(ast: &'a yata_cypher::ast::Query) -> Vec<&'a yata_cypher::ast::NodePattern> {
+    let mut nodes = Vec::new();
+    let mut collect_from_patterns = |patterns: &'a [yata_cypher::ast::Pattern]| {
+        for pattern in patterns {
+            for window in pattern.elements.windows(3) {
+                let [yata_cypher::ast::PatternElement::Node(src), yata_cypher::ast::PatternElement::Rel(_), yata_cypher::ast::PatternElement::Node(_)] = window else {
+                    continue;
+                };
+                nodes.push(src);
+            }
+        }
+    };
+
+    for clause in &ast.clauses {
+        match clause {
+            yata_cypher::ast::Clause::Match { patterns, .. }
+            | yata_cypher::ast::Clause::OptionalMatch { patterns, .. }
+            | yata_cypher::ast::Clause::Create { patterns } => collect_from_patterns(patterns),
+            yata_cypher::ast::Clause::Merge { pattern, .. } => collect_from_patterns(std::slice::from_ref(pattern)),
+            _ => {}
+        }
+    }
+    nodes
+}
+
+fn reverse_sql_op(op: &yata_cypher::ast::BinOp) -> Option<&'static str> {
+    match op {
+        yata_cypher::ast::BinOp::Eq => Some("="),
+        yata_cypher::ast::BinOp::Neq => Some("!="),
+        yata_cypher::ast::BinOp::Lt => Some(">"),
+        yata_cypher::ast::BinOp::Lte => Some(">="),
+        yata_cypher::ast::BinOp::Gt => Some("<"),
+        yata_cypher::ast::BinOp::Gte => Some("<="),
+        _ => None,
+    }
+}
+
+fn sql_op(op: &yata_cypher::ast::BinOp) -> Option<&'static str> {
+    match op {
+        yata_cypher::ast::BinOp::Eq => Some("="),
+        yata_cypher::ast::BinOp::Neq => Some("!="),
+        yata_cypher::ast::BinOp::Lt => Some("<"),
+        yata_cypher::ast::BinOp::Lte => Some("<="),
+        yata_cypher::ast::BinOp::Gt => Some(">"),
+        yata_cypher::ast::BinOp::Gte => Some(">="),
+        _ => None,
+    }
+}
+
+fn collect_var_where_filters(
+    expr: &yata_cypher::ast::Expr,
+    vars: &std::collections::HashSet<String>,
+    params: &HashMap<String, String>,
+    out: &mut HashMap<String, Vec<String>>,
+) {
+    use yata_cypher::ast::{BinOp, Expr};
+    match expr {
+        Expr::BinOp(BinOp::And, lhs, rhs) => {
+            collect_var_where_filters(lhs, vars, params, out);
+            collect_var_where_filters(rhs, vars, params, out);
+        }
+        Expr::BinOp(op, lhs, rhs) => {
+            let promoted = ["repo", "owner_did", "name", "app_id", "rkey"];
+            if let Expr::Prop(base, key) = lhs.as_ref() {
+                if let Expr::Var(var) = base.as_ref() {
+                    if vars.contains(var) && promoted.contains(&key.as_str()) {
+                        if let (Some(op_str), Some(lit)) = (sql_op(op), expr_to_sql_literal(rhs, params)) {
+                            out.entry(var.clone()).or_default().push(format!("{key} {op_str} {lit}"));
+                        }
+                    }
+                }
+            }
+            if let Expr::Prop(base, key) = rhs.as_ref() {
+                if let Expr::Var(var) = base.as_ref() {
+                    if vars.contains(var) && promoted.contains(&key.as_str()) {
+                        if let (Some(op_str), Some(lit)) = (reverse_sql_op(op), expr_to_sql_literal(lhs, params)) {
+                            out.entry(var.clone()).or_default().push(format!("{key} {op_str} {lit}"));
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Graph engine: LanceDB-backed. No persistent CSR. Query = LanceDB scan → ephemeral CSR → GIE.
@@ -347,6 +472,84 @@ impl TieredGraphEngine {
         });
     }
 
+    fn collect_src_vid_candidates(
+        &self,
+        ast: &yata_cypher::ast::Query,
+        params: &HashMap<String, String>,
+    ) -> Result<Vec<String>, String> {
+        self.ensure_lance();
+        let source_nodes = edge_source_patterns(ast);
+        let source_vars: std::collections::HashSet<String> = source_nodes.iter()
+            .filter_map(|node| node.var.clone())
+            .collect();
+        let mut where_filters_by_var: HashMap<String, Vec<String>> = HashMap::new();
+        for clause in &ast.clauses {
+            match clause {
+                yata_cypher::ast::Clause::Match { where_, .. }
+                | yata_cypher::ast::Clause::OptionalMatch { where_, .. } => {
+                    if let Some(expr) = where_ {
+                        collect_var_where_filters(expr, &source_vars, params, &mut where_filters_by_var);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let filters: Vec<String> = source_nodes.into_iter()
+            .filter_map(|node| {
+                let mut parts = Vec::new();
+                if let Some(base) = build_vertex_pushdown_filter(node, params) {
+                    parts.push(base);
+                } else if let Some(label) = node.labels.first() {
+                    parts.push(format!("label = {}", sql_quote(label)));
+                }
+                if let Some(var) = &node.var {
+                    if let Some(extra) = where_filters_by_var.get(var) {
+                        parts.extend(extra.iter().cloned());
+                    }
+                }
+                if parts.len() <= 1 {
+                    None
+                } else {
+                    Some(parts.join(" AND "))
+                }
+            })
+            .collect();
+        if filters.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let lance_tbl = self.lance_table.clone();
+        self.block_on(async {
+            let tbl_guard = lance_tbl.lock().await;
+            let tbl = match tbl_guard.as_ref() {
+                Some(t) => t,
+                None => return Ok(Vec::new()),
+            };
+            let mut vids = Vec::new();
+            for filter in filters {
+                let batches = tbl.scan_filter_limit(&filter, Some(EDGE_SRC_SCAN_LIMIT), None)
+                    .await
+                    .map_err(|e| format!("LanceDB source-vid scan: {e}"))?;
+                for batch in batches {
+                    let pk_val_col = batch.column(2).as_any().downcast_ref::<arrow::array::StringArray>()
+                        .ok_or("column 2 (pk_value) is not Utf8")?;
+                    for row in 0..batch.num_rows() {
+                        vids.push(pk_val_col.value(row).to_string());
+                        if vids.len() >= EDGE_SRC_VID_PUSHDOWN_LIMIT {
+                            vids.sort();
+                            vids.dedup();
+                            return Ok(vids);
+                        }
+                    }
+                }
+            }
+            vids.sort();
+            vids.dedup();
+            Ok(vids)
+        })
+    }
+
     /// Create a new engine with Lance-backed persistence.
     pub fn new(config: TieredEngineConfig, data_dir: &str) -> Self {
         Self::build(config, data_dir)
@@ -381,7 +584,7 @@ impl TieredGraphEngine {
     /// Build an ArrowStore from LanceDB (zero-copy, lazy props).
     /// Label pushdown: only scans fragments matching requested labels.
     fn build_read_store(&self, labels: &[&str]) -> Result<yata_lance::ArrowStore, String> {
-        self.build_read_store_pushdown(labels, &[], &[], &[], &[], None)
+        self.build_read_store_pushdown(labels, &[], &[], &[], &[], &[], None)
     }
 
     /// Build ArrowStore with full pushdown: label filter + WHERE conditions + LIMIT.
@@ -394,6 +597,7 @@ impl TieredGraphEngine {
         edge_labels: &[&str],
         edge_src_labels: &[&str],
         edge_dst_labels: &[&str],
+        edge_src_vids: &[String],
         lance_filters: &[String],
         limit: Option<usize>,
     ) -> Result<yata_lance::ArrowStore, String> {
@@ -467,6 +671,16 @@ impl TieredGraphEngine {
                                 edge_filter_parts.push(format!("dst_label = {}", label_exprs[0]));
                             } else {
                                 edge_filter_parts.push(format!("dst_label IN ({})", label_exprs.join(", ")));
+                            }
+                        }
+                        if !edge_src_vids.is_empty() && edge_src_vids.len() <= EDGE_SRC_VID_PUSHDOWN_LIMIT {
+                            let vid_exprs: Vec<String> = edge_src_vids.iter()
+                                .map(|v| sql_quote(v))
+                                .collect();
+                            if vid_exprs.len() == 1 {
+                                edge_filter_parts.push(format!("src_vid = {}", vid_exprs[0]));
+                            } else {
+                                edge_filter_parts.push(format!("src_vid IN ({})", vid_exprs.join(", ")));
                             }
                         }
                         let combined_filter = edge_filter_parts.join(" AND ");
@@ -690,6 +904,7 @@ impl TieredGraphEngine {
             let hints = crate::hints::QueryHints::extract(cypher);
             let vl_refs: Vec<&str> = hints.node_labels.iter().map(|s| s.as_str()).collect();
             let rel_refs: Vec<&str> = hints.rel_types.iter().map(|s| s.as_str()).collect();
+            let param_map: HashMap<String, String> = params.iter().cloned().collect();
 
             // GIE path: Cypher → IR Plan → execute directly on the read store.
             // Design E: SecurityScope is compiled from policy vertices via query_with_did().
@@ -697,15 +912,22 @@ impl TieredGraphEngine {
             if let Ok(ast) = yata_cypher::parse(cypher) {
                 let plan_result = yata_gie::transpile::transpile(&ast);
                 let (edge_src_labels, edge_dst_labels) = edge_endpoint_labels(&ast);
+                let src_vid_candidates = self.collect_src_vid_candidates(&ast, &param_map).unwrap_or_default();
 
                 if let Ok(plan) = plan_result {
+                    let vertex_lance_filters: Vec<String> = if rel_refs.is_empty() {
+                        hints.lance_filters.clone()
+                    } else {
+                        Vec::new()
+                    };
                     // Use enhanced pushdown: label + WHERE + LIMIT pushed to Lance
                     let read_store = self.build_read_store_pushdown(
                         &vl_refs,
                         &rel_refs,
                         &edge_src_labels.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
                         &edge_dst_labels.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                        &hints.lance_filters,
+                        &src_vid_candidates,
+                        &vertex_lance_filters,
                         hints.limit,
                     )?;
                     // Use limit-aware executor for early termination
@@ -2262,6 +2484,24 @@ mod tests {
         ).unwrap();
         let followed = get_col(&traverse_rows, "name");
         assert!(followed.iter().any(|n| n.contains("Bob")), "Bob must be reachable over FOLLOWS");
+    }
+
+    #[test]
+    fn test_persist_cypher_edge_write_back_with_source_where() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        run_query(&e, "CREATE (a:User {name: 'Alice'})-[r:FOLLOWS]->(b:User {name: 'Bob'})", &[], None).unwrap();
+        run_query(&e, "CREATE (a:User {name: 'Carol'})-[r:FOLLOWS]->(b:User {name: 'Dave'})", &[], None).unwrap();
+
+        let rows = run_query(
+            &e,
+            "MATCH (a:User)-[:FOLLOWS]->(b:User) WHERE a.name = 'Alice' RETURN b.name AS name LIMIT 10",
+            &[],
+            None,
+        ).unwrap();
+        let names = get_col(&rows, "name");
+        assert!(names.iter().any(|n| n.contains("Bob")), "Bob must match source-filtered traversal");
+        assert!(!names.iter().any(|n| n.contains("Dave")), "Dave must be excluded by source WHERE");
     }
 
     #[test]
