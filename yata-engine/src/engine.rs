@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use yata_grin::{Predicate, PropValue, Property, Scannable};
+use yata_grin::{Predicate, PropValue, Property, Scannable, Topology};
 
 use crate::config::TieredEngineConfig;
 use crate::router;
@@ -268,6 +268,10 @@ const EDGE_DST_SCAN_LIMIT: usize = 256;
 const PATH_EXPAND_FRONTIER_LIMIT: usize = 256;
 const COUNT_STATS_CACHE_MAX: usize = 512;
 const COUNT_STATS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const PRESSURE_STATS_CACHE_MAX: usize = 64;
+const PRESSURE_STATS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const COMPACTION_DEAD_ROWS_THRESHOLD: usize = 64;
+const COMPACTION_DEAD_RATIO_THRESHOLD: f64 = 0.20;
 
 #[derive(Debug, Clone)]
 struct StagedPathRecord {
@@ -279,6 +283,21 @@ struct StagedPathRecord {
 struct CachedCountStat {
     count: usize,
     at: std::time::Instant,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPressureStat {
+    raw_rows: usize,
+    live_rows: usize,
+    dead_rows: usize,
+    dead_ratio: f64,
+    at: std::time::Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableKind {
+    Vertices,
+    Edges,
 }
 
 fn runtime_allows_staged_traversal(current_rows: usize, limit: Option<usize>) -> bool {
@@ -593,6 +612,8 @@ pub struct TieredGraphEngine {
     security_scope_cache: Arc<Mutex<HashMap<String, (yata_gie::ir::SecurityScope, std::time::Instant)>>>,
     /// Cheap traversal planning stats: filter key → (count, cached_at).
     count_stats_cache: Arc<Mutex<HashMap<String, CachedCountStat>>>,
+    /// Tombstone-aware table pressure stats: table key → raw/live/dead counts.
+    pressure_stats_cache: Arc<Mutex<HashMap<String, CachedPressureStat>>>,
     cypher_read_count: Arc<AtomicU64>,
     cypher_mutation_count: Arc<AtomicU64>,
     cypher_mutation_us_total: Arc<AtomicU64>,
@@ -601,6 +622,28 @@ pub struct TieredGraphEngine {
 }
 
 impl TieredGraphEngine {
+    fn cached_pressure_stat(&self, key: &str) -> Option<CachedPressureStat> {
+        let cache = self.pressure_stats_cache.lock().ok()?;
+        let entry = cache.get(key)?;
+        if entry.at.elapsed() < PRESSURE_STATS_CACHE_TTL {
+            Some(entry.clone())
+        } else {
+            None
+        }
+    }
+
+    fn store_pressure_stat(&self, key: String, stat: CachedPressureStat) {
+        if let Ok(mut cache) = self.pressure_stats_cache.lock() {
+            if cache.len() >= PRESSURE_STATS_CACHE_MAX {
+                cache.retain(|_, entry| entry.at.elapsed() < PRESSURE_STATS_CACHE_TTL);
+                if cache.len() >= PRESSURE_STATS_CACHE_MAX {
+                    cache.clear();
+                }
+            }
+            cache.insert(key, stat);
+        }
+    }
+
     fn cached_count_stat(&self, key: &str) -> Option<usize> {
         let cache = self.count_stats_cache.lock().ok()?;
         let entry = cache.get(key)?;
@@ -630,6 +673,80 @@ impl TieredGraphEngine {
         if let Ok(mut cache) = self.count_stats_cache.lock() {
             cache.clear();
         }
+        if let Ok(mut cache) = self.pressure_stats_cache.lock() {
+            cache.clear();
+        }
+    }
+
+    fn pressure_cache_key(kind: TableKind, label: Option<&str>) -> String {
+        match (kind, label) {
+            (TableKind::Vertices, Some(label)) => format!("pressure:vertices:{label}"),
+            (TableKind::Edges, Some(label)) => format!("pressure:edges:{label}"),
+            (TableKind::Vertices, None) => "pressure:vertices:*".to_string(),
+            (TableKind::Edges, None) => "pressure:edges:*".to_string(),
+        }
+    }
+
+    fn estimate_table_pressure(&self, kind: TableKind, label: Option<&str>) -> Option<CachedPressureStat> {
+        let cache_key = Self::pressure_cache_key(kind, label);
+        if let Some(stat) = self.cached_pressure_stat(&cache_key) {
+            return Some(stat);
+        }
+
+        let raw_rows = match kind {
+            TableKind::Vertices => {
+                let filter = label.map(|label| format!("label = {}", sql_quote(label)));
+                self.ensure_lance();
+                let lance_tbl = self.lance_table.clone();
+                self.block_on(async {
+                    let tbl_guard = lance_tbl.lock().await;
+                    let tbl = tbl_guard.as_ref()?;
+                    tbl.count_rows(filter.as_deref()).await.ok()
+                })?
+            }
+            TableKind::Edges => {
+                let filter = label.map(|label| format!("edge_label = {}", sql_quote(label)));
+                self.ensure_lance();
+                let lance_tbl = self.lance_edge_table.clone();
+                self.block_on(async {
+                    let tbl_guard = lance_tbl.lock().await;
+                    let tbl = tbl_guard.as_ref()?;
+                    tbl.count_rows(filter.as_deref()).await.ok()
+                })?
+            }
+        };
+
+        let live_rows = match kind {
+            TableKind::Vertices => {
+                if let Some(label) = label {
+                    self.build_read_store(&[label]).ok()?.vertex_count()
+                } else {
+                    self.build_read_store(&[]).ok()?.vertex_count()
+                }
+            }
+            TableKind::Edges => {
+                let edge_labels: Vec<&str> = label.into_iter().collect();
+                self.build_read_store_pushdown(&[], &edge_labels, &[], &[], &[], &[], &[], &[], None)
+                    .ok()?
+                    .edge_count()
+            }
+        };
+
+        let dead_rows = raw_rows.saturating_sub(live_rows);
+        let dead_ratio = if raw_rows == 0 {
+            0.0
+        } else {
+            dead_rows as f64 / raw_rows as f64
+        };
+        let stat = CachedPressureStat {
+            raw_rows,
+            live_rows,
+            dead_rows,
+            dead_ratio,
+            at: std::time::Instant::now(),
+        };
+        self.store_pressure_stat(cache_key, stat.clone());
+        Some(stat)
     }
 
     fn estimate_vertex_filter_cardinality(&self, filter: &str) -> Option<usize> {
@@ -788,7 +905,19 @@ impl TieredGraphEngine {
 
     fn maybe_schedule_compaction(&self) {
         let merges = self.merge_record_count.load(Ordering::Relaxed);
-        if merges % AUTO_COMPACT_FRAGMENT_THRESHOLD != 0 || merges == 0 {
+        let vertex_pressure = self.estimate_table_pressure(TableKind::Vertices, None);
+        let edge_pressure = self.estimate_table_pressure(TableKind::Edges, None);
+        let vertices_need_compaction = vertex_pressure.as_ref().is_some_and(|stat| {
+            stat.dead_rows >= COMPACTION_DEAD_ROWS_THRESHOLD
+                || stat.dead_ratio >= COMPACTION_DEAD_RATIO_THRESHOLD
+        });
+        let edges_need_compaction = edge_pressure.as_ref().is_some_and(|stat| {
+            stat.dead_rows >= COMPACTION_DEAD_ROWS_THRESHOLD
+                || stat.dead_ratio >= COMPACTION_DEAD_RATIO_THRESHOLD
+        });
+        let periodic_trigger = merges != 0 && merges % AUTO_COMPACT_FRAGMENT_THRESHOLD == 0;
+
+        if !periodic_trigger && !vertices_need_compaction && !edges_need_compaction {
             return;
         }
         let lance_ds = self.lance_table.clone();
@@ -796,7 +925,13 @@ impl TieredGraphEngine {
         let last_compact_ms = self.last_compaction_ms.clone();
         std::thread::spawn(move || {
             ENGINE_RT.block_on(async {
-                for (name, handle) in [("vertices", lance_ds), ("edges", lance_edge_ds)] {
+                for (name, handle, should_compact) in [
+                    ("vertices", lance_ds, periodic_trigger || vertices_need_compaction),
+                    ("edges", lance_edge_ds, periodic_trigger || edges_need_compaction),
+                ] {
+                    if !should_compact {
+                        continue;
+                    }
                     let ds_guard = handle.lock().await;
                     if let Some(ref ds) = *ds_guard {
                         match ds.compact().await {
@@ -1344,6 +1479,7 @@ impl TieredGraphEngine {
             s3_prefix,
             security_scope_cache: Arc::new(Mutex::new(HashMap::new())),
             count_stats_cache: Arc::new(Mutex::new(HashMap::new())),
+            pressure_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             cypher_read_count: Arc::new(AtomicU64::new(0)),
             cypher_mutation_count: Arc::new(AtomicU64::new(0)),
             cypher_mutation_us_total: Arc::new(AtomicU64::new(0)),
@@ -3560,6 +3696,42 @@ mod tests {
 
         assert!(e.cached_count_stat(&format!("vertex:{vertex_filter}")).is_none());
         assert!(e.cached_count_stat(&format!("edge:{edge_filter}")).is_none());
+    }
+
+    #[test]
+    fn test_vertex_pressure_stats_are_tombstone_aware() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        e.merge_record("Task", "rkey", "t1", &[("rkey", PropValue::Str("t1".into()))]).unwrap();
+        e.merge_record("Task", "rkey", "t2", &[("rkey", PropValue::Str("t2".into()))]).unwrap();
+        e.delete_record("Task", "rkey", "t1").unwrap();
+
+        let stat = e.estimate_table_pressure(TableKind::Vertices, Some("Task")).unwrap();
+        assert_eq!(stat.raw_rows, 3);
+        assert_eq!(stat.live_rows, 1);
+        assert_eq!(stat.dead_rows, 2);
+        assert!(stat.dead_ratio > 0.6);
+    }
+
+    #[test]
+    fn test_edge_pressure_stats_are_tombstone_aware() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        e.merge_record("User", "rkey", "alice", &[("rkey", PropValue::Str("alice".into()))]).unwrap();
+        e.merge_record("User", "rkey", "bob", &[("rkey", PropValue::Str("bob".into()))]).unwrap();
+        e.merge_record("FOLLOWS", "eid", "e1", &[
+            ("_src", PropValue::Str("alice".into())),
+            ("_dst", PropValue::Str("bob".into())),
+            ("_src_label", PropValue::Str("User".into())),
+            ("_dst_label", PropValue::Str("User".into())),
+        ]).unwrap();
+        e.delete_record("FOLLOWS", "eid", "e1").unwrap();
+
+        let stat = e.estimate_table_pressure(TableKind::Edges, Some("FOLLOWS")).unwrap();
+        assert_eq!(stat.raw_rows, 2);
+        assert_eq!(stat.live_rows, 0);
+        assert_eq!(stat.dead_rows, 2);
+        assert!(stat.dead_ratio > 0.9);
     }
 
     #[test]

@@ -26,9 +26,11 @@ Read:  query_inner() → build_read_store_pushdown() → ArrowStore (zero-copy, 
        Cypher source/destination predicates (inline props + simple WHERE comparisons) feed `src_vid` / `dst_vid` candidate extraction before edge scan
        GIE optimizer annotates traversal with `TraversalStrategy` (`PreferStaged` / `PreferGie` / `Auto`)
        Engine refines traversal strategy with Lance `count_rows(filter)` cardinality on source-node filters and `edge_label`/`src_label` edge spread
+       Engine keeps tombstone-aware pressure stats cache (`raw_rows`, `live_rows`, `dead_rows`, `dead_ratio`) for vertices/edges
        Selective traversal ops are engine-led when hint + runtime frontier allow it: staged Expand/PathExpand scan edge frontier first, rebuild narrow ArrowStore, then resume GIE
        Chained traversals reuse touched alias vids across stages so later Expand/PathExpand keep prior bindings
        Cost gate: large frontier / over-limit intermediate sets fall back to normal GIE execution
+       Delete-aware compaction: periodic compact + dead-row pressure compact when tombstones accumulate
        Early LIMIT: execute_with_limit() caps intermediate results (no aggregate blowup)
        Disk spill: ArrowStore exceeding YATA_ARROWSTORE_BUDGET_MB → IPC file in YATA_VINEYARD_DIR
 
