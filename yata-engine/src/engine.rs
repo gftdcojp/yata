@@ -3004,13 +3004,16 @@ impl TieredGraphEngine {
             if db_guard.is_none() {
                 let new_db = match yata_lance::YataDb::connect_from_env(&prefix_owned).await {
                     Some(db) => db,
-                    None => match yata_lance::YataDb::connect_local(&prefix_owned).await {
-                        Ok(db) => db,
-                        Err(e) => {
-                            tracing::info!(error = %e, "LanceDB connect failed (new database)");
-                            return 0u64;
+                    None => {
+                        tracing::warn!("R2 connection unavailable — falling back to local filesystem (data will NOT persist across restarts)");
+                        match yata_lance::YataDb::connect_local(&prefix_owned).await {
+                            Ok(db) => db,
+                            Err(e) => {
+                                tracing::error!(error = %e, "LanceDB local connect also failed");
+                                return 0u64;
+                            }
                         }
-                    },
+                    }
                 };
                 *db_guard = Some(new_db);
             }

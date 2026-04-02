@@ -107,6 +107,7 @@ impl YataDb {
     }
 
     /// Connect from YATA_S3_* env vars. Returns None if not configured.
+    /// CRITICAL: S3 connection errors are logged, not silently swallowed.
     pub async fn connect_from_env(prefix: &str) -> Option<Self> {
         let endpoint = std::env::var("YATA_S3_ENDPOINT").ok()?;
         let bucket = std::env::var("YATA_S3_BUCKET").unwrap_or_default();
@@ -119,13 +120,27 @@ impl YataDb {
             .unwrap_or_default();
         let region = std::env::var("YATA_S3_REGION").unwrap_or_else(|_| "auto".to_string());
         if endpoint.is_empty() || bucket.is_empty() || key_id.is_empty() || secret.is_empty() {
+            tracing::warn!(
+                endpoint_set = !endpoint.is_empty(),
+                bucket_set = !bucket.is_empty(),
+                key_id_set = !key_id.is_empty(),
+                secret_set = !secret.is_empty(),
+                "S3 env vars incomplete — cannot connect to R2"
+            );
             return None;
         }
         let uri = format!("s3://{bucket}/{prefix}");
         tracing::info!(%uri, %endpoint, "connecting to LanceDB on R2");
-        Self::connect_s3(&uri, &endpoint, &key_id, &secret, &region)
-            .await
-            .ok()
+        match Self::connect_s3(&uri, &endpoint, &key_id, &secret, &region).await {
+            Ok(db) => {
+                tracing::info!(%uri, "LanceDB R2 connection established");
+                Some(db)
+            }
+            Err(e) => {
+                tracing::error!(%uri, %endpoint, error = %e, "CRITICAL: LanceDB R2 connection FAILED — data will NOT persist");
+                None
+            }
+        }
     }
 
     /// Open an existing table.
