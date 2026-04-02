@@ -131,6 +131,7 @@ fn transpile_pattern(
     pattern: &Pattern,
 ) -> Result<PlanBuilder, TranspileError> {
     let mut last_node_alias: Option<String> = None;
+    let mut pending_rel: Option<&RelPattern> = None;
 
     for element in &pattern.elements {
         match element {
@@ -139,49 +140,49 @@ fn transpile_pattern(
                     .var
                     .clone()
                     .unwrap_or_else(|| format!("_anon_{}", rand_id()));
-                let label = node.labels.first().cloned().unwrap_or_default();
-                let predicate = extract_node_predicate(&node.props);
-                builder = if let Some(pred) = predicate {
-                    builder.scan_with_predicate(&label, &alias, pred)
+                if let Some(rel) = pending_rel.take() {
+                    let src = last_node_alias
+                        .as_ref()
+                        .ok_or(TranspileError::MissingVariable)?
+                        .clone();
+                    let edge_label = rel.types.first().cloned().unwrap_or_default();
+                    let direction = match rel.dir {
+                        RelDir::Right => Direction::Out,
+                        RelDir::Left => Direction::In,
+                        RelDir::Both => Direction::Both,
+                    };
+                    let is_variable_length = rel.min_hops.is_some() || rel.max_hops.is_some();
+                    builder = if is_variable_length {
+                        builder.path_expand(
+                            &src,
+                            &edge_label,
+                            &alias,
+                            rel.min_hops.unwrap_or(1),
+                            rel.max_hops.unwrap_or(10),
+                            direction,
+                        )
+                    } else {
+                        builder.expand(&src, &edge_label, &alias, direction)
+                    };
+                    if let Some(pred) = extract_node_predicate(&node.props) {
+                        builder = builder.filter_on(&alias, pred);
+                    }
                 } else {
-                    builder.scan(&label, &alias)
-                };
+                    let label = node.labels.first().cloned().unwrap_or_default();
+                    let predicate = extract_node_predicate(&node.props);
+                    builder = if let Some(pred) = predicate {
+                        builder.scan_with_predicate(&label, &alias, pred)
+                    } else {
+                        builder.scan(&label, &alias)
+                    };
+                }
                 last_node_alias = Some(alias);
             }
             PatternElement::Rel(rel) => {
-                let src = last_node_alias
-                    .as_ref()
-                    .ok_or(TranspileError::MissingVariable)?
-                    .clone();
-                let edge_label = rel.types.first().cloned().unwrap_or_default();
-                let direction = match rel.dir {
-                    RelDir::Right => Direction::Out,
-                    RelDir::Left => Direction::In,
-                    RelDir::Both => Direction::Both,
-                };
-
-                // Peek ahead: the next element should be a Node with the dst alias
-                // For now, generate a synthetic dst alias
-                let dst_alias = rel
-                    .var
-                    .clone()
-                    .unwrap_or_else(|| format!("_dst_{}", rand_id()));
-
-                let is_variable_length = rel.min_hops.is_some() || rel.max_hops.is_some();
-                if is_variable_length {
-                    builder = builder.path_expand(
-                        &src,
-                        &edge_label,
-                        &dst_alias,
-                        rel.min_hops.unwrap_or(1),
-                        rel.max_hops.unwrap_or(10),
-                        direction,
-                    );
-                } else {
-                    builder = builder.expand(&src, &edge_label, &dst_alias, direction);
+                if last_node_alias.is_none() {
+                    return Err(TranspileError::MissingVariable);
                 }
-                // The rel becomes the "last node" for the next element
-                last_node_alias = Some(dst_alias);
+                pending_rel = Some(rel);
             }
         }
     }

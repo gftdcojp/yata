@@ -14,7 +14,7 @@ pub fn optimize(plan: QueryPlan) -> QueryPlan {
     plan
 }
 
-/// Move Filter ops before Expand when the filter only references the scan alias.
+/// Move Filter ops before Expand/PathExpand when the filter only references the source alias.
 ///
 /// Pattern: Scan(alias=n) -> Expand -> Filter(pred on n) -> ...
 /// becomes: Scan(alias=n) -> Filter(pred on n) -> Expand -> ...
@@ -28,20 +28,17 @@ fn push_down_filters(plan: QueryPlan) -> QueryPlan {
         changed = false;
         let mut i = 0;
         while i + 1 < ops.len() {
-            // If ops[i] is Expand and ops[i+1] is Filter referencing only
-            // the scan alias (before the expand), swap them.
-            let should_swap = if let (
-                LogicalOp::Expand { src_alias, .. },
-                LogicalOp::Filter {
-                    alias: Some(filter_alias),
-                    ..
-                },
-            ) = (&ops[i], &ops[i + 1])
-            {
-                filter_alias == src_alias
-                } else {
-                    false
-                };
+            // If ops[i] is Expand/PathExpand and ops[i+1] is a source-bound Filter, swap them.
+            let should_swap = match (&ops[i], &ops[i + 1]) {
+                (
+                    LogicalOp::Expand { src_alias, .. } | LogicalOp::PathExpand { src_alias, .. },
+                    LogicalOp::Filter {
+                        alias: Some(filter_alias),
+                        ..
+                    },
+                ) => filter_alias == src_alias,
+                _ => false,
+            };
 
             if should_swap {
                 ops.swap(i, i + 1);
@@ -156,6 +153,36 @@ mod tests {
         assert!(matches!(&optimized.ops[0], LogicalOp::Scan { .. }));
         assert!(matches!(&optimized.ops[1], LogicalOp::Filter { .. }));
         assert!(matches!(&optimized.ops[2], LogicalOp::Expand { .. }));
+    }
+
+    #[test]
+    fn test_path_filter_pushdown() {
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: None,
+                },
+                LogicalOp::PathExpand {
+                    src_alias: "n".into(),
+                    edge_label: "KNOWS".into(),
+                    dst_alias: "m".into(),
+                    min_hops: 1,
+                    max_hops: 3,
+                    direction: yata_grin::Direction::Out,
+                },
+                LogicalOp::Filter {
+                    alias: Some("n".into()),
+                    predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
+                },
+            ],
+        };
+
+        let optimized = push_down_filters(plan);
+        assert!(matches!(&optimized.ops[0], LogicalOp::Scan { .. }));
+        assert!(matches!(&optimized.ops[1], LogicalOp::Filter { .. }));
+        assert!(matches!(&optimized.ops[2], LogicalOp::PathExpand { .. }));
     }
 
     #[test]
@@ -508,6 +535,41 @@ mod tests {
 
         let optimized = push_down_filters(plan);
         assert!(matches!(&optimized.ops[1], LogicalOp::Expand { .. }));
+        assert!(matches!(
+            &optimized.ops[2],
+            LogicalOp::Filter {
+                alias: Some(alias),
+                ..
+            } if alias == "m"
+        ));
+    }
+
+    #[test]
+    fn test_filter_on_path_dst_alias_is_not_pushed_before_path_expand() {
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: None,
+                },
+                LogicalOp::PathExpand {
+                    src_alias: "n".into(),
+                    edge_label: "KNOWS".into(),
+                    dst_alias: "m".into(),
+                    min_hops: 1,
+                    max_hops: 3,
+                    direction: yata_grin::Direction::Out,
+                },
+                LogicalOp::Filter {
+                    alias: Some("m".into()),
+                    predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
+                },
+            ],
+        };
+
+        let optimized = push_down_filters(plan);
+        assert!(matches!(&optimized.ops[1], LogicalOp::PathExpand { .. }));
         assert!(matches!(
             &optimized.ops[2],
             LogicalOp::Filter {
