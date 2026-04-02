@@ -267,6 +267,12 @@ const EDGE_SRC_SCAN_LIMIT: usize = 256;
 const EDGE_DST_SCAN_LIMIT: usize = 256;
 const PATH_EXPAND_FRONTIER_LIMIT: usize = 256;
 
+#[derive(Debug, Clone)]
+struct StagedPathRecord {
+    bindings: HashMap<String, String>,
+    values: Vec<PropValue>,
+}
+
 fn sql_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -717,6 +723,189 @@ impl TieredGraphEngine {
         })
     }
 
+    fn scan_path_edges_for_frontier(
+        &self,
+        edge_label: &str,
+        direction: yata_grin::Direction,
+        frontier: &[String],
+    ) -> Result<Vec<(String, String)>, String> {
+        if frontier.is_empty() || frontier.len() > PATH_EXPAND_FRONTIER_LIMIT {
+            return Ok(Vec::new());
+        }
+        let lance_edge_tbl = self.lance_edge_table.clone();
+        let edge_label = edge_label.to_string();
+        let frontier_owned = frontier.to_vec();
+        self.block_on(async {
+            let tbl_guard = lance_edge_tbl.lock().await;
+            let Some(tbl) = tbl_guard.as_ref() else {
+                return Ok(Vec::new());
+            };
+            let frontier_exprs: Vec<String> = frontier_owned.iter().map(|v| sql_quote(v)).collect();
+            let endpoint_filter = match direction {
+                yata_grin::Direction::Out => {
+                    if frontier_exprs.len() == 1 {
+                        format!("src_vid = {}", frontier_exprs[0])
+                    } else {
+                        format!("src_vid IN ({})", frontier_exprs.join(", "))
+                    }
+                }
+                yata_grin::Direction::In => {
+                    if frontier_exprs.len() == 1 {
+                        format!("dst_vid = {}", frontier_exprs[0])
+                    } else {
+                        format!("dst_vid IN ({})", frontier_exprs.join(", "))
+                    }
+                }
+                yata_grin::Direction::Both => return Ok(Vec::new()),
+            };
+            let combined_filter = if edge_label.is_empty() {
+                endpoint_filter
+            } else {
+                format!("edge_label = {} AND {}", sql_quote(&edge_label), endpoint_filter)
+            };
+            let batches = tbl
+                .scan_filter_limit(&combined_filter, None, None)
+                .await
+                .map_err(|e| format!("LanceDB staged path scan: {e}"))?;
+            let mut edges = Vec::new();
+            for batch in batches {
+                let src_vid_col = batch.column(3).as_any().downcast_ref::<arrow::array::StringArray>()
+                    .ok_or("edge column 3 (src_vid) is not Utf8")?;
+                let dst_vid_col = batch.column(4).as_any().downcast_ref::<arrow::array::StringArray>()
+                    .ok_or("edge column 4 (dst_vid) is not Utf8")?;
+                for row in 0..batch.num_rows() {
+                    edges.push((
+                        src_vid_col.value(row).to_string(),
+                        dst_vid_col.value(row).to_string(),
+                    ));
+                }
+            }
+            Ok(edges)
+        })
+    }
+
+    fn execute_staged_path_expand(
+        &self,
+        plan: &yata_gie::ir::QueryPlan,
+        initial_store: &yata_lance::ArrowStore,
+        initial_records: Vec<yata_gie::executor::Record>,
+        path_op: &yata_gie::ir::LogicalOp,
+        path_idx: usize,
+        rel_refs: &[&str],
+        limit: Option<usize>,
+    ) -> Result<Vec<Vec<(String, String)>>, String> {
+        let yata_gie::ir::LogicalOp::PathExpand {
+            src_alias,
+            edge_label,
+            dst_alias,
+            min_hops,
+            max_hops,
+            direction,
+        } = path_op else {
+            return Err("expected PathExpand op".into());
+        };
+
+        let mut staged_records = Vec::new();
+        let mut touched_vids = Vec::new();
+        let mut scanned_src_vids = Vec::new();
+        let mut scanned_dst_vids = Vec::new();
+
+        for record in initial_records {
+            let Some(&start_vid) = record.bindings.get(src_alias.as_str()) else {
+                continue;
+            };
+            let Some(PropValue::Str(start_pk)) = initial_store.vertex_prop(start_vid, "pk_value") else {
+                continue;
+            };
+
+            let mut frontier: Vec<(String, u32)> = vec![(start_pk.clone(), 0)];
+            let mut visited = std::collections::HashSet::new();
+            visited.insert(start_pk.clone());
+            touched_vids.push(start_pk.clone());
+
+            while let Some((current_pk, depth)) = frontier.pop() {
+                if depth >= *min_hops && depth <= *max_hops {
+                    let mut bindings = HashMap::new();
+                    for (alias, &vid) in &record.bindings {
+                        if let Some(PropValue::Str(pk)) = initial_store.vertex_prop(vid, "pk_value") {
+                            bindings.insert(alias.clone(), pk);
+                        }
+                    }
+                    bindings.insert(dst_alias.clone(), current_pk.clone());
+                    staged_records.push(StagedPathRecord {
+                        bindings,
+                        values: record.values.clone(),
+                    });
+                }
+
+                if depth >= *max_hops {
+                    continue;
+                }
+                let edges = self.scan_path_edges_for_frontier(edge_label, *direction, &[current_pk.clone()])?;
+                for (src_pk, dst_pk) in edges {
+                    match direction {
+                        yata_grin::Direction::Out => scanned_src_vids.push(src_pk.clone()),
+                        yata_grin::Direction::In => scanned_dst_vids.push(dst_pk.clone()),
+                        yata_grin::Direction::Both => {}
+                    }
+                    let next_pk = match direction {
+                        yata_grin::Direction::Out => dst_pk,
+                        yata_grin::Direction::In => src_pk,
+                        yata_grin::Direction::Both => continue,
+                    };
+                    if visited.insert(next_pk.clone()) {
+                        touched_vids.push(next_pk.clone());
+                        frontier.push((next_pk, depth + 1));
+                    }
+                }
+            }
+        }
+
+        touched_vids.sort();
+        touched_vids.dedup();
+        scanned_src_vids.sort();
+        scanned_src_vids.dedup();
+        scanned_dst_vids.sort();
+        scanned_dst_vids.dedup();
+
+        let final_store = self.build_read_store_pushdown(
+            &[],
+            rel_refs,
+            &[],
+            &[],
+            &touched_vids,
+            &scanned_src_vids,
+            &scanned_dst_vids,
+            &[],
+            limit,
+        )?;
+
+        let mut pk_to_vid = HashMap::new();
+        for vid in final_store.scan_all_vertices() {
+            if let Some(PropValue::Str(pk)) = final_store.vertex_prop(vid, "pk_value") {
+                pk_to_vid.insert(pk, vid);
+            }
+        }
+
+        let mut data: Vec<yata_gie::executor::Record> = staged_records
+            .into_iter()
+            .filter_map(|record| {
+                let mut bindings = HashMap::new();
+                for (alias, pk) in record.bindings {
+                    let vid = pk_to_vid.get(&pk).copied()?;
+                    bindings.insert(alias, vid);
+                }
+                Some(yata_gie::executor::Record { bindings, values: record.values })
+            })
+            .collect();
+
+        for op in plan.ops.iter().skip(path_idx + 1) {
+            data = yata_gie::executor::execute_op(op, data, &final_store);
+        }
+
+        Ok(yata_gie::executor::result_to_rows(&data, plan))
+    }
+
     /// Create a new engine with Lance-backed persistence.
     pub fn new(config: TieredEngineConfig, data_dir: &str) -> Self {
         Self::build(config, data_dir)
@@ -1103,6 +1292,32 @@ impl TieredGraphEngine {
                 let mut dst_vid_candidates = self.collect_dst_vid_candidates(&ast, &param_map).unwrap_or_default();
 
                 if let Ok(plan) = plan_result {
+                    if let Some(path_idx) = plan.ops.iter().position(|op| matches!(op, yata_gie::ir::LogicalOp::PathExpand { .. })) {
+                        let initial_store = self.build_read_store_pushdown(
+                            &vl_refs,
+                            &[],
+                            &[],
+                            &[],
+                            &[],
+                            &src_vid_candidates,
+                            &[],
+                            &vertex_lance_filters,
+                            hints.limit,
+                        )?;
+                        let mut prefix_records = Vec::new();
+                        for op in plan.ops.iter().take(path_idx) {
+                            prefix_records = yata_gie::executor::execute_op(op, prefix_records, &initial_store);
+                        }
+                        return self.execute_staged_path_expand(
+                            &plan,
+                            &initial_store,
+                            prefix_records,
+                            &plan.ops[path_idx],
+                            path_idx,
+                            &rel_refs,
+                            hints.limit,
+                        );
+                    }
                     let path_expand_meta = plan.ops.iter().find_map(|op| {
                         if let yata_gie::ir::LogicalOp::PathExpand { max_hops, .. } = op {
                             Some(*max_hops)
