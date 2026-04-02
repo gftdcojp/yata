@@ -273,6 +273,27 @@ struct StagedPathRecord {
     values: Vec<PropValue>,
 }
 
+fn should_stage_traversal(
+    op: &yata_gie::ir::LogicalOp,
+    current_rows: usize,
+    limit: Option<usize>,
+) -> bool {
+    if current_rows == 0 || current_rows > PATH_EXPAND_FRONTIER_LIMIT {
+        return false;
+    }
+    let limit_ok = limit.is_none_or(|l| current_rows <= l.saturating_mul(4).max(32));
+    if !limit_ok {
+        return false;
+    }
+    match op {
+        yata_gie::ir::LogicalOp::Expand { direction, .. }
+        | yata_gie::ir::LogicalOp::PathExpand { direction, .. } => {
+            !matches!(direction, yata_grin::Direction::Both)
+        }
+        _ => false,
+    }
+}
+
 fn sql_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -786,14 +807,12 @@ impl TieredGraphEngine {
 
     fn execute_staged_path_expand(
         &self,
-        plan: &yata_gie::ir::QueryPlan,
         initial_store: &yata_lance::ArrowStore,
         initial_records: Vec<yata_gie::executor::Record>,
         path_op: &yata_gie::ir::LogicalOp,
-        path_idx: usize,
         rel_refs: &[&str],
         limit: Option<usize>,
-    ) -> Result<Vec<Vec<(String, String)>>, String> {
+    ) -> Result<(yata_lance::ArrowStore, Vec<yata_gie::executor::Record>), String> {
         let yata_gie::ir::LogicalOp::PathExpand {
             src_alias,
             edge_label,
@@ -814,6 +833,11 @@ impl TieredGraphEngine {
             let Some(&start_vid) = record.bindings.get(src_alias.as_str()) else {
                 continue;
             };
+            for &vid in record.bindings.values() {
+                if let Some(PropValue::Str(bound_pk)) = initial_store.vertex_prop(vid, "pk_value") {
+                    touched_vids.push(bound_pk);
+                }
+            }
             let Some(PropValue::Str(start_pk)) = initial_store.vertex_prop(start_vid, "pk_value") else {
                 continue;
             };
@@ -887,7 +911,7 @@ impl TieredGraphEngine {
             }
         }
 
-        let mut data: Vec<yata_gie::executor::Record> = staged_records
+        let data: Vec<yata_gie::executor::Record> = staged_records
             .into_iter()
             .filter_map(|record| {
                 let mut bindings = HashMap::new();
@@ -898,24 +922,17 @@ impl TieredGraphEngine {
                 Some(yata_gie::executor::Record { bindings, values: record.values })
             })
             .collect();
-
-        for op in plan.ops.iter().skip(path_idx + 1) {
-            data = yata_gie::executor::execute_op(op, data, &final_store);
-        }
-
-        Ok(yata_gie::executor::result_to_rows(&data, plan))
+        Ok((final_store, data))
     }
 
     fn execute_staged_expand(
         &self,
-        plan: &yata_gie::ir::QueryPlan,
         initial_store: &yata_lance::ArrowStore,
         initial_records: Vec<yata_gie::executor::Record>,
         expand_op: &yata_gie::ir::LogicalOp,
-        expand_idx: usize,
         rel_refs: &[&str],
         limit: Option<usize>,
-    ) -> Result<Vec<Vec<(String, String)>>, String> {
+    ) -> Result<(yata_lance::ArrowStore, Vec<yata_gie::executor::Record>), String> {
         let yata_gie::ir::LogicalOp::Expand {
             src_alias,
             edge_label,
@@ -934,6 +951,11 @@ impl TieredGraphEngine {
             let Some(&start_vid) = record.bindings.get(src_alias.as_str()) else {
                 continue;
             };
+            for &vid in record.bindings.values() {
+                if let Some(PropValue::Str(bound_pk)) = initial_store.vertex_prop(vid, "pk_value") {
+                    touched_vids.push(bound_pk);
+                }
+            }
             let Some(PropValue::Str(start_pk)) = initial_store.vertex_prop(start_vid, "pk_value") else {
                 continue;
             };
@@ -993,7 +1015,7 @@ impl TieredGraphEngine {
             }
         }
 
-        let mut data: Vec<yata_gie::executor::Record> = staged_records
+        let data: Vec<yata_gie::executor::Record> = staged_records
             .into_iter()
             .filter_map(|record| {
                 let mut bindings = HashMap::new();
@@ -1004,12 +1026,7 @@ impl TieredGraphEngine {
                 Some(yata_gie::executor::Record { bindings, values: record.values })
             })
             .collect();
-
-        for op in plan.ops.iter().skip(expand_idx + 1) {
-            data = yata_gie::executor::execute_op(op, data, &final_store);
-        }
-
-        Ok(yata_gie::executor::result_to_rows(&data, plan))
+        Ok((final_store, data))
     }
 
     /// Create a new engine with Lance-backed persistence.
@@ -1403,8 +1420,11 @@ impl TieredGraphEngine {
                 };
 
                 if let Ok(plan) = plan_result {
-                    if let Some(path_idx) = plan.ops.iter().position(|op| matches!(op, yata_gie::ir::LogicalOp::PathExpand { .. })) {
-                        let initial_store = self.build_read_store_pushdown(
+                    if plan.ops.iter().any(|op| matches!(
+                        op,
+                        yata_gie::ir::LogicalOp::Expand { .. } | yata_gie::ir::LogicalOp::PathExpand { .. }
+                    )) {
+                        let mut current_store = self.build_read_store_pushdown(
                             &vl_refs,
                             &[],
                             &[],
@@ -1415,19 +1435,56 @@ impl TieredGraphEngine {
                             &vertex_lance_filters,
                             hints.limit,
                         )?;
-                        let mut prefix_records = Vec::new();
-                        for op in plan.ops.iter().take(path_idx) {
-                            prefix_records = yata_gie::executor::execute_op(op, prefix_records, &initial_store);
+                        let has_orderby = plan.ops.iter().any(|op| matches!(op, yata_gie::ir::LogicalOp::OrderBy { .. }));
+                        let has_aggregate = plan.ops.iter().any(|op| matches!(op, yata_gie::ir::LogicalOp::Aggregate { .. }));
+                        let intermediate_cap = hints.limit.map(|l| if has_orderby { l.saturating_mul(4) } else { l });
+                        let mut data = Vec::new();
+                        for op in &plan.ops {
+                            match op {
+                                yata_gie::ir::LogicalOp::Expand { .. } => {
+                                    let (new_store, new_data) = self.execute_staged_expand(
+                                        &current_store,
+                                        data,
+                                        op,
+                                        &rel_refs,
+                                        hints.limit,
+                                    )?;
+                                    current_store = new_store;
+                                    data = new_data;
+                                }
+                                yata_gie::ir::LogicalOp::PathExpand { .. } => {
+                                    let (new_store, new_data) = self.execute_staged_path_expand(
+                                        &current_store,
+                                        data,
+                                        op,
+                                        &rel_refs,
+                                        hints.limit,
+                                    )?;
+                                    current_store = new_store;
+                                    data = new_data;
+                                }
+                                _ => {
+                                    data = yata_gie::executor::execute_op(op, data, &current_store);
+                                }
+                            }
+                            if !has_aggregate {
+                                if let Some(cap) = intermediate_cap {
+                                    match op {
+                                        yata_gie::ir::LogicalOp::Scan { .. }
+                                        | yata_gie::ir::LogicalOp::Expand { .. }
+                                        | yata_gie::ir::LogicalOp::PathExpand { .. }
+                                        | yata_gie::ir::LogicalOp::Filter { .. }
+                                        | yata_gie::ir::LogicalOp::SecurityFilter { .. } => {
+                                            if data.len() > cap {
+                                                data.truncate(cap);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
                         }
-                        return self.execute_staged_path_expand(
-                            &plan,
-                            &initial_store,
-                            prefix_records,
-                            &plan.ops[path_idx],
-                            path_idx,
-                            &rel_refs,
-                            hints.limit,
-                        );
+                        return Ok(yata_gie::executor::result_to_rows(&data, &plan));
                     }
                     let path_expand_meta = plan.ops.iter().find_map(|op| {
                         if let yata_gie::ir::LogicalOp::PathExpand { max_hops, .. } = op {
@@ -3086,6 +3143,24 @@ mod tests {
         let names = get_col(&rows, "name");
         assert_eq!(rows.len(), 1);
         assert!(names.iter().any(|n| n.contains("Carol")), "Carol must be reachable via variable-hop destination filter");
+    }
+
+    #[test]
+    fn test_persist_cypher_multi_expand_chain_with_destination_where() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        run_query(&e, "CREATE (a:User {name: 'Alice'})-[:FOLLOWS]->(b:User {name: 'Bob'})-[:FOLLOWS]->(c:User {name: 'Carol'})", &[], None).unwrap();
+        run_query(&e, "CREATE (a:User {name: 'Dave'})-[:FOLLOWS]->(b:User {name: 'Eve'})-[:FOLLOWS]->(c:User {name: 'Mallory'})", &[], None).unwrap();
+
+        let rows = run_query(
+            &e,
+            "MATCH (a:User {name: 'Alice'})-[:FOLLOWS]->(b:User)-[:FOLLOWS]->(c:User) WHERE c.name = 'Carol' RETURN c.name AS name LIMIT 10",
+            &[],
+            None,
+        ).unwrap();
+        let names = get_col(&rows, "name");
+        assert_eq!(rows.len(), 1);
+        assert!(names.iter().any(|n| n.contains("Carol")), "Carol must match chained expand destination filter");
     }
 
     #[test]
