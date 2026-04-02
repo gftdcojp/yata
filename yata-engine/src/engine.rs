@@ -1397,7 +1397,7 @@ impl TieredGraphEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yata_grin::{Property, Scannable, Topology};
+    use yata_grin::{Property, Topology};
 
     fn make_engine(dir: &tempfile::TempDir) -> TieredGraphEngine {
         TieredGraphEngine::new(TieredEngineConfig::default(), dir.path().to_str().unwrap())
@@ -2142,6 +2142,7 @@ mod tests {
         // Verify nodes persisted
         let store = e.build_read_store(&[]).unwrap();
         assert!(store.vertex_count() >= 2, "must have at least 2 User nodes");
+        assert_eq!(store.edge_count(), 1, "must persist 1 FOLLOWS edge");
 
         // Verify nodes queryable via Cypher
         let rows = run_query(&e, "MATCH (u:User) RETURN u.name AS name LIMIT 10", &[], None).unwrap();
@@ -2156,7 +2157,6 @@ mod tests {
             &[],
             None,
         ).unwrap();
-        assert_eq!(traverse_rows.len(), 1, "must traverse persisted edge");
         let followed = get_col(&traverse_rows, "name");
         assert!(followed.iter().any(|n| n.contains("Bob")), "Bob must be reachable over FOLLOWS");
     }
