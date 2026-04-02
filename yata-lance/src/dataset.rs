@@ -247,6 +247,11 @@ impl YataTable {
         self.table.count_rows(filter.map(|s| s.to_string())).await
     }
 
+    /// List configured indices.
+    pub async fn list_indices(&self) -> Result<Vec<lancedb::index::IndexConfig>, lancedb::Error> {
+        self.table.list_indices().await
+    }
+
     /// Compact fragments (merge small files). Delegates to LanceDB built-in optimization.
     pub async fn compact(&self) -> Result<lancedb::table::OptimizeStats, lancedb::Error> {
         self.table
@@ -310,7 +315,7 @@ impl YataTable {
                 || (idx.columns.len() == 1
                     && idx.columns[0] == column
                     && matches!(
-                        (kind, idx.index_type),
+                        (kind, idx.index_type.clone()),
                         (ScalarIndexKind::BTree, IndexType::BTree)
                             | (ScalarIndexKind::Bitmap, IndexType::Bitmap)
                     ))

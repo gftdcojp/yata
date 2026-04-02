@@ -1336,7 +1336,7 @@ impl TieredGraphEngine {
                     }
                     let ds_guard = handle.lock().await;
                     if let Some(ref ds) = *ds_guard {
-                        match ds.compact().await {
+                        match ds.optimize_all().await {
                             Ok(stats) => {
                                 let removed = stats.compaction.as_ref().map(|c| c.fragments_removed).unwrap_or(0);
                                 let added = stats.compaction.as_ref().map(|c| c.fragments_added).unwrap_or(0);
@@ -2104,6 +2104,7 @@ impl TieredGraphEngine {
                     }
                 }
             }
+            let vertices_ready = tbl_guard.is_some();
             drop(tbl_guard);
             // Edge table (P1)
             let mut edge_guard = lance_edge_tbl.lock().await;
@@ -2120,7 +2121,6 @@ impl TieredGraphEngine {
                     }
                 }
             }
-            let vertices_ready = tbl_guard.is_some();
             let edges_ready = edge_guard.is_some();
             drop(edge_guard);
             let mut stats_guard = lance_stats_tbl.lock().await;
@@ -2137,7 +2137,6 @@ impl TieredGraphEngine {
                     }
                 }
             }
-            drop(tbl_guard);
             drop(stats_guard);
             if vertices_ready || edges_ready {
                 let vertices_guard = lance_tbl.lock().await;
@@ -2945,7 +2944,7 @@ impl TieredGraphEngine {
                 let ds_guard = handle.lock().await;
                 if let Some(ref ds) = *ds_guard {
                     let version_before = ds.version().await.unwrap_or(0);
-                    match ds.compact().await {
+                    match ds.optimize_all().await {
                         Ok(stats) => {
                             let version_after = ds.version().await.unwrap_or(version_before);
                             let removed = stats.compaction.as_ref().map(|c| c.fragments_removed).unwrap_or(0);
