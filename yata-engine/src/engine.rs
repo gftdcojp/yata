@@ -120,6 +120,20 @@ fn edge_lance_schema() -> Arc<arrow::datatypes::Schema> {
     ]))
 }
 
+/// Persistent stats catalog schema for planner cold-start hydration.
+fn stats_catalog_schema() -> Arc<arrow::datatypes::Schema> {
+    use arrow::datatypes::{DataType, Field, Schema};
+    Arc::new(Schema::new(vec![
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("key", DataType::Utf8, false),
+        Field::new("raw_rows", DataType::UInt64, false),
+        Field::new("live_rows", DataType::UInt64, false),
+        Field::new("dead_rows", DataType::UInt64, false),
+        Field::new("dead_ratio", DataType::Float64, false),
+        Field::new("timestamp_ms", DataType::UInt64, false),
+    ]))
+}
+
 /// Promoted vertex property names (columns 4-8 in lance_schema).
 const PROMOTED_PROPS: [&str; 5] = ["repo", "owner_did", "name", "app_id", "rkey"];
 
@@ -243,6 +257,27 @@ fn build_edge_lance_batch(
 
     RecordBatch::try_new(edge_lance_schema(), columns)
         .map_err(|e| format!("Arrow edge RecordBatch build failed: {e}"))
+}
+
+fn build_stats_catalog_batch(
+    kind: &str,
+    key: &str,
+    stat: &CachedPressureStat,
+) -> Result<arrow::array::RecordBatch, String> {
+    use arrow::array::{ArrayRef, Float64Array, RecordBatch, StringArray, UInt64Array};
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(vec![kind])),
+        Arc::new(StringArray::from(vec![key])),
+        Arc::new(UInt64Array::from(vec![stat.raw_rows as u64])),
+        Arc::new(UInt64Array::from(vec![stat.live_rows as u64])),
+        Arc::new(UInt64Array::from(vec![stat.dead_rows as u64])),
+        Arc::new(Float64Array::from(vec![stat.dead_ratio])),
+        Arc::new(UInt64Array::from(vec![now_ms()])),
+    ];
+
+    RecordBatch::try_new(stats_catalog_schema(), columns)
+        .map_err(|e| format!("Arrow stats catalog RecordBatch build failed: {e}"))
 }
 
 
@@ -607,6 +642,8 @@ pub struct TieredGraphEngine {
     lance_table: Arc<tokio::sync::Mutex<Option<yata_lance::YataTable>>>,
     /// Separate edge table (P1).
     lance_edge_table: Arc<tokio::sync::Mutex<Option<yata_lance::YataTable>>>,
+    /// Persistent planner stats catalog.
+    lance_stats_table: Arc<tokio::sync::Mutex<Option<yata_lance::YataTable>>>,
     s3_prefix: String,
     /// SecurityScope cache: DID → (SecurityScope, compiled_at). Design E.
     security_scope_cache: Arc<Mutex<HashMap<String, (yata_gie::ir::SecurityScope, std::time::Instant)>>>,
@@ -641,6 +678,70 @@ impl TieredGraphEngine {
                 }
             }
             cache.insert(key, stat);
+        }
+    }
+
+    fn persist_pressure_stat_catalog(&self, key: &str, stat: &CachedPressureStat) {
+        self.ensure_lance();
+        let lance_stats_tbl = self.lance_stats_table.clone();
+        let kind = if key.contains(":edges:") { "edges" } else { "vertices" }.to_string();
+        let key_owned = key.to_string();
+        let stat_owned = stat.clone();
+        let _ = self.block_on(async move {
+            let tbl_guard = lance_stats_tbl.lock().await;
+            let tbl = match tbl_guard.as_ref() {
+                Some(tbl) => tbl,
+                None => return Ok::<(), String>(()),
+            };
+            let batch = build_stats_catalog_batch(&kind, &key_owned, &stat_owned)?;
+            tbl.add(batch)
+                .await
+                .map_err(|e| format!("stats catalog add: {e}"))?;
+            Ok(())
+        });
+    }
+
+    fn hydrate_pressure_stats_cache_from_catalog(&self) {
+        let lance_stats_tbl = self.lance_stats_table.clone();
+        let hydrated = self.block_on(async move {
+            let tbl_guard = lance_stats_tbl.lock().await;
+            let tbl = tbl_guard.as_ref()?;
+            let batches = tbl.scan_all().await.ok()?;
+            let mut latest: HashMap<String, (u64, CachedPressureStat)> = HashMap::new();
+            for batch in batches {
+                let key_col = batch.column(1).as_any().downcast_ref::<arrow::array::StringArray>()?;
+                let raw_col = batch.column(2).as_any().downcast_ref::<arrow::array::UInt64Array>()?;
+                let live_col = batch.column(3).as_any().downcast_ref::<arrow::array::UInt64Array>()?;
+                let dead_col = batch.column(4).as_any().downcast_ref::<arrow::array::UInt64Array>()?;
+                let ratio_col = batch.column(5).as_any().downcast_ref::<arrow::array::Float64Array>()?;
+                let ts_col = batch.column(6).as_any().downcast_ref::<arrow::array::UInt64Array>()?;
+                for row in 0..batch.num_rows() {
+                    let key = key_col.value(row).to_string();
+                    let ts = ts_col.value(row);
+                    let stat = CachedPressureStat {
+                        raw_rows: raw_col.value(row) as usize,
+                        live_rows: live_col.value(row) as usize,
+                        dead_rows: dead_col.value(row) as usize,
+                        dead_ratio: ratio_col.value(row),
+                        at: std::time::Instant::now(),
+                    };
+                    match latest.get(&key) {
+                        Some((prev_ts, _)) if *prev_ts >= ts => {}
+                        _ => {
+                            latest.insert(key, (ts, stat));
+                        }
+                    }
+                }
+            }
+            Some(latest.into_iter().map(|(k, (_, v))| (k, v)).collect::<HashMap<_, _>>())
+        });
+
+        if let Some(entries) = hydrated
+            && let Ok(mut cache) = self.pressure_stats_cache.lock()
+        {
+            for (key, stat) in entries {
+                cache.insert(key, stat);
+            }
         }
     }
 
@@ -746,6 +847,7 @@ impl TieredGraphEngine {
             at: std::time::Instant::now(),
         };
         self.store_pressure_stat(cache_key, stat.clone());
+        self.persist_pressure_stat_catalog(&Self::pressure_cache_key(kind, label), &stat);
         Some(stat)
     }
 
@@ -799,6 +901,23 @@ impl TieredGraphEngine {
         parts.join(" AND ")
     }
 
+    fn apply_pressure_penalty(
+        &self,
+        base_cost: usize,
+        vertex_label: Option<&str>,
+        edge_label: &str,
+    ) -> usize {
+        let vertex_penalty = vertex_label
+            .and_then(|label| self.estimate_table_pressure(TableKind::Vertices, Some(label)))
+            .map(|stat| 1.0 + (stat.dead_ratio * 4.0))
+            .unwrap_or(1.0);
+        let edge_penalty = self
+            .estimate_table_pressure(TableKind::Edges, Some(edge_label))
+            .map(|stat| 1.0 + (stat.dead_ratio * 4.0))
+            .unwrap_or(1.0);
+        ((base_cost as f64) * vertex_penalty * edge_penalty).ceil() as usize
+    }
+
     fn refine_traversal_strategy_with_stats(
         &self,
         plan: &mut yata_gie::ir::QueryPlan,
@@ -830,9 +949,20 @@ impl TieredGraphEngine {
                     let Some(source_cardinality) = self.estimate_vertex_filter_cardinality(&ctx.filter) else {
                         continue;
                     };
+                    if self
+                        .estimate_table_pressure(TableKind::Edges, Some(edge_label))
+                        .is_some_and(|stat| stat.dead_ratio > 0.5)
+                    {
+                        *strategy = TraversalStrategy::PreferGie;
+                        continue;
+                    }
                     let edge_filter = self.build_edge_cardinality_filter(edge_label, ctx.label.as_deref());
                     let edge_cardinality = self.estimate_edge_filter_cardinality(&edge_filter).unwrap_or(0);
-                    let estimated_cost = edge_cardinality.max(source_cardinality);
+                    let estimated_cost = self.apply_pressure_penalty(
+                        edge_cardinality.max(source_cardinality),
+                        ctx.label.as_deref(),
+                        edge_label,
+                    );
 
                     if source_cardinality == 0 || edge_cardinality == 0 {
                         *strategy = TraversalStrategy::PreferGie;
@@ -872,11 +1002,22 @@ impl TieredGraphEngine {
                     let Some(source_cardinality) = self.estimate_vertex_filter_cardinality(&ctx.filter) else {
                         continue;
                     };
+                    if self
+                        .estimate_table_pressure(TableKind::Edges, Some(edge_label))
+                        .is_some_and(|stat| stat.dead_ratio > 0.5)
+                    {
+                        *strategy = TraversalStrategy::PreferGie;
+                        continue;
+                    }
                     let edge_filter = self.build_edge_cardinality_filter(edge_label, ctx.label.as_deref());
                     let edge_cardinality = self.estimate_edge_filter_cardinality(&edge_filter).unwrap_or(0);
-                    let estimated_cost = edge_cardinality
-                        .saturating_mul((*max_hops as usize).max(1))
-                        .max(source_cardinality);
+                    let estimated_cost = self.apply_pressure_penalty(
+                        edge_cardinality
+                            .saturating_mul((*max_hops as usize).max(1))
+                            .max(source_cardinality),
+                        ctx.label.as_deref(),
+                        edge_label,
+                    );
 
                     if source_cardinality == 0 || edge_cardinality == 0 {
                         *strategy = TraversalStrategy::PreferGie;
@@ -1476,6 +1617,7 @@ impl TieredGraphEngine {
             lance_db: Arc::new(tokio::sync::Mutex::new(None)),
             lance_table: Arc::new(tokio::sync::Mutex::new(None)),
             lance_edge_table: Arc::new(tokio::sync::Mutex::new(None)),
+            lance_stats_table: Arc::new(tokio::sync::Mutex::new(None)),
             s3_prefix,
             security_scope_cache: Arc::new(Mutex::new(HashMap::new())),
             count_stats_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -1638,6 +1780,7 @@ impl TieredGraphEngine {
         let lance_db = self.lance_db.clone();
         let lance_tbl = self.lance_table.clone();
         let lance_edge_tbl = self.lance_edge_table.clone();
+        let lance_stats_tbl = self.lance_stats_table.clone();
         let prefix = self.s3_prefix.clone();
         let _ = self.block_on(async {
             let mut db_guard = lance_db.lock().await;
@@ -1716,7 +1859,30 @@ impl TieredGraphEngine {
                     }
                 }
             }
+            drop(edge_guard);
+            let mut stats_guard = lance_stats_tbl.lock().await;
+            if stats_guard.is_none() {
+                if let Some(ref db) = *db_guard {
+                    match db.open_table("stats_catalog").await {
+                        Ok(tbl) => { *stats_guard = Some(tbl); }
+                        Err(_) => {
+                            let schema = stats_catalog_schema();
+                            if let Ok(tbl) = db.create_empty_table("stats_catalog", schema).await {
+                                *stats_guard = Some(tbl);
+                            }
+                        }
+                    }
+                }
+            }
         });
+        let should_hydrate = self
+            .pressure_stats_cache
+            .lock()
+            .map(|cache| cache.is_empty())
+            .unwrap_or(false);
+        if should_hydrate {
+            self.hydrate_pressure_stats_cache_from_catalog();
+        }
     }
 
     /// Run an async future, handling both inside-runtime and outside-runtime contexts.
@@ -2486,6 +2652,7 @@ impl TieredGraphEngine {
     fn cold_start_lance(&self) -> Result<u64, String> {
         let lance_tbl = self.lance_table.clone();
         let lance_edge_tbl = self.lance_edge_table.clone();
+        let lance_stats_tbl = self.lance_stats_table.clone();
         let lance_db = self.lance_db.clone();
         let prefix_owned = self.s3_prefix.clone();
 
@@ -2529,9 +2696,21 @@ impl TieredGraphEngine {
                         tracing::info!(error = %e, "no LanceDB edges table (new database)");
                     }
                 }
+                match db.open_table("stats_catalog").await {
+                    Ok(tbl) => {
+                        *lance_stats_tbl.lock().await = Some(tbl);
+                    }
+                    Err(_) => {
+                        if let Ok(tbl) = db.create_empty_table("stats_catalog", stats_catalog_schema()).await {
+                            *lance_stats_tbl.lock().await = Some(tbl);
+                        }
+                    }
+                }
             }
             version
         });
+
+        self.hydrate_pressure_stats_cache_from_catalog();
 
         Ok(checkpoint_seq)
     }
@@ -3679,6 +3858,44 @@ mod tests {
     }
 
     #[test]
+    fn test_refine_traversal_strategy_with_stats_prefers_gie_for_tombstone_heavy_edge_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        e.merge_record("User", "rkey", "alice", &[("rkey", PropValue::Str("alice".into())), ("name", PropValue::Str("Alice".into()))]).unwrap();
+        e.merge_record("User", "rkey", "bob", &[("rkey", PropValue::Str("bob".into())), ("name", PropValue::Str("Bob".into()))]).unwrap();
+        e.merge_record("FOLLOWS", "eid", "live-1", &[
+            ("_src", PropValue::Str("alice".into())),
+            ("_dst", PropValue::Str("bob".into())),
+            ("_src_label", PropValue::Str("User".into())),
+            ("_dst_label", PropValue::Str("User".into())),
+        ]).unwrap();
+        for i in 0..40 {
+            let eid = format!("dead-{i}");
+            e.merge_record("FOLLOWS", "eid", &eid, &[
+                ("_src", PropValue::Str("alice".into())),
+                ("_dst", PropValue::Str("bob".into())),
+                ("_src_label", PropValue::Str("User".into())),
+                ("_dst_label", PropValue::Str("User".into())),
+            ]).unwrap();
+            e.delete_record("FOLLOWS", "eid", &eid).unwrap();
+        }
+
+        let ast = yata_cypher::parse(
+            "MATCH (a:User)-[:FOLLOWS]->(b:User) WHERE a.name = 'Alice' RETURN b.name AS name LIMIT 10"
+        ).unwrap();
+        let mut plan = yata_gie::transpile::transpile(&ast).unwrap();
+        e.refine_traversal_strategy_with_stats(&mut plan, &ast, &HashMap::new(), Some(10));
+
+        assert!(matches!(
+            plan.ops.iter().find(|op| matches!(op, yata_gie::ir::LogicalOp::Expand { .. })),
+            Some(yata_gie::ir::LogicalOp::Expand {
+                strategy: yata_gie::ir::TraversalStrategy::PreferGie,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn test_count_stats_cache_populates_and_invalidates_on_mutation() {
         let dir = tempfile::tempdir().unwrap();
         let e = make_engine(&dir);
@@ -3732,6 +3949,24 @@ mod tests {
         assert_eq!(stat.live_rows, 0);
         assert_eq!(stat.dead_rows, 2);
         assert!(stat.dead_ratio > 0.9);
+    }
+
+    #[test]
+    fn test_pressure_stats_catalog_persists_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        e.merge_record("Task", "rkey", "t1", &[("rkey", PropValue::Str("t1".into()))]).unwrap();
+        e.delete_record("Task", "rkey", "t1").unwrap();
+
+        let key = TieredGraphEngine::pressure_cache_key(TableKind::Vertices, Some("Task"));
+        let stat = e.estimate_table_pressure(TableKind::Vertices, Some("Task")).unwrap();
+        assert!(stat.dead_rows >= 1);
+
+        let e2 = engine_at(dir.path());
+        e2.cold_start().unwrap();
+        let restored = e2.cached_pressure_stat(&key).unwrap();
+        assert!(restored.dead_rows >= 1);
+        assert!(restored.dead_ratio > 0.0);
     }
 
     #[test]
