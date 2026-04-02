@@ -266,11 +266,19 @@ const EDGE_DST_VID_PUSHDOWN_LIMIT: usize = 256;
 const EDGE_SRC_SCAN_LIMIT: usize = 256;
 const EDGE_DST_SCAN_LIMIT: usize = 256;
 const PATH_EXPAND_FRONTIER_LIMIT: usize = 256;
+const COUNT_STATS_CACHE_MAX: usize = 512;
+const COUNT_STATS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 struct StagedPathRecord {
     bindings: HashMap<String, String>,
     values: Vec<PropValue>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedCountStat {
+    count: usize,
+    at: std::time::Instant,
 }
 
 fn runtime_allows_staged_traversal(current_rows: usize, limit: Option<usize>) -> bool {
@@ -583,6 +591,8 @@ pub struct TieredGraphEngine {
     s3_prefix: String,
     /// SecurityScope cache: DID → (SecurityScope, compiled_at). Design E.
     security_scope_cache: Arc<Mutex<HashMap<String, (yata_gie::ir::SecurityScope, std::time::Instant)>>>,
+    /// Cheap traversal planning stats: filter key → (count, cached_at).
+    count_stats_cache: Arc<Mutex<HashMap<String, CachedCountStat>>>,
     cypher_read_count: Arc<AtomicU64>,
     cypher_mutation_count: Arc<AtomicU64>,
     cypher_mutation_us_total: Arc<AtomicU64>,
@@ -1286,6 +1296,7 @@ impl TieredGraphEngine {
             lance_edge_table: Arc::new(tokio::sync::Mutex::new(None)),
             s3_prefix,
             security_scope_cache: Arc::new(Mutex::new(HashMap::new())),
+            count_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             cypher_read_count: Arc::new(AtomicU64::new(0)),
             cypher_mutation_count: Arc::new(AtomicU64::new(0)),
             cypher_mutation_us_total: Arc::new(AtomicU64::new(0)),
