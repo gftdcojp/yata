@@ -500,6 +500,70 @@ fn collect_var_where_filters(
     }
 }
 
+fn collect_node_pushdown_filters(
+    ast: &yata_cypher::ast::Query,
+    params: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut filters = HashMap::new();
+    let mut nodes_by_var: HashMap<String, yata_cypher::ast::NodePattern> = HashMap::new();
+    let mut collect_from_patterns = |patterns: &[yata_cypher::ast::Pattern]| {
+        for pattern in patterns {
+            for element in &pattern.elements {
+                let yata_cypher::ast::PatternElement::Node(node) = element else {
+                    continue;
+                };
+                let Some(var) = node.var.clone() else {
+                    continue;
+                };
+                nodes_by_var.entry(var).or_insert_with(|| node.clone());
+            }
+        }
+    };
+
+    for clause in &ast.clauses {
+        match clause {
+            yata_cypher::ast::Clause::Match { patterns, .. }
+            | yata_cypher::ast::Clause::OptionalMatch { patterns, .. }
+            | yata_cypher::ast::Clause::Create { patterns } => collect_from_patterns(patterns),
+            yata_cypher::ast::Clause::Merge { pattern, .. } => {
+                collect_from_patterns(std::slice::from_ref(pattern))
+            }
+            _ => {}
+        }
+    }
+
+    let node_vars: std::collections::HashSet<String> = nodes_by_var.keys().cloned().collect();
+    let mut where_filters_by_var: HashMap<String, Vec<String>> = HashMap::new();
+    for clause in &ast.clauses {
+        match clause {
+            yata_cypher::ast::Clause::Match { where_, .. }
+            | yata_cypher::ast::Clause::OptionalMatch { where_, .. } => {
+                if let Some(expr) = where_ {
+                    collect_var_where_filters(expr, &node_vars, params, &mut where_filters_by_var);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (var, node) in nodes_by_var {
+        let mut parts = Vec::new();
+        if let Some(base) = build_vertex_pushdown_filter(&node, params) {
+            parts.push(base);
+        } else if let Some(label) = node.labels.first() {
+            parts.push(format!("label = {}", sql_quote(label)));
+        }
+        if let Some(extra) = where_filters_by_var.get(&var) {
+            parts.extend(extra.iter().cloned());
+        }
+        if !parts.is_empty() {
+            filters.insert(var, parts.join(" AND "));
+        }
+    }
+
+    filters
+}
+
 /// Graph engine: LanceDB-backed. No persistent CSR. Query = LanceDB scan → ephemeral CSR → GIE.
 pub struct TieredGraphEngine {
     config: TieredEngineConfig,
@@ -518,6 +582,82 @@ pub struct TieredGraphEngine {
 }
 
 impl TieredGraphEngine {
+    fn estimate_vertex_filter_cardinality(&self, filter: &str) -> Option<usize> {
+        if filter.is_empty() {
+            return None;
+        }
+        self.ensure_lance();
+        let lance_tbl = self.lance_table.clone();
+        self.block_on(async {
+            let tbl_guard = lance_tbl.lock().await;
+            let tbl = tbl_guard.as_ref()?;
+            tbl.count_rows(Some(filter)).await.ok()
+        })
+    }
+
+    fn refine_traversal_strategy_with_stats(
+        &self,
+        plan: &mut yata_gie::ir::QueryPlan,
+        ast: &yata_cypher::ast::Query,
+        params: &HashMap<String, String>,
+        limit: Option<usize>,
+    ) {
+        use yata_gie::ir::TraversalStrategy;
+
+        let node_filters = collect_node_pushdown_filters(ast, params);
+        let soft_limit = limit.map(|l| l.saturating_mul(4).max(32));
+
+        for op in &mut plan.ops {
+            match op {
+                yata_gie::ir::LogicalOp::Expand {
+                    src_alias,
+                    edge_label,
+                    direction,
+                    strategy,
+                    ..
+                }
+                | yata_gie::ir::LogicalOp::PathExpand {
+                    src_alias,
+                    edge_label,
+                    direction,
+                    strategy,
+                    ..
+                } => {
+                    if matches!(direction, yata_grin::Direction::Both) || edge_label.is_empty() {
+                        *strategy = TraversalStrategy::PreferGie;
+                        continue;
+                    }
+                    let Some(filter) = node_filters.get(src_alias) else {
+                        continue;
+                    };
+                    let Some(cardinality) = self.estimate_vertex_filter_cardinality(filter) else {
+                        continue;
+                    };
+                    if cardinality == 0 {
+                        *strategy = TraversalStrategy::PreferGie;
+                        continue;
+                    }
+                    if cardinality <= PATH_EXPAND_FRONTIER_LIMIT / 2 {
+                        *strategy = TraversalStrategy::PreferStaged;
+                        continue;
+                    }
+                    if cardinality > PATH_EXPAND_FRONTIER_LIMIT {
+                        *strategy = TraversalStrategy::PreferGie;
+                        continue;
+                    }
+                    if let Some(cap) = soft_limit {
+                        *strategy = if cardinality <= cap {
+                            TraversalStrategy::PreferStaged
+                        } else {
+                            TraversalStrategy::PreferGie
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn maybe_schedule_compaction(&self) {
         let merges = self.merge_record_count.load(Ordering::Relaxed);
         if merges % AUTO_COMPACT_FRAGMENT_THRESHOLD != 0 || merges == 0 {
@@ -1442,7 +1582,8 @@ impl TieredGraphEngine {
                     Vec::new()
                 };
 
-                if let Ok(plan) = plan_result {
+                if let Ok(mut plan) = plan_result {
+                    self.refine_traversal_strategy_with_stats(&mut plan, &ast, &param_map, hints.limit);
                     if plan.ops.iter().any(|op| matches!(
                         op,
                         yata_gie::ir::LogicalOp::Expand { .. } | yata_gie::ir::LogicalOp::PathExpand { .. }
@@ -3187,6 +3328,56 @@ mod tests {
         let names = get_col(&rows, "name");
         assert_eq!(rows.len(), 1);
         assert!(names.iter().any(|n| n.contains("Carol")), "Carol must match chained expand destination filter");
+    }
+
+    #[test]
+    fn test_refine_traversal_strategy_with_stats_prefers_staged_for_small_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        run_query(&e, "CREATE (a:User {name: 'Alice'})-[:FOLLOWS]->(b:User {name: 'Bob'})", &[], None).unwrap();
+        run_query(&e, "CREATE (a:User {name: 'Carol'})-[:FOLLOWS]->(b:User {name: 'Dave'})", &[], None).unwrap();
+
+        let ast = yata_cypher::parse(
+            "MATCH (a:User)-[:FOLLOWS]->(b:User) WHERE a.name = 'Alice' RETURN b.name AS name LIMIT 10"
+        ).unwrap();
+        let mut plan = yata_gie::transpile::transpile(&ast).unwrap();
+        e.refine_traversal_strategy_with_stats(&mut plan, &ast, &HashMap::new(), Some(10));
+
+        assert!(matches!(
+            plan.ops.iter().find(|op| matches!(op, yata_gie::ir::LogicalOp::Expand { .. })),
+            Some(yata_gie::ir::LogicalOp::Expand {
+                strategy: yata_gie::ir::TraversalStrategy::PreferStaged,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_refine_traversal_strategy_with_stats_prefers_gie_for_broad_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        for i in 0..300 {
+            run_query(
+                &e,
+                &format!("CREATE (a:User {{name: 'User{i}'}})-[:FOLLOWS]->(b:User {{name: 'Dst{i}'}})"),
+                &[],
+                None,
+            ).unwrap();
+        }
+
+        let ast = yata_cypher::parse(
+            "MATCH (a:User)-[:FOLLOWS]->(b:User) RETURN b.name AS name LIMIT 10"
+        ).unwrap();
+        let mut plan = yata_gie::transpile::transpile(&ast).unwrap();
+        e.refine_traversal_strategy_with_stats(&mut plan, &ast, &HashMap::new(), Some(10));
+
+        assert!(matches!(
+            plan.ops.iter().find(|op| matches!(op, yata_gie::ir::LogicalOp::Expand { .. })),
+            Some(yata_gie::ir::LogicalOp::Expand {
+                strategy: yata_gie::ir::TraversalStrategy::PreferGie,
+                ..
+            })
+        ));
     }
 
     #[test]
