@@ -656,6 +656,7 @@ impl ArrowStore {
     pub fn from_batches(batches: Vec<RecordBatch>) -> Result<Self, String> {
         let (rows, label_index, vertex_labels, known_labels, pk_keys) =
             Self::build_dedup_index(&batches)?;
+        let vertex_count = vertex_labels.len();
 
         Ok(Self {
             storage: BatchStorage::InMemory(batches),
@@ -667,8 +668,8 @@ impl ArrowStore {
             edge_props: Vec::new(),
             edge_labels: Vec::new(),
             known_edge_labels: Vec::new(),
-            out_adj: vec![Vec::new(); vertex_labels.len()],
-            in_adj: vec![Vec::new(); vertex_labels.len()],
+            out_adj: vec![Vec::new(); vertex_count],
+            in_adj: vec![Vec::new(); vertex_count],
             props_cache: std::sync::Mutex::new(HashMap::new()),
         })
     }
@@ -815,6 +816,7 @@ impl ArrowStore {
         // Build dedup index first (always in memory — small relative to data)
         let (rows, label_index, vertex_labels, known_labels, pk_keys) =
             Self::build_dedup_index(&batches)?;
+        let vertex_count = vertex_labels.len();
 
         let storage = if total_bytes <= budget_bytes || batches.is_empty() {
             BatchStorage::InMemory(batches)
@@ -858,8 +860,8 @@ impl ArrowStore {
             edge_props: Vec::new(),
             edge_labels: Vec::new(),
             known_edge_labels: Vec::new(),
-            out_adj: vec![Vec::new(); vertex_labels.len()],
-            in_adj: vec![Vec::new(); vertex_labels.len()],
+            out_adj: vec![Vec::new(); vertex_count],
+            in_adj: vec![Vec::new(); vertex_count],
             props_cache: std::sync::Mutex::new(HashMap::new()),
         })
     }
