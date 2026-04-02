@@ -52,10 +52,39 @@ async fn main() -> anyhow::Result<()> {
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], rest_port));
     tracing::info!(%addr, "yata-server REST API listening");
 
+    let shutdown_engine = engine.clone();
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router)
-        .with_graceful_shutdown(async { tokio::signal::ctrl_c().await.ok(); })
+        .with_graceful_shutdown(async {
+            // Listen for both SIGTERM (Container) and Ctrl+C (dev)
+            let ctrl_c = tokio::signal::ctrl_c();
+            #[cfg(unix)]
+            let sigterm = async {
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("SIGTERM handler")
+                    .recv()
+                    .await;
+            };
+            #[cfg(not(unix))]
+            let sigterm = std::future::pending::<()>();
+            tokio::select! {
+                _ = ctrl_c => tracing::info!("received Ctrl+C"),
+                _ = sigterm => tracing::info!("received SIGTERM"),
+            }
+        })
         .await?;
+
+    // Graceful shutdown: flush all pending writes to R2 via compaction
+    tracing::info!("graceful shutdown: triggering final compaction...");
+    match shutdown_engine.trigger_compaction() {
+        Ok(stats) => tracing::info!(
+            input = stats.input_entries,
+            output = stats.output_entries,
+            "graceful shutdown: final compaction complete"
+        ),
+        Err(e) => tracing::error!(error = %e, "graceful shutdown: final compaction FAILED"),
+    }
+    tracing::info!("yata-server shutdown complete");
 
     Ok(())
 }

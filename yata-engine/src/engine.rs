@@ -260,7 +260,7 @@ pub struct MutationContext {
     pub actor_did: String,
 }
 
-const AUTO_COMPACT_FRAGMENT_THRESHOLD: u64 = 32;
+const AUTO_COMPACT_FRAGMENT_THRESHOLD: u64 = 8;
 
 /// Graph engine: LanceDB-backed. No persistent CSR. Query = LanceDB scan → ephemeral CSR → GIE.
 pub struct TieredGraphEngine {
