@@ -26,8 +26,24 @@ export function multiDidFilter(field: string, did: string): string {
 
 // ── Decoding ──
 
-/** Decode base64-encoded valueB64 to a record object. Returns {} on failure. */
-export function tryDecodeRecord(b64: unknown): Record<string, unknown> {
+/**
+ * Decode a record value from valueJson (fast path) or valueB64 (legacy fallback).
+ *
+ * Accepts either a raw base64 string (legacy) or an object with optional
+ * `valueJson` / `valueB64` fields. When `valueJson` is present, base64
+ * decode is skipped entirely. Returns `{}` on failure.
+ */
+export function tryDecodeRecord(input: unknown): Record<string, unknown> {
+  // Fast path: object with valueJson (skip base64 entirely)
+  if (input && typeof input === "object" && "valueJson" in (input as any)) {
+    const json = (input as any).valueJson;
+    if (typeof json === "string") {
+      try { return JSON.parse(json); } catch { /* fall through to b64 */ }
+    }
+  }
+  // Resolve the base64 string: direct string or object.valueB64
+  const b64 = typeof input === "string" ? input
+    : (input && typeof input === "object" ? (input as any).valueB64 : null);
   if (!b64 || typeof b64 !== "string") return {};
   try {
     const clean = b64.replace(/"/g, "");
@@ -43,7 +59,12 @@ export function tryDecodeRecord(b64: unknown): Record<string, unknown> {
 
 // ── Merge Props ──
 
-/** Build merge properties for YATA_RPC.mergeRecord(). */
+/**
+ * Build merge properties for YATA_RPC.mergeRecord().
+ *
+ * Includes both `valueJson` (direct JSON, fast decode path) and `valueB64`
+ * (legacy base64 encoding) for backward compatibility during rollout.
+ */
 export function buildMergeProps(
   collection: string,
   json: string,
@@ -51,6 +72,7 @@ export function buildMergeProps(
 ): MergeProps {
   return {
     collection,
+    'valueJson': json,
     'valueB64': toBase64(json),
     repo,
     'sensitivity_ord': "0",

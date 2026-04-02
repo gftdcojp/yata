@@ -157,15 +157,40 @@ export async function loadManifestViaLatest(
   return pointer == null ? null : loadManifest(store, pointer.versioned_key);
 }
 
+/**
+ * Publish a manifest with atomic pointer update.
+ *
+ * Writes the immutable versioned manifest first, then updates the latest
+ * pointer with retry + read-after-write verification to guard against
+ * partial R2 writes.
+ */
 export async function publishManifest(
   store: ManifestStore,
   manifest: GraphManifest,
 ): Promise<void> {
+  // 1. Write versioned manifest (immutable, idempotent)
   await saveManifest(store, manifest.key_layout.versioned_key, manifest);
-  await store.put(
-    manifest.key_layout.pointer_key,
-    stringifyLatestPointer(createLatestPointer(manifest)),
-  );
+
+  // 2. Atomic pointer update with retry + read-after-write verify
+  const pointerBody = stringifyLatestPointer(createLatestPointer(manifest));
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await store.put(manifest.key_layout.pointer_key, pointerBody);
+      // Verify: read-after-write consistency check
+      const verify = await store.get(manifest.key_layout.pointer_key);
+      if (verify) {
+        try {
+          const parsed = JSON.parse(verify);
+          if (parsed.version === manifest.version) return;
+        } catch { /* parse error, retry */ }
+      }
+    } catch (e) {
+      if (attempt === 2) throw e;
+    }
+    // Exponential backoff
+    await new Promise(r => setTimeout(r, 100 * Math.pow(2, attempt)));
+  }
+  console.error(`publishManifest: pointer verify failed after 3 attempts (v=${manifest.version})`);
 }
 
 export function createLatestPointer(
