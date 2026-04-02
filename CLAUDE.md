@@ -17,9 +17,12 @@ Write: merge_record() → build_lance_batch() (Format D) → table.add() [LanceD
        Cypher MATCH+DELETE → scan ArrowStore → delete_record() per matched
        Auto-compact: every 32 merges (background thread, non-blocking)
 
-Read:  query_inner() → build_read_store() → ArrowStore (zero-copy, lazy val_json)
+Read:  query_inner() → build_read_store_pushdown() → ArrowStore (zero-copy, lazy val_json)
        → GIE push-based executor (Topology/Property/Scannable on Arrow columns)
        ArrowStore auto-detects Format D (10-col) vs legacy (7-col) schema
+       Lance pushdown: label IN + WHERE promoted-col conditions + LIMIT → scan_filter_limit()
+       Early LIMIT: execute_with_limit() caps intermediate results (no aggregate blowup)
+       Disk spill: ArrowStore exceeding YATA_ARROWSTORE_BUDGET_MB → IPC file in YATA_VINEYARD_DIR
 
 Cold:  ensure_lance() → open_table("vertices") + open_table("edges")
        Legacy 7-col table → auto drop + recreate as Format D

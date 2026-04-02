@@ -692,7 +692,8 @@ impl ArrowStore {
                 .join(format!("arrowstore-{}.ipc", std::process::id()));
             let file = std::fs::File::create(&path)
                 .map_err(|e| format!("create spill file: {e}"))?;
-            let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &schema)
+            let batch_schema = batches[0].schema();
+            let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &batch_schema)
                 .map_err(|e| format!("IPC writer: {e}"))?;
             let batch_count = batches.len();
             for batch in &batches {
@@ -709,7 +710,6 @@ impl ArrowStore {
             BatchStorage::Spilled {
                 path,
                 batch_count,
-                schema,
                 cache: std::sync::Mutex::new(HashMap::new()),
             }
         };
