@@ -21,6 +21,9 @@ Read:  query_inner() → build_read_store_pushdown() → ArrowStore (zero-copy, 
        → GIE push-based executor (Topology/Property/Scannable on Arrow columns)
        ArrowStore auto-detects Format D (10-col) vs legacy (7-col) schema
        Lance pushdown: label IN + WHERE promoted-col conditions + LIMIT → scan_filter_limit()
+       Edge pushdown: edge_label + src_label + dst_label + src_vid IN (...) on separate `edges` table
+       GIE Filter is alias-aware: source-side `WHERE a.*` is evaluated on binding `a`, not any bound vertex
+       Cypher source predicates (inline props + simple WHERE comparisons) feed `src_vid` candidate extraction before edge scan
        Early LIMIT: execute_with_limit() caps intermediate results (no aggregate blowup)
        Disk spill: ArrowStore exceeding YATA_ARROWSTORE_BUDGET_MB → IPC file in YATA_VINEYARD_DIR
 
@@ -36,7 +39,7 @@ Cold:  ensure_lance() → open_table("vertices") + open_table("edges")
 | `yata-grin` | GRIN trait (Topology, Property, Schema, Scannable, Mutable) |
 | `yata-engine` | TieredGraphEngine。Format D write/read/compact。Edge separation。MERGE clause。SecurityScope (Design E)。55 tests |
 | `yata-cypher` | Cypher parser + executor。286 tests |
-| `yata-gie` | GIE push-based executor + SecurityFilter。208 tests |
+| `yata-gie` | GIE push-based executor + SecurityFilter + alias-aware Filter pushdown。210 tests |
 | `yata-lance` | LanceDB wrapper。YataDb + YataTable + ArrowStore (zero-copy, Format D auto-detect) |
 | `yata-server` | XRPC API + JWT auth + operation timeouts (query 5s, cold start 30s, compact/repair 60s) |
 
