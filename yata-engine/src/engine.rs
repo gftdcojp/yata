@@ -1440,32 +1440,35 @@ impl TieredGraphEngine {
                         let intermediate_cap = hints.limit.map(|l| if has_orderby { l.saturating_mul(4) } else { l });
                         let mut data = Vec::new();
                         for op in &plan.ops {
-                            match op {
-                                yata_gie::ir::LogicalOp::Expand { .. } => {
-                                    let (new_store, new_data) = self.execute_staged_expand(
-                                        &current_store,
-                                        data,
-                                        op,
-                                        &rel_refs,
-                                        hints.limit,
-                                    )?;
-                                    current_store = new_store;
-                                    data = new_data;
+                            let stage_this_op = should_stage_traversal(op, data.len(), hints.limit);
+                            if stage_this_op {
+                                match op {
+                                    yata_gie::ir::LogicalOp::Expand { .. } => {
+                                        let (new_store, new_data) = self.execute_staged_expand(
+                                            &current_store,
+                                            data,
+                                            op,
+                                            &rel_refs,
+                                            hints.limit,
+                                        )?;
+                                        current_store = new_store;
+                                        data = new_data;
+                                    }
+                                    yata_gie::ir::LogicalOp::PathExpand { .. } => {
+                                        let (new_store, new_data) = self.execute_staged_path_expand(
+                                            &current_store,
+                                            data,
+                                            op,
+                                            &rel_refs,
+                                            hints.limit,
+                                        )?;
+                                        current_store = new_store;
+                                        data = new_data;
+                                    }
+                                    _ => unreachable!(),
                                 }
-                                yata_gie::ir::LogicalOp::PathExpand { .. } => {
-                                    let (new_store, new_data) = self.execute_staged_path_expand(
-                                        &current_store,
-                                        data,
-                                        op,
-                                        &rel_refs,
-                                        hints.limit,
-                                    )?;
-                                    current_store = new_store;
-                                    data = new_data;
-                                }
-                                _ => {
-                                    data = yata_gie::executor::execute_op(op, data, &current_store);
-                                }
+                            } else {
+                                data = yata_gie::executor::execute_op(op, data, &current_store);
                             }
                             if !has_aggregate {
                                 if let Some(cap) = intermediate_cap {
