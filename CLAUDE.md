@@ -1,6 +1,6 @@
 # packages/server/yata
 
-yata — Rust Cypher graph engine on LanceDB。`lancedb` 0.27 (lance 4.0)。No CSR。No WAL。No MemoryGraph。No cache。
+yata — Rust Cypher graph engine on LanceDB。`lancedb` 0.27 (lance 4.0)。No CSR。No WAL。No MemoryGraph。No query cache。
 
 **Role (2026-04-02)**: Query index (materialized view)。KV (PDS_KV) が authoritative source of truth。yata は fire-and-forget で index 更新される。Container crash/restart でもデータは KV に永続化済み。Graceful shutdown で final compaction → R2 flush。AUTO_COMPACT_FRAGMENT_THRESHOLD=8。
 
@@ -36,6 +36,11 @@ Read:  query_inner() → build_read_store_pushdown() → ArrowStore (zero-copy, 
        Disk spill: ArrowStore exceeding YATA_ARROWSTORE_BUDGET_MB → IPC file in YATA_VINEYARD_DIR
 
 Cold:  ensure_lance() → open_table("vertices") + open_table("edges")
+       LanceDB shared `Session` reused across tables (index/metadata cache shared)
+       OSS scalar index auto-ensure:
+         vertices: `pk_value`/`rkey` = BTREE, `label`/`repo`/`owner_did`/`app_id` = BITMAP
+         edges: `eid`/`src_vid`/`dst_vid` = BTREE, `edge_label`/`src_label`/`dst_label`/`app_id` = BITMAP
+       R2 connect uses timeout/retry storage options (`request_timeout`, `connect_timeout`, `download_retry_count`, `client_max_retries`, `client_retry_timeout`)
        Legacy 7-col table → auto drop + recreate as Format D
 ```
 
