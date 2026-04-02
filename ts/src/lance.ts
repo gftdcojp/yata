@@ -46,19 +46,19 @@ export type YataGraphTableName =
   | typeof EDGE_LIVE_IN_TABLE;
 
 export interface YataCreatedTables<TTable = unknown> {
-  'yata_vertex_log': TTable;
-  'yata_edge_log': TTable;
-  'yata_vertex_live': TTable;
-  'yata_edge_live_out': TTable;
-  'yata_edge_live_in': TTable;
+  'yataVertexLog': TTable;
+  'yataEdgeLog': TTable;
+  'yataVertexLive': TTable;
+  'yataEdgeLiveOut': TTable;
+  'yataEdgeLiveIn': TTable;
 }
 
 export interface YataOpenedTables<TTable = unknown> {
-  'vertex_log': TTable;
-  'edge_log': TTable;
-  'vertex_live': TTable;
-  'edge_live_out': TTable;
-  'edge_live_in': TTable;
+  'vertexLog': TTable;
+  'edgeLog': TTable;
+  'vertexLive': TTable;
+  'edgeLiveOut': TTable;
+  'edgeLiveIn': TTable;
 }
 
 function mapScalarType<TType>(kind: YataScalarType, factory: ArrowSchemaFactory<unknown, TType, unknown>): TType {
@@ -155,11 +155,11 @@ export async function openYataGraphTablesFromManifest<TTable>(
   manifest: import("./manifest.js").GraphManifest,
 ): Promise<YataOpenedTables<TTable>> {
   const [vertexLog, edgeLog, vertexLive, edgeLiveOut, edgeLiveIn] = await Promise.all([
-    connection.openTable(manifest.tables.vertex_log.table_name),
-    connection.openTable(manifest.tables.edge_log.table_name),
-    connection.openTable(manifest.tables.vertex_live.table_name),
-    connection.openTable(manifest.tables.edge_live_out.table_name),
-    connection.openTable(manifest.tables.edge_live_in.table_name),
+    connection.openTable(manifest.tables.vertexLog.tableName),
+    connection.openTable(manifest.tables.edgeLog.tableName),
+    connection.openTable(manifest.tables.vertexLive.tableName),
+    connection.openTable(manifest.tables.edgeLiveOut.tableName),
+    connection.openTable(manifest.tables.edgeLiveIn.tableName),
   ]);
 
   return {

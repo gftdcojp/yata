@@ -12,9 +12,9 @@ export interface PipelineWriterLike {
 }
 
 export interface GraphPipelineEnvelopeBase {
-  'partition_id': number;
-  'tx_id': string;
-  'emitted_at_ms': number;
+  'partitionId': number;
+  'txId': string;
+  'emittedAtMs': number;
   source?: string | null;
 }
 
@@ -59,9 +59,9 @@ export function createVertexPipelineEnvelope(
 ): GraphVertexPipelineEnvelope {
   return {
     kind: "vertex",
-    'partition_id': mutation.partition_id,
-    'tx_id': mutation.tx_id,
-    'emitted_at_ms': mutation.updated_at_ms,
+    'partitionId': mutation.partitionId,
+    'txId': mutation.txId,
+    'emittedAtMs': mutation.updatedAtMs,
     source: source ?? null,
     mutation,
   };
@@ -73,9 +73,9 @@ export function createEdgePipelineEnvelope(
 ): GraphEdgePipelineEnvelope {
   return {
     kind: "edge",
-    'partition_id': mutation.partition_id,
-    'tx_id': mutation.tx_id,
-    'emitted_at_ms': mutation.updated_at_ms,
+    'partitionId': mutation.partitionId,
+    'txId': mutation.txId,
+    'emittedAtMs': mutation.updatedAtMs,
     source: source ?? null,
     mutation,
   };

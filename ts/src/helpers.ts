@@ -75,8 +75,8 @@ export function buildMergeProps(
     'valueJson': json,
     'valueB64': toBase64(json),
     repo,
-    'sensitivity_ord': "0",
-    'owner_hash': String(fnv1a32(repo)),
+    'sensitivityOrd': "0",
+    'ownerHash': String(fnv1a32(repo)),
     'updatedAt': String(Date.now()),
   };
 }

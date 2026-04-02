@@ -25,9 +25,9 @@ describe("cypher-exec", () => {
   describe("Pattern A: node scan", () => {
     it("filters by equality", () => {
       const table = makeVertexTable([
-        { vid: "v1", repo: "did:web:alice", rkey: "r1", 'updated_at_ms': 1000 },
-        { vid: "v2", repo: "did:web:bob", rkey: "r2", 'updated_at_ms': 2000 },
-        { vid: "v3", repo: "did:web:alice", rkey: "r3", 'updated_at_ms': 3000 },
+        { vid: "v1", repo: "did:web:alice", rkey: "r1", 'updatedAtMs': 1000 },
+        { vid: "v2", repo: "did:web:bob", rkey: "r2", 'updatedAtMs': 2000 },
+        { vid: "v3", repo: "did:web:alice", rkey: "r3", 'updatedAtMs': 3000 },
       ]);
       const ctx = makeCtx([["Post", table]], [], { p0: "did:web:alice" });
       const ast = parseCypher(
@@ -71,13 +71,13 @@ describe("cypher-exec", () => {
 
     it("sorts by ORDER BY DESC", () => {
       const table = makeVertexTable([
-        { vid: "v1", repo: "did:web:a", rkey: "r1", 'updated_at_ms': 1000 },
-        { vid: "v2", repo: "did:web:a", rkey: "r2", 'updated_at_ms': 3000 },
-        { vid: "v3", repo: "did:web:a", rkey: "r3", 'updated_at_ms': 2000 },
+        { vid: "v1", repo: "did:web:a", rkey: "r1", 'updatedAtMs': 1000 },
+        { vid: "v2", repo: "did:web:a", rkey: "r2", 'updatedAtMs': 3000 },
+        { vid: "v3", repo: "did:web:a", rkey: "r3", 'updatedAtMs': 2000 },
       ]);
       const ctx = makeCtx([["Post", table]], [], { p0: "did:web:a" });
       const ast = parseCypher(
-        "MATCH (r:Post) WHERE r.repo = $p0 RETURN r.rkey AS rkey ORDER BY r.updated_at_ms DESC LIMIT 50",
+        "MATCH (r:Post) WHERE r.repo = $p0 RETURN r.rkey AS rkey ORDER BY r.updatedAtMs DESC LIMIT 50",
       );
       const result = execCypher(ast, ctx);
       expect(result.rows.map(r => r[0])).toEqual(["r2", "r3", "r1"]);
@@ -101,8 +101,8 @@ describe("cypher-exec", () => {
         { vid: "v3", repo: "did:web:carol", rkey: "a3", label: "Actor" },
       ]);
       const edges = makeEdgeTable([
-        { 'src_vid': "v1", 'dst_vid': "v2" },
-        { 'src_vid': "v1", 'dst_vid': "v3" },
+        { 'srcVid': "v1", 'dstVid': "v2" },
+        { 'srcVid': "v1", 'dstVid': "v3" },
       ]);
       const ctx = makeCtx(
         [["Actor", actors]],
@@ -125,7 +125,7 @@ describe("cypher-exec", () => {
         { vid: "v2", repo: "did:web:bob", rkey: "a2" },
       ]);
       const edges = makeEdgeTable([
-        { 'src_vid': "v1", 'dst_vid': "v2", alive: false },
+        { 'srcVid': "v1", 'dstVid': "v2", alive: false },
       ]);
       const ctx = makeCtx(
         [["Actor", actors]],
@@ -234,8 +234,8 @@ describe("cypher-exec", () => {
   describe("Arrow IPC roundtrip", () => {
     it("can decode IPC-encoded table and query it", () => {
       const original = makeVertexTable([
-        { vid: "v1", repo: "did:web:alice", rkey: "r1", 'updated_at_ms': 1000 },
-        { vid: "v2", repo: "did:web:bob", rkey: "r2", 'updated_at_ms': 2000 },
+        { vid: "v1", repo: "did:web:alice", rkey: "r1", 'updatedAtMs': 1000 },
+        { vid: "v2", repo: "did:web:bob", rkey: "r2", 'updatedAtMs': 2000 },
       ]);
       const ipc = tableToIPC(original);
       const decoded = tableFromIPC(ipc);

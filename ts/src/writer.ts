@@ -13,50 +13,50 @@ export interface LanceWritableTableLike {
 }
 
 export interface YataWritableTables {
-  'vertex_log': LanceWritableTableLike;
-  'edge_log': LanceWritableTableLike;
-  'vertex_live': LanceWritableTableLike;
-  'edge_live_out': LanceWritableTableLike;
-  'edge_live_in': LanceWritableTableLike;
+  'vertexLog': LanceWritableTableLike;
+  'edgeLog': LanceWritableTableLike;
+  'vertexLive': LanceWritableTableLike;
+  'edgeLiveOut': LanceWritableTableLike;
+  'edgeLiveIn': LanceWritableTableLike;
 }
 
 export interface VertexMutation {
-  'partition_id': number;
+  'partitionId': number;
   seq: number;
-  'tx_id': string;
+  'txId': string;
   op: "upsert" | "delete";
   label: string;
-  'pk_key': string;
-  'pk_value': string;
+  'pkKey': string;
+  'pkValue': string;
   vid: string;
   repo?: string | null;
   rkey?: string | null;
-  owner_did?: string | null;
-  'created_at_ms': number;
-  'updated_at_ms': number;
+  ownerDid?: string | null;
+  'createdAtMs': number;
+  'updatedAtMs': number;
   tombstone: boolean;
-  props_json?: string | null;
-  props_hash?: string | null;
+  propsJson?: string | null;
+  propsHash?: string | null;
 }
 
 export interface EdgeMutation {
-  'partition_id': number;
+  'partitionId': number;
   seq: number;
-  'tx_id': string;
+  'txId': string;
   op: "upsert" | "delete";
-  'edge_label': string;
-  'pk_key': string;
-  'pk_value': string;
+  'edgeLabel': string;
+  'pkKey': string;
+  'pkValue': string;
   eid: string;
-  'src_vid': string;
-  'dst_vid': string;
-  src_label?: string | null;
-  dst_label?: string | null;
-  'created_at_ms': number;
-  'updated_at_ms': number;
+  'srcVid': string;
+  'dstVid': string;
+  srcLabel?: string | null;
+  dstLabel?: string | null;
+  'createdAtMs': number;
+  'updatedAtMs': number;
   tombstone: boolean;
-  props_json?: string | null;
-  props_hash?: string | null;
+  propsJson?: string | null;
+  propsHash?: string | null;
 }
 
 function baseUriFromTableUri(uri: string): string {
@@ -70,33 +70,33 @@ export async function projectVertexMutation(
   currentManifest: GraphManifest,
   mutation: VertexMutation,
 ): Promise<GraphManifest> {
-  await tables.vertex_log.add([{ ...mutation }]);
-  await tables.vertex_live.add([{
-    'partition_id': mutation.partition_id,
+  await tables.vertexLog.add([{ ...mutation }]);
+  await tables.vertexLive.add([{
+    'partitionId': mutation.partitionId,
     label: mutation.label,
-    'pk_key': mutation.pk_key,
-    'pk_value': mutation.pk_value,
+    'pkKey': mutation.pkKey,
+    'pkValue': mutation.pkValue,
     vid: mutation.vid,
     alive: !mutation.tombstone,
-    'latest_seq': mutation.seq,
+    'latestSeq': mutation.seq,
     repo: mutation.repo ?? null,
     rkey: mutation.rkey ?? null,
-    'owner_did': mutation.owner_did ?? null,
-    'updated_at_ms': mutation.updated_at_ms,
-    'props_json': mutation.props_json ?? null,
+    'ownerDid': mutation.ownerDid ?? null,
+    'updatedAtMs': mutation.updatedAtMs,
+    'propsJson': mutation.propsJson ?? null,
   }]);
 
   const next = GraphCatalog.createManifest(
-    currentManifest.partition_id,
+    currentManifest.partitionId,
     currentManifest.version + 1,
     {
       min: Math.min(currentManifest.seq.min, mutation.seq),
       max: Math.max(currentManifest.seq.max, mutation.seq),
     },
-    baseUriFromTableUri(currentManifest.tables.vertex_log.uri),
+    baseUriFromTableUri(currentManifest.tables.vertexLog.uri),
   );
-  next.dirty_labels = [mutation.label];
-  next.generated_at_ms = mutation.updated_at_ms;
+  next.dirtyLabels = [mutation.label];
+  next.generatedAtMs = mutation.updatedAtMs;
   await GraphCatalog.publish(store, next);
   return next;
 }
@@ -107,49 +107,49 @@ export async function projectEdgeMutation(
   currentManifest: GraphManifest,
   mutation: EdgeMutation,
 ): Promise<GraphManifest> {
-  await tables.edge_log.add([{ ...mutation }]);
-  await tables.edge_live_out.add([{
-    'partition_id': mutation.partition_id,
-    'edge_label': mutation.edge_label,
-    'pk_key': mutation.pk_key,
-    'pk_value': mutation.pk_value,
+  await tables.edgeLog.add([{ ...mutation }]);
+  await tables.edgeLiveOut.add([{
+    'partitionId': mutation.partitionId,
+    'edgeLabel': mutation.edgeLabel,
+    'pkKey': mutation.pkKey,
+    'pkValue': mutation.pkValue,
     eid: mutation.eid,
-    'src_vid': mutation.src_vid,
-    'dst_vid': mutation.dst_vid,
-    'src_label': mutation.src_label ?? null,
-    'dst_label': mutation.dst_label ?? null,
+    'srcVid': mutation.srcVid,
+    'dstVid': mutation.dstVid,
+    'srcLabel': mutation.srcLabel ?? null,
+    'dstLabel': mutation.dstLabel ?? null,
     alive: !mutation.tombstone,
-    'latest_seq': mutation.seq,
-    'updated_at_ms': mutation.updated_at_ms,
-    'props_json': mutation.props_json ?? null,
+    'latestSeq': mutation.seq,
+    'updatedAtMs': mutation.updatedAtMs,
+    'propsJson': mutation.propsJson ?? null,
   }]);
-  await tables.edge_live_in.add([{
-    'partition_id': mutation.partition_id,
-    'edge_label': mutation.edge_label,
-    'pk_key': mutation.pk_key,
-    'pk_value': mutation.pk_value,
+  await tables.edgeLiveIn.add([{
+    'partitionId': mutation.partitionId,
+    'edgeLabel': mutation.edgeLabel,
+    'pkKey': mutation.pkKey,
+    'pkValue': mutation.pkValue,
     eid: mutation.eid,
-    'dst_vid': mutation.dst_vid,
-    'src_vid': mutation.src_vid,
-    'src_label': mutation.src_label ?? null,
-    'dst_label': mutation.dst_label ?? null,
+    'dstVid': mutation.dstVid,
+    'srcVid': mutation.srcVid,
+    'srcLabel': mutation.srcLabel ?? null,
+    'dstLabel': mutation.dstLabel ?? null,
     alive: !mutation.tombstone,
-    'latest_seq': mutation.seq,
-    'updated_at_ms': mutation.updated_at_ms,
-    'props_json': mutation.props_json ?? null,
+    'latestSeq': mutation.seq,
+    'updatedAtMs': mutation.updatedAtMs,
+    'propsJson': mutation.propsJson ?? null,
   }]);
 
   const next = GraphCatalog.createManifest(
-    currentManifest.partition_id,
+    currentManifest.partitionId,
     currentManifest.version + 1,
     {
       min: Math.min(currentManifest.seq.min, mutation.seq),
       max: Math.max(currentManifest.seq.max, mutation.seq),
     },
-    baseUriFromTableUri(currentManifest.tables.edge_log.uri),
+    baseUriFromTableUri(currentManifest.tables.edgeLog.uri),
   );
-  next.dirty_labels = [mutation.edge_label];
-  next.generated_at_ms = mutation.updated_at_ms;
+  next.dirtyLabels = [mutation.edgeLabel];
+  next.generatedAtMs = mutation.updatedAtMs;
   await GraphCatalog.publish(store, next);
   return next;
 }

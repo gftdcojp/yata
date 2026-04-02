@@ -6,20 +6,20 @@ import { makeVertexTable, makeArrowBuffer } from "./test-helpers.js";
 
 function makeTestManifest(): CompactionManifest {
   return {
-    'partition_id': 0,
+    'partitionId': 0,
     version: 2,
-    'compacted_segment_key': "",
-    'compacted_seq': 100,
-    'entry_count': 3,
+    'compactedSegmentKey': "",
+    'compactedSeq': 100,
+    'entryCount': 3,
     labels: ["Post"],
-    'created_at_ms': Date.now(),
-    'segment_bytes': 512,
-    'label_segments': {
+    'createdAtMs': Date.now(),
+    'segmentBytes': 512,
+    'labelSegments': {
       Post: {
         key: "yata/log/compacted/0/label/Post.arrow",
-        'max_seq': 100,
-        'entry_count': 3,
-        'segment_bytes': 512,
+        'maxSeq': 100,
+        'entryCount': 3,
+        'segmentBytes': 512,
         blake3_hex: "abc",
       },
     },
@@ -28,9 +28,9 @@ function makeTestManifest(): CompactionManifest {
 
 function makeTestArrowBuffer(): ArrayBuffer {
   const table = makeVertexTable([
-    { vid: "v1", repo: "did:web:alice", rkey: "r1", 'updated_at_ms': 1000 },
-    { vid: "v2", repo: "did:web:bob", rkey: "r2", 'updated_at_ms': 2000 },
-    { vid: "v3", repo: "did:web:alice", rkey: "r3", 'updated_at_ms': 3000 },
+    { vid: "v1", repo: "did:web:alice", rkey: "r1", 'updatedAtMs': 1000 },
+    { vid: "v2", repo: "did:web:bob", rkey: "r2", 'updatedAtMs': 2000 },
+    { vid: "v3", repo: "did:web:alice", rkey: "r3", 'updatedAtMs': 3000 },
   ]);
   return makeArrowBuffer(table);
 }

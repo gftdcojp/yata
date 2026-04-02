@@ -2,7 +2,7 @@
  * @gftd/yata — Workers-side Cypher executor.
  *
  * Executes a parsed CypherAST against Arrow Tables loaded from R2.
- * Operates on vertex_live + edge_live_out tables (compacted, per-label segments).
+ * Operates on vertexLive + edgeLiveOut tables (compacted, per-label segments).
  *
  * Supports:
  *   - Single-label MATCH + WHERE + RETURN + ORDER BY + LIMIT
@@ -108,8 +108,8 @@ function execTraversal(ast: CypherAST, ctx: ExecContext): CypherResult {
 
   // Step 2: Find matching edges
   const edgeTable = edgeData.table;
-  const edgeSrcCol = edgeTable.getChild("src_vid");
-  const edgeDstCol = edgeTable.getChild("dst_vid");
+  const edgeSrcCol = edgeTable.getChild("srcVid");
+  const edgeDstCol = edgeTable.getChild("dstVid");
   const edgeAliveCol = edgeTable.getChild("alive");
   if (!edgeSrcCol || !edgeDstCol) return emptyResult(ast);
 
@@ -164,7 +164,7 @@ function filterRows(
   params: Record<string, unknown>,
   rowCount: number,
 ): number[] {
-  // Pre-filter: only alive vertices ('vertex_live': alive column, Lance: op column where 0=upsert)
+  // Pre-filter: only alive vertices ('vertexLive': alive column, Lance: op column where 0=upsert)
   const aliveCol = table.getChild("alive");
   const opCol = !aliveCol ? table.getChild("op") : null; // Lance schema fallback
 
@@ -205,7 +205,7 @@ function evalWhere(
       return left === right;
     }
 
-    case "starts_with": {
+    case "startsWith": {
       const left = resolveValue(table, row, alias, clause.left, params);
       const right = resolveExpr(table, row, alias, clause.right, params);
       if (typeof left !== "string" || typeof right !== "string") return false;
@@ -225,7 +225,7 @@ function evalWhere(
   }
 }
 
-// Cache parsed props_json per table+row to avoid re-parsing
+// Cache parsed propsJson per table+row to avoid re-parsing
 const _propsCache = new WeakMap<Table, Map<number, Record<string, unknown>>>();
 
 function getProps(table: Table, row: number): Record<string, unknown> {
@@ -237,7 +237,7 @@ function getProps(table: Table, row: number): Record<string, unknown> {
   let cached = tableCache.get(row);
   if (cached) return cached;
 
-  const propsCol = table.getChild("props_json");
+  const propsCol = table.getChild("propsJson");
   if (!propsCol) return {};
   const raw = propsCol.get(row);
   if (!raw || typeof raw !== "string") return {};
@@ -250,13 +250,13 @@ function getProps(table: Table, row: number): Record<string, unknown> {
   }
 }
 
-// Lance schema → vertex_live field aliases
+// Lance schema → vertexLive field aliases
 const LANCE_FIELD_ALIASES: Record<string, string> = {
-  rkey: "pk_value",
-  repo: "repo",              // props_json fallback
-  collection: "collection",  // props_json fallback
-  'valueB64': "valueB64",   // props_json fallback
-  'updatedAt': "timestamp_ms",
+  rkey: "pkValue",
+  repo: "repo",              // propsJson fallback
+  collection: "collection",  // propsJson fallback
+  'valueB64': "valueB64",   // propsJson fallback
+  'updatedAt': "timestampMs",
 };
 
 function resolveValue(
@@ -270,13 +270,13 @@ function resolveValue(
   // 1. Try direct column first
   const col = table.getChild(prop.field);
   if (col) return col.get(row);
-  // 2. Try Lance field alias (e.g. rkey → pk_value)
+  // 2. Try Lance field alias (e.g. rkey → pkValue)
   const aliasField = LANCE_FIELD_ALIASES[prop.field];
   if (aliasField) {
     const aliasCol = table.getChild(aliasField);
     if (aliasCol) return aliasCol.get(row);
   }
-  // 3. Fallback: look inside props_json (Lance schema has flattened props here)
+  // 3. Fallback: look inside propsJson (Lance schema has flattened props here)
   const props = getProps(table, row);
   return props[prop.field];
 }

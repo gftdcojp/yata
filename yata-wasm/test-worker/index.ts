@@ -1,5 +1,5 @@
 import wasmModule from "../lance-fork/pkg/yata_wasm_bg.wasm";
-import { initSync, probe, encode_vertex_lance, read_lance_footer } from "../lance-fork/pkg/yata_wasm.js";
+import { initSync, probe, encodeVertexLance, readLanceFooter } from "../lance-fork/pkg/yata_wasm.js";
 
 export default {
   async fetch(request: Request): Promise<Response> {
@@ -13,7 +13,7 @@ export default {
 
     if (url.pathname === "/encode") {
       try {
-        const lanceBytes = encode_vertex_lance(
+        const lanceBytes = encodeVertexLance(
           ["Post", "Post", "Profile"],
           ["rkey1", "rkey2", "rkey3"],
           ["did:web:alice", "did:web:bob", "did:web:carol"],
@@ -22,13 +22,13 @@ export default {
         );
 
         // Read back the footer to verify it's a valid Lance file
-        const footer = JSON.parse(read_lance_footer(lanceBytes));
+        const footer = JSON.parse(readLanceFooter(lanceBytes));
 
         return Response.json({
           ok: true,
-          'lance_file_bytes': lanceBytes.length,
+          'lanceFileBytes': lanceBytes.length,
           footer,
-          'has_magic': true,
+          'hasMagic': true,
         });
       } catch (e: any) {
         return Response.json({ error: e.message || String(e) }, { status: 500 });

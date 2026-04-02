@@ -13,31 +13,31 @@ import {
 } from "apache-arrow";
 
 export const VERTEX_SCHEMA = new Schema([
-  new Field("partition_id", new Uint32(), false),
+  new Field("partitionId", new Uint32(), false),
   new Field("label", new Utf8(), false),
-  new Field("pk_key", new Utf8(), false),
-  new Field("pk_value", new Utf8(), false),
+  new Field("pkKey", new Utf8(), false),
+  new Field("pkValue", new Utf8(), false),
   new Field("vid", new Utf8(), false),
   new Field("alive", new Bool(), false),
-  new Field("latest_seq", new Uint64(), false),
+  new Field("latestSeq", new Uint64(), false),
   new Field("repo", new Utf8(), true),
   new Field("rkey", new Utf8(), true),
-  new Field("updated_at_ms", new Uint64(), false),
-  new Field("props_json", new Utf8(), true),
+  new Field("updatedAtMs", new Uint64(), false),
+  new Field("propsJson", new Utf8(), true),
 ]);
 
 export const EDGE_SCHEMA = new Schema([
-  new Field("partition_id", new Uint32(), false),
-  new Field("edge_label", new Utf8(), false),
-  new Field("pk_key", new Utf8(), false),
-  new Field("pk_value", new Utf8(), false),
+  new Field("partitionId", new Uint32(), false),
+  new Field("edgeLabel", new Utf8(), false),
+  new Field("pkKey", new Utf8(), false),
+  new Field("pkValue", new Utf8(), false),
   new Field("eid", new Utf8(), false),
-  new Field("src_vid", new Utf8(), false),
-  new Field("dst_vid", new Utf8(), false),
+  new Field("srcVid", new Utf8(), false),
+  new Field("dstVid", new Utf8(), false),
   new Field("alive", new Bool(), false),
-  new Field("latest_seq", new Uint64(), false),
-  new Field("updated_at_ms", new Uint64(), false),
-  new Field("props_json", new Utf8(), true),
+  new Field("latestSeq", new Uint64(), false),
+  new Field("updatedAtMs", new Uint64(), false),
+  new Field("propsJson", new Utf8(), true),
 ]);
 
 function buildTable(schema: Schema, columns: Record<string, unknown[]>): Table {
@@ -56,35 +56,35 @@ function buildTable(schema: Schema, columns: Record<string, unknown[]>): Table {
 
 export function makeVertexTable(rows: Record<string, unknown>[]): Table {
   return buildTable(VERTEX_SCHEMA, {
-    'partition_id': rows.map(() => 0),
+    'partitionId': rows.map(() => 0),
     label: rows.map(r => String(r.label ?? "")),
-    'pk_key': rows.map(r => String(r.pk_key ?? "rkey")),
-    'pk_value': rows.map(r => String(r.pk_value ?? "")),
+    'pkKey': rows.map(r => String(r.pkKey ?? "rkey")),
+    'pkValue': rows.map(r => String(r.pkValue ?? "")),
     vid: rows.map(r => String(r.vid ?? "")),
     alive: rows.map(r => r.alive !== false),
-    'latest_seq': rows.map(r => BigInt(r.latest_seq ?? 0)),
+    'latestSeq': rows.map(r => BigInt(r.latestSeq ?? 0)),
     repo: rows.map(r => String(r.repo ?? "")),
     rkey: rows.map(r => String(r.rkey ?? "")),
-    'updated_at_ms': rows.map(r => BigInt(r.updated_at_ms ?? 0)),
-    'props_json': rows.map(r => String(r.props_json ?? "{}")),
+    'updatedAtMs': rows.map(r => BigInt(r.updatedAtMs ?? 0)),
+    'propsJson': rows.map(r => String(r.propsJson ?? "{}")),
   });
 }
 
 export function makeEdgeTable(
-  rows: { 'src_vid': string; 'dst_vid': string; alive?: boolean }[],
+  rows: { 'srcVid': string; 'dstVid': string; alive?: boolean }[],
 ): Table {
   return buildTable(EDGE_SCHEMA, {
-    'partition_id': rows.map(() => 0),
-    'edge_label': rows.map(() => "FOLLOW"),
-    'pk_key': rows.map((_, i) => `pk_${i}`),
-    'pk_value': rows.map((_, i) => `pv_${i}`),
+    'partitionId': rows.map(() => 0),
+    'edgeLabel': rows.map(() => "FOLLOW"),
+    'pkKey': rows.map((_, i) => `pk_${i}`),
+    'pkValue': rows.map((_, i) => `pv_${i}`),
     eid: rows.map((_, i) => `e_${i}`),
-    'src_vid': rows.map(r => r.src_vid),
-    'dst_vid': rows.map(r => r.dst_vid),
+    'srcVid': rows.map(r => r.srcVid),
+    'dstVid': rows.map(r => r.dstVid),
     alive: rows.map(r => r.alive !== false),
-    'latest_seq': rows.map(() => 1n),
-    'updated_at_ms': rows.map(() => 1000n),
-    'props_json': rows.map(() => "{}"),
+    'latestSeq': rows.map(() => 1n),
+    'updatedAtMs': rows.map(() => 1000n),
+    'propsJson': rows.map(() => "{}"),
   });
 }
 

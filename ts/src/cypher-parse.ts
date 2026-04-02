@@ -39,7 +39,7 @@ export interface WhereEq {
 }
 
 export interface WhereStartsWith {
-  op: "starts_with";
+  op: "startsWith";
   left: PropRef;
   right: Expr;
 }
@@ -258,7 +258,7 @@ function parseAtom(s: string, cypher: string): WhereClause {
   if (swIdx >= 0) {
     const left = parsePropRef(trimmed.slice(0, swIdx).trim(), cypher);
     const right = parseExpr(trimmed.slice(swIdx + 13).trim(), cypher);
-    return { op: "starts_with", left, right };
+    return { op: "startsWith", left, right };
   }
 
   // IN [...]

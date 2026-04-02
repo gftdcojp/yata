@@ -91,7 +91,7 @@ describe("cypher-parse", () => {
         "MATCH (r:Post) WHERE r.repo STARTS WITH $p0 RETURN r LIMIT 10",
       );
       expect(ast.where).toEqual({
-        op: "starts_with",
+        op: "startsWith",
         left: { kind: "prop", alias: "r", field: "repo" },
         right: { kind: "param", name: "p0" },
       });

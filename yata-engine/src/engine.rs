@@ -614,29 +614,30 @@ impl TieredGraphEngine {
         &self,
         plan: &yata_gie::ir::QueryPlan,
         initial_src_vids: &[String],
-    ) -> Result<(Vec<String>, Vec<String>), String> {
+    ) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
         let Some(yata_gie::ir::LogicalOp::PathExpand {
             edge_label,
             max_hops,
             direction,
             ..
         }) = plan.ops.iter().find(|op| matches!(op, yata_gie::ir::LogicalOp::PathExpand { .. })) else {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
         };
         if initial_src_vids.is_empty() || initial_src_vids.len() > PATH_EXPAND_FRONTIER_LIMIT || *max_hops <= 1 {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
         }
 
         let lance_edge_tbl = self.lance_edge_table.clone();
         self.block_on(async {
             let tbl_guard = lance_edge_tbl.lock().await;
             let Some(tbl) = tbl_guard.as_ref() else {
-                return Ok((Vec::new(), Vec::new()));
+                return Ok((Vec::new(), Vec::new(), Vec::new()));
             };
 
             let mut frontier: Vec<String> = initial_src_vids.to_vec();
             let mut scanned_src_vids = Vec::new();
             let mut scanned_dst_vids = Vec::new();
+            let mut touched_vids = initial_src_vids.to_vec();
 
             for _hop in 0..*max_hops {
                 if frontier.is_empty() || frontier.len() > PATH_EXPAND_FRONTIER_LIMIT {
@@ -687,11 +688,15 @@ impl TieredGraphEngine {
                         match direction {
                             yata_grin::Direction::Out => {
                                 scanned_src_vids.push(src_vid_col.value(row).to_string());
-                                next_frontier.push(dst_vid_col.value(row).to_string());
+                                let dst = dst_vid_col.value(row).to_string();
+                                touched_vids.push(dst.clone());
+                                next_frontier.push(dst);
                             }
                             yata_grin::Direction::In => {
                                 scanned_dst_vids.push(dst_vid_col.value(row).to_string());
-                                next_frontier.push(src_vid_col.value(row).to_string());
+                                let src = src_vid_col.value(row).to_string();
+                                touched_vids.push(src.clone());
+                                next_frontier.push(src);
                             }
                             yata_grin::Direction::Both => {}
                         }
@@ -706,7 +711,9 @@ impl TieredGraphEngine {
             scanned_src_vids.dedup();
             scanned_dst_vids.sort();
             scanned_dst_vids.dedup();
-            Ok((scanned_src_vids, scanned_dst_vids))
+            touched_vids.sort();
+            touched_vids.dedup();
+            Ok((scanned_src_vids, scanned_dst_vids, touched_vids))
         })
     }
 
@@ -744,7 +751,7 @@ impl TieredGraphEngine {
     /// Build an ArrowStore from LanceDB (zero-copy, lazy props).
     /// Label pushdown: only scans fragments matching requested labels.
     fn build_read_store(&self, labels: &[&str]) -> Result<yata_lance::ArrowStore, String> {
-        self.build_read_store_pushdown(labels, &[], &[], &[], &[], &[], &[], None)
+        self.build_read_store_pushdown(labels, &[], &[], &[], &[], &[], &[], &[], None)
     }
 
     /// Build ArrowStore with full pushdown: label filter + WHERE conditions + LIMIT.
@@ -757,6 +764,7 @@ impl TieredGraphEngine {
         edge_labels: &[&str],
         edge_src_labels: &[&str],
         edge_dst_labels: &[&str],
+        vertex_pk_values: &[String],
         edge_src_vids: &[String],
         edge_dst_vids: &[String],
         lance_filters: &[String],
@@ -784,6 +792,14 @@ impl TieredGraphEngine {
                         filter_parts.push(format!("label = {}", label_exprs[0]));
                     } else {
                         filter_parts.push(format!("label IN ({})", label_exprs.join(", ")));
+                    }
+                }
+                if !vertex_pk_values.is_empty() {
+                    let pk_exprs: Vec<String> = vertex_pk_values.iter().map(|v| sql_quote(v)).collect();
+                    if pk_exprs.len() == 1 {
+                        filter_parts.push(format!("pk_value = {}", pk_exprs[0]));
+                    } else {
+                        filter_parts.push(format!("pk_value IN ({})", pk_exprs.join(", ")));
                     }
                 }
                 for f in &filters_owned {
@@ -1096,8 +1112,9 @@ impl TieredGraphEngine {
                     });
                     let mut effective_edge_src_labels = edge_src_labels.clone();
                     let mut effective_edge_dst_labels = edge_dst_labels.clone();
+                    let mut vertex_pk_candidates: Vec<String> = Vec::new();
                     if let Some(max_hops) = path_expand_meta.filter(|h| *h > 1) {
-                        let (path_src_vids, path_dst_vids) = self
+                        let (path_src_vids, path_dst_vids, path_vertex_vids) = self
                             .collect_path_expand_frontier_vids(&plan, &src_vid_candidates)
                             .unwrap_or_default();
                         if !path_src_vids.is_empty() {
@@ -1110,6 +1127,7 @@ impl TieredGraphEngine {
                         effective_edge_src_labels.clear();
                         effective_edge_dst_labels.clear();
                         dst_vid_candidates.clear();
+                        vertex_pk_candidates = path_vertex_vids;
                         let _ = max_hops;
                     }
                     let vertex_lance_filters: Vec<String> = if rel_refs.is_empty() {
@@ -1123,6 +1141,7 @@ impl TieredGraphEngine {
                         &rel_refs,
                         &effective_edge_src_labels.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
                         &effective_edge_dst_labels.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                        &vertex_pk_candidates,
                         &src_vid_candidates,
                         &dst_vid_candidates,
                         &vertex_lance_filters,
@@ -2734,8 +2753,7 @@ mod tests {
     fn test_persist_cypher_variable_hop_with_destination_where() {
         let dir = tempfile::tempdir().unwrap();
         let e = make_engine(&dir);
-        run_query(&e, "CREATE (a:User {name: 'Alice'})-[r:FOLLOWS]->(b:User {name: 'Bob'})", &[], None).unwrap();
-        run_query(&e, "CREATE (a:User {name: 'Bob'})-[r:FOLLOWS]->(b:User {name: 'Carol'})", &[], None).unwrap();
+        run_query(&e, "CREATE (a:User {name: 'Alice'})-[:FOLLOWS]->(b:User {name: 'Bob'})-[:FOLLOWS]->(c:User {name: 'Carol'})", &[], None).unwrap();
         run_query(&e, "CREATE (a:User {name: 'Dave'})-[r:FOLLOWS]->(b:User {name: 'Eve'})", &[], None).unwrap();
 
         let rows = run_query(

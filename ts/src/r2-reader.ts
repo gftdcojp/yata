@@ -16,22 +16,22 @@ import type { R2BucketLike } from "./manifest.js";
 
 export interface LabelSegmentState {
   key: string;
-  'max_seq': number;
-  'entry_count': number;
-  'segment_bytes': number;
+  'maxSeq': number;
+  'entryCount': number;
+  'segmentBytes': number;
   blake3_hex: string;
 }
 
 export interface CompactionManifest {
-  'partition_id': number;
+  'partitionId': number;
   version: number;
-  'compacted_segment_key': string;
-  'compacted_seq': number;
-  'entry_count': number;
+  'compactedSegmentKey': string;
+  'compactedSeq': number;
+  'entryCount': number;
   labels: string[];
-  'created_at_ms': number;
-  'segment_bytes': number;
-  'label_segments': Record<string, LabelSegmentState>;
+  'createdAtMs': number;
+  'segmentBytes': number;
+  'labelSegments': Record<string, LabelSegmentState>;
 }
 
 // ── R2 Fragment Store ──
@@ -115,19 +115,19 @@ export async function loadLabels(
 ): Promise<Map<string, LabelData>> {
   const result = new Map<string, LabelData>();
 
-  if (manifest.version < 2 || !manifest.label_segments) {
+  if (manifest.version < 2 || !manifest.labelSegments) {
     // v1 monolithic — not supported in Workers read path (too large)
     return result;
   }
 
   const fetches = labels
-    .filter(label => label in manifest.label_segments)
+    .filter(label => label in manifest.labelSegments)
     .map(async (label) => {
-      const seg = manifest.label_segments[label];
+      const seg = manifest.labelSegments[label];
       const buf = await store.getFragment(seg.key);
       if (!buf) return null;
       const table = tableFromIPC(new Uint8Array(buf));
-      return { label, table, entryCount: seg.entry_count } as LabelData;
+      return { label, table, entryCount: seg.entryCount } as LabelData;
     });
 
   const results = await Promise.all(fetches);
