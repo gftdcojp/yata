@@ -638,6 +638,11 @@ pub struct ArrowStore {
     vertex_labels: Vec<String>,
     known_labels: Vec<String>,
     pk_keys: HashMap<String, String>,
+    edge_props: Vec<HashMap<String, PropValue>>,
+    edge_labels: Vec<String>,
+    known_edge_labels: Vec<String>,
+    out_adj: Vec<Vec<Neighbor>>,
+    in_adj: Vec<Vec<Neighbor>>,
     /// Lazy props cache: vid → parsed props
     props_cache: std::sync::Mutex<HashMap<u32, HashMap<String, PropValue>>>,
 }

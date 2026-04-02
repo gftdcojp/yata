@@ -219,7 +219,7 @@ fn build_edge_lance_batch(
     // Edge overflow: all non-structural props
     let overflow: serde_json::Map<String, serde_json::Value> = props
         .iter()
-        .filter(|(k, _)| !["app_id", "_app_id", "_src", "_dst"].contains(k))
+        .filter(|(k, _)| !["app_id", "_app_id", "_src", "_dst", "_src_label", "_dst_label"].contains(k))
         .map(|(k, v)| (k.to_string(), prop_to_json(v)))
         .collect();
     let val_json = if overflow.is_empty() {
@@ -314,7 +314,7 @@ impl TieredGraphEngine {
     /// Build an ArrowStore from LanceDB (zero-copy, lazy props).
     /// Label pushdown: only scans fragments matching requested labels.
     fn build_read_store(&self, labels: &[&str]) -> Result<yata_lance::ArrowStore, String> {
-        self.build_read_store_pushdown(labels, &[], None)
+        self.build_read_store_pushdown(labels, &[], &[], None)
     }
 
     /// Build ArrowStore with full pushdown: label filter + WHERE conditions + LIMIT.
@@ -324,43 +324,76 @@ impl TieredGraphEngine {
     fn build_read_store_pushdown(
         &self,
         labels: &[&str],
+        edge_labels: &[&str],
         lance_filters: &[String],
         limit: Option<usize>,
     ) -> Result<yata_lance::ArrowStore, String> {
         let lance_tbl = self.lance_table.clone();
+        let lance_edge_tbl = self.lance_edge_table.clone();
         let filters_owned: Vec<String> = lance_filters.to_vec();
+        let edge_labels_owned: Vec<String> = edge_labels.iter().map(|s| (*s).to_string()).collect();
         self.block_on(async {
-            let tbl_guard = lance_tbl.lock().await;
-            let tbl = match tbl_guard.as_ref() {
-                Some(t) => t,
-                None => return yata_lance::ArrowStore::from_batches(Vec::new()),
-            };
+            let vertex_batches = {
+                let tbl_guard = lance_tbl.lock().await;
+                let tbl = match tbl_guard.as_ref() {
+                    Some(t) => t,
+                    None => return yata_lance::ArrowStore::from_batches(Vec::new()),
+                };
 
-            // Build combined filter: label IN (...) AND extra conditions
-            let mut filter_parts = Vec::new();
-            if !labels.is_empty() {
-                let label_exprs: Vec<String> = labels.iter()
-                    .map(|l| format!("'{}'", l.replace('\'', "''")))
-                    .collect();
-                if label_exprs.len() == 1 {
-                    filter_parts.push(format!("label = {}", label_exprs[0]));
-                } else {
-                    filter_parts.push(format!("label IN ({})", label_exprs.join(", ")));
+                // Build combined filter: label IN (...) AND extra conditions
+                let mut filter_parts = Vec::new();
+                if !labels.is_empty() {
+                    let label_exprs: Vec<String> = labels.iter()
+                        .map(|l| format!("'{}'", l.replace('\'', "''")))
+                        .collect();
+                    if label_exprs.len() == 1 {
+                        filter_parts.push(format!("label = {}", label_exprs[0]));
+                    } else {
+                        filter_parts.push(format!("label IN ({})", label_exprs.join(", ")));
+                    }
                 }
-            }
-            for f in &filters_owned {
-                filter_parts.push(f.clone());
-            }
+                for f in &filters_owned {
+                    filter_parts.push(f.clone());
+                }
 
-            let combined_filter = filter_parts.join(" AND ");
-            let batches = if combined_filter.is_empty() && limit.is_none() {
-                tbl.scan_all().await.map_err(|e| format!("LanceDB scan: {e}"))?
-            } else {
-                tbl.scan_filter_limit(&combined_filter, limit, None)
-                    .await.map_err(|e| format!("LanceDB scan: {e}"))?
+                let combined_filter = filter_parts.join(" AND ");
+                if combined_filter.is_empty() && limit.is_none() {
+                    tbl.scan_all().await.map_err(|e| format!("LanceDB scan: {e}"))?
+                } else {
+                    tbl.scan_filter_limit(&combined_filter, limit, None)
+                        .await.map_err(|e| format!("LanceDB scan: {e}"))?
+                }
             };
-            yata_lance::ArrowStore::from_batches_with_spill(
-                batches,
+
+            let edge_batches = {
+                let tbl_guard = lance_edge_tbl.lock().await;
+                match tbl_guard.as_ref() {
+                    Some(tbl) => {
+                        let mut edge_filter_parts = Vec::new();
+                        if !edge_labels_owned.is_empty() {
+                            let label_exprs: Vec<String> = edge_labels_owned.iter()
+                                .map(|l| format!("'{}'", l.replace('\'', "''")))
+                                .collect();
+                            if label_exprs.len() == 1 {
+                                edge_filter_parts.push(format!("edge_label = {}", label_exprs[0]));
+                            } else {
+                                edge_filter_parts.push(format!("edge_label IN ({})", label_exprs.join(", ")));
+                            }
+                        }
+                        let combined_filter = edge_filter_parts.join(" AND ");
+                        if combined_filter.is_empty() {
+                            tbl.scan_all().await.map_err(|e| format!("LanceDB edge scan: {e}"))?
+                        } else {
+                            tbl.scan_filter_limit(&combined_filter, None, None)
+                                .await.map_err(|e| format!("LanceDB edge scan: {e}"))?
+                        }
+                    }
+                    None => Vec::new(),
+                }
+            };
+            yata_lance::ArrowStore::from_vertex_edge_batches_with_spill(
+                vertex_batches,
+                edge_batches,
                 self.config.arrowstore_budget_mb * 1024 * 1024,
                 &self.config.vineyard_dir,
             )
@@ -567,6 +600,7 @@ impl TieredGraphEngine {
             // Extract full pushdown hints: labels, WHERE conditions, LIMIT
             let hints = crate::hints::QueryHints::extract(cypher);
             let vl_refs: Vec<&str> = hints.node_labels.iter().map(|s| s.as_str()).collect();
+            let rel_refs: Vec<&str> = hints.rel_types.iter().map(|s| s.as_str()).collect();
 
             // GIE path: Cypher → IR Plan → execute directly on the read store.
             // Design E: SecurityScope is compiled from policy vertices via query_with_did().
@@ -578,6 +612,7 @@ impl TieredGraphEngine {
                     // Use enhanced pushdown: label + WHERE + LIMIT pushed to Lance
                     let read_store = self.build_read_store_pushdown(
                         &vl_refs,
+                        &rel_refs,
                         &hints.lance_filters,
                         hints.limit,
                     )?;
@@ -623,7 +658,8 @@ impl TieredGraphEngine {
                 yata_cypher::Clause::Create { patterns } => {
                     for pattern in patterns {
                         let mut prev_node_id: Option<String> = None;
-                        let mut pending_rel: Option<(String, String, Vec<(String, yata_grin::PropValue)>)> = None; // (src, rel_type, props)
+                        let mut prev_node_label: Option<String> = None;
+                        let mut pending_rel: Option<(String, String, String, Vec<(String, yata_grin::PropValue)>)> = None; // (src_id, src_label, rel_type, props)
 
                         for elem in &pattern.elements {
                             match elem {
@@ -640,21 +676,25 @@ impl TieredGraphEngine {
                                     }
 
                                     // Complete pending relationship
-                                    if let Some((src, rel_type, eprops)) = pending_rel.take() {
+                                    if let Some((src, src_label, rel_type, eprops)) = pending_rel.take() {
                                         let mut full_props = eprops;
                                         full_props.push(("_src".into(), yata_grin::PropValue::Str(src)));
                                         full_props.push(("_dst".into(), yata_grin::PropValue::Str(node_id.clone())));
+                                        full_props.push(("_src_label".into(), yata_grin::PropValue::Str(src_label)));
+                                        full_props.push(("_dst_label".into(), yata_grin::PropValue::Str(label.to_string())));
                                         let edge_id = generate_edge_id();
                                         let props_ref: Vec<(&str, yata_grin::PropValue)> = full_props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
                                         self.merge_record(&rel_type, "eid", &edge_id, &props_ref)?;
                                     }
 
                                     prev_node_id = Some(node_id);
+                                    prev_node_label = Some(label.to_string());
                                 }
                                 yata_cypher::PatternElement::Rel(rp) => {
                                     let rel_type = rp.types.first().cloned().unwrap_or_else(|| "RELATED".into());
                                     let eprops = self.resolve_pattern_props(&rp.props, &param_map)?;
-                                    pending_rel = Some((prev_node_id.clone().unwrap_or_default(), rel_type, eprops));
+                                    let src_label = prev_node_label.clone().unwrap_or_else(|| "_default".to_string());
+                                    pending_rel = Some((prev_node_id.clone().unwrap_or_default(), src_label, rel_type, eprops));
                                 }
                             }
                         }
@@ -968,7 +1008,9 @@ impl TieredGraphEngine {
         if pk_key == "eid" {
             let src = props.iter().find_map(|(k, v)| if *k == "_src" { if let PropValue::Str(s) = v { Some(s.as_str()) } else { None } } else { None }).unwrap_or("");
             let dst = props.iter().find_map(|(k, v)| if *k == "_dst" { if let PropValue::Str(s) = v { Some(s.as_str()) } else { None } } else { None }).unwrap_or("");
-            let batch = build_edge_lance_batch(0, label, pk_value, src, dst, None, None, props)?;
+            let src_label = props.iter().find_map(|(k, v)| if *k == "_src_label" { if let PropValue::Str(s) = v { Some(s.as_str()) } else { None } } else { None });
+            let dst_label = props.iter().find_map(|(k, v)| if *k == "_dst_label" { if let PropValue::Str(s) = v { Some(s.as_str()) } else { None } } else { None });
+            let batch = build_edge_lance_batch(0, label, pk_value, src, dst, src_label, dst_label, props)?;
             let lance_edge_tbl = self.lance_edge_table.clone();
             self.block_on(async {
                 let tbl_guard = lance_edge_tbl.lock().await;
@@ -2107,6 +2149,16 @@ mod tests {
         let names = get_col(&rows, "name");
         assert!(names.iter().any(|n| n.contains("Alice")), "Alice must be in results");
         assert!(names.iter().any(|n| n.contains("Bob")), "Bob must be in results");
+
+        let traverse_rows = run_query(
+            &e,
+            "MATCH (a:User {name: 'Alice'})-[:FOLLOWS]->(b:User) RETURN b.name AS name LIMIT 10",
+            &[],
+            None,
+        ).unwrap();
+        assert_eq!(traverse_rows.len(), 1, "must traverse persisted edge");
+        let followed = get_col(&traverse_rows, "name");
+        assert!(followed.iter().any(|n| n.contains("Bob")), "Bob must be reachable over FOLLOWS");
     }
 
     #[test]
