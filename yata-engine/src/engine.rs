@@ -2734,6 +2734,7 @@ impl TieredGraphEngine {
         pk_value: &str,
         props: &[(&str, yata_grin::PropValue)],
     ) -> Result<u32, String> {
+        let started_at = std::time::Instant::now();
         self.merge_record_count.fetch_add(1, Ordering::Relaxed);
         self.invalidate_security_cache_if_policy(label, props);
         self.ensure_lance();
@@ -2754,6 +2755,17 @@ impl TieredGraphEngine {
             })?;
             self.invalidate_count_stats_cache();
             self.maybe_schedule_compaction();
+            let elapsed_ms = started_at.elapsed().as_millis() as u64;
+            tracing::info!(
+                op = "merge_record",
+                kind = "edge",
+                label,
+                pk_key,
+                pk_value,
+                props = props.len(),
+                elapsed_ms,
+                "Lance mutation complete"
+            );
             return Ok(0);
         }
 
@@ -2769,11 +2781,23 @@ impl TieredGraphEngine {
 
         self.invalidate_count_stats_cache();
         self.maybe_schedule_compaction();
+        let elapsed_ms = started_at.elapsed().as_millis() as u64;
+        tracing::info!(
+            op = "merge_record",
+            kind = "vertex",
+            label,
+            pk_key,
+            pk_value,
+            props = props.len(),
+            elapsed_ms,
+            "Lance mutation complete"
+        );
         Ok(0)
     }
 
     /// Delete a record (tombstone write to LanceDB). Returns false if record doesn't exist.
     pub fn delete_record(&self, label: &str, pk_key: &str, pk_value: &str) -> Result<bool, String> {
+        let started_at = std::time::Instant::now();
         self.ensure_lance();
         if pk_key == "eid" {
             let batch = build_edge_lance_batch(1, label, pk_value, "", "", None, None, &[])?;
@@ -2786,11 +2810,31 @@ impl TieredGraphEngine {
             })?;
             self.invalidate_count_stats_cache();
             self.maybe_schedule_compaction();
+            let elapsed_ms = started_at.elapsed().as_millis() as u64;
+            tracing::info!(
+                op = "delete_record",
+                kind = "edge",
+                label,
+                pk_key,
+                pk_value,
+                elapsed_ms,
+                "Lance tombstone write complete"
+            );
             return Ok(true);
         }
         let store = self.build_read_store(&[label])?;
         let exists = store.find_vertex_by_pk(label, pk_key, &yata_grin::PropValue::Str(pk_value.to_string())).is_some();
         if !exists {
+            let elapsed_ms = started_at.elapsed().as_millis() as u64;
+            tracing::info!(
+                op = "delete_record",
+                kind = "vertex",
+                label,
+                pk_key,
+                pk_value,
+                elapsed_ms,
+                "Lance tombstone skipped: record not found"
+            );
             return Ok(false);
         }
         let batch = build_lance_batch(1, label, pk_key, pk_value, &[])?;
@@ -2803,6 +2847,16 @@ impl TieredGraphEngine {
         })?;
         self.invalidate_count_stats_cache();
         self.maybe_schedule_compaction();
+        let elapsed_ms = started_at.elapsed().as_millis() as u64;
+        tracing::info!(
+            op = "delete_record",
+            kind = "vertex",
+            label,
+            pk_key,
+            pk_value,
+            elapsed_ms,
+            "Lance tombstone write complete"
+        );
         Ok(true)
     }
 
@@ -2832,6 +2886,7 @@ impl TieredGraphEngine {
 
     /// LanceDB compaction.
     pub fn trigger_compaction(&self) -> Result<CompactionResult, String> {
+        let started_at = std::time::Instant::now();
         self.ensure_lance();
         let lance_ds = self.lance_table.clone();
         let lance_edge_ds = self.lance_edge_table.clone();
@@ -2872,6 +2927,22 @@ impl TieredGraphEngine {
         });
 
         self.last_compaction_ms.store(now_ms(), Ordering::SeqCst);
+        match &result {
+            Ok(stats) => tracing::info!(
+                op = "trigger_compaction",
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                input_entries = stats.input_entries,
+                output_entries = stats.output_entries,
+                max_seq = stats.max_seq,
+                "Lance compaction finished"
+            ),
+            Err(error) => tracing::warn!(
+                op = "trigger_compaction",
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                error = %error,
+                "Lance compaction failed"
+            ),
+        }
         result
     }
 

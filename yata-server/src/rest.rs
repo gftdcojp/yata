@@ -14,6 +14,7 @@ use axum::{
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Trait abstracting the graph query interface needed by the REST API.
 pub trait GraphQueryExecutor: Send + Sync + 'static {
@@ -258,6 +259,7 @@ async fn xrpc_cypher<G: GraphQueryExecutor>(
     headers: HeaderMap,
     Json(req): Json<XrpcCypherReq>,
 ) -> impl IntoResponse {
+    let started_at = Instant::now();
     let auth = match authorize(&headers, &state) {
         Ok(a) => a,
         Err(_) => {
@@ -293,12 +295,18 @@ async fn xrpc_cypher<G: GraphQueryExecutor>(
 
     match result {
         Err(_) => {
+            tracing::warn!(
+                op = "xrpc_cypher",
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "query exceeded timeout"
+            );
             return (
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(serde_json::json!({"code":"timeout","message":"query exceeded 5s timeout"})),
             );
         }
         Ok(Ok(Ok(raw_rows))) => {
+            let row_count = raw_rows.len();
             let columns: Vec<String> = if let Some(first) = raw_rows.first() {
                 first.iter().map(|(col, _)| col.clone()).collect()
             } else {
@@ -315,6 +323,14 @@ async fn xrpc_cypher<G: GraphQueryExecutor>(
                         .collect()
                 })
                 .collect();
+            let elapsed_ms = started_at.elapsed().as_millis() as u64;
+            tracing::info!(
+                op = "xrpc_cypher",
+                elapsed_ms,
+                row_count,
+                columns = columns.len(),
+                "query completed"
+            );
 
             (
                 StatusCode::OK,
@@ -324,14 +340,30 @@ async fn xrpc_cypher<G: GraphQueryExecutor>(
                 })),
             )
         }
-        Ok(Ok(Err(e))) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"code":"internal","message":e})),
-        ),
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"code":"internal","message":e.to_string()})),
-        ),
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(
+                op = "xrpc_cypher",
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                error = %e,
+                "query failed"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"code":"internal","message":e})),
+            )
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                op = "xrpc_cypher",
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                error = %e,
+                "query task failed"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"code":"internal","message":e.to_string()})),
+            )
+        }
     }
 }
 
@@ -348,6 +380,7 @@ async fn xrpc_cypher_batch<G: GraphQueryExecutor>(
     headers: HeaderMap,
     Json(req): Json<XrpcCypherBatchReq>,
 ) -> impl IntoResponse {
+    let started_at = Instant::now();
     let auth = match authorize(&headers, &state) {
         Ok(a) => a,
         Err(_) => {
@@ -383,6 +416,12 @@ async fn xrpc_cypher_batch<G: GraphQueryExecutor>(
             Err(e) => serde_json::json!({"error": e}),
         }
     }).collect();
+    tracing::info!(
+        op = "xrpc_cypher_batch",
+        elapsed_ms = started_at.elapsed().as_millis() as u64,
+        statements = results.len(),
+        "batch query completed"
+    );
 
     (StatusCode::OK, Json(serde_json::json!({"results": results})))
 }
@@ -409,6 +448,7 @@ async fn cold_start_handler<G: GraphQueryExecutor>(
 async fn compact_handler<G: GraphQueryExecutor>(
     State(state): State<YataRestState<G>>,
 ) -> impl IntoResponse {
+    let started_at = Instant::now();
     if state.readonly {
         return (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"error": "read-only container"})));
     }
@@ -418,15 +458,48 @@ async fn compact_handler<G: GraphQueryExecutor>(
         tokio::task::spawn_blocking(move || graph.trigger_compaction())
     ).await;
     match result {
-        Err(_) => (StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({"error": "compaction exceeded 60s timeout"}))),
-        Ok(Ok(Ok(r))) => (StatusCode::OK, Json(serde_json::json!({
-            "input_entries": r.input_entries,
-            "output_entries": r.output_entries,
-            "compacted_seq": r.max_seq,
-            "labels": r.labels,
-        }))),
-        Ok(Ok(Err(e))) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+        Err(_) => {
+            tracing::warn!(
+                op = "compact_handler",
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "compaction exceeded timeout"
+            );
+            (StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({"error": "compaction exceeded 60s timeout"})))
+        }
+        Ok(Ok(Ok(r))) => {
+            tracing::info!(
+                op = "compact_handler",
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                input_entries = r.input_entries,
+                output_entries = r.output_entries,
+                compacted_seq = r.max_seq,
+                "compaction completed"
+            );
+            (StatusCode::OK, Json(serde_json::json!({
+                "input_entries": r.input_entries,
+                "output_entries": r.output_entries,
+                "compacted_seq": r.max_seq,
+                "labels": r.labels,
+            })))
+        }
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(
+                op = "compact_handler",
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                error = %e,
+                "compaction failed"
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e})))
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                op = "compact_handler",
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                error = %e,
+                "compaction task failed"
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})))
+        }
     }
 }
 
