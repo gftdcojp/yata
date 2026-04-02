@@ -14,6 +14,12 @@ pub struct TieredEngineConfig {
     pub hot_partition_id: PartitionId,
     pub partition_count: u32,
     pub blob_cache_budget_mb: u64,
+    /// Directory for ArrowStore spill files (IPC temp files).
+    /// Defaults to YATA_VINEYARD_DIR or `/tmp/yata-vineyard`.
+    pub vineyard_dir: String,
+    /// Max approximate bytes for ArrowStore in-memory batches before spilling to disk.
+    /// Defaults to YATA_ARROWSTORE_BUDGET_MB (128 MB).
+    pub arrowstore_budget_mb: u64,
 }
 
 impl Default for TieredEngineConfig {
@@ -50,6 +56,10 @@ impl Default for TieredEngineConfig {
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(1),
             blob_cache_budget_mb: std::env::var("YATA_VINEYARD_BUDGET_MB")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(256),
+            vineyard_dir: std::env::var("YATA_VINEYARD_DIR")
+                .unwrap_or_else(|_| "/tmp/yata-vineyard".to_string()),
+            arrowstore_budget_mb: std::env::var("YATA_ARROWSTORE_BUDGET_MB")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(128),
         }
     }
 }

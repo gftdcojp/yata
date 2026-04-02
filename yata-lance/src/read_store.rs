@@ -585,9 +585,53 @@ struct RowLoc {
     row: u32,
 }
 
+/// Batch storage: either in-memory Vec or spilled to disk IPC file.
+enum BatchStorage {
+    /// All batches held in RAM (default, fast path).
+    InMemory(Vec<RecordBatch>),
+    /// Batches spilled to a local Arrow IPC file; loaded on demand per batch index.
+    /// The file path and batch count are stored. Individual batches are read via
+    /// Arrow IPC FileReader seeking to the batch offset.
+    Spilled {
+        path: std::path::PathBuf,
+        batch_count: usize,
+        /// Cache of recently accessed batches (LRU-ish, small fixed size).
+        cache: std::sync::Mutex<HashMap<u16, RecordBatch>>,
+    },
+}
+
+impl BatchStorage {
+    /// Get a batch by index. For InMemory, this is O(1). For Spilled, reads from IPC file.
+    fn get(&self, idx: u16) -> Option<RecordBatch> {
+        match self {
+            BatchStorage::InMemory(batches) => batches.get(idx as usize).cloned(),
+            BatchStorage::Spilled { path, batch_count, cache, .. } => {
+                if idx as usize >= *batch_count { return None; }
+                // Check cache first
+                if let Some(batch) = cache.lock().unwrap().get(&idx) {
+                    return Some(batch.clone());
+                }
+                // Read from IPC file
+                let file = std::fs::File::open(path).ok()?;
+                let reader = arrow::ipc::reader::FileReader::try_new(file, None).ok()?;
+                let batch = reader.into_iter().nth(idx as usize)?.ok()?;
+                // Cache it (evict if cache too large)
+                let mut c = cache.lock().unwrap();
+                if c.len() >= 8 {
+                    // Evict oldest (simple: clear all)
+                    c.clear();
+                }
+                c.insert(idx, batch.clone());
+                Some(batch)
+            }
+        }
+    }
+
+}
+
 /// Zero-copy read store backed by Arrow RecordBatches from LanceDB.
 pub struct ArrowStore {
-    batches: Vec<RecordBatch>,
+    storage: BatchStorage,
     /// vid → row location (only alive, after PK dedup)
     rows: Vec<RowLoc>,
     label_index: HashMap<String, Vec<u32>>,
@@ -605,6 +649,92 @@ impl ArrowStore {
     /// and new 10-col Format D schema (op, label, pk_value, ts, repo, owner_did, name, app_id, rkey, val_json).
     /// Auto-detects schema by column count and first column type.
     pub fn from_batches(batches: Vec<RecordBatch>) -> Result<Self, String> {
+        let (rows, label_index, vertex_labels, known_labels, pk_keys) =
+            Self::build_dedup_index(&batches)?;
+
+        Ok(Self {
+            storage: BatchStorage::InMemory(batches),
+            rows,
+            label_index,
+            vertex_labels,
+            known_labels,
+            pk_keys,
+            props_cache: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Build from batches with disk spill when total size exceeds `budget_bytes`.
+    ///
+    /// If total batch size is within budget, behaves identically to `from_batches()`.
+    /// Otherwise, writes batches to a temporary Arrow IPC file in `spill_dir` and
+    /// reads them back on demand. The dedup index (small) stays in RAM.
+    pub fn from_batches_with_spill(
+        batches: Vec<RecordBatch>,
+        budget_bytes: u64,
+        spill_dir: &str,
+    ) -> Result<Self, String> {
+        // Estimate total batch size from Arrow buffer sizes
+        let total_bytes: u64 = batches.iter()
+            .map(|b| b.get_array_memory_size() as u64)
+            .sum();
+
+        // Build dedup index first (always in memory — small relative to data)
+        let (rows, label_index, vertex_labels, known_labels, pk_keys) =
+            Self::build_dedup_index(&batches)?;
+
+        let storage = if total_bytes <= budget_bytes || batches.is_empty() {
+            BatchStorage::InMemory(batches)
+        } else {
+            // Write to IPC file
+            std::fs::create_dir_all(spill_dir)
+                .map_err(|e| format!("create spill dir: {e}"))?;
+            let path = std::path::PathBuf::from(spill_dir)
+                .join(format!("arrowstore-{}.ipc", std::process::id()));
+            let file = std::fs::File::create(&path)
+                .map_err(|e| format!("create spill file: {e}"))?;
+            let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &schema)
+                .map_err(|e| format!("IPC writer: {e}"))?;
+            let batch_count = batches.len();
+            for batch in &batches {
+                writer.write(batch).map_err(|e| format!("IPC write: {e}"))?;
+            }
+            writer.finish().map_err(|e| format!("IPC finish: {e}"))?;
+            drop(batches); // Free RAM
+            tracing::info!(
+                total_mb = total_bytes / (1024 * 1024),
+                batch_count,
+                path = %path.display(),
+                "ArrowStore spilled to disk"
+            );
+            BatchStorage::Spilled {
+                path,
+                batch_count,
+                schema,
+                cache: std::sync::Mutex::new(HashMap::new()),
+            }
+        };
+
+        Ok(Self {
+            storage,
+            rows,
+            label_index,
+            vertex_labels,
+            known_labels,
+            pk_keys,
+            props_cache: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Build dedup index from batches (shared between from_batches and from_batches_with_spill).
+    fn build_dedup_index(
+        batches: &[RecordBatch],
+    ) -> Result<(
+        Vec<RowLoc>,
+        HashMap<String, Vec<u32>>,
+        Vec<String>,
+        Vec<String>,
+        HashMap<String, String>,
+    ), String> {
         let mut dedup: HashMap<(String, String), (u16, u32, bool)> = HashMap::new();
         for (bi, batch) in batches.iter().enumerate() {
             if batch.num_columns() < 3 { continue; }
@@ -613,9 +743,9 @@ impl ArrowStore {
             let is_format_d = batch.schema().field(0).data_type() == &arrow::datatypes::DataType::UInt8;
 
             let (op_idx, label_idx, pk_val_idx) = if is_format_d {
-                (0usize, 1usize, 2usize) // Format D: op=0, label=1, pk_value=2
+                (0usize, 1usize, 2usize)
             } else {
-                (1usize, 2usize, 4usize) // Legacy: seq=0, op=1, label=2, pk_key=3, pk_value=4
+                (1usize, 2usize, 4usize)
             };
 
             let op_col = batch.column(op_idx).as_any().downcast_ref::<UInt8Array>()
@@ -648,20 +778,17 @@ impl ArrowStore {
             pk_keys.entry(label.clone()).or_insert_with(|| "rkey".to_string());
         }
 
-        Ok(Self {
-            batches,
-            rows,
-            label_index,
-            vertex_labels,
-            known_labels,
-            pk_keys,
-            props_cache: std::sync::Mutex::new(HashMap::new()),
-        })
+        Ok((rows, label_index, vertex_labels, known_labels, pk_keys))
+    }
+
+    /// Get a batch from storage (in-memory or disk).
+    fn get_batch(&self, idx: u16) -> Option<RecordBatch> {
+        self.storage.get(idx)
     }
 
     fn col_str(&self, vid: u32, col_idx: usize) -> Option<String> {
         let loc = self.rows.get(vid as usize)?;
-        let batch = self.batches.get(loc.batch as usize)?;
+        let batch = self.get_batch(loc.batch)?;
         let col = batch.column(col_idx).as_any().downcast_ref::<StringArray>()?;
         Some(col.value(loc.row as usize).to_string())
     }
@@ -669,7 +796,7 @@ impl ArrowStore {
     fn ensure_props(&self, vid: u32) -> Option<()> {
         if self.props_cache.lock().unwrap().contains_key(&vid) { return Some(()); }
         let loc = self.rows.get(vid as usize)?;
-        let batch = self.batches.get(loc.batch as usize)?;
+        let batch = self.get_batch(loc.batch)?;
         // Format D: val_json at col 9. Legacy: props_json at col 6.
         let is_format_d = batch.schema().field(0).data_type() == &arrow::datatypes::DataType::UInt8;
         let json_col_idx = if is_format_d { 9 } else { 6 };
@@ -691,9 +818,9 @@ impl ArrowStore {
         self.label_index.get(label)?.iter().copied().find(|&vid| {
             // Detect schema to find pk_value column index
             let loc = match self.rows.get(vid as usize) { Some(l) => l, None => return false };
-            let batch = match self.batches.get(loc.batch as usize) { Some(b) => b, None => return false };
+            let batch = match self.get_batch(loc.batch) { Some(b) => b, None => return false };
             let is_format_d = batch.schema().field(0).data_type() == &arrow::datatypes::DataType::UInt8;
-            let pk_col = if is_format_d { 2 } else { 4 }; // Format D: pk_value=2, Legacy: pk_value=4
+            let pk_col = if is_format_d { 2 } else { 4 };
             self.col_str(vid, pk_col).as_deref() == Some(expected)
         })
     }
@@ -719,7 +846,7 @@ impl Property for ArrowStore {
     fn vertex_prop(&self, vid: u32, key: &str) -> Option<PropValue> {
         // Detect schema: Format D has op(UInt8) at col 0
         let loc = self.rows.get(vid as usize)?;
-        let batch = self.batches.get(loc.batch as usize)?;
+        let batch = self.get_batch(loc.batch)?;
         let is_format_d = batch.schema().field(0).data_type() == &arrow::datatypes::DataType::UInt8;
 
         if is_format_d {
@@ -772,6 +899,14 @@ impl Schema for ArrowStore {
     fn vertex_labels(&self) -> Vec<String> { self.known_labels.clone() }
     fn edge_labels(&self) -> Vec<String> { Vec::new() }
     fn vertex_primary_key(&self, label: &str) -> Option<String> { self.pk_keys.get(label).cloned() }
+}
+
+impl Drop for ArrowStore {
+    fn drop(&mut self) {
+        if let BatchStorage::Spilled { ref path, .. } = self.storage {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 impl Scannable for ArrowStore {

@@ -157,6 +157,32 @@ impl YataTable {
         Ok(batches)
     }
 
+    /// Scan with SQL filter, optional LIMIT, and optional column selection.
+    ///
+    /// Pushes filter + limit down to Lance row-group level, reducing I/O and memory.
+    /// `columns`: if non-empty, only these columns are read (projection pushdown).
+    pub async fn scan_filter_limit(
+        &self,
+        filter: &str,
+        limit: Option<usize>,
+        columns: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, lancedb::Error> {
+        let mut q = self.table.query();
+        if !filter.is_empty() {
+            q = q.only_if(filter);
+        }
+        if let Some(lim) = limit {
+            q = q.limit(lim);
+        }
+        if let Some(cols) = columns {
+            let col_vec: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
+            q = q.select(lancedb::query::Select::Columns(col_vec));
+        }
+        let stream = q.execute().await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        Ok(batches)
+    }
+
     /// Count rows, optionally with a filter.
     pub async fn count_rows(&self, filter: Option<&str>) -> Result<usize, lancedb::Error> {
         self.table.count_rows(filter.map(|s| s.to_string())).await

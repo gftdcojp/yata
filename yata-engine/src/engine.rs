@@ -314,25 +314,56 @@ impl TieredGraphEngine {
     /// Build an ArrowStore from LanceDB (zero-copy, lazy props).
     /// Label pushdown: only scans fragments matching requested labels.
     fn build_read_store(&self, labels: &[&str]) -> Result<yata_lance::ArrowStore, String> {
+        self.build_read_store_pushdown(labels, &[], None)
+    }
+
+    /// Build ArrowStore with full pushdown: label filter + WHERE conditions + LIMIT.
+    ///
+    /// `lance_filters`: additional SQL conditions on promoted columns (e.g., `timestamp_ms > 1000`).
+    /// `limit`: max rows to scan from Lance (reduces I/O for large tables).
+    fn build_read_store_pushdown(
+        &self,
+        labels: &[&str],
+        lance_filters: &[String],
+        limit: Option<usize>,
+    ) -> Result<yata_lance::ArrowStore, String> {
         let lance_tbl = self.lance_table.clone();
+        let filters_owned: Vec<String> = lance_filters.to_vec();
         self.block_on(async {
             let tbl_guard = lance_tbl.lock().await;
             let tbl = match tbl_guard.as_ref() {
                 Some(t) => t,
                 None => return yata_lance::ArrowStore::from_batches(Vec::new()),
             };
-            let batches = if labels.is_empty() {
+
+            // Build combined filter: label IN (...) AND extra conditions
+            let mut filter_parts = Vec::new();
+            if !labels.is_empty() {
+                let label_exprs: Vec<String> = labels.iter()
+                    .map(|l| format!("'{}'", l.replace('\'', "''")))
+                    .collect();
+                if label_exprs.len() == 1 {
+                    filter_parts.push(format!("label = {}", label_exprs[0]));
+                } else {
+                    filter_parts.push(format!("label IN ({})", label_exprs.join(", ")));
+                }
+            }
+            for f in &filters_owned {
+                filter_parts.push(f.clone());
+            }
+
+            let combined_filter = filter_parts.join(" AND ");
+            let batches = if combined_filter.is_empty() && limit.is_none() {
                 tbl.scan_all().await.map_err(|e| format!("LanceDB scan: {e}"))?
             } else {
-                let mut all = Vec::new();
-                for label in labels {
-                    let lb = tbl.scan_filter(&format!("label = '{}'", label.replace('\'', "''")))
-                        .await.map_err(|e| format!("LanceDB scan: {e}"))?;
-                    all.extend(lb);
-                }
-                all
+                tbl.scan_filter_limit(&combined_filter, limit, None)
+                    .await.map_err(|e| format!("LanceDB scan: {e}"))?
             };
-            yata_lance::ArrowStore::from_batches(batches)
+            yata_lance::ArrowStore::from_batches_with_spill(
+                batches,
+                self.config.arrowstore_budget_mb * 1024 * 1024,
+                &self.config.vineyard_dir,
+            )
         })
     }
 
@@ -533,10 +564,9 @@ impl TieredGraphEngine {
 
         if !is_mutation {
 
-            // Load only vertex labels referenced in Cypher (on demand from CAS)
-            let (hints_labels, _) =
-                router::extract_pushdown_hints(cypher).unwrap_or_default();
-            let vl_refs: Vec<&str> = hints_labels.iter().map(|s| s.as_str()).collect();
+            // Extract full pushdown hints: labels, WHERE conditions, LIMIT
+            let hints = crate::hints::QueryHints::extract(cypher);
+            let vl_refs: Vec<&str> = hints.node_labels.iter().map(|s| s.as_str()).collect();
 
             // GIE path: Cypher → IR Plan → execute directly on the read store.
             // Design E: SecurityScope is compiled from policy vertices via query_with_did().
@@ -545,8 +575,18 @@ impl TieredGraphEngine {
                 let plan_result = yata_gie::transpile::transpile(&ast);
 
                 if let Ok(plan) = plan_result {
-                    let read_store = self.build_read_store(&vl_refs)?;
-                    let records = yata_gie::executor::execute(&plan, &read_store);
+                    // Use enhanced pushdown: label + WHERE + LIMIT pushed to Lance
+                    let read_store = self.build_read_store_pushdown(
+                        &vl_refs,
+                        &hints.lance_filters,
+                        hints.limit,
+                    )?;
+                    // Use limit-aware executor for early termination
+                    let records = yata_gie::executor::execute_with_limit(
+                        &plan,
+                        &read_store,
+                        hints.limit,
+                    );
                     let rows = yata_gie::executor::result_to_rows(&records, &plan);
                     return Ok(rows);
                 }
