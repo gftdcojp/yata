@@ -906,6 +906,112 @@ impl TieredGraphEngine {
         Ok(yata_gie::executor::result_to_rows(&data, plan))
     }
 
+    fn execute_staged_expand(
+        &self,
+        plan: &yata_gie::ir::QueryPlan,
+        initial_store: &yata_lance::ArrowStore,
+        initial_records: Vec<yata_gie::executor::Record>,
+        expand_op: &yata_gie::ir::LogicalOp,
+        expand_idx: usize,
+        rel_refs: &[&str],
+        limit: Option<usize>,
+    ) -> Result<Vec<Vec<(String, String)>>, String> {
+        let yata_gie::ir::LogicalOp::Expand {
+            src_alias,
+            edge_label,
+            dst_alias,
+            direction,
+        } = expand_op else {
+            return Err("expected Expand op".into());
+        };
+
+        let mut staged_records = Vec::new();
+        let mut touched_vids = Vec::new();
+        let mut scanned_src_vids = Vec::new();
+        let mut scanned_dst_vids = Vec::new();
+
+        for record in initial_records {
+            let Some(&start_vid) = record.bindings.get(src_alias.as_str()) else {
+                continue;
+            };
+            let Some(PropValue::Str(start_pk)) = initial_store.vertex_prop(start_vid, "pk_value") else {
+                continue;
+            };
+            touched_vids.push(start_pk.clone());
+
+            let edges = self.scan_path_edges_for_frontier(edge_label, *direction, std::slice::from_ref(&start_pk))?;
+            for (src_pk, dst_pk) in edges {
+                let mut bindings = HashMap::new();
+                for (alias, &vid) in &record.bindings {
+                    if let Some(PropValue::Str(pk)) = initial_store.vertex_prop(vid, "pk_value") {
+                        bindings.insert(alias.clone(), pk);
+                    }
+                }
+                match direction {
+                    yata_grin::Direction::Out => {
+                        scanned_src_vids.push(src_pk.clone());
+                        touched_vids.push(dst_pk.clone());
+                        bindings.insert(dst_alias.clone(), dst_pk);
+                    }
+                    yata_grin::Direction::In => {
+                        scanned_dst_vids.push(dst_pk.clone());
+                        touched_vids.push(src_pk.clone());
+                        bindings.insert(dst_alias.clone(), src_pk);
+                    }
+                    yata_grin::Direction::Both => continue,
+                }
+                staged_records.push(StagedPathRecord {
+                    bindings,
+                    values: record.values.clone(),
+                });
+            }
+        }
+
+        touched_vids.sort();
+        touched_vids.dedup();
+        scanned_src_vids.sort();
+        scanned_src_vids.dedup();
+        scanned_dst_vids.sort();
+        scanned_dst_vids.dedup();
+
+        let final_store = self.build_read_store_pushdown(
+            &[],
+            rel_refs,
+            &[],
+            &[],
+            &touched_vids,
+            &scanned_src_vids,
+            &scanned_dst_vids,
+            &[],
+            limit,
+        )?;
+
+        let mut pk_to_vid = HashMap::new();
+        for vid in final_store.scan_all_vertices() {
+            if let Some(PropValue::Str(pk)) = final_store.vertex_prop(vid, "pk_value") {
+                pk_to_vid.insert(pk, vid);
+            }
+        }
+
+        let mut data: Vec<yata_gie::executor::Record> = staged_records
+            .into_iter()
+            .filter_map(|record| {
+                let mut bindings = HashMap::new();
+                for (alias, pk) in record.bindings {
+                    let vid = pk_to_vid.get(&pk).copied()?;
+                    bindings.insert(alias, vid);
+                }
+                Some(yata_gie::executor::Record { bindings, values: record.values })
+            })
+            .collect();
+
+        for op in plan.ops.iter().skip(expand_idx + 1) {
+            data = yata_gie::executor::execute_op(op, data, &final_store);
+        }
+
+        Ok(yata_gie::executor::result_to_rows(&data, plan))
+    }
+
     /// Create a new engine with Lance-backed persistence.
     pub fn new(config: TieredEngineConfig, data_dir: &str) -> Self {
         Self::build(config, data_dir)
@@ -1290,6 +1396,11 @@ impl TieredGraphEngine {
                 let (edge_src_labels, edge_dst_labels) = edge_endpoint_labels(&ast);
                 let mut src_vid_candidates = self.collect_src_vid_candidates(&ast, &param_map).unwrap_or_default();
                 let mut dst_vid_candidates = self.collect_dst_vid_candidates(&ast, &param_map).unwrap_or_default();
+                let vertex_lance_filters: Vec<String> = if rel_refs.is_empty() {
+                    hints.lance_filters.clone()
+                } else {
+                    Vec::new()
+                };
 
                 if let Ok(plan) = plan_result {
                     if let Some(path_idx) = plan.ops.iter().position(|op| matches!(op, yata_gie::ir::LogicalOp::PathExpand { .. })) {
@@ -1345,11 +1456,6 @@ impl TieredGraphEngine {
                         vertex_pk_candidates = path_vertex_vids;
                         let _ = max_hops;
                     }
-                    let vertex_lance_filters: Vec<String> = if rel_refs.is_empty() {
-                        hints.lance_filters.clone()
-                    } else {
-                        Vec::new()
-                    };
                     // Use enhanced pushdown: label + WHERE + LIMIT pushed to Lance
                     let read_store = self.build_read_store_pushdown(
                         &vl_refs,
