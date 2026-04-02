@@ -75,8 +75,8 @@ export interface R2BucketLike {
   ): Promise<unknown>;
 }
 
-export function makeManifestTableRef('table_name': string, uri: string): GraphManifestTableRef {
-  return { table_name, uri };
+export function makeManifestTableRef(tableName: string, uri: string): GraphManifestTableRef {
+  return { 'table_name': tableName, uri };
 }
 
 export function createGraphManifest(

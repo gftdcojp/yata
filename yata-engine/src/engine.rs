@@ -265,6 +265,7 @@ const EDGE_SRC_VID_PUSHDOWN_LIMIT: usize = 256;
 const EDGE_DST_VID_PUSHDOWN_LIMIT: usize = 256;
 const EDGE_SRC_SCAN_LIMIT: usize = 256;
 const EDGE_DST_SCAN_LIMIT: usize = 256;
+const PATH_EXPAND_FRONTIER_LIMIT: usize = 256;
 
 fn sql_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
@@ -607,6 +608,106 @@ impl TieredGraphEngine {
             ast,
             params,
         )
+    }
+
+    fn collect_path_expand_frontier_vids(
+        &self,
+        plan: &yata_gie::ir::QueryPlan,
+        initial_src_vids: &[String],
+    ) -> Result<(Vec<String>, Vec<String>), String> {
+        let Some(yata_gie::ir::LogicalOp::PathExpand {
+            edge_label,
+            max_hops,
+            direction,
+            ..
+        }) = plan.ops.iter().find(|op| matches!(op, yata_gie::ir::LogicalOp::PathExpand { .. })) else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        if initial_src_vids.is_empty() || initial_src_vids.len() > PATH_EXPAND_FRONTIER_LIMIT || *max_hops <= 1 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let lance_edge_tbl = self.lance_edge_table.clone();
+        self.block_on(async {
+            let tbl_guard = lance_edge_tbl.lock().await;
+            let Some(tbl) = tbl_guard.as_ref() else {
+                return Ok((Vec::new(), Vec::new()));
+            };
+
+            let mut frontier: Vec<String> = initial_src_vids.to_vec();
+            let mut scanned_src_vids = Vec::new();
+            let mut scanned_dst_vids = Vec::new();
+
+            for _hop in 0..*max_hops {
+                if frontier.is_empty() || frontier.len() > PATH_EXPAND_FRONTIER_LIMIT {
+                    break;
+                }
+                let frontier_exprs: Vec<String> = frontier.iter().map(|v| sql_quote(v)).collect();
+                let edge_label_filter = if edge_label.is_empty() {
+                    String::new()
+                } else {
+                    format!("edge_label = {}", sql_quote(edge_label))
+                };
+
+                let filter = match direction {
+                    yata_grin::Direction::Out => {
+                        if frontier_exprs.len() == 1 {
+                            format!("src_vid = {}", frontier_exprs[0])
+                        } else {
+                            format!("src_vid IN ({})", frontier_exprs.join(", "))
+                        }
+                    }
+                    yata_grin::Direction::In => {
+                        if frontier_exprs.len() == 1 {
+                            format!("dst_vid = {}", frontier_exprs[0])
+                        } else {
+                            format!("dst_vid IN ({})", frontier_exprs.join(", "))
+                        }
+                    }
+                    yata_grin::Direction::Both => break,
+                };
+                let combined_filter = if edge_label_filter.is_empty() {
+                    filter
+                } else {
+                    format!("{edge_label_filter} AND {filter}")
+                };
+
+                let batches = tbl
+                    .scan_filter_limit(&combined_filter, None, None)
+                    .await
+                    .map_err(|e| format!("LanceDB path frontier scan: {e}"))?;
+
+                let mut next_frontier = Vec::new();
+                for batch in batches {
+                    let src_vid_col = batch.column(3).as_any().downcast_ref::<arrow::array::StringArray>()
+                        .ok_or("edge column 3 (src_vid) is not Utf8")?;
+                    let dst_vid_col = batch.column(4).as_any().downcast_ref::<arrow::array::StringArray>()
+                        .ok_or("edge column 4 (dst_vid) is not Utf8")?;
+                    for row in 0..batch.num_rows() {
+                        match direction {
+                            yata_grin::Direction::Out => {
+                                scanned_src_vids.push(src_vid_col.value(row).to_string());
+                                next_frontier.push(dst_vid_col.value(row).to_string());
+                            }
+                            yata_grin::Direction::In => {
+                                scanned_dst_vids.push(dst_vid_col.value(row).to_string());
+                                next_frontier.push(src_vid_col.value(row).to_string());
+                            }
+                            yata_grin::Direction::Both => {}
+                        }
+                    }
+                }
+                next_frontier.sort();
+                next_frontier.dedup();
+                frontier = next_frontier;
+            }
+
+            scanned_src_vids.sort();
+            scanned_src_vids.dedup();
+            scanned_dst_vids.sort();
+            scanned_dst_vids.dedup();
+            Ok((scanned_src_vids, scanned_dst_vids))
+        })
     }
 
     /// Create a new engine with Lance-backed persistence.
@@ -982,10 +1083,35 @@ impl TieredGraphEngine {
             if let Ok(ast) = yata_cypher::parse(cypher) {
                 let plan_result = yata_gie::transpile::transpile(&ast);
                 let (edge_src_labels, edge_dst_labels) = edge_endpoint_labels(&ast);
-                let src_vid_candidates = self.collect_src_vid_candidates(&ast, &param_map).unwrap_or_default();
-                let dst_vid_candidates = self.collect_dst_vid_candidates(&ast, &param_map).unwrap_or_default();
+                let mut src_vid_candidates = self.collect_src_vid_candidates(&ast, &param_map).unwrap_or_default();
+                let mut dst_vid_candidates = self.collect_dst_vid_candidates(&ast, &param_map).unwrap_or_default();
 
                 if let Ok(plan) = plan_result {
+                    let path_expand_meta = plan.ops.iter().find_map(|op| {
+                        if let yata_gie::ir::LogicalOp::PathExpand { max_hops, .. } = op {
+                            Some(*max_hops)
+                        } else {
+                            None
+                        }
+                    });
+                    let mut effective_edge_src_labels = edge_src_labels.clone();
+                    let mut effective_edge_dst_labels = edge_dst_labels.clone();
+                    if let Some(max_hops) = path_expand_meta.filter(|h| *h > 1) {
+                        let (path_src_vids, path_dst_vids) = self
+                            .collect_path_expand_frontier_vids(&plan, &src_vid_candidates)
+                            .unwrap_or_default();
+                        if !path_src_vids.is_empty() {
+                            src_vid_candidates = path_src_vids;
+                        }
+                        if !path_dst_vids.is_empty() {
+                            dst_vid_candidates = path_dst_vids;
+                        }
+                        // Final endpoint constraints are not safe to apply to every hop.
+                        effective_edge_src_labels.clear();
+                        effective_edge_dst_labels.clear();
+                        dst_vid_candidates.clear();
+                        let _ = max_hops;
+                    }
                     let vertex_lance_filters: Vec<String> = if rel_refs.is_empty() {
                         hints.lance_filters.clone()
                     } else {
@@ -995,8 +1121,8 @@ impl TieredGraphEngine {
                     let read_store = self.build_read_store_pushdown(
                         &vl_refs,
                         &rel_refs,
-                        &edge_src_labels.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                        &edge_dst_labels.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                        &effective_edge_src_labels.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                        &effective_edge_dst_labels.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
                         &src_vid_candidates,
                         &dst_vid_candidates,
                         &vertex_lance_filters,
@@ -2602,6 +2728,25 @@ mod tests {
         let names = get_col(&rows, "name");
         assert_eq!(rows.len(), 1);
         assert!(names.iter().any(|n| n.contains("Alice")), "Alice must match destination-side filter");
+    }
+
+    #[test]
+    fn test_persist_cypher_variable_hop_with_destination_where() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        run_query(&e, "CREATE (a:User {name: 'Alice'})-[r:FOLLOWS]->(b:User {name: 'Bob'})", &[], None).unwrap();
+        run_query(&e, "CREATE (a:User {name: 'Bob'})-[r:FOLLOWS]->(b:User {name: 'Carol'})", &[], None).unwrap();
+        run_query(&e, "CREATE (a:User {name: 'Dave'})-[r:FOLLOWS]->(b:User {name: 'Eve'})", &[], None).unwrap();
+
+        let rows = run_query(
+            &e,
+            "MATCH (a:User {name: 'Alice'})-[:FOLLOWS*1..2]->(b:User) WHERE b.name = 'Carol' RETURN b.name AS name LIMIT 10",
+            &[],
+            None,
+        ).unwrap();
+        let names = get_col(&rows, "name");
+        assert_eq!(rows.len(), 1);
+        assert!(names.iter().any(|n| n.contains("Carol")), "Carol must be reachable via variable-hop destination filter");
     }
 
     #[test]
