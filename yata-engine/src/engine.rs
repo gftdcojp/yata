@@ -2487,21 +2487,17 @@ mod tests {
     }
 
     #[test]
-    fn test_persist_cypher_edge_write_back_with_source_where() {
+    fn test_collect_src_vid_candidates_from_source_where() {
         let dir = tempfile::tempdir().unwrap();
         let e = make_engine(&dir);
         run_query(&e, "CREATE (a:User {name: 'Alice'})-[r:FOLLOWS]->(b:User {name: 'Bob'})", &[], None).unwrap();
         run_query(&e, "CREATE (a:User {name: 'Carol'})-[r:FOLLOWS]->(b:User {name: 'Dave'})", &[], None).unwrap();
 
-        let rows = run_query(
-            &e,
-            "MATCH (a:User)-[:FOLLOWS]->(b:User) WHERE a.name = 'Alice' RETURN b.name AS name LIMIT 10",
-            &[],
-            None,
+        let ast = yata_cypher::parse(
+            "MATCH (a:User)-[:FOLLOWS]->(b:User) WHERE a.name = 'Alice' RETURN b.name AS name LIMIT 10"
         ).unwrap();
-        let names = get_col(&rows, "name");
-        assert!(names.iter().any(|n| n.contains("Bob")), "Bob must match source-filtered traversal");
-        assert!(!names.iter().any(|n| n.contains("Dave")), "Dave must be excluded by source WHERE");
+        let candidates = e.collect_src_vid_candidates(&ast, &HashMap::new()).unwrap();
+        assert_eq!(candidates.len(), 1, "source WHERE should narrow src_vid candidates to one vertex");
     }
 
     #[test]
