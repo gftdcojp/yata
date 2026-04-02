@@ -262,6 +262,43 @@ pub struct MutationContext {
 
 const AUTO_COMPACT_FRAGMENT_THRESHOLD: u64 = 8;
 
+fn edge_endpoint_labels(ast: &yata_cypher::ast::Query) -> (Vec<String>, Vec<String>) {
+    let mut src_labels = Vec::new();
+    let mut dst_labels = Vec::new();
+
+    let mut collect_from_patterns = |patterns: &[yata_cypher::ast::Pattern]| {
+        for pattern in patterns {
+            for window in pattern.elements.windows(3) {
+                let [yata_cypher::ast::PatternElement::Node(src), yata_cypher::ast::PatternElement::Rel(_), yata_cypher::ast::PatternElement::Node(dst)] = window else {
+                    continue;
+                };
+                if let Some(label) = src.labels.first() {
+                    src_labels.push(label.clone());
+                }
+                if let Some(label) = dst.labels.first() {
+                    dst_labels.push(label.clone());
+                }
+            }
+        }
+    };
+
+    for clause in &ast.clauses {
+        match clause {
+            yata_cypher::ast::Clause::Match { patterns, .. }
+            | yata_cypher::ast::Clause::OptionalMatch { patterns, .. }
+            | yata_cypher::ast::Clause::Create { patterns } => collect_from_patterns(patterns),
+            yata_cypher::ast::Clause::Merge { pattern, .. } => collect_from_patterns(std::slice::from_ref(pattern)),
+            _ => {}
+        }
+    }
+
+    src_labels.sort();
+    src_labels.dedup();
+    dst_labels.sort();
+    dst_labels.dedup();
+    (src_labels, dst_labels)
+}
+
 /// Graph engine: LanceDB-backed. No persistent CSR. Query = LanceDB scan → ephemeral CSR → GIE.
 pub struct TieredGraphEngine {
     config: TieredEngineConfig,
@@ -280,6 +317,36 @@ pub struct TieredGraphEngine {
 }
 
 impl TieredGraphEngine {
+    fn maybe_schedule_compaction(&self) {
+        let merges = self.merge_record_count.load(Ordering::Relaxed);
+        if merges % AUTO_COMPACT_FRAGMENT_THRESHOLD != 0 || merges == 0 {
+            return;
+        }
+        let lance_ds = self.lance_table.clone();
+        let lance_edge_ds = self.lance_edge_table.clone();
+        let last_compact_ms = self.last_compaction_ms.clone();
+        std::thread::spawn(move || {
+            ENGINE_RT.block_on(async {
+                for (name, handle) in [("vertices", lance_ds), ("edges", lance_edge_ds)] {
+                    let ds_guard = handle.lock().await;
+                    if let Some(ref ds) = *ds_guard {
+                        match ds.compact().await {
+                            Ok(stats) => {
+                                let removed = stats.compaction.as_ref().map(|c| c.fragments_removed).unwrap_or(0);
+                                let added = stats.compaction.as_ref().map(|c| c.fragments_added).unwrap_or(0);
+                                tracing::info!(table = name, removed, added, "background compaction complete");
+                            }
+                            Err(e) => {
+                                tracing::warn!(table = name, error = %e, "background compaction failed");
+                            }
+                        }
+                    }
+                }
+                last_compact_ms.store(now_ms(), Ordering::SeqCst);
+            });
+        });
+    }
+
     /// Create a new engine with Lance-backed persistence.
     pub fn new(config: TieredEngineConfig, data_dir: &str) -> Self {
         Self::build(config, data_dir)
@@ -314,7 +381,7 @@ impl TieredGraphEngine {
     /// Build an ArrowStore from LanceDB (zero-copy, lazy props).
     /// Label pushdown: only scans fragments matching requested labels.
     fn build_read_store(&self, labels: &[&str]) -> Result<yata_lance::ArrowStore, String> {
-        self.build_read_store_pushdown(labels, &[], &[], None)
+        self.build_read_store_pushdown(labels, &[], &[], &[], &[], None)
     }
 
     /// Build ArrowStore with full pushdown: label filter + WHERE conditions + LIMIT.
@@ -325,6 +392,8 @@ impl TieredGraphEngine {
         &self,
         labels: &[&str],
         edge_labels: &[&str],
+        edge_src_labels: &[&str],
+        edge_dst_labels: &[&str],
         lance_filters: &[String],
         limit: Option<usize>,
     ) -> Result<yata_lance::ArrowStore, String> {
@@ -378,6 +447,26 @@ impl TieredGraphEngine {
                                 edge_filter_parts.push(format!("edge_label = {}", label_exprs[0]));
                             } else {
                                 edge_filter_parts.push(format!("edge_label IN ({})", label_exprs.join(", ")));
+                            }
+                        }
+                        if !edge_src_labels.is_empty() {
+                            let label_exprs: Vec<String> = edge_src_labels.iter()
+                                .map(|l| format!("'{}'", l.replace('\'', "''")))
+                                .collect();
+                            if label_exprs.len() == 1 {
+                                edge_filter_parts.push(format!("src_label = {}", label_exprs[0]));
+                            } else {
+                                edge_filter_parts.push(format!("src_label IN ({})", label_exprs.join(", ")));
+                            }
+                        }
+                        if !edge_dst_labels.is_empty() {
+                            let label_exprs: Vec<String> = edge_dst_labels.iter()
+                                .map(|l| format!("'{}'", l.replace('\'', "''")))
+                                .collect();
+                            if label_exprs.len() == 1 {
+                                edge_filter_parts.push(format!("dst_label = {}", label_exprs[0]));
+                            } else {
+                                edge_filter_parts.push(format!("dst_label IN ({})", label_exprs.join(", ")));
                             }
                         }
                         let combined_filter = edge_filter_parts.join(" AND ");
@@ -607,12 +696,15 @@ impl TieredGraphEngine {
             // This path (query_inner) is Internal-only (no SecurityFilter needed).
             if let Ok(ast) = yata_cypher::parse(cypher) {
                 let plan_result = yata_gie::transpile::transpile(&ast);
+                let (edge_src_labels, edge_dst_labels) = edge_endpoint_labels(&ast);
 
                 if let Ok(plan) = plan_result {
                     // Use enhanced pushdown: label + WHERE + LIMIT pushed to Lance
                     let read_store = self.build_read_store_pushdown(
                         &vl_refs,
                         &rel_refs,
+                        &edge_src_labels.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                        &edge_dst_labels.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
                         &hints.lance_filters,
                         hints.limit,
                     )?;
@@ -1018,6 +1110,7 @@ impl TieredGraphEngine {
                 tbl.add(batch).await.map_err(|e| format!("LanceDB edge add: {e}"))?;
                 Ok::<(), String>(())
             })?;
+            self.maybe_schedule_compaction();
             return Ok(0);
         }
 
@@ -1031,36 +1124,25 @@ impl TieredGraphEngine {
             Ok::<(), String>(())
         })?;
 
-        // Auto-compact: background spawn (never blocks write path)
-        let merges = self.merge_record_count.load(Ordering::Relaxed);
-        if merges % AUTO_COMPACT_FRAGMENT_THRESHOLD == 0 && merges > 0 {
-            let lance_ds = self.lance_table.clone();
-            let last_compact_ms = self.last_compaction_ms.clone();
-            std::thread::spawn(move || {
-                ENGINE_RT.block_on(async {
-                    let ds_guard = lance_ds.lock().await;
-                    if let Some(ref ds) = *ds_guard {
-                        match ds.compact().await {
-                            Ok(stats) => {
-                                let removed = stats.compaction.as_ref().map(|c| c.fragments_removed).unwrap_or(0);
-                                let added = stats.compaction.as_ref().map(|c| c.fragments_added).unwrap_or(0);
-                                tracing::info!(removed, added, "background compaction complete");
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "background compaction failed");
-                            }
-                        }
-                    }
-                    last_compact_ms.store(now_ms(), Ordering::SeqCst);
-                });
-            });
-        }
+        self.maybe_schedule_compaction();
         Ok(0)
     }
 
     /// Delete a record (tombstone write to LanceDB). Returns false if record doesn't exist.
     pub fn delete_record(&self, label: &str, pk_key: &str, pk_value: &str) -> Result<bool, String> {
         self.ensure_lance();
+        if pk_key == "eid" {
+            let batch = build_edge_lance_batch(1, label, pk_value, "", "", None, None, &[])?;
+            let lance_edge_tbl = self.lance_edge_table.clone();
+            self.block_on(async {
+                let tbl_guard = lance_edge_tbl.lock().await;
+                let tbl = tbl_guard.as_ref().ok_or("LanceDB edge table not initialized")?;
+                tbl.add(batch).await.map_err(|e| format!("LanceDB edge tombstone add: {e}"))?;
+                Ok::<(), String>(())
+            })?;
+            self.maybe_schedule_compaction();
+            return Ok(true);
+        }
         let store = self.build_read_store(&[label])?;
         let exists = store.find_vertex_by_pk(label, pk_key, &yata_grin::PropValue::Str(pk_value.to_string())).is_some();
         if !exists {
@@ -1074,6 +1156,7 @@ impl TieredGraphEngine {
             tbl.add(batch).await.map_err(|e| format!("LanceDB add: {e}"))?;
             Ok::<(), String>(())
         })?;
+        self.maybe_schedule_compaction();
         Ok(true)
     }
 
@@ -1105,44 +1188,41 @@ impl TieredGraphEngine {
     pub fn trigger_compaction(&self) -> Result<CompactionResult, String> {
         self.ensure_lance();
         let lance_ds = self.lance_table.clone();
+        let lance_edge_ds = self.lance_edge_table.clone();
 
-        // Primary: use Lance built-in compaction to merge fragments
         let result = self.block_on(async {
-            let ds_guard = lance_ds.lock().await;
-            if let Some(ref ds) = *ds_guard {
-                let version_before = ds.version().await.unwrap_or(0);
-                match ds.compact().await {
-                    Ok(stats) => {
-                        let version_after = ds.version().await.unwrap_or(version_before);
-                        let removed = stats.compaction.as_ref().map(|c| c.fragments_removed).unwrap_or(0);
-                        let added = stats.compaction.as_ref().map(|c| c.fragments_added).unwrap_or(0);
-                        tracing::info!(
-                            version_before,
-                            version_after,
-                            files_removed = removed,
-                            files_added = added,
-                                                        "Lance compaction complete"
-                        );
-                        Ok(CompactionResult {
-                            max_seq: version_after,
-                            input_entries: removed,
-                            output_entries: added,
-                            labels: Vec::new(),
-                        })
+            let mut max_seq = 0u64;
+            let mut input_entries = 0usize;
+            let mut output_entries = 0usize;
+            for (name, handle) in [("vertices", lance_ds), ("edges", lance_edge_ds)] {
+                let ds_guard = handle.lock().await;
+                if let Some(ref ds) = *ds_guard {
+                    let version_before = ds.version().await.unwrap_or(0);
+                    match ds.compact().await {
+                        Ok(stats) => {
+                            let version_after = ds.version().await.unwrap_or(version_before);
+                            let removed = stats.compaction.as_ref().map(|c| c.fragments_removed).unwrap_or(0);
+                            let added = stats.compaction.as_ref().map(|c| c.fragments_added).unwrap_or(0);
+                            tracing::info!(table = name, version_before, version_after, files_removed = removed, files_added = added, "Lance compaction complete");
+                            max_seq = max_seq.max(version_after);
+                            input_entries += removed;
+                            output_entries += added;
+                        }
+                        Err(e) => {
+                            tracing::warn!(table = name, error = %e, "Lance compaction failed, skipping");
+                            max_seq = max_seq.max(version_before);
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Lance compaction failed, skipping");
-                        Ok(CompactionResult {
-                            max_seq: version_before,
-                            input_entries: 0,
-                            output_entries: 0,
-                            labels: Vec::new(),
-                        })
-                    }
+                } else if name == "vertices" {
+                    return Err("compaction: LanceDB vertices table not initialized".to_string());
                 }
-            } else {
-                Err("compaction: LanceDB table not initialized".to_string())
             }
+            Ok(CompactionResult {
+                max_seq,
+                input_entries,
+                output_entries,
+                labels: Vec::new(),
+            })
         });
 
         self.last_compaction_ms.store(now_ms(), Ordering::SeqCst);
@@ -2110,6 +2190,29 @@ mod tests {
         let store2 = e.build_read_store(&["Task"]).unwrap();
         assert!(store2.find_vertex_by_pk("Task", "rkey", &PropValue::Str("t1".into())).is_none(),
             "tombstoned record must not be visible");
+    }
+
+    #[test]
+    fn test_persist_delete_edge_tombstone_hides_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        e.merge_record("User", "rkey", "alice", &[("rkey", PropValue::Str("alice".into()))]).unwrap();
+        e.merge_record("User", "rkey", "bob", &[("rkey", PropValue::Str("bob".into()))]).unwrap();
+        e.merge_record("FOLLOWS", "eid", "edge-1", &[
+            ("_src", PropValue::Str("alice".into())),
+            ("_dst", PropValue::Str("bob".into())),
+            ("_src_label", PropValue::Str("User".into())),
+            ("_dst_label", PropValue::Str("User".into())),
+        ]).unwrap();
+
+        let store1 = e.build_read_store(&[]).unwrap();
+        assert_eq!(store1.edge_count(), 1, "edge must be visible before tombstone");
+
+        let deleted = e.delete_record("FOLLOWS", "eid", "edge-1").unwrap();
+        assert!(deleted, "delete existing edge must return true");
+
+        let store2 = e.build_read_store(&[]).unwrap();
+        assert_eq!(store2.edge_count(), 0, "tombstoned edge must not be visible");
     }
 
     #[test]
