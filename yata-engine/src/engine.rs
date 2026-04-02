@@ -120,6 +120,43 @@ fn edge_lance_schema() -> Arc<arrow::datatypes::Schema> {
     ]))
 }
 
+async fn ensure_lance_scalar_indices(
+    vertices: Option<&yata_lance::YataTable>,
+    edges: Option<&yata_lance::YataTable>,
+) {
+    use yata_lance::dataset::ScalarIndexKind;
+
+    if let Some(vertices) = vertices {
+        for (column, kind, name) in [
+            ("pk_value", ScalarIndexKind::BTree, "vertices_pk_value_btree"),
+            ("label", ScalarIndexKind::Bitmap, "vertices_label_bitmap"),
+            ("repo", ScalarIndexKind::Bitmap, "vertices_repo_bitmap"),
+            ("owner_did", ScalarIndexKind::Bitmap, "vertices_owner_did_bitmap"),
+            ("app_id", ScalarIndexKind::Bitmap, "vertices_app_id_bitmap"),
+            ("rkey", ScalarIndexKind::BTree, "vertices_rkey_btree"),
+        ] {
+            if let Err(error) = vertices.ensure_scalar_index(column, kind, name).await {
+                tracing::warn!(table = "vertices", column, index_name = name, error = %error, "failed to ensure Lance scalar index");
+            }
+        }
+    }
+    if let Some(edges) = edges {
+        for (column, kind, name) in [
+            ("eid", ScalarIndexKind::BTree, "edges_eid_btree"),
+            ("src_vid", ScalarIndexKind::BTree, "edges_src_vid_btree"),
+            ("dst_vid", ScalarIndexKind::BTree, "edges_dst_vid_btree"),
+            ("edge_label", ScalarIndexKind::Bitmap, "edges_edge_label_bitmap"),
+            ("src_label", ScalarIndexKind::Bitmap, "edges_src_label_bitmap"),
+            ("dst_label", ScalarIndexKind::Bitmap, "edges_dst_label_bitmap"),
+            ("app_id", ScalarIndexKind::Bitmap, "edges_app_id_bitmap"),
+        ] {
+            if let Err(error) = edges.ensure_scalar_index(column, kind, name).await {
+                tracing::warn!(table = "edges", column, index_name = name, error = %error, "failed to ensure Lance scalar index");
+            }
+        }
+    }
+}
+
 /// Persistent stats catalog schema for planner cold-start hydration.
 fn stats_catalog_schema() -> Arc<arrow::datatypes::Schema> {
     use arrow::datatypes::{DataType, Field, Schema};
@@ -2083,6 +2120,8 @@ impl TieredGraphEngine {
                     }
                 }
             }
+            let vertices_ready = tbl_guard.is_some();
+            let edges_ready = edge_guard.is_some();
             drop(edge_guard);
             let mut stats_guard = lance_stats_tbl.lock().await;
             if stats_guard.is_none() {
@@ -2097,6 +2136,13 @@ impl TieredGraphEngine {
                         }
                     }
                 }
+            }
+            drop(tbl_guard);
+            drop(stats_guard);
+            if vertices_ready || edges_ready {
+                let vertices_guard = lance_tbl.lock().await;
+                let edges_guard = lance_edge_tbl.lock().await;
+                ensure_lance_scalar_indices(vertices_guard.as_ref(), edges_guard.as_ref()).await;
             }
         });
         let should_hydrate = self
