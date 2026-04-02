@@ -664,6 +664,135 @@ impl ArrowStore {
             vertex_labels,
             known_labels,
             pk_keys,
+            edge_props: Vec::new(),
+            edge_labels: Vec::new(),
+            known_edge_labels: Vec::new(),
+            out_adj: vec![Vec::new(); vertex_labels.len()],
+            in_adj: vec![Vec::new(); vertex_labels.len()],
+            props_cache: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Build from separate vertex and edge Lance batches.
+    pub fn from_vertex_edge_batches_with_spill(
+        vertex_batches: Vec<RecordBatch>,
+        edge_batches: Vec<RecordBatch>,
+        budget_bytes: u64,
+        spill_dir: &str,
+    ) -> Result<Self, String> {
+        let total_vertex_bytes: u64 = vertex_batches.iter()
+            .map(|b| b.get_array_memory_size() as u64)
+            .sum();
+
+        let (rows, label_index, vertex_labels, known_labels, pk_keys) =
+            Self::build_dedup_index(&vertex_batches)?;
+
+        let raw_vid_to_local: HashMap<String, u32> = rows.iter()
+            .enumerate()
+            .filter_map(|(local_vid, loc)| {
+                let batch = vertex_batches.get(loc.batch as usize)?;
+                let pk_val_col = batch.column(2).as_any().downcast_ref::<StringArray>()?;
+                Some((pk_val_col.value(loc.row as usize).to_string(), local_vid as u32))
+            })
+            .collect();
+
+        let storage = if total_vertex_bytes <= budget_bytes || vertex_batches.is_empty() {
+            BatchStorage::InMemory(vertex_batches)
+        } else {
+            std::fs::create_dir_all(spill_dir)
+                .map_err(|e| format!("create spill dir: {e}"))?;
+            let path = std::path::PathBuf::from(spill_dir)
+                .join(format!("arrowstore-{}.ipc", std::process::id()));
+            let file = std::fs::File::create(&path)
+                .map_err(|e| format!("create spill file: {e}"))?;
+            let batch_schema = vertex_batches[0].schema();
+            let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &batch_schema)
+                .map_err(|e| format!("IPC writer: {e}"))?;
+            let batch_count = vertex_batches.len();
+            for batch in &vertex_batches {
+                writer.write(batch).map_err(|e| format!("IPC write: {e}"))?;
+            }
+            writer.finish().map_err(|e| format!("IPC finish: {e}"))?;
+            drop(vertex_batches);
+            BatchStorage::Spilled {
+                path,
+                batch_count,
+                cache: std::sync::Mutex::new(HashMap::new()),
+            }
+        };
+
+        let mut edge_dedup: HashMap<(String, String), (usize, usize, bool)> = HashMap::new();
+        for (bi, batch) in edge_batches.iter().enumerate() {
+            if batch.num_columns() < 5 { continue; }
+            let op_col = batch.column(0).as_any().downcast_ref::<UInt8Array>()
+                .ok_or("edge column 0 (op) is not UInt8")?;
+            let edge_label_col = str_col(batch, 1)?;
+            let eid_col = str_col(batch, 2)?;
+            for row in 0..batch.num_rows() {
+                edge_dedup.insert(
+                    (
+                        edge_label_col.value(row).to_string(),
+                        eid_col.value(row).to_string(),
+                    ),
+                    (bi, row, op_col.value(row) == 0),
+                );
+            }
+        }
+
+        let mut edge_props = Vec::new();
+        let mut edge_labels = Vec::new();
+        let mut known_edge_labels = Vec::new();
+        let mut out_adj = vec![Vec::new(); rows.len()];
+        let mut in_adj = vec![Vec::new(); rows.len()];
+
+        for ((edge_label, _), (bi, ri, alive)) in edge_dedup {
+            if !alive { continue; }
+            let Some(batch) = edge_batches.get(bi) else { continue };
+            let src_vid_col = str_col(batch, 3)?;
+            let dst_vid_col = str_col(batch, 4)?;
+            let Some(&src_local_vid) = raw_vid_to_local.get(src_vid_col.value(ri)) else { continue };
+            let Some(&dst_local_vid) = raw_vid_to_local.get(dst_vid_col.value(ri)) else { continue };
+
+            let val_json_col = batch.column(9).as_any().downcast_ref::<StringArray>()
+                .ok_or("edge column 9 (val_json) is not Utf8")?;
+            let mut props = if val_json_col.is_null(ri) {
+                HashMap::new()
+            } else {
+                parse_props_json(Some(val_json_col.value(ri)))?
+            };
+            let eid_col = str_col(batch, 2)?;
+            props.insert("eid".to_string(), PropValue::Str(eid_col.value(ri).to_string()));
+
+            let edge_id = edge_labels.len() as u32;
+            edge_labels.push(edge_label.clone());
+            edge_props.push(props);
+            if !known_edge_labels.contains(&edge_label) {
+                known_edge_labels.push(edge_label.clone());
+            }
+            out_adj[src_local_vid as usize].push(Neighbor {
+                vid: dst_local_vid,
+                edge_id,
+                edge_label: edge_label.clone(),
+            });
+            in_adj[dst_local_vid as usize].push(Neighbor {
+                vid: src_local_vid,
+                edge_id,
+                edge_label,
+            });
+        }
+
+        Ok(Self {
+            storage,
+            rows,
+            label_index,
+            vertex_labels,
+            known_labels,
+            pk_keys,
+            edge_props,
+            edge_labels,
+            known_edge_labels,
+            out_adj,
+            in_adj,
             props_cache: std::sync::Mutex::new(HashMap::new()),
         })
     }
@@ -726,6 +855,11 @@ impl ArrowStore {
             vertex_labels,
             known_labels,
             pk_keys,
+            edge_props: Vec::new(),
+            edge_labels: Vec::new(),
+            known_edge_labels: Vec::new(),
+            out_adj: vec![Vec::new(); vertex_labels.len()],
+            in_adj: vec![Vec::new(); vertex_labels.len()],
             props_cache: std::sync::Mutex::new(HashMap::new()),
         })
     }
@@ -833,14 +967,18 @@ impl ArrowStore {
 
 impl Topology for ArrowStore {
     fn vertex_count(&self) -> usize { self.rows.len() }
-    fn edge_count(&self) -> usize { 0 }
+    fn edge_count(&self) -> usize { self.edge_labels.len() }
     fn has_vertex(&self, vid: u32) -> bool { (vid as usize) < self.rows.len() }
-    fn out_degree(&self, _vid: u32) -> usize { 0 }
-    fn in_degree(&self, _vid: u32) -> usize { 0 }
-    fn out_neighbors(&self, _vid: u32) -> Vec<Neighbor> { Vec::new() }
-    fn in_neighbors(&self, _vid: u32) -> Vec<Neighbor> { Vec::new() }
-    fn out_neighbors_by_label(&self, _vid: u32, _edge_label: &str) -> Vec<Neighbor> { Vec::new() }
-    fn in_neighbors_by_label(&self, _vid: u32, _edge_label: &str) -> Vec<Neighbor> { Vec::new() }
+    fn out_degree(&self, vid: u32) -> usize { self.out_adj.get(vid as usize).map(|v| v.len()).unwrap_or(0) }
+    fn in_degree(&self, vid: u32) -> usize { self.in_adj.get(vid as usize).map(|v| v.len()).unwrap_or(0) }
+    fn out_neighbors(&self, vid: u32) -> Vec<Neighbor> { self.out_adj.get(vid as usize).cloned().unwrap_or_default() }
+    fn in_neighbors(&self, vid: u32) -> Vec<Neighbor> { self.in_adj.get(vid as usize).cloned().unwrap_or_default() }
+    fn out_neighbors_by_label(&self, vid: u32, edge_label: &str) -> Vec<Neighbor> {
+        self.out_neighbors(vid).into_iter().filter(|n| n.edge_label == edge_label).collect()
+    }
+    fn in_neighbors_by_label(&self, vid: u32, edge_label: &str) -> Vec<Neighbor> {
+        self.in_neighbors(vid).into_iter().filter(|n| n.edge_label == edge_label).collect()
+    }
 }
 
 impl Property for ArrowStore {
@@ -879,7 +1017,9 @@ impl Property for ArrowStore {
         self.props_cache.lock().unwrap().get(&vid)?.get(key).cloned()
     }
 
-    fn edge_prop(&self, _edge_id: u32, _key: &str) -> Option<PropValue> { None }
+    fn edge_prop(&self, edge_id: u32, key: &str) -> Option<PropValue> {
+        self.edge_props.get(edge_id as usize)?.get(key).cloned()
+    }
 
     fn vertex_prop_keys(&self, label: &str) -> Vec<String> {
         let mut keys = HashSet::new();
@@ -892,7 +1032,17 @@ impl Property for ArrowStore {
         keys.into_iter().collect()
     }
 
-    fn edge_prop_keys(&self, _label: &str) -> Vec<String> { Vec::new() }
+    fn edge_prop_keys(&self, label: &str) -> Vec<String> {
+        let mut keys = HashSet::new();
+        for (idx, edge_label) in self.edge_labels.iter().enumerate() {
+            if edge_label == label {
+                if let Some(props) = self.edge_props.get(idx) {
+                    keys.extend(props.keys().cloned());
+                }
+            }
+        }
+        keys.into_iter().collect()
+    }
 
     fn vertex_all_props(&self, vid: u32) -> HashMap<String, PropValue> {
         self.ensure_props(vid);
@@ -902,7 +1052,7 @@ impl Property for ArrowStore {
 
 impl Schema for ArrowStore {
     fn vertex_labels(&self) -> Vec<String> { self.known_labels.clone() }
-    fn edge_labels(&self) -> Vec<String> { Vec::new() }
+    fn edge_labels(&self) -> Vec<String> { self.known_edge_labels.clone() }
     fn vertex_primary_key(&self, label: &str) -> Option<String> { self.pk_keys.get(label).cloned() }
 }
 
