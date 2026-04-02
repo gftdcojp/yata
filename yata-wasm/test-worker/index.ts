@@ -13,7 +13,7 @@ export default {
 
     if (url.pathname === "/encode") {
       try {
-        const lance_bytes = encode_vertex_lance(
+        const lanceBytes = encode_vertex_lance(
           ["Post", "Post", "Profile"],
           ["rkey1", "rkey2", "rkey3"],
           ["did:web:alice", "did:web:bob", "did:web:carol"],
@@ -22,11 +22,11 @@ export default {
         );
 
         // Read back the footer to verify it's a valid Lance file
-        const footer = JSON.parse(read_lance_footer(lance_bytes));
+        const footer = JSON.parse(read_lance_footer(lanceBytes));
 
         return Response.json({
           ok: true,
-          'lance_file_bytes': lance_bytes.length,
+          'lance_file_bytes': lanceBytes.length,
           footer,
           'has_magic': true,
         });

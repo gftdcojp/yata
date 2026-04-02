@@ -108,11 +108,11 @@ export async function createEmptyYataGraphTables<TSchema, TTable>(
   const schemas = yataGraphArrowSchemas(factory);
 
   const [
-    yata_vertex_log,
-    yata_edge_log,
-    yata_vertex_live,
-    yata_edge_live_out,
-    yata_edge_live_in,
+    yataVertexLog,
+    yataEdgeLog,
+    yataVertexLive,
+    yataEdgeLiveOut,
+    yataEdgeLiveIn,
   ] = await Promise.all([
     connection.createEmptyTable(VERTEX_LOG_TABLE, schemas[VERTEX_LOG_TABLE], options),
     connection.createEmptyTable(EDGE_LOG_TABLE, schemas[EDGE_LOG_TABLE], options),
@@ -122,18 +122,18 @@ export async function createEmptyYataGraphTables<TSchema, TTable>(
   ]);
 
   return {
-    yata_vertex_log,
-    yata_edge_log,
-    yata_vertex_live,
-    yata_edge_live_out,
-    yata_edge_live_in,
+    yataVertexLog,
+    yataEdgeLog,
+    yataVertexLive,
+    yataEdgeLiveOut,
+    yataEdgeLiveIn,
   };
 }
 
 export async function openYataGraphTables<TTable>(
   connection: LanceConnectionLike<unknown, TTable>,
 ): Promise<YataOpenedTables<TTable>> {
-  const [vertex_log, edge_log, vertex_live, edge_live_out, edge_live_in] = await Promise.all([
+  const [vertexLog, edgeLog, vertexLive, edgeLiveOut, edgeLiveIn] = await Promise.all([
     connection.openTable(VERTEX_LOG_TABLE),
     connection.openTable(EDGE_LOG_TABLE),
     connection.openTable(VERTEX_LIVE_TABLE),
@@ -142,11 +142,11 @@ export async function openYataGraphTables<TTable>(
   ]);
 
   return {
-    vertex_log,
-    edge_log,
-    vertex_live,
-    edge_live_out,
-    edge_live_in,
+    vertexLog,
+    edgeLog,
+    vertexLive,
+    edgeLiveOut,
+    edgeLiveIn,
   };
 }
 
@@ -154,7 +154,7 @@ export async function openYataGraphTablesFromManifest<TTable>(
   connection: LanceConnectionLike<unknown, TTable>,
   manifest: import("./manifest.js").GraphManifest,
 ): Promise<YataOpenedTables<TTable>> {
-  const [vertex_log, edge_log, vertex_live, edge_live_out, edge_live_in] = await Promise.all([
+  const [vertexLog, edgeLog, vertexLive, edgeLiveOut, edgeLiveIn] = await Promise.all([
     connection.openTable(manifest.tables.vertex_log.table_name),
     connection.openTable(manifest.tables.edge_log.table_name),
     connection.openTable(manifest.tables.vertex_live.table_name),
@@ -163,10 +163,10 @@ export async function openYataGraphTablesFromManifest<TTable>(
   ]);
 
   return {
-    vertex_log,
-    edge_log,
-    vertex_live,
-    edge_live_out,
-    edge_live_in,
+    vertexLog,
+    edgeLog,
+    vertexLive,
+    edgeLiveOut,
+    edgeLiveIn,
   };
 }
