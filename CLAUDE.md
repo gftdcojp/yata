@@ -2,6 +2,8 @@
 
 yata — Rust Cypher graph engine on LanceDB。`lancedb` 0.27 (lance 4.0)。No CSR。No WAL。No MemoryGraph。No cache。
 
+**Role (2026-04-02)**: Query index (materialized view)。KV (PDS_KV) が authoritative source of truth。yata は fire-and-forget で index 更新される。Container crash/restart でもデータは KV に永続化済み。Graceful shutdown で final compaction → R2 flush。AUTO_COMPACT_FRAGMENT_THRESHOLD=8。
+
 ## Architecture
 
 ```
