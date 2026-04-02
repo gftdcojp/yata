@@ -44,8 +44,11 @@ pub enum LogicalOp {
         max_hops: u32,
         direction: Direction,
     },
-    /// Filter rows by predicate.
-    Filter { predicate: Predicate },
+    /// Filter rows by predicate, optionally scoped to a bound alias.
+    Filter {
+        alias: Option<String>,
+        predicate: Predicate,
+    },
     /// Project (select) columns.
     Project { exprs: Vec<Expr> },
     /// Aggregate with optional group-by.
@@ -304,6 +307,7 @@ mod tests {
             direction: Direction::Out,
         });
         plan.push(LogicalOp::Filter {
+            alias: Some("n".into()),
             predicate: Predicate::Gt("age".into(), PropValue::Int(18)),
         });
         plan.push(LogicalOp::Project {

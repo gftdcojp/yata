@@ -30,24 +30,15 @@ fn push_down_filters(plan: QueryPlan) -> QueryPlan {
         while i + 1 < ops.len() {
             // If ops[i] is Expand and ops[i+1] is Filter referencing only
             // the scan alias (before the expand), swap them.
-            let should_swap =
-                if let (LogicalOp::Expand { src_alias: _, .. }, LogicalOp::Filter { predicate }) =
-                    (&ops[i], &ops[i + 1])
-                {
-                    // Check if the filter predicate only references properties
-                    // (not variables from the expand destination).
-                    // Simple heuristic: if we can find a Scan before this Expand
-                    // whose alias matches, and the predicate doesn't reference
-                    // the dst_alias, we can push down.
-                    let expand_dst = if let LogicalOp::Expand { dst_alias, .. } = &ops[i] {
-                        dst_alias.clone()
-                    } else {
-                        String::new()
-                    };
-                    // Predicates in GRIN format don't reference aliases directly,
-                    // they reference property keys. We push down all pure property
-                    // predicates that appear after an Expand.
-                    !predicate_references_alias(&expand_dst, predicate) && !expand_dst.is_empty()
+            let should_swap = if let (
+                LogicalOp::Expand { src_alias, .. },
+                LogicalOp::Filter {
+                    alias: Some(filter_alias),
+                    ..
+                },
+            ) = (&ops[i], &ops[i + 1])
+            {
+                filter_alias == src_alias
                 } else {
                     false
                 };
@@ -89,10 +80,24 @@ fn merge_adjacent_scans(plan: QueryPlan) -> QueryPlan {
                         predicate: existing,
                     },
                     LogicalOp::Filter {
+                        alias: filter_alias,
                         predicate: new_pred,
                     },
                 ) = (scan, filter)
                 {
+                    if filter_alias.as_deref() != Some(alias.as_str()) {
+                        result.push(LogicalOp::Scan {
+                            label,
+                            alias,
+                            predicate: existing,
+                        });
+                        result.push(LogicalOp::Filter {
+                            alias: filter_alias,
+                            predicate: new_pred,
+                        });
+                        i += 2;
+                        continue;
+                    }
                     let merged_pred = match existing {
                         None => new_pred,
                         Some(existing_pred) => {
@@ -114,19 +119,6 @@ fn merge_adjacent_scans(plan: QueryPlan) -> QueryPlan {
     }
 
     QueryPlan { ops: result }
-}
-
-/// Check if a predicate conceptually references a given alias.
-/// Since GRIN predicates are property-key based (not alias-based),
-/// this is a heuristic: we return false for all pure property predicates,
-/// meaning they can be pushed down past expands.
-fn predicate_references_alias(_alias: &str, _predicate: &Predicate) -> bool {
-    // GRIN predicates (Eq, Lt, Gt, etc.) reference property keys, not aliases.
-    // They are always safe to push down since they filter on vertex properties
-    // of whatever the current context vertex is.
-    // In a more sophisticated system, we'd track which alias each predicate
-    // applies to. For now, all predicates are considered pushdown-safe.
-    false
 }
 
 #[cfg(test)]
@@ -151,6 +143,7 @@ mod tests {
                     direction: yata_grin::Direction::Out,
                 },
                 LogicalOp::Filter {
+                    alias: Some("n".into()),
                     predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
                 },
             ],
@@ -176,6 +169,7 @@ mod tests {
                     predicate: None,
                 },
                 LogicalOp::Filter {
+                    alias: Some("n".into()),
                     predicate: Predicate::Eq("name".into(), PropValue::Str("Alice".into())),
                 },
             ],
@@ -206,6 +200,7 @@ mod tests {
                     predicate: Some(Predicate::Eq("name".into(), PropValue::Str("Alice".into()))),
                 },
                 LogicalOp::Filter {
+                    alias: Some("n".into()),
                     predicate: Predicate::Gt("age".into(), PropValue::Int(18)),
                 },
             ],
@@ -241,6 +236,7 @@ mod tests {
                     direction: yata_grin::Direction::Out,
                 },
                 LogicalOp::Filter {
+                    alias: Some("n".into()),
                     predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
                 },
                 LogicalOp::Project {
@@ -329,9 +325,11 @@ mod tests {
                     direction: yata_grin::Direction::Out,
                 },
                 LogicalOp::Filter {
+                    alias: Some("n".into()),
                     predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
                 },
                 LogicalOp::Filter {
+                    alias: Some("n".into()),
                     predicate: Predicate::Eq("name".into(), PropValue::Str("Alice".into())),
                 },
                 LogicalOp::Project {
@@ -395,6 +393,7 @@ mod tests {
                     exprs: vec![Expr::Prop("n".into(), "name".into())],
                 },
                 LogicalOp::Filter {
+                    alias: Some("n".into()),
                     predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
                 },
             ],
@@ -431,6 +430,7 @@ mod tests {
                     exprs: vec![Expr::Var("n".into())],
                 },
                 LogicalOp::Filter {
+                    alias: Some("n".into()),
                     predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
                 },
             ],
@@ -471,6 +471,7 @@ mod tests {
                     direction: yata_grin::Direction::Out,
                 },
                 LogicalOp::Filter {
+                    alias: Some("n".into()),
                     predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
                 },
             ],
@@ -481,5 +482,38 @@ mod tests {
             .iter()
             .any(|op| matches!(op, LogicalOp::SecurityFilter { .. }));
         assert!(has_security, "SecurityFilter should be preserved after optimization");
+    }
+
+    #[test]
+    fn test_filter_on_dst_alias_is_not_pushed_before_expand() {
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: None,
+                },
+                LogicalOp::Expand {
+                    src_alias: "n".into(),
+                    edge_label: "KNOWS".into(),
+                    dst_alias: "m".into(),
+                    direction: yata_grin::Direction::Out,
+                },
+                LogicalOp::Filter {
+                    alias: Some("m".into()),
+                    predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
+                },
+            ],
+        };
+
+        let optimized = push_down_filters(plan);
+        assert!(matches!(&optimized.ops[1], LogicalOp::Expand { .. }));
+        assert!(matches!(
+            &optimized.ops[2],
+            LogicalOp::Filter {
+                alias: Some(alias),
+                ..
+            } if alias == "m"
+        ));
     }
 }

@@ -284,19 +284,23 @@ pub fn execute_op<S: GraphStore>(op: &LogicalOp, input: Vec<Record>, store: &S) 
             output
         }
 
-        LogicalOp::Filter { predicate } => {
+        LogicalOp::Filter { alias, predicate } => {
             input
                 .into_iter()
                 .filter(|record| {
-                    // Apply predicate against any bound vertex.
-                    // Try each binding to see if any satisfies.
                     if record.bindings.is_empty() {
                         return true;
                     }
-                    record
-                        .bindings
-                        .values()
-                        .any(|&vid| predicate_matches_vertex(store, vid, predicate))
+                    match alias {
+                        Some(alias) => record
+                            .bindings
+                            .get(alias.as_str())
+                            .is_some_and(|&vid| predicate_matches_vertex(store, vid, predicate)),
+                        None => record
+                            .bindings
+                            .values()
+                            .any(|&vid| predicate_matches_vertex(store, vid, predicate)),
+                    }
                 })
                 .collect()
         }
@@ -1159,6 +1163,7 @@ mod tests {
                     direction: Direction::Out,
                 },
                 LogicalOp::Filter {
+                    alias: Some("n".into()),
                     predicate: Predicate::Gt("age".into(), PropValue::Int(28)),
                 },
                 LogicalOp::Project {
@@ -1178,6 +1183,34 @@ mod tests {
         // The results may differ because the filter applies to different bindings.
         // Both are valid behaviors -- the important thing is the optimizer doesn't crash.
         assert!(!results_orig.is_empty() || !results_opt.is_empty() || true);
+    }
+
+    #[test]
+    fn test_execute_alias_scoped_filter_checks_only_target_binding() {
+        let store = test_store();
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: Some(Predicate::Eq("name".into(), PropValue::Str("Alice".into()))),
+                },
+                LogicalOp::Expand {
+                    src_alias: "n".into(),
+                    edge_label: "KNOWS".into(),
+                    dst_alias: "m".into(),
+                    direction: Direction::Out,
+                },
+                LogicalOp::Filter {
+                    alias: Some("m".into()),
+                    predicate: Predicate::Eq("name".into(), PropValue::Str("Charlie".into())),
+                },
+            ],
+        };
+
+        let results = execute(&plan, &store);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].bindings["m"], 2);
     }
 
     #[test]

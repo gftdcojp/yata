@@ -95,8 +95,11 @@ fn transpile_clause(builder: PlanBuilder, clause: &Clause) -> Result<PlanBuilder
                 .collect::<Result<_, _>>()?;
             b = b.project(exprs);
             if let Some(w) = where_ {
-                let pred = transpile_predicate(w)?;
-                b = b.filter(pred);
+                let (alias, pred) = transpile_predicate(w)?;
+                b = match alias {
+                    Some(alias) => b.filter_on(&alias, pred),
+                    None => b.filter(pred),
+                };
             }
             Ok(b)
         }
@@ -114,8 +117,11 @@ fn transpile_match(
         builder = transpile_pattern(builder, pattern)?;
     }
     if let Some(w) = where_ {
-        let pred = transpile_predicate(w)?;
-        builder = builder.filter(pred);
+        let (alias, pred) = transpile_predicate(w)?;
+        builder = match alias {
+            Some(alias) => builder.filter_on(&alias, pred),
+            None => builder.filter(pred),
+        };
     }
     Ok(builder)
 }
@@ -280,19 +286,21 @@ fn transpile_ir_expr(expr: &Expr) -> Result<ir::Expr, TranspileError> {
     }
 }
 
-/// Convert Cypher WHERE expression → GRIN Predicate.
-fn transpile_predicate(expr: &Expr) -> Result<Predicate, TranspileError> {
+/// Convert Cypher WHERE expression → GRIN Predicate plus the bound alias when unambiguous.
+fn transpile_predicate(expr: &Expr) -> Result<(Option<String>, Predicate), TranspileError> {
     match expr {
         Expr::BinOp(op, lhs, rhs) => match op {
             BinOp::And => {
-                let l = transpile_predicate(lhs)?;
-                let r = transpile_predicate(rhs)?;
-                Ok(Predicate::And(Box::new(l), Box::new(r)))
+                let (l_alias, l_pred) = transpile_predicate(lhs)?;
+                let (r_alias, r_pred) = transpile_predicate(rhs)?;
+                let alias = if l_alias == r_alias { l_alias } else { None };
+                Ok((alias, Predicate::And(Box::new(l_pred), Box::new(r_pred))))
             }
             BinOp::Or => {
-                let l = transpile_predicate(lhs)?;
-                let r = transpile_predicate(rhs)?;
-                Ok(Predicate::Or(Box::new(l), Box::new(r)))
+                let (l_alias, l_pred) = transpile_predicate(lhs)?;
+                let (r_alias, r_pred) = transpile_predicate(rhs)?;
+                let alias = if l_alias == r_alias { l_alias } else { None };
+                Ok((alias, Predicate::Or(Box::new(l_pred), Box::new(r_pred))))
             }
             BinOp::Eq => prop_cmp_predicate(lhs, rhs, |k, v| Predicate::Eq(k, v)),
             BinOp::Neq => prop_cmp_predicate(lhs, rhs, |k, v| Predicate::Neq(k, v)),
@@ -302,7 +310,7 @@ fn transpile_predicate(expr: &Expr) -> Result<Predicate, TranspileError> {
         },
         Expr::IsNotNull(_inner) => {
             // IS NOT NULL → True (always passes, approximate)
-            Ok(Predicate::True)
+            Ok((None, Predicate::True))
         }
         _ => Err(TranspileError::UnsupportedExpr(format!(
             "predicate {expr:?}"
@@ -314,11 +322,11 @@ fn prop_cmp_predicate(
     lhs: &Expr,
     rhs: &Expr,
     make: impl Fn(String, PropValue) -> Predicate,
-) -> Result<Predicate, TranspileError> {
+) -> Result<(Option<String>, Predicate), TranspileError> {
     // n.key = value
-    if let Expr::Prop(_base, key) = lhs {
+    if let Expr::Prop(base, key) = lhs {
         if let Expr::Lit(lit) = rhs {
-            return Ok(make(key.clone(), literal_to_prop(lit)));
+            return Ok((prop_base_alias(base), make(key.clone(), literal_to_prop(lit))));
         }
         if let Expr::Param(_) = rhs {
             // Parameters not resolved at transpile time → can't push down
@@ -328,14 +336,21 @@ fn prop_cmp_predicate(
         }
     }
     // value = n.key (reversed)
-    if let Expr::Prop(_base, key) = rhs {
+    if let Expr::Prop(base, key) = rhs {
         if let Expr::Lit(lit) = lhs {
-            return Ok(make(key.clone(), literal_to_prop(lit)));
+            return Ok((prop_base_alias(base), make(key.clone(), literal_to_prop(lit))));
         }
     }
     Err(TranspileError::UnsupportedExpr(
         "non-property comparison".into(),
     ))
+}
+
+fn prop_base_alias(base: &Expr) -> Option<String> {
+    match base {
+        Expr::Var(var) => Some(var.clone()),
+        _ => None,
+    }
 }
 
 /// Extract inline property predicates from NodePattern props: `{name: 'Alice'}`.
@@ -638,6 +653,7 @@ mod tests {
         let filter_has_and = filter.map_or(false, |op| match op {
             LogicalOp::Filter {
                 predicate: Predicate::And(_, _),
+                ..
             } => true,
             _ => false,
         });
@@ -734,6 +750,7 @@ mod tests {
         let has_or = plan.ops.iter().any(|op| match op {
             LogicalOp::Filter {
                 predicate: Predicate::Or(_, _),
+                ..
             } => true,
             LogicalOp::Scan {
                 predicate: Some(Predicate::Or(_, _)),
@@ -754,6 +771,7 @@ mod tests {
         let has_neq = plan.ops.iter().any(|op| match op {
             LogicalOp::Filter {
                 predicate: Predicate::Neq(_, _),
+                ..
             } => true,
             LogicalOp::Scan {
                 predicate: Some(Predicate::Neq(_, _)),
@@ -774,6 +792,7 @@ mod tests {
         let has_lt = plan.ops.iter().any(|op| match op {
             LogicalOp::Filter {
                 predicate: Predicate::Lt(_, _),
+                ..
             } => true,
             LogicalOp::Scan {
                 predicate: Some(Predicate::Lt(_, _)),

@@ -108,7 +108,18 @@ impl PlanBuilder {
     }
 
     pub fn filter(mut self, predicate: Predicate) -> Self {
-        self.plan.push(LogicalOp::Filter { predicate });
+        self.plan.push(LogicalOp::Filter {
+            alias: None,
+            predicate,
+        });
+        self
+    }
+
+    pub fn filter_on(mut self, alias: &str, predicate: Predicate) -> Self {
+        self.plan.push(LogicalOp::Filter {
+            alias: Some(alias.to_string()),
+            predicate,
+        });
         self
     }
 
