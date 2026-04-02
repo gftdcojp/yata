@@ -25,7 +25,7 @@ Read:  query_inner() → build_read_store_pushdown() → ArrowStore (zero-copy, 
        GIE Filter is alias-aware: source-side `WHERE a.*` is evaluated on binding `a`, not any bound vertex
        Cypher source/destination predicates (inline props + simple WHERE comparisons) feed `src_vid` / `dst_vid` candidate extraction before edge scan
        GIE optimizer annotates traversal with `TraversalStrategy` (`PreferStaged` / `PreferGie` / `Auto`)
-       Engine refines traversal strategy with Lance `count_rows(filter)` cardinality on source-node pushdown filters
+       Engine refines traversal strategy with Lance `count_rows(filter)` cardinality on source-node filters and `edge_label`/`src_label` edge spread
        Selective traversal ops are engine-led when hint + runtime frontier allow it: staged Expand/PathExpand scan edge frontier first, rebuild narrow ArrowStore, then resume GIE
        Chained traversals reuse touched alias vids across stages so later Expand/PathExpand keep prior bindings
        Cost gate: large frontier / over-limit intermediate sets fall back to normal GIE execution

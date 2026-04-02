@@ -500,10 +500,16 @@ fn collect_var_where_filters(
     }
 }
 
+#[derive(Debug, Clone)]
+struct NodePushdownContext {
+    filter: String,
+    label: Option<String>,
+}
+
 fn collect_node_pushdown_filters(
     ast: &yata_cypher::ast::Query,
     params: &HashMap<String, String>,
-) -> HashMap<String, String> {
+) -> HashMap<String, NodePushdownContext> {
     let mut filters = HashMap::new();
     let mut nodes_by_var: HashMap<String, yata_cypher::ast::NodePattern> = HashMap::new();
     let mut collect_from_patterns = |patterns: &[yata_cypher::ast::Pattern]| {
@@ -557,7 +563,10 @@ fn collect_node_pushdown_filters(
             parts.extend(extra.iter().cloned());
         }
         if !parts.is_empty() {
-            filters.insert(var, parts.join(" AND "));
+            filters.insert(var, NodePushdownContext {
+                filter: parts.join(" AND "),
+                label: node.labels.first().cloned(),
+            });
         }
     }
 
@@ -595,6 +604,27 @@ impl TieredGraphEngine {
         })
     }
 
+    fn estimate_edge_filter_cardinality(&self, filter: &str) -> Option<usize> {
+        if filter.is_empty() {
+            return None;
+        }
+        self.ensure_lance();
+        let lance_tbl = self.lance_edge_table.clone();
+        self.block_on(async {
+            let tbl_guard = lance_tbl.lock().await;
+            let tbl = tbl_guard.as_ref()?;
+            tbl.count_rows(Some(filter)).await.ok()
+        })
+    }
+
+    fn build_edge_cardinality_filter(&self, edge_label: &str, src_label: Option<&str>) -> String {
+        let mut parts = vec![format!("edge_label = {}", sql_quote(edge_label))];
+        if let Some(label) = src_label {
+            parts.push(format!("src_label = {}", sql_quote(label)));
+        }
+        parts.join(" AND ")
+    }
+
     fn refine_traversal_strategy_with_stats(
         &self,
         plan: &mut yata_gie::ir::QueryPlan,
@@ -615,10 +645,45 @@ impl TieredGraphEngine {
                     direction,
                     strategy,
                     ..
+                } => {
+                    if matches!(direction, yata_grin::Direction::Both) || edge_label.is_empty() {
+                        *strategy = TraversalStrategy::PreferGie;
+                        continue;
+                    }
+                    let Some(ctx) = node_filters.get(src_alias) else {
+                        continue;
+                    };
+                    let Some(source_cardinality) = self.estimate_vertex_filter_cardinality(&ctx.filter) else {
+                        continue;
+                    };
+                    let edge_filter = self.build_edge_cardinality_filter(edge_label, ctx.label.as_deref());
+                    let edge_cardinality = self.estimate_edge_filter_cardinality(&edge_filter).unwrap_or(0);
+                    let estimated_cost = edge_cardinality.max(source_cardinality);
+
+                    if source_cardinality == 0 || edge_cardinality == 0 {
+                        *strategy = TraversalStrategy::PreferGie;
+                        continue;
+                    }
+                    if estimated_cost <= PATH_EXPAND_FRONTIER_LIMIT {
+                        *strategy = TraversalStrategy::PreferStaged;
+                        continue;
+                    }
+                    if estimated_cost > PATH_EXPAND_FRONTIER_LIMIT.saturating_mul(4) {
+                        *strategy = TraversalStrategy::PreferGie;
+                        continue;
+                    }
+                    if let Some(cap) = soft_limit {
+                        *strategy = if estimated_cost <= cap {
+                            TraversalStrategy::PreferStaged
+                        } else {
+                            TraversalStrategy::PreferGie
+                        };
+                    }
                 }
-                | yata_gie::ir::LogicalOp::PathExpand {
+                yata_gie::ir::LogicalOp::PathExpand {
                     src_alias,
                     edge_label,
+                    max_hops,
                     direction,
                     strategy,
                     ..
@@ -627,26 +692,32 @@ impl TieredGraphEngine {
                         *strategy = TraversalStrategy::PreferGie;
                         continue;
                     }
-                    let Some(filter) = node_filters.get(src_alias) else {
+                    let Some(ctx) = node_filters.get(src_alias) else {
                         continue;
                     };
-                    let Some(cardinality) = self.estimate_vertex_filter_cardinality(filter) else {
+                    let Some(source_cardinality) = self.estimate_vertex_filter_cardinality(&ctx.filter) else {
                         continue;
                     };
-                    if cardinality == 0 {
+                    let edge_filter = self.build_edge_cardinality_filter(edge_label, ctx.label.as_deref());
+                    let edge_cardinality = self.estimate_edge_filter_cardinality(&edge_filter).unwrap_or(0);
+                    let estimated_cost = edge_cardinality
+                        .saturating_mul((*max_hops as usize).max(1))
+                        .max(source_cardinality);
+
+                    if source_cardinality == 0 || edge_cardinality == 0 {
                         *strategy = TraversalStrategy::PreferGie;
                         continue;
                     }
-                    if cardinality <= PATH_EXPAND_FRONTIER_LIMIT / 2 {
+                    if estimated_cost <= PATH_EXPAND_FRONTIER_LIMIT {
                         *strategy = TraversalStrategy::PreferStaged;
                         continue;
                     }
-                    if cardinality > PATH_EXPAND_FRONTIER_LIMIT {
+                    if estimated_cost > PATH_EXPAND_FRONTIER_LIMIT.saturating_mul(4) {
                         *strategy = TraversalStrategy::PreferGie;
                         continue;
                     }
                     if let Some(cap) = soft_limit {
-                        *strategy = if cardinality <= cap {
+                        *strategy = if estimated_cost <= cap {
                             TraversalStrategy::PreferStaged
                         } else {
                             TraversalStrategy::PreferGie
@@ -3367,6 +3438,35 @@ mod tests {
 
         let ast = yata_cypher::parse(
             "MATCH (a:User)-[:FOLLOWS]->(b:User) RETURN b.name AS name LIMIT 10"
+        ).unwrap();
+        let mut plan = yata_gie::transpile::transpile(&ast).unwrap();
+        e.refine_traversal_strategy_with_stats(&mut plan, &ast, &HashMap::new(), Some(10));
+
+        assert!(matches!(
+            plan.ops.iter().find(|op| matches!(op, yata_gie::ir::LogicalOp::Expand { .. })),
+            Some(yata_gie::ir::LogicalOp::Expand {
+                strategy: yata_gie::ir::TraversalStrategy::PreferGie,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_refine_traversal_strategy_with_stats_prefers_gie_for_broad_edge_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = make_engine(&dir);
+        run_query(&e, "CREATE (a:User {name: 'Alice'})-[:FOLLOWS]->(b:User {name: 'Bob'})", &[], None).unwrap();
+        for i in 0..300 {
+            run_query(
+                &e,
+                &format!("CREATE (a:User {{name: 'User{i}'}})-[:FOLLOWS]->(b:User {{name: 'Dst{i}'}})"),
+                &[],
+                None,
+            ).unwrap();
+        }
+
+        let ast = yata_cypher::parse(
+            "MATCH (a:User)-[:FOLLOWS]->(b:User) WHERE a.name = 'Alice' RETURN b.name AS name LIMIT 10"
         ).unwrap();
         let mut plan = yata_gie::transpile::transpile(&ast).unwrap();
         e.refine_traversal_strategy_with_stats(&mut plan, &ast, &HashMap::new(), Some(10));
