@@ -16,6 +16,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
 
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_STATEMENT_BYTES: usize = 64 * 1024;
+const MAX_BATCH_STATEMENTS: usize = 50;
+
 /// Trait abstracting the graph query interface needed by the REST API.
 pub trait GraphQueryExecutor: Send + Sync + 'static {
     fn query(
@@ -139,10 +143,8 @@ enum AuthResult {
 /// 3. No auth → Public
 fn authorize<G: GraphQueryExecutor>(headers: &HeaderMap, state: &YataRestState<G>) -> Result<AuthResult, StatusCode> {
     // 1. Workers RPC internal trust (coordinator sets this header)
-    if let Some(verified) = headers.get("X-Magatama-Verified") {
-        if verified.to_str().unwrap_or("") == "true" {
-            return Ok(AuthResult::Internal);
-        }
+    if is_internal_verified(headers) {
+        return Ok(AuthResult::Internal);
     }
 
     // 2. JWT verification (Design E: yata-native ES256 verify)
@@ -169,6 +171,27 @@ fn authorize<G: GraphQueryExecutor>(headers: &HeaderMap, state: &YataRestState<G
     Ok(AuthResult::Public)
 }
 
+fn is_internal_verified(headers: &HeaderMap) -> bool {
+    let verified = headers
+        .get("X-Magatama-Verified")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    if !verified {
+        return false;
+    }
+    // If configured, require a shared secret header for internal bypass.
+    let expected_secret = std::env::var("YATA_API_SECRET").unwrap_or_default();
+    if expected_secret.is_empty() {
+        return true;
+    }
+    headers
+        .get("X-Yata-Api-Secret")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == expected_secret)
+        .unwrap_or(false)
+}
+
 #[derive(Serialize)]
 struct HealthResp {
     status: String,
@@ -183,7 +206,12 @@ async fn health() -> impl IntoResponse {
 /// GET /xrpc/ai.gftd.yata.stats — CPM metrics (read/mutation/mergeRecord counters).
 async fn stats_handler<G: GraphQueryExecutor>(
     State(state): State<YataRestState<G>>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    match authorize(&headers, &state) {
+        Ok(AuthResult::Internal) => {}
+        _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "internal only"}))),
+    };
     match state.graph.cpm_stats() {
         Some(stats) => (StatusCode::OK, Json(serde_json::to_value(stats).unwrap_or_default())),
         None => (StatusCode::OK, Json(serde_json::json!({"error": "stats not available"}))),
@@ -270,11 +298,24 @@ async fn xrpc_cypher<G: GraphQueryExecutor>(
         }
     };
 
+    if req.statement.len() > MAX_STATEMENT_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"code":"payload_too_large","message":"statement too large"})),
+        );
+    }
+    let is_mutation = yata_engine::router::is_cypher_mutation(&req.statement);
+    if is_mutation && !matches!(auth, AuthResult::Internal) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"code":"forbidden","message":"mutation requires internal auth"})),
+        );
+    }
+
     let params = xrpc_parse_params(&req.parameters);
     let stmt = req.statement;
     let graph = state.graph.clone();
 
-    const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
     let result = match auth {
         AuthResult::Internal => {
             tokio::time::timeout(QUERY_TIMEOUT,
@@ -391,15 +432,57 @@ async fn xrpc_cypher_batch<G: GraphQueryExecutor>(
         }
     };
 
-    let results: Vec<serde_json::Value> = req.statements.into_iter().map(|stmt_req| {
+    if req.statements.len() > MAX_BATCH_STATEMENTS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"code":"bad_request","message":"too many statements"})),
+        );
+    }
+
+    let did = match &auth {
+        AuthResult::Authenticated { did } => Some(did.clone()),
+        _ => None,
+    };
+    let internal = matches!(auth, AuthResult::Internal);
+
+    let mut results: Vec<serde_json::Value> = Vec::with_capacity(req.statements.len());
+    for stmt_req in req.statements {
+        if stmt_req.statement.len() > MAX_STATEMENT_BYTES {
+            results.push(serde_json::json!({"error": "statement too large"}));
+            continue;
+        }
+        let is_mutation = yata_engine::router::is_cypher_mutation(&stmt_req.statement);
+        if is_mutation && !internal {
+            results.push(serde_json::json!({"error": "mutation requires internal auth"}));
+            continue;
+        }
+
         let params = xrpc_parse_params(&stmt_req.parameters);
-        let result = match &auth {
-            AuthResult::Internal => state.graph.query(&stmt_req.statement, &params, None),
-            AuthResult::Authenticated { did } => state.graph.query_with_did(&stmt_req.statement, &params, did),
-            AuthResult::Public => state.graph.query_with_did(&stmt_req.statement, &params, ""),
+        let stmt = stmt_req.statement;
+        let graph = state.graph.clone();
+        let result = if internal {
+            tokio::time::timeout(
+                QUERY_TIMEOUT,
+                tokio::task::spawn_blocking(move || graph.query(&stmt, &params, None)),
+            )
+            .await
+        } else if let Some(did) = did.clone() {
+            tokio::time::timeout(
+                QUERY_TIMEOUT,
+                tokio::task::spawn_blocking(move || graph.query_with_did(&stmt, &params, &did)),
+            )
+            .await
+        } else {
+            tokio::time::timeout(
+                QUERY_TIMEOUT,
+                tokio::task::spawn_blocking(move || graph.query_with_did(&stmt, &params, "")),
+            )
+            .await
         };
-        match result {
-            Ok(raw_rows) => {
+
+        let value = match result {
+            Err(_) => serde_json::json!({"error":"timeout"}),
+            Ok(Ok(Ok(raw_rows))) => {
                 let columns: Vec<String> = if let Some(first) = raw_rows.first() {
                     first.iter().map(|(col, _)| col.clone()).collect()
                 } else {
@@ -413,9 +496,12 @@ async fn xrpc_cypher_batch<G: GraphQueryExecutor>(
                     .collect();
                 serde_json::json!({"columns": columns, "rows": rows})
             }
-            Err(e) => serde_json::json!({"error": e}),
-        }
-    }).collect();
+            Ok(Ok(Err(e))) => serde_json::json!({"error": e}),
+            Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
+        };
+        results.push(value);
+    }
+
     tracing::info!(
         op = "xrpc_cypher_batch",
         elapsed_ms = started_at.elapsed().as_millis() as u64,
@@ -430,7 +516,12 @@ async fn xrpc_cypher_batch<G: GraphQueryExecutor>(
 /// POST /xrpc/ai.gftd.yata.coldStart — Open LanceDB table from R2.
 async fn cold_start_handler<G: GraphQueryExecutor>(
     State(state): State<YataRestState<G>>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    match authorize(&headers, &state) {
+        Ok(AuthResult::Internal) => {}
+        _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "internal only"}))),
+    };
     let graph = state.graph.clone();
     const COLD_START_TIMEOUT: Duration = Duration::from_secs(30);
     let result = tokio::time::timeout(COLD_START_TIMEOUT,
@@ -447,7 +538,12 @@ async fn cold_start_handler<G: GraphQueryExecutor>(
 /// POST /xrpc/ai.gftd.yata.compact — L1 Compaction: PK-dedup Lance fragments.
 async fn compact_handler<G: GraphQueryExecutor>(
     State(state): State<YataRestState<G>>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    match authorize(&headers, &state) {
+        Ok(AuthResult::Internal) => {}
+        _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "internal only"}))),
+    };
     let started_at = Instant::now();
     if state.readonly {
         return (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"error": "read-only container"})));
@@ -506,7 +602,12 @@ async fn compact_handler<G: GraphQueryExecutor>(
 /// POST /xrpc/ai.gftd.yata.repair — Repair corrupted Lance table by version rollback.
 async fn repair_handler<G: GraphQueryExecutor>(
     State(state): State<YataRestState<G>>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    match authorize(&headers, &state) {
+        Ok(AuthResult::Internal) => {}
+        _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "internal only"}))),
+    };
     let graph = state.graph.clone();
     const REPAIR_TIMEOUT: Duration = Duration::from_secs(60);
     let result = tokio::time::timeout(REPAIR_TIMEOUT,
