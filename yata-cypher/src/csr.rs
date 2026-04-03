@@ -36,7 +36,13 @@ impl CsrIndex {
         let (out_offsets, out_edges) = Self::pack(out_map);
         let (in_offsets, in_edges) = Self::pack(in_map);
 
-        Self { out_offsets, out_edges, in_offsets, in_edges, edge_keys }
+        Self {
+            out_offsets,
+            out_edges,
+            in_offsets,
+            in_edges,
+            edge_keys,
+        }
     }
 
     fn pack(map: HashMap<String, Vec<usize>>) -> (HashMap<String, (usize, usize)>, Vec<usize>) {
@@ -86,9 +92,7 @@ mod tests {
 
     #[test]
     fn test_single_edge() {
-        let edges = vec![
-            ("a".into(), "b".into(), "e1".into()),
-        ];
+        let edges = vec![("a".into(), "b".into(), "e1".into())];
         let csr = CsrIndex::build(&edges);
         assert_eq!(csr.out_edge_indices("a"), &[0]);
         assert!(csr.out_edge_indices("b").is_empty());
@@ -131,9 +135,7 @@ mod tests {
 
     #[test]
     fn test_no_neighbors_for_isolated_vertex() {
-        let edges = vec![
-            ("a".into(), "b".into(), "e1".into()),
-        ];
+        let edges = vec![("a".into(), "b".into(), "e1".into())];
         let csr = CsrIndex::build(&edges);
         assert!(csr.out_edge_indices("isolated").is_empty());
         assert!(csr.in_edge_indices("isolated").is_empty());

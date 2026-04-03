@@ -17,59 +17,26 @@ path = "src/cypher_bench.rs"
 name = "cypher-transport-bench"
 path = "src/cypher_transport_bench.rs"
 
-[[bin]]
-name = "cypher-storage-bench"
-path = "src/cypher_storage_bench.rs"
-
-[[bin]]
-name = "at-bench"
-path = "src/at_bench.rs"
-
-[[bin]]
-name = "signal-bench"
-path = "src/signal_bench.rs"
-
-[[bin]]
-name = "embedded-vs-cluster-bench"
-path = "src/embedded_vs_cluster_bench.rs"
 
 [dependencies]
 yata-core.workspace = true
-yata-at.workspace = true
-yata-signal.workspace = true
-x25519-dalek.workspace = true
-ciborium.workspace = true
-yata-arrow.workspace = true
-yata-log.workspace = true
-yata-kv.workspace = true
-yata-object.workspace = true
-yata-ocel.workspace = true
-yata-lance.workspace = true
-yata-server.workspace = true
-yata-b2.workspace = true
-yata-client.workspace = true
 yata-cypher.workspace = true
-lancedb.workspace = true
+yata-engine.workspace = true
+yata-lance.workspace = true
+yata-grin.workspace = true
+yata-gie.workspace = true
 arrow.workspace = true
-arrow-array.workspace = true
-arrow-schema.workspace = true
 bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tokio = { workspace = true }
-futures.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-chrono.workspace = true
-tempfile = "3"
-neo4rs = "0.8"
 rand = { workspace = true }
+tempfile = "3"
 memmap2 = "0.9"
 libc = "0.2"
-yata-flight.workspace = true
-arrow-flight.workspace = true
-tonic.workspace = true
-prost.workspace = true
-aws-config = { version = "1", default-features = false, features = ["rustls"] }
-aws-sdk-s3 = { version = "1", default-features = false, features = ["rustls"] }
+
+[package.metadata.cargo-machete]
+ignored = ["tracing"]

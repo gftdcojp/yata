@@ -11,10 +11,117 @@ use yata_grin::Predicate;
 pub fn optimize(plan: QueryPlan) -> QueryPlan {
     let plan = push_down_filters(plan);
     let plan = merge_adjacent_scans(plan);
-    plan
+    annotate_traversal_strategy(plan)
 }
 
-/// Move Filter ops before Expand when the filter only references the scan alias.
+fn annotate_traversal_strategy(plan: QueryPlan) -> QueryPlan {
+    let has_limit = plan.ops.iter().any(|op| matches!(op, LogicalOp::Limit { .. }));
+    let original_ops = plan.ops.clone();
+    let ops = plan
+        .ops
+        .into_iter()
+        .enumerate()
+        .map(|(idx, op)| match op {
+            LogicalOp::Expand {
+                src_alias,
+                edge_label,
+                dst_alias,
+                direction,
+                ..
+            } => LogicalOp::Expand {
+                src_alias: src_alias.clone(),
+                edge_label: edge_label.clone(),
+                dst_alias: dst_alias.clone(),
+                direction,
+                strategy: classify_traversal(
+                    &QueryPlan {
+                        ops: original_ops.clone(),
+                    },
+                    idx,
+                    &src_alias,
+                    &edge_label,
+                    direction,
+                    false,
+                    has_limit,
+                ),
+            },
+            LogicalOp::PathExpand {
+                src_alias,
+                edge_label,
+                dst_alias,
+                min_hops,
+                max_hops,
+                direction,
+                ..
+            } => LogicalOp::PathExpand {
+                src_alias: src_alias.clone(),
+                edge_label: edge_label.clone(),
+                dst_alias: dst_alias.clone(),
+                min_hops,
+                max_hops,
+                direction,
+                strategy: classify_traversal(
+                    &QueryPlan {
+                        ops: original_ops.clone(),
+                    },
+                    idx,
+                    &src_alias,
+                    &edge_label,
+                    direction,
+                    true,
+                    has_limit,
+                ),
+            },
+            other => other,
+        })
+        .collect();
+    QueryPlan { ops }
+}
+
+fn classify_traversal(
+    plan: &QueryPlan,
+    op_index: usize,
+    src_alias: &str,
+    edge_label: &str,
+    direction: yata_grin::Direction,
+    is_path_expand: bool,
+    has_limit: bool,
+) -> TraversalStrategy {
+    if matches!(direction, yata_grin::Direction::Both) || edge_label.is_empty() {
+        return TraversalStrategy::PreferGie;
+    }
+    let has_selective_scan = plan.ops[..op_index].iter().any(|op| {
+        matches!(
+            op,
+            LogicalOp::Scan {
+                alias,
+                predicate: Some(_),
+                ..
+            } if alias == src_alias
+        )
+    });
+    let has_source_filter = plan.ops[..op_index].iter().any(|op| {
+        matches!(
+            op,
+            LogicalOp::Filter {
+                alias: Some(alias),
+                ..
+            } if alias == src_alias
+        )
+    });
+    if has_selective_scan || has_source_filter {
+        return TraversalStrategy::PreferStaged;
+    }
+    if is_path_expand && has_limit {
+        return TraversalStrategy::PreferStaged;
+    }
+    if has_limit && op_index == 1 {
+        return TraversalStrategy::PreferStaged;
+    }
+    TraversalStrategy::Auto
+}
+
+/// Move Filter ops before Expand/PathExpand when the filter only references the source alias.
 ///
 /// Pattern: Scan(alias=n) -> Expand -> Filter(pred on n) -> ...
 /// becomes: Scan(alias=n) -> Filter(pred on n) -> Expand -> ...
@@ -28,29 +135,16 @@ fn push_down_filters(plan: QueryPlan) -> QueryPlan {
         changed = false;
         let mut i = 0;
         while i + 1 < ops.len() {
-            // If ops[i] is Expand and ops[i+1] is Filter referencing only
-            // the scan alias (before the expand), swap them.
-            let should_swap = if let (
-                LogicalOp::Expand { src_alias: _, .. },
-                LogicalOp::Filter { predicate },
-            ) = (&ops[i], &ops[i + 1])
-            {
-                // Check if the filter predicate only references properties
-                // (not variables from the expand destination).
-                // Simple heuristic: if we can find a Scan before this Expand
-                // whose alias matches, and the predicate doesn't reference
-                // the dst_alias, we can push down.
-                let expand_dst = if let LogicalOp::Expand { dst_alias, .. } = &ops[i] {
-                    dst_alias.clone()
-                } else {
-                    String::new()
-                };
-                // Predicates in GRIN format don't reference aliases directly,
-                // they reference property keys. We push down all pure property
-                // predicates that appear after an Expand.
-                !predicate_references_alias(&expand_dst, predicate) && !expand_dst.is_empty()
-            } else {
-                false
+            // If ops[i] is Expand/PathExpand and ops[i+1] is a source-bound Filter, swap them.
+            let should_swap = match (&ops[i], &ops[i + 1]) {
+                (
+                    LogicalOp::Expand { src_alias, .. } | LogicalOp::PathExpand { src_alias, .. },
+                    LogicalOp::Filter {
+                        alias: Some(filter_alias),
+                        ..
+                    },
+                ) => filter_alias == src_alias,
+                _ => false,
             };
 
             if should_swap {
@@ -84,16 +178,35 @@ fn merge_adjacent_scans(plan: QueryPlan) -> QueryPlan {
                 let filter = ops[i + 1].clone();
 
                 if let (
-                    LogicalOp::Scan { label, alias, predicate: existing },
-                    LogicalOp::Filter { predicate: new_pred },
+                    LogicalOp::Scan {
+                        label,
+                        alias,
+                        predicate: existing,
+                    },
+                    LogicalOp::Filter {
+                        alias: filter_alias,
+                        predicate: new_pred,
+                    },
                 ) = (scan, filter)
                 {
+                    if filter_alias.as_deref() != Some(alias.as_str()) {
+                        result.push(LogicalOp::Scan {
+                            label,
+                            alias,
+                            predicate: existing,
+                        });
+                        result.push(LogicalOp::Filter {
+                            alias: filter_alias,
+                            predicate: new_pred,
+                        });
+                        i += 2;
+                        continue;
+                    }
                     let merged_pred = match existing {
                         None => new_pred,
-                        Some(existing_pred) => Predicate::And(
-                            Box::new(existing_pred),
-                            Box::new(new_pred),
-                        ),
+                        Some(existing_pred) => {
+                            Predicate::And(Box::new(existing_pred), Box::new(new_pred))
+                        }
                     };
                     result.push(LogicalOp::Scan {
                         label,
@@ -110,19 +223,6 @@ fn merge_adjacent_scans(plan: QueryPlan) -> QueryPlan {
     }
 
     QueryPlan { ops: result }
-}
-
-/// Check if a predicate conceptually references a given alias.
-/// Since GRIN predicates are property-key based (not alias-based),
-/// this is a heuristic: we return false for all pure property predicates,
-/// meaning they can be pushed down past expands.
-fn predicate_references_alias(_alias: &str, _predicate: &Predicate) -> bool {
-    // GRIN predicates (Eq, Lt, Gt, etc.) reference property keys, not aliases.
-    // They are always safe to push down since they filter on vertex properties
-    // of whatever the current context vertex is.
-    // In a more sophisticated system, we'd track which alias each predicate
-    // applies to. For now, all predicates are considered pushdown-safe.
-    false
 }
 
 #[cfg(test)]
@@ -145,8 +245,10 @@ mod tests {
                     edge_label: "KNOWS".into(),
                     dst_alias: "m".into(),
                     direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
                 },
                 LogicalOp::Filter {
+                    alias: Some("n".into()),
                     predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
                 },
             ],
@@ -162,6 +264,37 @@ mod tests {
     }
 
     #[test]
+    fn test_path_filter_pushdown() {
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: None,
+                },
+                LogicalOp::PathExpand {
+                    src_alias: "n".into(),
+                    edge_label: "KNOWS".into(),
+                    dst_alias: "m".into(),
+                    min_hops: 1,
+                    max_hops: 3,
+                    direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
+                },
+                LogicalOp::Filter {
+                    alias: Some("n".into()),
+                    predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
+                },
+            ],
+        };
+
+        let optimized = push_down_filters(plan);
+        assert!(matches!(&optimized.ops[0], LogicalOp::Scan { .. }));
+        assert!(matches!(&optimized.ops[1], LogicalOp::Filter { .. }));
+        assert!(matches!(&optimized.ops[2], LogicalOp::PathExpand { .. }));
+    }
+
+    #[test]
     fn test_merge_scans() {
         // Scan(no pred) -> Filter(pred)  =>  Scan(pred)
         let plan = QueryPlan {
@@ -172,6 +305,7 @@ mod tests {
                     predicate: None,
                 },
                 LogicalOp::Filter {
+                    alias: Some("n".into()),
                     predicate: Predicate::Eq("name".into(), PropValue::Str("Alice".into())),
                 },
             ],
@@ -181,7 +315,10 @@ mod tests {
         assert_eq!(optimized.ops.len(), 1);
 
         match &optimized.ops[0] {
-            LogicalOp::Scan { predicate: Some(Predicate::Eq(k, _)), .. } => {
+            LogicalOp::Scan {
+                predicate: Some(Predicate::Eq(k, _)),
+                ..
+            } => {
                 assert_eq!(k, "name");
             }
             _ => panic!("expected Scan with merged predicate"),
@@ -199,6 +336,7 @@ mod tests {
                     predicate: Some(Predicate::Eq("name".into(), PropValue::Str("Alice".into()))),
                 },
                 LogicalOp::Filter {
+                    alias: Some("n".into()),
                     predicate: Predicate::Gt("age".into(), PropValue::Int(18)),
                 },
             ],
@@ -208,7 +346,10 @@ mod tests {
         assert_eq!(optimized.ops.len(), 1);
 
         match &optimized.ops[0] {
-            LogicalOp::Scan { predicate: Some(Predicate::And(_, _)), .. } => {}
+            LogicalOp::Scan {
+                predicate: Some(Predicate::And(_, _)),
+                ..
+            } => {}
             _ => panic!("expected Scan with And predicate"),
         }
     }
@@ -229,8 +370,10 @@ mod tests {
                     edge_label: "KNOWS".into(),
                     dst_alias: "m".into(),
                     direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
                 },
                 LogicalOp::Filter {
+                    alias: Some("n".into()),
                     predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
                 },
                 LogicalOp::Project {
@@ -243,7 +386,13 @@ mod tests {
         // After pushdown: Scan -> Filter -> Expand -> Project
         // After merge: Scan(pred) -> Expand -> Project
         assert_eq!(optimized.ops.len(), 3);
-        assert!(matches!(&optimized.ops[0], LogicalOp::Scan { predicate: Some(_), .. }));
+        assert!(matches!(
+            &optimized.ops[0],
+            LogicalOp::Scan {
+                predicate: Some(_),
+                ..
+            }
+        ));
         assert!(matches!(&optimized.ops[1], LogicalOp::Expand { .. }));
         assert!(matches!(&optimized.ops[2], LogicalOp::Project { .. }));
     }
@@ -263,6 +412,7 @@ mod tests {
                     edge_label: "KNOWS".into(),
                     dst_alias: "m".into(),
                     direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
                 },
                 LogicalOp::Project {
                     exprs: vec![Expr::Var("m".into())],
@@ -292,5 +442,314 @@ mod tests {
         };
         let optimized = optimize(plan);
         assert_eq!(optimized.ops.len(), 1);
+    }
+
+    #[test]
+    fn test_multiple_filters_pushdown_and_merge() {
+        // Scan -> Expand -> Filter1 -> Filter2 -> Project
+        // After pushdown: Scan -> Filter1 -> Filter2 -> Expand -> Project
+        // After merge: Scan(And(pred1, pred2)) -> Expand -> Project
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: None,
+                },
+                LogicalOp::Expand {
+                    src_alias: "n".into(),
+                    edge_label: "KNOWS".into(),
+                    dst_alias: "m".into(),
+                    direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
+                },
+                LogicalOp::Filter {
+                    alias: Some("n".into()),
+                    predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
+                },
+                LogicalOp::Filter {
+                    alias: Some("n".into()),
+                    predicate: Predicate::Eq("name".into(), PropValue::Str("Alice".into())),
+                },
+                LogicalOp::Project {
+                    exprs: vec![Expr::Var("m".into())],
+                },
+            ],
+        };
+        let optimized = optimize(plan);
+        // Both filters should be pushed down and merged into scan
+        assert!(
+            optimized.ops.len() <= 4,
+            "optimization should reduce op count, got {}",
+            optimized.ops.len()
+        );
+        // Scan should have a predicate
+        match &optimized.ops[0] {
+            LogicalOp::Scan {
+                predicate: Some(_), ..
+            } => {}
+            _ => panic!("expected Scan with merged predicate after optimization"),
+        }
+    }
+
+    #[test]
+    fn test_optimize_idempotent() {
+        // Optimizing an already-optimized plan should produce the same result
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: Some(Predicate::Eq("age".into(), PropValue::Int(30))),
+                },
+                LogicalOp::Expand {
+                    src_alias: "n".into(),
+                    edge_label: "KNOWS".into(),
+                    dst_alias: "m".into(),
+                    direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
+                },
+                LogicalOp::Project {
+                    exprs: vec![Expr::Var("m".into())],
+                },
+            ],
+        };
+        let first = optimize(plan.clone());
+        let second = optimize(first.clone());
+        assert_eq!(first.ops.len(), second.ops.len());
+    }
+
+    #[test]
+    fn test_filter_not_pushed_past_project() {
+        // Filter after Project should NOT be pushed down
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: None,
+                },
+                LogicalOp::Project {
+                    exprs: vec![Expr::Prop("n".into(), "name".into())],
+                },
+                LogicalOp::Filter {
+                    alias: Some("n".into()),
+                    predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
+                },
+            ],
+        };
+        let optimized = optimize(plan);
+        // Project should still precede Filter (not swap)
+        let project_idx = optimized
+            .ops
+            .iter()
+            .position(|op| matches!(op, LogicalOp::Project { .. }));
+        let filter_idx = optimized
+            .ops
+            .iter()
+            .position(|op| matches!(op, LogicalOp::Filter { .. }));
+        if let (Some(p), Some(f)) = (project_idx, filter_idx) {
+            assert!(
+                p < f,
+                "Filter after Project should not be reordered: project@{p} filter@{f}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_only_adjacent_scan_filter() {
+        // Scan -> Project -> Filter should NOT merge (not adjacent)
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: None,
+                },
+                LogicalOp::Project {
+                    exprs: vec![Expr::Var("n".into())],
+                },
+                LogicalOp::Filter {
+                    alias: Some("n".into()),
+                    predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
+                },
+            ],
+        };
+        let optimized = merge_adjacent_scans(plan);
+        assert_eq!(
+            optimized.ops.len(),
+            3,
+            "non-adjacent Scan+Filter should not merge"
+        );
+        // Scan should still have no predicate
+        match &optimized.ops[0] {
+            LogicalOp::Scan {
+                predicate: None, ..
+            } => {}
+            _ => panic!("Scan should remain without predicate"),
+        }
+    }
+
+    #[test]
+    fn test_pushdown_preserves_security_filter() {
+        // SecurityFilter should not be affected by pushdown
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Post".into(),
+                    alias: "p".into(),
+                    predicate: None,
+                },
+                LogicalOp::SecurityFilter {
+                    aliases: vec!["p".into()],
+                    scope: crate::ir::SecurityScope::default(),
+                },
+                LogicalOp::Expand {
+                    src_alias: "p".into(),
+                    edge_label: "REPLIED_TO".into(),
+                    dst_alias: "r".into(),
+                    direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
+                },
+                LogicalOp::Filter {
+                    alias: Some("n".into()),
+                    predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
+                },
+            ],
+        };
+        let optimized = optimize(plan);
+        let has_security = optimized
+            .ops
+            .iter()
+            .any(|op| matches!(op, LogicalOp::SecurityFilter { .. }));
+        assert!(has_security, "SecurityFilter should be preserved after optimization");
+    }
+
+    #[test]
+    fn test_filter_on_dst_alias_is_not_pushed_before_expand() {
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: None,
+                },
+                LogicalOp::Expand {
+                    src_alias: "n".into(),
+                    edge_label: "KNOWS".into(),
+                    dst_alias: "m".into(),
+                    direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
+                },
+                LogicalOp::Filter {
+                    alias: Some("m".into()),
+                    predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
+                },
+            ],
+        };
+
+        let optimized = push_down_filters(plan);
+        assert!(matches!(&optimized.ops[1], LogicalOp::Expand { .. }));
+        assert!(matches!(
+            &optimized.ops[2],
+            LogicalOp::Filter {
+                alias: Some(alias),
+                ..
+            } if alias == "m"
+        ));
+    }
+
+    #[test]
+    fn test_filter_on_path_dst_alias_is_not_pushed_before_path_expand() {
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: None,
+                },
+                LogicalOp::PathExpand {
+                    src_alias: "n".into(),
+                    edge_label: "KNOWS".into(),
+                    dst_alias: "m".into(),
+                    min_hops: 1,
+                    max_hops: 3,
+                    direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
+                },
+                LogicalOp::Filter {
+                    alias: Some("m".into()),
+                    predicate: Predicate::Eq("age".into(), PropValue::Int(30)),
+                },
+            ],
+        };
+
+        let optimized = push_down_filters(plan);
+        assert!(matches!(&optimized.ops[1], LogicalOp::PathExpand { .. }));
+        assert!(matches!(
+            &optimized.ops[2],
+            LogicalOp::Filter {
+                alias: Some(alias),
+                ..
+            } if alias == "m"
+        ));
+    }
+
+    #[test]
+    fn test_selective_traversal_prefers_staged_strategy() {
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: Some(Predicate::Eq("name".into(), PropValue::Str("Alice".into()))),
+                },
+                LogicalOp::Expand {
+                    src_alias: "n".into(),
+                    edge_label: "KNOWS".into(),
+                    dst_alias: "m".into(),
+                    direction: yata_grin::Direction::Out,
+                    strategy: TraversalStrategy::Auto,
+                },
+            ],
+        };
+
+        let optimized = optimize(plan);
+        assert!(matches!(
+            &optimized.ops[1],
+            LogicalOp::Expand {
+                strategy: TraversalStrategy::PreferStaged,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_bidirectional_traversal_prefers_gie_strategy() {
+        let plan = QueryPlan {
+            ops: vec![
+                LogicalOp::Scan {
+                    label: "Person".into(),
+                    alias: "n".into(),
+                    predicate: None,
+                },
+                LogicalOp::Expand {
+                    src_alias: "n".into(),
+                    edge_label: "KNOWS".into(),
+                    dst_alias: "m".into(),
+                    direction: yata_grin::Direction::Both,
+                    strategy: TraversalStrategy::Auto,
+                },
+            ],
+        };
+
+        let optimized = optimize(plan);
+        assert!(matches!(
+            &optimized.ops[1],
+            LogicalOp::Expand {
+                strategy: TraversalStrategy::PreferGie,
+                ..
+            }
+        ));
     }
 }

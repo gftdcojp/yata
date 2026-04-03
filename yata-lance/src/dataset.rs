@@ -1,0 +1,525 @@
+//! YataDb — LanceDB-backed persistence for yata graph.
+//!
+//! Uses lancedb::Connection + Table for all storage operations.
+//! LanceDB handles versioning, manifest, fragments, compaction, and S3/R2 internally.
+
+use arrow::record_batch::RecordBatch;
+use futures::TryStreamExt;
+use lancedb::index::scalar::{BTreeIndexBuilder, BitmapIndexBuilder};
+use lancedb::index::{Index, IndexType};
+use lancedb::query::{ExecutableQuery, QueryBase};
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
+
+/// LanceDB connection wrapper for yata graph persistence.
+pub struct YataDb {
+    db: lancedb::Connection,
+}
+
+/// Single table handle (vertices or edges).
+pub struct YataTable {
+    table: lancedb::Table,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarIndexKind {
+    BTree,
+    Bitmap,
+}
+
+static SHARED_SESSION: LazyLock<Arc<lancedb::Session>> = LazyLock::new(|| {
+    let index_cache_size = std::env::var("YATA_LANCE_INDEX_CACHE_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1024);
+    let metadata_cache_size = std::env::var("YATA_LANCE_METADATA_CACHE_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(32 * 1024 * 1024);
+    Arc::new(lancedb::Session::new(
+        index_cache_size,
+        metadata_cache_size,
+        Arc::new(lancedb::ObjectStoreRegistry::default()),
+    ))
+});
+
+fn read_consistency_interval_from_env() -> Option<Duration> {
+    let secs = std::env::var("YATA_LANCE_READ_CONSISTENCY_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())?;
+    Some(Duration::from_secs(secs))
+}
+
+fn apply_common_connect_options(
+    mut builder: lancedb::connection::ConnectBuilder,
+) -> lancedb::connection::ConnectBuilder {
+    builder = builder.session(SHARED_SESSION.clone());
+    if let Some(interval) = read_consistency_interval_from_env() {
+        builder = builder.read_consistency_interval(interval);
+    }
+    builder
+}
+
+impl YataDb {
+    /// Connect to a local LanceDB database.
+    pub async fn connect_local(path: &str) -> Result<Self, lancedb::Error> {
+        let db = apply_common_connect_options(lancedb::connect(path))
+            .execute()
+            .await?;
+        Ok(Self { db })
+    }
+
+    /// Connect to an S3/R2-backed LanceDB database.
+    ///
+    /// `uri` should be `s3://bucket/prefix` or `s3+ddb://bucket/prefix` for DynamoDB commit store.
+    /// R2 is S3-compatible, so use `s3://bucket/prefix` with R2 endpoint.
+    pub async fn connect_s3(
+        uri: &str,
+        endpoint: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+        region: &str,
+    ) -> Result<Self, lancedb::Error> {
+        let request_timeout =
+            std::env::var("YATA_LANCE_REQUEST_TIMEOUT").unwrap_or_else(|_| "120s".to_string());
+        let connect_timeout =
+            std::env::var("YATA_LANCE_CONNECT_TIMEOUT").unwrap_or_else(|_| "10s".to_string());
+        let download_retry_count = std::env::var("YATA_LANCE_DOWNLOAD_RETRY_COUNT")
+            .unwrap_or_else(|_| "8".to_string());
+        let client_max_retries =
+            std::env::var("YATA_LANCE_CLIENT_MAX_RETRIES").unwrap_or_else(|_| "20".to_string());
+        let client_retry_timeout = std::env::var("YATA_LANCE_CLIENT_RETRY_TIMEOUT")
+            .unwrap_or_else(|_| "300".to_string());
+        let db = apply_common_connect_options(lancedb::connect(uri))
+            .storage_option("aws_access_key_id", access_key_id)
+            .storage_option("aws_secret_access_key", secret_access_key)
+            .storage_option("aws_endpoint", endpoint)
+            .storage_option("aws_region", region)
+            .storage_option("aws_virtual_hosted_style_request", "false")
+            .storage_option("request_timeout", request_timeout)
+            .storage_option("connect_timeout", connect_timeout)
+            .storage_option("download_retry_count", download_retry_count)
+            .storage_option("client_max_retries", client_max_retries)
+            .storage_option("client_retry_timeout", client_retry_timeout)
+            .execute()
+            .await?;
+        Ok(Self { db })
+    }
+
+    /// Connect from YATA_S3_* env vars. Returns None if not configured.
+    /// CRITICAL: S3 connection errors are logged, not silently swallowed.
+    pub async fn connect_from_env(prefix: &str) -> Option<Self> {
+        let endpoint = std::env::var("YATA_S3_ENDPOINT").ok()?;
+        let bucket = std::env::var("YATA_S3_BUCKET").unwrap_or_default();
+        let key_id = std::env::var("YATA_S3_ACCESS_KEY_ID")
+            .or_else(|_| std::env::var("YATA_S3_KEY_ID"))
+            .unwrap_or_default();
+        let secret = std::env::var("YATA_S3_SECRET_ACCESS_KEY")
+            .or_else(|_| std::env::var("YATA_S3_SECRET_KEY"))
+            .or_else(|_| std::env::var("YATA_S3_APPLICATION_KEY"))
+            .unwrap_or_default();
+        let region = std::env::var("YATA_S3_REGION").unwrap_or_else(|_| "auto".to_string());
+        if endpoint.is_empty() || bucket.is_empty() || key_id.is_empty() || secret.is_empty() {
+            tracing::warn!(
+                endpoint_set = !endpoint.is_empty(),
+                bucket_set = !bucket.is_empty(),
+                key_id_set = !key_id.is_empty(),
+                secret_set = !secret.is_empty(),
+                "S3 env vars incomplete — cannot connect to R2"
+            );
+            return None;
+        }
+        let uri = format!("s3://{bucket}/{prefix}");
+        tracing::info!(%uri, %endpoint, "connecting to LanceDB on R2");
+        match Self::connect_s3(&uri, &endpoint, &key_id, &secret, &region).await {
+            Ok(db) => {
+                tracing::info!(%uri, "LanceDB R2 connection established");
+                Some(db)
+            }
+            Err(e) => {
+                tracing::error!(%uri, %endpoint, error = %e, "CRITICAL: LanceDB R2 connection FAILED — data will NOT persist");
+                None
+            }
+        }
+    }
+
+    /// Open an existing table.
+    pub async fn open_table(&self, name: &str) -> Result<YataTable, lancedb::Error> {
+        let table = self.db.open_table(name).execute().await?;
+        Ok(YataTable { table })
+    }
+
+    /// Create a new table with initial data.
+    pub async fn create_table(
+        &self,
+        name: &str,
+        batch: RecordBatch,
+    ) -> Result<YataTable, lancedb::Error> {
+        let table = self.db.create_table(name, batch).execute().await?;
+        Ok(YataTable { table })
+    }
+
+    /// Create an empty table with a given schema.
+    pub async fn create_empty_table(
+        &self,
+        name: &str,
+        schema: Arc<arrow::datatypes::Schema>,
+    ) -> Result<YataTable, lancedb::Error> {
+        let table = self.db.create_empty_table(name, schema).execute().await?;
+        Ok(YataTable { table })
+    }
+
+    /// List all table names.
+    pub async fn table_names(&self) -> Result<Vec<String>, lancedb::Error> {
+        self.db.table_names().execute().await
+    }
+
+    /// Get the underlying LanceDB connection.
+    pub fn inner(&self) -> &lancedb::Connection {
+        &self.db
+    }
+
+    /// Open or create the embeddings table for vector search.
+    pub async fn open_or_create_embeddings_table(
+        &self,
+        dim: usize,
+    ) -> Result<YataTable, lancedb::Error> {
+        match self.open_table("embeddings").await {
+            Ok(tbl) => Ok(tbl),
+            Err(_) => {
+                let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                    arrow::datatypes::Field::new("vid", arrow::datatypes::DataType::Utf8, false),
+                    arrow::datatypes::Field::new("label", arrow::datatypes::DataType::Utf8, false),
+                    arrow::datatypes::Field::new(
+                        "vector",
+                        arrow::datatypes::DataType::FixedSizeList(
+                            Arc::new(arrow::datatypes::Field::new("item", arrow::datatypes::DataType::Float32, true)),
+                            dim as i32,
+                        ),
+                        true,
+                    ),
+                ]));
+                self.create_empty_table("embeddings", schema).await
+            }
+        }
+    }
+}
+
+impl YataTable {
+    /// Append a batch to the table (creates a new version).
+    pub async fn add(&self, batch: RecordBatch) -> Result<(), lancedb::Error> {
+        self.table.add(batch).execute().await?;
+        Ok(())
+    }
+
+    /// Scan the full table, returning all rows.
+    pub async fn scan_all(&self) -> Result<Vec<RecordBatch>, lancedb::Error> {
+        let stream = self.table.query().execute().await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        Ok(batches)
+    }
+
+    /// Scan with a SQL filter expression (e.g. `"label = 'Post'"`).
+    pub async fn scan_filter(&self, filter: &str) -> Result<Vec<RecordBatch>, lancedb::Error> {
+        let stream = self
+            .table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        Ok(batches)
+    }
+
+    /// Scan with SQL filter, optional LIMIT, and optional column selection.
+    ///
+    /// Pushes filter + limit down to Lance row-group level, reducing I/O and memory.
+    /// `columns`: if non-empty, only these columns are read (projection pushdown).
+    pub async fn scan_filter_limit(
+        &self,
+        filter: &str,
+        limit: Option<usize>,
+        columns: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, lancedb::Error> {
+        let mut q = self.table.query();
+        if !filter.is_empty() {
+            q = q.only_if(filter);
+        }
+        if let Some(lim) = limit {
+            q = q.limit(lim);
+        }
+        if let Some(cols) = columns {
+            let col_vec: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
+            q = q.select(lancedb::query::Select::Columns(col_vec));
+        }
+        let stream = q.execute().await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        Ok(batches)
+    }
+
+    /// Count rows, optionally with a filter.
+    pub async fn count_rows(&self, filter: Option<&str>) -> Result<usize, lancedb::Error> {
+        self.table.count_rows(filter.map(|s| s.to_string())).await
+    }
+
+    /// List configured indices.
+    pub async fn list_indices(&self) -> Result<Vec<lancedb::index::IndexConfig>, lancedb::Error> {
+        self.table.list_indices().await
+    }
+
+    /// Compact fragments (merge small files). Delegates to LanceDB built-in optimization.
+    pub async fn compact(&self) -> Result<lancedb::table::OptimizeStats, lancedb::Error> {
+        self.table
+            .optimize(lancedb::table::OptimizeAction::Compact {
+                options: Default::default(),
+                remap_options: None,
+            })
+            .await
+    }
+
+    /// Run Lance's full optimization cycle: compaction, pruning, and index maintenance.
+    pub async fn optimize_all(&self) -> Result<lancedb::table::OptimizeStats, lancedb::Error> {
+        self.table.optimize(lancedb::table::OptimizeAction::All).await
+    }
+
+    /// Get the current table version.
+    pub async fn version(&self) -> Result<u64, lancedb::Error> {
+        self.table.version().await
+    }
+
+    /// Get table name.
+    pub fn name(&self) -> &str {
+        self.table.name()
+    }
+
+    /// Vector search: find nearest neighbors by embedding vector.
+    pub async fn vector_search(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: Option<&str>,
+    ) -> Result<Vec<RecordBatch>, lancedb::Error> {
+        let mut q = self.table.query().nearest_to(query)?;
+        q = q.limit(limit);
+        if let Some(f) = filter {
+            q = q.only_if(f);
+        }
+        let stream = q.execute().await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        Ok(batches)
+    }
+
+    /// Create a vector index on the "vector" column.
+    pub async fn create_vector_index(&self) -> Result<(), lancedb::Error> {
+        self.table
+            .create_index(&["vector"], lancedb::index::Index::Auto)
+            .execute()
+            .await
+    }
+
+    /// Ensure a scalar index exists on a column.
+    pub async fn ensure_scalar_index(
+        &self,
+        column: &str,
+        kind: ScalarIndexKind,
+        name: &str,
+    ) -> Result<(), lancedb::Error> {
+        let existing = self.table.list_indices().await?;
+        let already_present = existing.iter().any(|idx| {
+            idx.name == name
+                || (idx.columns.len() == 1
+                    && idx.columns[0] == column
+                    && matches!(
+                        (kind, idx.index_type.clone()),
+                        (ScalarIndexKind::BTree, IndexType::BTree)
+                            | (ScalarIndexKind::Bitmap, IndexType::Bitmap)
+                    ))
+        });
+        if already_present {
+            return Ok(());
+        }
+        let train = self.table.count_rows(None).await.unwrap_or(0) > 0;
+        let index = match kind {
+            ScalarIndexKind::BTree => Index::BTree(BTreeIndexBuilder::default()),
+            ScalarIndexKind::Bitmap => Index::Bitmap(BitmapIndexBuilder::default()),
+        };
+        self.table
+            .create_index(&[column], index)
+            .name(name.to_string())
+            .replace(false)
+            .train(train)
+            .execute()
+            .await
+    }
+
+    /// Checkout a specific table version (read-only snapshot).
+    pub async fn checkout(&self, version: u64) -> Result<(), lancedb::Error> {
+        self.table.checkout(version).await
+    }
+
+    /// Checkout the latest version.
+    pub async fn checkout_latest(&self) -> Result<(), lancedb::Error> {
+        self.table.checkout_latest().await
+    }
+
+    /// Restore the currently checked-out version as the new latest.
+    pub async fn restore(&self) -> Result<(), lancedb::Error> {
+        self.table.restore().await
+    }
+
+    /// List all table versions with their version numbers.
+    pub async fn list_versions(&self) -> Result<Vec<u64>, lancedb::Error> {
+        let versions = self.table.list_versions().await?;
+        Ok(versions.iter().map(|v| v.version).collect())
+    }
+
+    /// Repair: find the newest version with valid data and restore it.
+    /// Returns (restored_version, row_count) on success.
+    pub async fn repair(&self) -> Result<(u64, usize), lancedb::Error> {
+        let versions = self.table.list_versions().await?;
+        let mut sorted: Vec<u64> = versions.iter().map(|v| v.version).collect();
+        sorted.sort_unstable_by(|a, b| b.cmp(a)); // newest first
+
+        for ver in &sorted {
+            self.table.checkout(*ver).await?;
+            match self.table.count_rows(None).await {
+                Ok(count) => {
+                    tracing::info!(version = ver, rows = count, "repair: version OK, restoring");
+                    self.table.restore().await?;
+                    return Ok((*ver, count));
+                }
+                Err(e) => {
+                    tracing::warn!(version = ver, error = %e, "repair: version has missing fragments, skipping");
+                    continue;
+                }
+            }
+        }
+        Err(lancedb::Error::Runtime {
+            message: "repair: no valid version found".into(),
+        })
+    }
+
+    /// Get the underlying LanceDB table.
+    pub fn inner(&self) -> &lancedb::Table {
+        &self.table
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{StringArray, UInt64Array, UInt8Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn lance_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::UInt64, false),
+            Field::new("op", DataType::UInt8, false),
+            Field::new("label", DataType::Utf8, false),
+            Field::new("pk_key", DataType::Utf8, false),
+            Field::new("pk_value", DataType::Utf8, false),
+            Field::new("timestamp_ms", DataType::UInt64, false),
+            Field::new("props_json", DataType::Utf8, true),
+        ]))
+    }
+
+    fn test_batch(
+        schema: &Arc<Schema>,
+        seq: &[u64],
+        labels: &[&str],
+        rkeys: &[&str],
+    ) -> RecordBatch {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(seq.to_vec())),
+                Arc::new(UInt8Array::from(vec![0u8; seq.len()])),
+                Arc::new(StringArray::from(labels.to_vec())),
+                Arc::new(StringArray::from(vec!["rkey"; seq.len()])),
+                Arc::new(StringArray::from(rkeys.to_vec())),
+                Arc::new(UInt64Array::from(vec![1711900000000u64; seq.len()])),
+                Arc::new(StringArray::from(vec!["{}"; seq.len()])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_create_and_scan() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db = YataDb::connect_local(tmpdir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let schema = lance_schema();
+        let batch = test_batch(&schema, &[1, 2, 3], &["Post", "Like", "Post"], &["a", "b", "c"]);
+
+        let table = db.create_table("vertices", batch).await.unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_add_and_reopen() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().to_str().unwrap();
+        let db = YataDb::connect_local(path).await.unwrap();
+        let schema = lance_schema();
+
+        let table = db
+            .create_table(
+                "vertices",
+                test_batch(&schema, &[1, 2], &["Post", "Like"], &["a", "b"]),
+            )
+            .await
+            .unwrap();
+
+        table
+            .add(test_batch(&schema, &[3], &["Follow"], &["c"]))
+            .await
+            .unwrap();
+
+        assert_eq!(table.count_rows(None).await.unwrap(), 3);
+
+        // Re-open
+        let db2 = YataDb::connect_local(path).await.unwrap();
+        let table2 = db2.open_table("vertices").await.unwrap();
+        assert_eq!(table2.count_rows(None).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_scan_filter() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db = YataDb::connect_local(tmpdir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let schema = lance_schema();
+        let batch = test_batch(&schema, &[1, 2, 3], &["Post", "Like", "Post"], &["a", "b", "c"]);
+
+        let table = db.create_table("vertices", batch).await.unwrap();
+        let posts = table.count_rows(Some("label = 'Post'")).await.unwrap();
+        assert_eq!(posts, 2);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_scalar_indices() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db = YataDb::connect_local(tmpdir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let schema = lance_schema();
+        let batch = test_batch(&schema, &[1, 2, 3], &["Post", "Like", "Post"], &["a", "b", "c"]);
+        let table = db.create_table("vertices", batch).await.unwrap();
+
+        table
+            .ensure_scalar_index("pk_value", ScalarIndexKind::BTree, "vertices_pk_value_btree")
+            .await
+            .unwrap();
+        table
+            .ensure_scalar_index("label", ScalarIndexKind::Bitmap, "vertices_label_bitmap")
+            .await
+            .unwrap();
+
+        let indices = table.list_indices().await.unwrap();
+        assert!(indices.iter().any(|i| i.name == "vertices_pk_value_btree"));
+        assert!(indices.iter().any(|i| i.name == "vertices_label_bitmap"));
+    }
+}

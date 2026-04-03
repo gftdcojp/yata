@@ -8,22 +8,66 @@
 // ---- Forward declarations for inline modules ---------------------------
 // All modules are defined inline below; pub use re-exports at crate root.
 
-pub use self::ids::*;
-pub use self::hash::*;
+pub use self::ack::*;
 pub use self::envelope::*;
-pub use self::payload::*;
+pub use self::error::*;
+pub use self::graph_identity::*;
+pub use self::hash::*;
+pub use self::ids::*;
 pub use self::log::*;
 pub use self::object::*;
-pub use self::kv::*;
-pub use self::ack::*;
+pub use self::payload::*;
 pub use self::publish::*;
-pub use self::error::*;
-pub use self::traits::{AppendLog, KvStore, ObjectStorage};
+pub use self::traits::{AppendLog, ObjectStorage, WrpcBroker};
 
 // ---- ids ---------------------------------------------------------------
 
 pub mod ids {
     use std::fmt;
+
+    macro_rules! numeric_id {
+        ($name:ident, $inner:ty) => {
+            #[derive(
+                Clone,
+                Copy,
+                Debug,
+                Default,
+                PartialEq,
+                Eq,
+                PartialOrd,
+                Ord,
+                Hash,
+                serde::Serialize,
+                serde::Deserialize,
+                rkyv::Archive,
+                rkyv::Serialize,
+                rkyv::Deserialize,
+            )]
+            #[rkyv(derive(Debug))]
+            pub struct $name(pub $inner);
+
+            impl $name {
+                pub fn new(value: $inner) -> Self {
+                    Self(value)
+                }
+                pub fn get(self) -> $inner {
+                    self.0
+                }
+            }
+
+            impl fmt::Display for $name {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    write!(f, "{}", self.0)
+                }
+            }
+
+            impl From<$inner> for $name {
+                fn from(value: $inner) -> Self {
+                    Self(value)
+                }
+            }
+        };
+    }
 
     #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
     pub struct StreamId(pub String);
@@ -34,10 +78,14 @@ pub mod ids {
         }
     }
     impl From<&str> for StreamId {
-        fn from(s: &str) -> Self { Self(s.to_owned()) }
+        fn from(s: &str) -> Self {
+            Self(s.to_owned())
+        }
     }
     impl From<String> for StreamId {
-        fn from(s: String) -> Self { Self(s) }
+        fn from(s: String) -> Self {
+            Self(s)
+        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -49,36 +97,29 @@ pub mod ids {
         }
     }
     impl From<&str> for Subject {
-        fn from(s: &str) -> Self { Self(s.to_owned()) }
-    }
-    impl From<String> for Subject {
-        fn from(s: String) -> Self { Self(s) }
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-    pub struct BucketId(pub String);
-
-    impl fmt::Display for BucketId {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "{}", self.0)
+        fn from(s: &str) -> Self {
+            Self(s.to_owned())
         }
     }
-    impl From<&str> for BucketId {
-        fn from(s: &str) -> Self { Self(s.to_owned()) }
-    }
-    impl From<String> for BucketId {
-        fn from(s: String) -> Self { Self(s) }
+    impl From<String> for Subject {
+        fn from(s: String) -> Self {
+            Self(s)
+        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
     pub struct ObjectId(pub uuid::Uuid);
 
     impl ObjectId {
-        pub fn new() -> Self { Self(uuid::Uuid::new_v4()) }
+        pub fn new() -> Self {
+            Self(uuid::Uuid::new_v4())
+        }
     }
 
     impl Default for ObjectId {
-        fn default() -> Self { Self::new() }
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl fmt::Display for ObjectId {
@@ -88,7 +129,9 @@ pub mod ids {
     }
 
     impl From<uuid::Uuid> for ObjectId {
-        fn from(u: uuid::Uuid) -> Self { Self(u) }
+        fn from(u: uuid::Uuid) -> Self {
+            Self(u)
+        }
     }
 
     impl std::str::FromStr for ObjectId {
@@ -102,11 +145,15 @@ pub mod ids {
     pub struct MessageId(pub uuid::Uuid);
 
     impl MessageId {
-        pub fn new() -> Self { Self(uuid::Uuid::new_v4()) }
+        pub fn new() -> Self {
+            Self(uuid::Uuid::new_v4())
+        }
     }
 
     impl Default for MessageId {
-        fn default() -> Self { Self::new() }
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl fmt::Display for MessageId {
@@ -124,18 +171,37 @@ pub mod ids {
         }
     }
     impl From<&str> for SchemaId {
-        fn from(s: &str) -> Self { Self(s.to_owned()) }
+        fn from(s: &str) -> Self {
+            Self(s.to_owned())
+        }
     }
     impl From<String> for SchemaId {
-        fn from(s: String) -> Self { Self(s) }
+        fn from(s: String) -> Self {
+            Self(s)
+        }
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        PartialEq,
+        Eq,
+        PartialOrd,
+        Ord,
+        Hash,
+        serde::Serialize,
+        serde::Deserialize,
+    )]
     pub struct Sequence(pub u64);
 
     impl Sequence {
-        pub fn next(self) -> Self { Self(self.0 + 1) }
-        pub fn as_u64(self) -> u64 { self.0 }
+        pub fn next(self) -> Self {
+            Self(self.0 + 1)
+        }
+        pub fn as_u64(self) -> u64 {
+            self.0
+        }
     }
 
     impl fmt::Display for Sequence {
@@ -145,47 +211,157 @@ pub mod ids {
     }
 
     impl From<u64> for Sequence {
-        fn from(v: u64) -> Self { Self(v) }
+        fn from(v: u64) -> Self {
+            Self(v)
+        }
     }
 
     impl std::ops::Add<u64> for Sequence {
         type Output = Self;
-        fn add(self, rhs: u64) -> Self { Self(self.0 + rhs) }
+        fn add(self, rhs: u64) -> Self {
+            Self(self.0 + rhs)
+        }
     }
 
     impl std::ops::Sub<u64> for Sequence {
         type Output = Self;
-        fn sub(self, rhs: u64) -> Self { Self(self.0.saturating_sub(rhs)) }
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
-    pub struct Revision(pub u64);
-
-    impl Revision {
-        pub fn next(self) -> Self { Self(self.0 + 1) }
-        pub fn as_u64(self) -> u64 { self.0 }
-    }
-
-    impl fmt::Display for Revision {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "{}", self.0)
+        fn sub(self, rhs: u64) -> Self {
+            Self(self.0.saturating_sub(rhs))
         }
     }
 
-    impl From<u64> for Revision {
-        fn from(v: u64) -> Self { Self(v) }
+    numeric_id!(PartitionId, u32);
+    numeric_id!(LocalVid, u32);
+    numeric_id!(LocalEid, u32);
+    numeric_id!(GlobalVid, u64);
+    numeric_id!(GlobalEid, u64);
+
+    // ── Global/Local ID encoding ────────────────────────────────────
+    //
+    // GlobalVid layout (u64):
+    //   [16-bit partition_id][48-bit local_vid]
+    //   → up to 65,536 partitions × 281 trillion local vertices per partition
+    //
+    // GlobalEid layout (u64):
+    //   [16-bit partition_id][48-bit local_eid]
+    //   → same structure as GlobalVid
+
+    const PARTITION_BITS: u32 = 16;
+    const LOCAL_BITS: u32 = 48;
+    const LOCAL_MASK: u64 = (1u64 << LOCAL_BITS) - 1;
+    const PARTITION_MAX: u32 = (1u32 << PARTITION_BITS) - 1;
+
+    impl GlobalVid {
+        /// Encode a partition + local vertex ID into a global ID.
+        /// Panics if partition_id exceeds 16-bit range or local_vid exceeds 48-bit range.
+        pub fn encode(partition: PartitionId, local: LocalVid) -> Self {
+            debug_assert!(
+                partition.0 <= PARTITION_MAX,
+                "partition_id overflow: {}",
+                partition.0
+            );
+            debug_assert!(
+                (local.0 as u64) <= LOCAL_MASK,
+                "local_vid overflow: {}",
+                local.0
+            );
+            Self(((partition.0 as u64) << LOCAL_BITS) | (local.0 as u64))
+        }
+
+        /// Decode the partition ID from a global vertex ID.
+        pub fn partition(self) -> PartitionId {
+            PartitionId((self.0 >> LOCAL_BITS) as u32)
+        }
+
+        /// Decode the local vertex ID from a global vertex ID.
+        pub fn local(self) -> LocalVid {
+            LocalVid((self.0 & LOCAL_MASK) as u32)
+        }
+
+        /// Split into (partition, local) tuple.
+        pub fn split(self) -> (PartitionId, LocalVid) {
+            (self.partition(), self.local())
+        }
+
+        /// Create from a raw local u32 in partition 0 (single-partition compat).
+        pub fn from_local(vid: u32) -> Self {
+            Self(vid as u64)
+        }
     }
 
-    impl std::ops::Add<u64> for Revision {
-        type Output = Self;
-        fn add(self, rhs: u64) -> Self { Self(self.0 + rhs) }
+    impl From<LocalVid> for GlobalVid {
+        /// Widening conversion: LocalVid → GlobalVid (partition 0).
+        fn from(v: LocalVid) -> Self {
+            Self(v.0 as u64)
+        }
     }
+
+    impl GlobalEid {
+        /// Encode a partition + local edge ID into a global ID.
+        pub fn encode(partition: PartitionId, local: LocalEid) -> Self {
+            debug_assert!(partition.0 <= PARTITION_MAX);
+            debug_assert!((local.0 as u64) <= LOCAL_MASK);
+            Self(((partition.0 as u64) << LOCAL_BITS) | (local.0 as u64))
+        }
+
+        pub fn partition(self) -> PartitionId {
+            PartitionId((self.0 >> LOCAL_BITS) as u32)
+        }
+
+        pub fn local(self) -> LocalEid {
+            LocalEid((self.0 & LOCAL_MASK) as u32)
+        }
+
+        pub fn split(self) -> (PartitionId, LocalEid) {
+            (self.partition(), self.local())
+        }
+
+        pub fn from_local(eid: u32) -> Self {
+            Self(eid as u64)
+        }
+    }
+
+    impl From<LocalEid> for GlobalEid {
+        fn from(e: LocalEid) -> Self {
+            Self(e.0 as u64)
+        }
+    }
+
+    /// Maximum local ID value (48-bit).
+    pub const LOCAL_ID_MAX: u64 = LOCAL_MASK;
+    /// Maximum partition ID value (16-bit).
+    pub const PARTITION_ID_MAX: u32 = PARTITION_MAX;
 }
 
 // ---- hash ---------------------------------------------------------------
 
+// ---- graph_identity -----------------------------------------------------
+
+pub mod graph_identity {
+    use crate::{GlobalEid, GlobalVid};
+
+    pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+    pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+    pub const GLOBAL_VID_PROP_KEY: &str = "_global_vid";
+    pub const GLOBAL_EID_PROP_KEY: &str = "_global_eid";
+
+    pub fn parse_global_vid_str(node_id: &str) -> Option<GlobalVid> {
+        node_id
+            .strip_prefix('g')
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .map(GlobalVid::from)
+    }
+
+    pub fn parse_global_eid_str(edge_id: &str) -> Option<GlobalEid> {
+        edge_id
+            .strip_prefix('e')
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .map(GlobalEid::from)
+    }
+}
+
 pub mod hash {
-    #[derive(Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
     pub struct Blake3Hash(pub [u8; 32]);
 
     impl Blake3Hash {
@@ -196,6 +372,18 @@ pub mod hash {
 
         pub fn hex(&self) -> String {
             self.0.iter().map(|b| format!("{:02x}", b)).collect()
+        }
+
+        pub fn from_hex(hex: &str) -> std::result::Result<Self, String> {
+            if hex.len() != 64 {
+                return Err(format!("expected 64 hex chars, got {}", hex.len()));
+            }
+            let mut bytes = [0u8; 32];
+            for i in 0..32 {
+                bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+                    .map_err(|e| format!("invalid hex at byte {i}: {e}"))?;
+            }
+            Ok(Self(bytes))
         }
     }
 
@@ -230,8 +418,8 @@ pub mod hash {
 // ---- envelope -----------------------------------------------------------
 
 pub mod envelope {
-    use crate::ids::{MessageId, SchemaId, Subject};
     use crate::hash::Blake3Hash;
+    use crate::ids::{MessageId, SchemaId, Subject};
 
     #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
     pub struct OcelObjectRef {
@@ -335,8 +523,8 @@ pub mod payload {
 // ---- log ----------------------------------------------------------------
 
 pub mod log {
-    use crate::ids::{Sequence, StreamId, Subject};
     use crate::hash::Blake3Hash;
+    use crate::ids::{Sequence, StreamId, Subject};
     use crate::payload::PayloadKind;
 
     #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -355,8 +543,8 @@ pub mod log {
 // ---- object -------------------------------------------------------------
 
 pub mod object {
-    use crate::ids::{ObjectId, SchemaId};
     use crate::hash::Blake3Hash;
+    use crate::ids::{ObjectId, SchemaId};
 
     #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
     pub struct ChunkRef {
@@ -386,54 +574,6 @@ pub mod object {
     }
 }
 
-// ---- kv -----------------------------------------------------------------
-
-pub mod kv {
-    use crate::ids::{BucketId, Revision};
-
-    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-    pub struct KvEntry {
-        pub bucket: BucketId,
-        pub key: String,
-        pub revision: Revision,
-        pub value: Vec<u8>,
-        pub ts_ns: i64,
-        pub op: KvOp,
-        /// Absolute expiry timestamp (nanoseconds since epoch).
-        /// `None` means the entry never expires.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub ttl_expires_at_ns: Option<i64>,
-    }
-
-    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-    pub enum KvOp {
-        Put,
-        Delete,
-        Purge,
-    }
-
-    #[derive(Clone, Debug)]
-    pub struct KvPutRequest {
-        pub bucket: BucketId,
-        pub key: String,
-        pub value: bytes::Bytes,
-        pub expected_revision: Option<Revision>,
-        pub ttl_secs: Option<u64>,
-    }
-
-    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-    pub struct KvAck {
-        pub revision: Revision,
-        pub ts_ns: i64,
-    }
-
-    #[derive(Clone, Debug)]
-    pub struct KvEvent {
-        pub entry: KvEntry,
-        pub is_delete: bool,
-    }
-}
-
 // ---- ack ----------------------------------------------------------------
 
 pub mod ack {
@@ -451,8 +591,8 @@ pub mod ack {
 // ---- publish ------------------------------------------------------------
 
 pub mod publish {
-    use crate::ids::{Sequence, StreamId, Subject};
     use crate::envelope::Envelope;
+    use crate::ids::{Sequence, StreamId, Subject};
     use crate::payload::PayloadRef;
 
     #[derive(Clone, Debug)]
@@ -468,12 +608,11 @@ pub mod publish {
 // ---- traits -------------------------------------------------------------
 
 pub mod traits {
-    use crate::error::Result;
-    use crate::ids::{BucketId, ObjectId, Revision, Sequence, StreamId};
-    use crate::log::LogEntry;
-    use crate::kv::{KvAck, KvEntry, KvEvent, KvPutRequest};
-    use crate::object::{ObjectManifest, ObjectMeta};
     use crate::ack::Ack;
+    use crate::error::Result;
+    use crate::ids::{ObjectId, Sequence, StreamId};
+    use crate::log::LogEntry;
+    use crate::object::{ObjectManifest, ObjectMeta};
     use crate::publish::PublishRequest;
     use async_trait::async_trait;
     use std::pin::Pin;
@@ -490,33 +629,21 @@ pub mod traits {
         async fn last_seq(&self, stream: &StreamId) -> Result<Option<Sequence>>;
     }
 
-    /// KV bucket store.
+    /// Broker handle for wRPC transport layer.
+    /// Provides the minimal interface yata-wrpc needs without pulling in
+    /// the full Broker (yata-server) and its heavyweight deps.
     #[async_trait]
-    pub trait KvStore: Send + Sync + 'static {
-        async fn put(&self, req: KvPutRequest) -> Result<KvAck>;
-        async fn get(&self, bucket: &BucketId, key: &str) -> Result<Option<KvEntry>>;
-        async fn delete(
-            &self,
-            bucket: &BucketId,
-            key: &str,
-            expected_revision: Option<Revision>,
-        ) -> Result<KvAck>;
-        async fn watch(
-            &self,
-            bucket: &BucketId,
-            prefix: &str,
-        ) -> Result<Pin<Box<dyn futures::Stream<Item = KvEvent> + Send>>>;
-        async fn history(&self, bucket: &BucketId, key: &str) -> Result<Vec<KvEntry>>;
+    pub trait WrpcBroker: Send + Sync + 'static {
+        /// Store bytes in CAS, returning Blake3 hash.
+        async fn cas_put(&self, data: bytes::Bytes) -> Result<crate::Blake3Hash>;
+        /// Per-app single-writer: always true.
+        fn is_leader(&self) -> bool;
     }
 
     /// Content-addressed object store.
     #[async_trait]
     pub trait ObjectStorage: Send + Sync + 'static {
-        async fn put_object(
-            &self,
-            data: bytes::Bytes,
-            meta: ObjectMeta,
-        ) -> Result<ObjectManifest>;
+        async fn put_object(&self, data: bytes::Bytes, meta: ObjectMeta) -> Result<ObjectManifest>;
         async fn get_object(&self, id: &ObjectId) -> Result<bytes::Bytes>;
         async fn head_object(&self, id: &ObjectId) -> Result<Option<ObjectManifest>>;
         async fn pin_object(&self, id: &ObjectId) -> Result<()>;
@@ -563,32 +690,65 @@ pub mod consumer {
 
 pub use self::consumer::*;
 
-// ---- cdc ----------------------------------------------------------------
 
-pub mod cdc {
-    /// CDC operation type.
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub enum CdcOp {
-        Insert,
-        Update,
-        Delete,
+// ---- ocel_draft ---------------------------------------------------------
+
+pub mod ocel_draft {
+    use crate::envelope::OcelObjectRef;
+
+    #[derive(Clone, Debug, Default)]
+    pub struct OcelEventDraft {
+        pub event_type: String,
+        pub attrs: indexmap::IndexMap<String, serde_json::Value>,
+        pub object_refs: Vec<OcelObjectRef>,
     }
 
-    /// A single CDC event describing a change to a Lance table.
-    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-    pub struct CdcEvent {
-        /// Table that was modified.
-        pub table: String,
-        /// Operation type.
-        pub op: CdcOp,
-        /// Number of rows affected.
-        pub row_count: usize,
-        /// Timestamp (nanoseconds since epoch).
-        pub ts_ns: i64,
+    impl OcelEventDraft {
+        pub fn new(event_type: impl Into<String>) -> Self {
+            Self {
+                event_type: event_type.into(),
+                attrs: indexmap::IndexMap::new(),
+                object_refs: Vec::new(),
+            }
+        }
+
+        pub fn attr(mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+            self.attrs.insert(key.into(), value.into());
+            self
+        }
+
+        pub fn touches(
+            mut self,
+            object_id: impl Into<String>,
+            object_type: impl Into<String>,
+        ) -> Self {
+            self.object_refs.push(OcelObjectRef {
+                object_id: object_id.into(),
+                object_type: object_type.into(),
+                qualifier: None,
+                role: None,
+            });
+            self
+        }
+
+        pub fn touches_with_role(
+            mut self,
+            object_id: impl Into<String>,
+            object_type: impl Into<String>,
+            role: impl Into<String>,
+        ) -> Self {
+            self.object_refs.push(OcelObjectRef {
+                object_id: object_id.into(),
+                object_type: object_type.into(),
+                qualifier: None,
+                role: Some(role.into()),
+            });
+            self
+        }
     }
 }
 
-pub use self::cdc::*;
+pub use self::ocel_draft::*;
 
 // ---- error --------------------------------------------------------------
 
@@ -597,8 +757,6 @@ pub mod error {
     pub enum YataError {
         #[error("not found: {0}")]
         NotFound(String),
-        #[error("revision conflict: expected {expected}, got {actual}")]
-        RevisionConflict { expected: u64, actual: u64 },
         #[error("sequence conflict: expected last_seq {expected:?}, actual {actual}")]
         SeqConflict { expected: Option<u64>, actual: u64 },
         #[error("io error: {0}")]
@@ -612,4 +770,174 @@ pub mod error {
     }
 
     pub type Result<T> = std::result::Result<T, YataError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_blake3_hash_of() {
+        let h = Blake3Hash::of(b"hello");
+        assert_eq!(h.hex().len(), 64);
+        assert_eq!(Blake3Hash::of(b"hello"), Blake3Hash::of(b"hello"));
+        assert_ne!(Blake3Hash::of(b"hello"), Blake3Hash::of(b"world"));
+    }
+
+    #[test]
+    fn test_blake3_hash_hex_roundtrip() {
+        let h = Blake3Hash::of(b"test data");
+        let hex = h.hex();
+        let parsed: Blake3Hash = hex.parse().unwrap();
+        assert_eq!(h, parsed);
+    }
+
+    #[test]
+    fn test_blake3_hash_from_str_invalid() {
+        assert!("not_a_hash".parse::<Blake3Hash>().is_err());
+        assert!("zz".parse::<Blake3Hash>().is_err());
+    }
+
+    #[test]
+    fn test_stream_id_display() {
+        let id = StreamId::from("my-stream");
+        assert_eq!(format!("{id}"), "my-stream");
+    }
+
+    #[test]
+    fn test_subject_from_string() {
+        let s = Subject::from("topic.events".to_string());
+        assert_eq!(s.0, "topic.events");
+    }
+
+    #[test]
+    fn test_object_id_unique() {
+        let a = ObjectId::new();
+        let b = ObjectId::new();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_sequence_next() {
+        let s = Sequence(5);
+        assert_eq!(s.next().as_u64(), 6);
+    }
+
+    #[test]
+    fn test_parse_global_graph_ids() {
+        assert_eq!(parse_global_vid_str("g42").map(|id| id.get()), Some(42));
+        assert_eq!(parse_global_eid_str("e77").map(|id| id.get()), Some(77));
+        assert_eq!(parse_global_vid_str("node-42"), None);
+        assert_eq!(parse_global_eid_str("edge-77"), None);
+    }
+
+    #[test]
+    fn test_envelope_new() {
+        let e = Envelope::new(
+            Subject::from("test"),
+            SchemaId::from("s1"),
+            Blake3Hash::of(b"data"),
+        );
+        assert!(e.ts_ns > 0);
+        assert_eq!(e.subject.0, "test");
+    }
+
+    #[test]
+    fn test_payload_ref_inline() {
+        let p = PayloadRef::InlineBytes(bytes::Bytes::from_static(b"hello"));
+        assert_eq!(p.kind(), PayloadKind::InlineBytes);
+        assert_eq!(p.size_bytes(), 5);
+    }
+
+    #[test]
+    fn test_payload_ref_content_hash() {
+        let p = PayloadRef::InlineBytes(bytes::Bytes::from_static(b"data"));
+        let h = p.content_hash();
+        assert_eq!(h, Blake3Hash::of(b"data"));
+    }
+
+    #[test]
+    fn test_payload_ref_to_ref_str() {
+        let p = PayloadRef::InlineBytes(bytes::Bytes::from_static(b"data"));
+        let s = p.to_ref_str();
+        assert!(s.starts_with("inline:"));
+    }
+
+    #[test]
+    fn test_schema_id_display() {
+        let s = SchemaId::from("my.schema.v1");
+        assert_eq!(format!("{s}"), "my.schema.v1");
+    }
+
+    // ── Global/Local ID encoding tests ──
+
+    #[test]
+    fn test_global_vid_encode_decode() {
+        let p = PartitionId::new(42);
+        let l = LocalVid::new(12345);
+        let g = GlobalVid::encode(p, l);
+        assert_eq!(g.partition(), p);
+        assert_eq!(g.local(), l);
+        let (pp, ll) = g.split();
+        assert_eq!(pp, p);
+        assert_eq!(ll, l);
+    }
+
+    #[test]
+    fn test_global_vid_partition_zero() {
+        let g = GlobalVid::from_local(999);
+        assert_eq!(g.partition(), PartitionId::new(0));
+        assert_eq!(g.local(), LocalVid::new(999));
+    }
+
+    #[test]
+    fn test_global_vid_from_local_vid() {
+        let lv = LocalVid::new(42);
+        let gv: GlobalVid = lv.into();
+        assert_eq!(gv.0, 42);
+        assert_eq!(gv.partition(), PartitionId::new(0));
+        assert_eq!(gv.local(), LocalVid::new(42));
+    }
+
+    #[test]
+    fn test_global_vid_max_partition() {
+        let p = PartitionId::new(ids::PARTITION_ID_MAX);
+        let l = LocalVid::new(0);
+        let g = GlobalVid::encode(p, l);
+        assert_eq!(g.partition(), p);
+        assert_eq!(g.local(), l);
+    }
+
+    #[test]
+    fn test_global_vid_max_local() {
+        let p = PartitionId::new(0);
+        let l = LocalVid::new(u32::MAX);
+        let g = GlobalVid::encode(p, l);
+        assert_eq!(g.partition(), p);
+        assert_eq!(g.local(), l);
+    }
+
+    #[test]
+    fn test_global_eid_encode_decode() {
+        let p = PartitionId::new(7);
+        let l = LocalEid::new(999999);
+        let g = GlobalEid::encode(p, l);
+        assert_eq!(g.partition(), p);
+        assert_eq!(g.local(), l);
+    }
+
+    #[test]
+    fn test_global_vid_different_partitions_differ() {
+        let g1 = GlobalVid::encode(PartitionId::new(0), LocalVid::new(1));
+        let g2 = GlobalVid::encode(PartitionId::new(1), LocalVid::new(1));
+        assert_ne!(g1, g2);
+    }
+
+    #[test]
+    fn test_global_vid_serde_roundtrip() {
+        let g = GlobalVid::encode(PartitionId::new(5), LocalVid::new(42));
+        let json = serde_json::to_string(&g).unwrap();
+        let g2: GlobalVid = serde_json::from_str(&json).unwrap();
+        assert_eq!(g, g2);
+    }
 }

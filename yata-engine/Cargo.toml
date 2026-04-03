@@ -3,21 +3,22 @@ name = "yata-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Tiered HTAP graph engine: HOT (CSR) to WARM (Lance) query routing"
+description = "Graph engine: Lance-backed read store with WAL projection"
 
 [dependencies]
+yata-core = { path = "../yata-core" }
 yata-grin = { path = "../yata-grin" }
-yata-store = { path = "../yata-store" }
-yata-graph = { path = "../yata-graph" }
 yata-cypher = { path = "../yata-cypher" }
-tokio = { workspace = true }
-tracing = { workspace = true }
-indexmap = { workspace = true }
+yata-gie = { path = "../yata-gie" }
+yata-lance = { path = "../yata-lance" }
+arrow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-arrow = { workspace = true }
-lancedb = { workspace = true }
-futures = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+indexmap = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,0 +1,5 @@
+{
+  "main": "../ipadic/main",
+  "user": "userdic.csv",
+  "userKind": "ipadic"
+}

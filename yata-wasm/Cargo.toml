@@ -1,0 +1,22 @@
+[package]
+name = "yata-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+
+[dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Use local lance-fork with WASM patches
+lance-core = { path = "lance-fork/rust/lance-core" }
+
+[profile.release]
+opt-level = "s"
+lto = true

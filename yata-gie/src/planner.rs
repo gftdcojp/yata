@@ -37,6 +37,7 @@ pub fn plan_traversal(
         edge_label: edge_label.to_string(),
         dst_alias: dst_alias.to_string(),
         direction,
+        strategy: TraversalStrategy::Auto,
     });
     plan
 }
@@ -83,6 +84,7 @@ impl PlanBuilder {
             edge_label: edge_label.to_string(),
             dst_alias: dst_alias.to_string(),
             direction,
+            strategy: TraversalStrategy::Auto,
         });
         self
     }
@@ -103,12 +105,24 @@ impl PlanBuilder {
             min_hops,
             max_hops,
             direction,
+            strategy: TraversalStrategy::Auto,
         });
         self
     }
 
     pub fn filter(mut self, predicate: Predicate) -> Self {
-        self.plan.push(LogicalOp::Filter { predicate });
+        self.plan.push(LogicalOp::Filter {
+            alias: None,
+            predicate,
+        });
+        self
+    }
+
+    pub fn filter_on(mut self, alias: &str, predicate: Predicate) -> Self {
+        self.plan.push(LogicalOp::Filter {
+            alias: Some(alias.to_string()),
+            predicate,
+        });
         self
     }
 
@@ -117,11 +131,7 @@ impl PlanBuilder {
         self
     }
 
-    pub fn aggregate(
-        mut self,
-        group_by: Vec<Expr>,
-        aggs: Vec<(String, AggOp, Expr)>,
-    ) -> Self {
+    pub fn aggregate(mut self, group_by: Vec<Expr>, aggs: Vec<(String, AggOp, Expr)>) -> Self {
         self.plan.push(LogicalOp::Aggregate { group_by, aggs });
         self
     }
@@ -167,7 +177,11 @@ mod tests {
         let plan = plan_scan("Person", "n", None);
         assert_eq!(plan.len(), 1);
         match &plan.ops[0] {
-            LogicalOp::Scan { label, alias, predicate } => {
+            LogicalOp::Scan {
+                label,
+                alias,
+                predicate,
+            } => {
                 assert_eq!(label, "Person");
                 assert_eq!(alias, "n");
                 assert!(predicate.is_none());
@@ -182,7 +196,10 @@ mod tests {
         let plan = plan_scan("Person", "n", Some(pred));
         assert_eq!(plan.len(), 1);
         match &plan.ops[0] {
-            LogicalOp::Scan { predicate: Some(Predicate::Eq(k, _)), .. } => {
+            LogicalOp::Scan {
+                predicate: Some(Predicate::Eq(k, _)),
+                ..
+            } => {
                 assert_eq!(k, "name");
             }
             _ => panic!("expected Scan with predicate"),
@@ -198,7 +215,11 @@ mod tests {
             _ => panic!("expected Scan"),
         }
         match &plan.ops[1] {
-            LogicalOp::Expand { edge_label, direction, .. } => {
+            LogicalOp::Expand {
+                edge_label,
+                direction,
+                ..
+            } => {
                 assert_eq!(edge_label, "KNOWS");
                 assert_eq!(*direction, Direction::Out);
             }
@@ -269,7 +290,9 @@ mod tests {
 
         assert_eq!(plan.len(), 2);
         match &plan.ops[1] {
-            LogicalOp::PathExpand { min_hops, max_hops, .. } => {
+            LogicalOp::PathExpand {
+                min_hops, max_hops, ..
+            } => {
                 assert_eq!(*min_hops, 1);
                 assert_eq!(*max_hops, 3);
             }
@@ -290,6 +313,132 @@ mod tests {
                 assert_eq!(*offset, 5);
             }
             _ => panic!("expected Limit"),
+        }
+    }
+
+    #[test]
+    fn test_builder_default() {
+        let builder = PlanBuilder::default();
+        let plan = builder.build();
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn test_plan_scan_empty_label() {
+        let plan = plan_scan("", "n", None);
+        assert_eq!(plan.len(), 1);
+        match &plan.ops[0] {
+            LogicalOp::Scan { label, .. } => assert!(label.is_empty()),
+            _ => panic!("expected Scan"),
+        }
+    }
+
+    #[test]
+    fn test_plan_traversal_both_direction() {
+        let plan = plan_traversal("Person", "n", "KNOWS", "m", Direction::Both);
+        assert_eq!(plan.len(), 2);
+        match &plan.ops[1] {
+            LogicalOp::Expand { direction, .. } => assert_eq!(*direction, Direction::Both),
+            _ => panic!("expected Expand"),
+        }
+    }
+
+    #[test]
+    fn test_plan_traversal_in_direction() {
+        let plan = plan_traversal("Person", "n", "KNOWS", "m", Direction::In);
+        match &plan.ops[1] {
+            LogicalOp::Expand { direction, .. } => assert_eq!(*direction, Direction::In),
+            _ => panic!("expected Expand"),
+        }
+    }
+
+    #[test]
+    fn test_builder_complex_chain() {
+        // Test chaining multiple operations in sequence
+        let plan = PlanBuilder::new()
+            .scan("Person", "a")
+            .expand("a", "KNOWS", "b", Direction::Out)
+            .expand("b", "WORKS_AT", "c", Direction::Out)
+            .filter(Predicate::Eq("name".into(), PropValue::Str("GFTD".into())))
+            .project(vec![
+                Expr::Prop("a".into(), "name".into()),
+                Expr::Prop("c".into(), "name".into()),
+            ])
+            .distinct(vec![Expr::Prop("c".into(), "name".into())])
+            .order_by(vec![(Expr::Prop("a".into(), "name".into()), true)])
+            .limit_offset(5, 2)
+            .build();
+
+        assert_eq!(plan.len(), 8, "should have 8 ops in the chain");
+        assert!(matches!(&plan.ops[0], LogicalOp::Scan { .. }));
+        assert!(matches!(&plan.ops[1], LogicalOp::Expand { .. }));
+        assert!(matches!(&plan.ops[2], LogicalOp::Expand { .. }));
+        assert!(matches!(&plan.ops[3], LogicalOp::Filter { .. }));
+        assert!(matches!(&plan.ops[4], LogicalOp::Project { .. }));
+        assert!(matches!(&plan.ops[5], LogicalOp::Distinct { .. }));
+        assert!(matches!(&plan.ops[6], LogicalOp::OrderBy { .. }));
+        assert!(matches!(&plan.ops[7], LogicalOp::Limit { .. }));
+    }
+
+    #[test]
+    fn test_builder_scan_preserves_predicate() {
+        let pred = Predicate::And(
+            Box::new(Predicate::Eq("name".into(), PropValue::Str("Alice".into()))),
+            Box::new(Predicate::Gt("age".into(), PropValue::Int(18))),
+        );
+        let plan = PlanBuilder::new()
+            .scan_with_predicate("Person", "n", pred)
+            .build();
+
+        match &plan.ops[0] {
+            LogicalOp::Scan {
+                predicate: Some(Predicate::And(_, _)),
+                ..
+            } => {}
+            _ => panic!("should preserve And predicate"),
+        }
+    }
+
+    #[test]
+    fn test_builder_aggregate_with_group_by() {
+        let plan = PlanBuilder::new()
+            .scan("Person", "n")
+            .aggregate(
+                vec![Expr::Prop("n".into(), "dept".into())],
+                vec![
+                    ("cnt".into(), AggOp::Count, Expr::Var("n".into())),
+                    ("total".into(), AggOp::Sum, Expr::Prop("n".into(), "age".into())),
+                ],
+            )
+            .build();
+
+        assert_eq!(plan.len(), 2);
+        match &plan.ops[1] {
+            LogicalOp::Aggregate { group_by, aggs } => {
+                assert_eq!(group_by.len(), 1);
+                assert_eq!(aggs.len(), 2);
+            }
+            _ => panic!("expected Aggregate"),
+        }
+    }
+
+    #[test]
+    fn test_builder_path_expand_max_hops() {
+        let plan = PlanBuilder::new()
+            .scan("Node", "n")
+            .path_expand("n", "EDGE", "m", 0, 100, Direction::Out)
+            .build();
+
+        match &plan.ops[1] {
+            LogicalOp::PathExpand {
+                min_hops,
+                max_hops,
+                ..
+            } => {
+                assert_eq!(*min_hops, 0);
+                assert_eq!(*max_hops, 100);
+            }
+            _ => panic!("expected PathExpand"),
         }
     }
 }

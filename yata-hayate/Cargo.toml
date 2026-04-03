@@ -1,0 +1,33 @@
+[package]
+name = "yata-hayate"
+version.workspace = true
+edition.workspace = true
+description = "Hayate V5 training/inference bridge — yata CSR ↔ MLX/numpy via PyO3"
+
+[lib]
+name = "yata_hayate"
+crate-type = ["cdylib"]  # Python extension module
+
+[dependencies]
+# yata crates (minimal deps — no yata-engine/yata-s3 to avoid ring/rustls linker issue)
+yata-core = { path = "../yata-core" }
+yata-grin = { path = "../yata-grin" }
+yata-store = { path = "../yata-store" }
+yata-vineyard = { path = "../yata-vineyard" }
+yata-cypher = { path = "../yata-cypher" }
+
+# Arrow (same version as workspace)
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+
+# PyO3 (Python bindings)
+pyo3 = { version = "0.28", features = ["extension-module"] }
+numpy = { version = "0.28", features = ["half"] }  # f16 support
+
+# HTTP client (remote mode — no rustls, native-tls for macOS compat)
+minreq = { version = "2", features = ["https-native"] }
+
+# Utils
+half = "2"
+serde_json = "1"

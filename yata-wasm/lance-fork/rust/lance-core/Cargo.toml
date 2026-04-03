@@ -1,0 +1,69 @@
+[package]
+name = "lance-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Lance Columnar Format -- Core Library"
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true
+lance-arrow.workspace = true
+byteorder.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+datafusion-common = { workspace = true, optional = true }
+datafusion-sql = { workspace = true, optional = true }
+deepsize.workspace = true
+futures.workspace = true
+lazy_static.workspace = true
+mock_instant.workspace = true
+pin-project.workspace = true
+prost.workspace = true
+rand.workspace = true
+roaring.workspace = true
+serde_json.workspace = true
+snafu.workspace = true
+tracing.workspace = true
+url.workspace = true
+log.workspace = true
+
+
+
+# WASM-gated: these deps are only needed on native targets
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+object_store = { version = "0.11.0", default-features = false }
+moka.workspace = true
+num_cpus = "1.0"
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+
+# WASM-safe tokio subset (sync, macros, rt, time only)
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.23", features = ["sync", "macros", "rt", "time"] }
+tokio-stream = "0.1.14"
+object_store = { version = "0.11.0", default-features = false }
+
+# This is used to detect CPU features at runtime.
+[target.'cfg(all(any(target_arch = "aarch64", target_arch = "loongarch64"), target_os = "linux"))'.dependencies]
+libc = { version = "0.2" }
+
+[dev-dependencies]
+tempfile.workspace = true
+lance-testing.workspace = true
+proptest.workspace = true
+
+[features]
+datafusion = ["datafusion-common", "datafusion-sql"]
+
+[lints]
+workspace = true

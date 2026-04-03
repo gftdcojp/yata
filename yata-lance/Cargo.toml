@@ -3,23 +3,34 @@ name = "yata-lance"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "LanceDB table I/O helpers, Arrow RecordBatch conversion, and vector search"
+description = "LanceDB persistence for yata graph"
 
 [dependencies]
-yata-core.workspace = true
-yata-arrow.workspace = true
-yata-ocel.workspace = true
-async-trait.workspace = true
-arrow.workspace = true
-arrow-array.workspace = true
-arrow-schema.workspace = true
-lancedb.workspace = true
-object_store.workspace = true
-bytes.workspace = true
+# Arrow (aligned with lancedb 0.27)
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+
+# LanceDB — high-level API (embeds lance 4.0, object_store, S3 support)
+lancedb = { version = "0.27", default-features = false, features = ["aws"] }
+
+# Async
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# Force rustls to use ring (not aws-lc-rs) for cross-compile compat
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+
+# Serialization / IO
+chrono.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
-tokio = { workspace = true }
-futures.workspace = true
-tracing.workspace = true
-chrono.workspace = true
+indexmap.workspace = true
+bytes.workspace = true
+yata-cypher = { path = "../yata-cypher" }
+yata-grin = { path = "../yata-grin" }
+
+[dev-dependencies]
+tempfile = "3"
