@@ -27,6 +27,7 @@
     "src"
   ],
   "dependencies": {
+    "@gftd/kagami-query-builder": "file:../../../graph/kagami-query-builder",
     "@gftd/xrpc": "file:../../../runtime/magatama/xrpc",
     "@lancedb/lancedb": "^0.18.2",
     "apache-arrow": "^21.1.0"
